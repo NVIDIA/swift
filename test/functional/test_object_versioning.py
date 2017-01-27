@@ -2089,6 +2089,7 @@ class TestContainerOperations(TestObjectVersioningBase):
             'version_id': obj_v1,
         }])
 
+
 class TestContainerOperationsUTF8(Base2, TestContainerOperations):
     pass
 
