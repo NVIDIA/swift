@@ -59,7 +59,8 @@ from swift.common.middleware.s3api.utils import MULTIUPLOAD_SUFFIX, \
 
 
 def get_acl_handler(controller_name):
-    for base_klass in [BaseAclHandler, MultiUploadAclHandler]:
+    for base_klass in [BaseAclHandler, MultiUploadAclHandler,
+                       BucketAclHandler]:
         # pylint: disable-msg=E1101
         for handler in base_klass.__subclasses__():
             handler_suffix_len = len('AclHandler') \
@@ -128,9 +129,14 @@ class BaseAclHandler(object):
             raise Exception('No permission to be checked exists')
 
         if resource == 'object':
+            version_id = self.req.params.get('versionId')
+            if version_id is None:
+                query = {}
+            else:
+                query = {'version-id': version_id}
             resp = self.req.get_acl_response(app, 'HEAD',
                                              container, obj,
-                                             headers)
+                                             headers, query=query)
             acl = resp.object_acl
         elif resource == 'container':
             resp = self.req.get_acl_response(app, 'HEAD',
@@ -220,6 +226,11 @@ class BucketAclHandler(BaseAclHandler):
         # FIXME If this request is failed, there is a possibility that the
         # bucket which has no ACL is left.
         return self.req.get_acl_response(app, 'POST')
+
+
+class VersioningAclHandler(BucketAclHandler):
+    def POST(self, app):
+        return self._handle_acl(app, 'POST')
 
 
 class ObjectAclHandler(BaseAclHandler):
@@ -460,4 +471,13 @@ ACL_MAP = {
     # Initiate Multipart Upload
     ('POST', 'HEAD', 'container'):
     {'Permission': 'WRITE'},
+    # Versioning
+    ('PUT', 'POST', 'container'):
+    {'Permission': 'WRITE'},
+    ('DELETE', 'POST', 'container'):
+    {'Permission': 'WRITE'},
+    ('DELETE', 'GET', 'container'):
+    {'Permission': 'READ'},
+    ('DELETE', 'GET', 'object'):
+    {'Permission': 'READ'},
 }
