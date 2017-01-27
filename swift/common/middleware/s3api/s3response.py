@@ -109,6 +109,10 @@ class S3Response(S3ResponseBase, swob.Response):
                           'etag', 'last-modified', 'x-robots-tag',
                           'cache-control', 'expires'):
                 headers[key] = val
+            elif _key == 'x-object-version-id':
+                headers['x-amz-version-id'] = val
+            elif _key == 'x-copied-from-version-id':
+                headers['x-amz-copy-source-version-id'] = val
             elif _key == 'x-static-large-object':
                 # for delete slo
                 self.is_slo = config_true_value(val)
@@ -217,7 +221,7 @@ class ErrorResponse(S3ResponseBase, swob.HTTPException):
 
     def _dict_to_etree(self, parent, d):
         for key, value in d.items():
-            tag = re.sub('\W', '', snake_to_camel(key))
+            tag = re.sub(r'\W', '', snake_to_camel(key))
             elem = SubElement(parent, tag)
 
             if isinstance(value, (dict, MutableMapping)):
@@ -481,7 +485,7 @@ class MalformedPOSTRequest(ErrorResponse):
 class MalformedXML(ErrorResponse):
     _status = '400 Bad Request'
     _msg = 'The XML you provided was not well-formed or did not validate ' \
-           'against our published schema.'
+           'against our published schema'
 
 
 class MaxMessageLengthExceeded(ErrorResponse):

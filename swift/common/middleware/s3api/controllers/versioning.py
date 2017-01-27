@@ -17,8 +17,11 @@ from swift.common.utils import public
 
 from swift.common.middleware.s3api.controllers.base import Controller, \
     bucket_operation
-from swift.common.middleware.s3api.etree import Element, tostring
-from swift.common.middleware.s3api.s3response import HTTPOk, S3NotImplemented
+from swift.common.middleware.s3api.etree import Element, tostring, \
+    fromstring, XMLSyntaxError, DocumentInvalid, SubElement
+from swift.common.middleware.s3api.s3response import HTTPOk, MalformedXML
+
+MAX_PUT_VERSIONING_BODY_SIZE = 10240
 
 
 class VersioningController(Controller):
@@ -36,13 +39,19 @@ class VersioningController(Controller):
         """
         Handles GET Bucket versioning.
         """
-        req.get_response(self.app, method='HEAD')
+        sysmeta = req.get_container_info(self.app).get('sysmeta', {})
 
-        # Just report there is no versioning configured here.
+        status = {
+            'True': 'Enabled',
+            'False': 'Suspended',
+            None: None,
+        }[sysmeta.get('versions-enabled')]
         elem = Element('VersioningConfiguration')
+        if status:
+            SubElement(elem, 'Status').text = status
         body = tostring(elem)
 
-        return HTTPOk(body=body, content_type="text/plain")
+        return HTTPOk(body=body, content_type=None)
 
     @public
     @bucket_operation
@@ -50,4 +59,26 @@ class VersioningController(Controller):
         """
         Handles PUT Bucket versioning.
         """
-        raise S3NotImplemented()
+        xml = req.xml(MAX_PUT_VERSIONING_BODY_SIZE)
+        try:
+            elem = fromstring(xml, 'VersioningConfiguration')
+            status = elem.find('./Status').text
+        except (XMLSyntaxError, DocumentInvalid):
+            raise MalformedXML()
+        except Exception as e:
+            self.logger.error(e)
+            raise
+
+        if status not in ['Enabled', 'Suspended']:
+            raise MalformedXML()
+
+        # Set up versioning
+        # NB: object_versioning responsible for ensuring its container exists
+        if status == 'Enabled':
+            req.headers['X-Versions-Enabled'] = 'true'
+        else:
+            req.headers['X-Versions-Enabled'] = 'false'
+        # Set the container back to what it originally was
+        req.get_response(self.app, 'POST')
+
+        return HTTPOk()

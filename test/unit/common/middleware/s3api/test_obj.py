@@ -22,6 +22,7 @@ from os.path import join
 import time
 from mock import patch
 import six
+import json
 
 from swift.common import swob
 from swift.common.swob import Request
@@ -371,6 +372,58 @@ class TestS3ApiObj(S3ApiTestCase):
         self.assertEqual(headers['content-encoding'], 'gzip')
 
     @s3acl
+    def test_object_GET_version_id(self):
+        # GET current version
+        req = Request.blank('/bucket/object?versionId=null',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200', body)
+        self.assertEqual(body, self.object_body)
+
+        # GET current version that is not null
+        req = Request.blank('/bucket/object?versionId=2',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200', body)
+        self.assertEqual(body, self.object_body)
+
+        # GET version in archive
+        headers = self.response_headers.copy()
+        headers['Content-Length'] = 6
+        account = 'test:tester'
+        grants = [Grant(User(account), 'FULL_CONTROL')]
+        headers.update(
+            encode_acl('object', ACL(Owner(account, account), grants)))
+        self.swift.register(
+            'HEAD', '/v1/AUTH_test/bucket/object?version-id=1', swob.HTTPOk,
+            headers, None)
+        self.swift.register(
+            'GET', '/v1/AUTH_test/bucket/object?version-id=1', swob.HTTPOk,
+            headers, 'hello1')
+        req = Request.blank('/bucket/object?versionId=1',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200', body)
+        self.assertEqual(body, b'hello1')
+
+        # Version not found
+        self.swift.register(
+            'GET', '/v1/AUTH_test/bucket/object?version-id=A',
+            swob.HTTPNotFound, {}, None)
+        req = Request.blank('/bucket/object?versionId=A',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '404')
+
+    @s3acl
     def test_object_PUT_error(self):
         code = self._test_method_error('PUT', '/bucket/object',
                                        swob.HTTPUnauthorized)
@@ -395,7 +448,7 @@ class TestS3ApiObj(S3ApiTestCase):
         self.assertEqual(code, 'MissingContentLength')
         code = self._test_method_error('PUT', '/bucket/object',
                                        swob.HTTPPreconditionFailed)
-        self.assertEqual(code, 'InternalError')
+        self.assertEqual(code, 'PreconditionFailed')
         code = self._test_method_error('PUT', '/bucket/object',
                                        swob.HTTPServiceUnavailable)
         self.assertEqual(code, 'ServiceUnavailable')
@@ -435,17 +488,41 @@ class TestS3ApiObj(S3ApiTestCase):
         code = self._test_method_error(
             'PUT', '/bucket/object',
             swob.HTTPCreated,
-            {'X-Amz-Copy-Source': '/bucket/src_obj?versionId=foo'})
-        self.assertEqual(code, 'NotImplemented')
-        code = self._test_method_error(
-            'PUT', '/bucket/object',
-            swob.HTTPCreated,
             {'X-Amz-Copy-Source': '/src_bucket/src_object',
              'X-Amz-Copy-Source-Range': 'bytes=0-0'})
         self.assertEqual(code, 'InvalidArgument')
         code = self._test_method_error('PUT', '/bucket/object',
                                        swob.HTTPRequestTimeout)
         self.assertEqual(code, 'RequestTimeout')
+
+    def test_object_PUT_with_version(self):
+        self.swift.register('GET',
+                            '/v1/AUTH_test/bucket/src_obj?version-id=foo',
+                            swob.HTTPOk, self.response_headers,
+                            self.object_body)
+        self.swift.register('PUT', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPCreated, {
+                                'etag': self.etag,
+                                'last-modified': self.last_modified,
+                            }, None)
+
+        req = Request.blank('/bucket/object', method='PUT', body='', headers={
+            'Authorization': 'AWS test:tester:hmac',
+            'Date': self.get_date_header(),
+            'X-Amz-Copy-Source': '/bucket/src_obj?versionId=foo',
+        })
+        status, headers, body = self.call_s3api(req)
+
+        self.assertEqual('200 OK', status)
+        elem = fromstring(body, 'CopyObjectResult')
+        self.assertEqual(elem.find('ETag').text, '"%s"' % self.etag)
+
+        self.assertEqual(self.swift.calls, [
+            ('HEAD', '/v1/AUTH_test/bucket/src_obj?version-id=foo'),
+            ('PUT', '/v1/AUTH_test/bucket/object?version-id=foo'),
+        ])
+        _, _, headers = self.swift.calls_with_headers[-1]
+        self.assertEqual(headers['x-copy-from'], '/bucket/src_obj')
 
     @s3acl
     def test_object_PUT(self):
@@ -643,7 +720,7 @@ class TestS3ApiObj(S3ApiTestCase):
 
     @s3acl
     def test_object_PUT_copy(self):
-        def do_test(src_path=None):
+        def do_test(src_path):
             date_header = self.get_date_header()
             timestamp = mktime(date_header)
             allowed_last_modified = [S3Timestamp(timestamp).s3xmlformat]
@@ -990,6 +1067,232 @@ class TestS3ApiObj(S3ApiTestCase):
         _, path = self.swift.calls[-1]
         self.assertEqual(path.count('?'), 0)
 
+    def test_object_DELETE_old_version_id(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPOk, self.response_headers, None)
+        resp_headers = {'X-Object-Current-Version-Id': '1574360804.34906'}
+        self.swift.register('DELETE', '/v1/AUTH_test/bucket/object'
+                            '?symlink=get&version-id=1574358170.12293',
+                            swob.HTTPNoContent, resp_headers, None)
+        req = Request.blank('/bucket/object?versionId=1574358170.12293',
+                            method='DELETE', headers={
+                                'Authorization': 'AWS test:tester:hmac',
+                                'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '204')
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('DELETE', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293')
+        ], self.swift.calls)
+
+    def test_object_DELETE_current_version_id(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPOk, self.response_headers, None)
+        resp_headers = {'X-Object-Current-Version-Id': 'null'}
+        self.swift.register('DELETE', '/v1/AUTH_test/bucket/object'
+                            '?symlink=get&version-id=1574358170.12293',
+                            swob.HTTPNoContent, resp_headers, None)
+        old_versions = [{
+            'name': 'object',
+            'version_id': '1574341899.21751',
+            'content_type': 'application/found',
+        }, {
+            'name': 'object',
+            'version_id': '1574333192.15190',
+            'content_type': 'application/older',
+        }]
+        self.swift.register('GET', '/v1/AUTH_test/bucket', swob.HTTPOk, {},
+                            json.dumps(old_versions))
+        req = Request.blank('/bucket/object?versionId=1574358170.12293',
+                            method='DELETE', headers={
+                                'Authorization': 'AWS test:tester:hmac',
+                                'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '204')
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('DELETE', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('GET', '/v1/AUTH_test/bucket'
+             '?prefix=object&versions=True'),
+            ('PUT', '/v1/AUTH_test/bucket/object'
+             '?version-id=1574341899.21751'),
+        ], self.swift.calls)
+
+    def test_object_DELETE_current_version_id_is_delete_marker(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPOk, self.response_headers, None)
+        resp_headers = {'X-Object-Current-Version-Id': 'null'}
+        self.swift.register('DELETE', '/v1/AUTH_test/bucket/object'
+                            '?symlink=get&version-id=1574358170.12293',
+                            swob.HTTPNoContent, resp_headers, None)
+        old_versions = [{
+            'name': 'object',
+            'version_id': '1574341899.21751',
+            'content_type': 'application/x-deleted;swift_versions_deleted=1',
+        }]
+        self.swift.register('GET', '/v1/AUTH_test/bucket', swob.HTTPOk, {},
+                            json.dumps(old_versions))
+        req = Request.blank('/bucket/object?versionId=1574358170.12293',
+                            method='DELETE', headers={
+                                'Authorization': 'AWS test:tester:hmac',
+                                'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '204')
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('DELETE', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('GET', '/v1/AUTH_test/bucket'
+             '?prefix=object&versions=True'),
+        ], self.swift.calls)
+
+    def test_object_DELETE_current_version_id_is_missing(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPOk, self.response_headers, None)
+        resp_headers = {'X-Object-Current-Version-Id': 'null'}
+        self.swift.register('DELETE', '/v1/AUTH_test/bucket/object'
+                            '?symlink=get&version-id=1574358170.12293',
+                            swob.HTTPNoContent, resp_headers, None)
+        old_versions = [{
+            'name': 'object',
+            'version_id': '1574341899.21751',
+            'content_type': 'application/missing',
+        }, {
+            'name': 'object',
+            'version_id': '1574333192.15190',
+            'content_type': 'application/found',
+        }]
+        self.swift.register('GET', '/v1/AUTH_test/bucket', swob.HTTPOk, {},
+                            json.dumps(old_versions))
+        self.swift.register('PUT', '/v1/AUTH_test/bucket/object'
+                            '?version-id=1574341899.21751',
+                            swob.HTTPPreconditionFailed, {}, None)
+        self.swift.register('PUT', '/v1/AUTH_test/bucket/object'
+                            '?version-id=1574333192.15190',
+                            swob.HTTPCreated, {}, None)
+        req = Request.blank('/bucket/object?versionId=1574358170.12293',
+                            method='DELETE', headers={
+                                'Authorization': 'AWS test:tester:hmac',
+                                'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '204')
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('DELETE', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('GET', '/v1/AUTH_test/bucket'
+             '?prefix=object&versions=True'),
+            ('PUT', '/v1/AUTH_test/bucket/object'
+             '?version-id=1574341899.21751'),
+            ('PUT', '/v1/AUTH_test/bucket/object'
+             '?version-id=1574333192.15190'),
+        ], self.swift.calls)
+
+    def test_object_DELETE_current_version_id_GET_error(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPOk, self.response_headers, None)
+        resp_headers = {'X-Object-Current-Version-Id': 'null'}
+        self.swift.register('DELETE', '/v1/AUTH_test/bucket/object'
+                            '?symlink=get&version-id=1574358170.12293',
+                            swob.HTTPNoContent, resp_headers, None)
+        self.swift.register('GET', '/v1/AUTH_test/bucket',
+                            swob.HTTPServerError, {}, '')
+        req = Request.blank('/bucket/object?versionId=1574358170.12293',
+                            method='DELETE', headers={
+                                'Authorization': 'AWS test:tester:hmac',
+                                'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '500')
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('DELETE', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('GET', '/v1/AUTH_test/bucket'
+             '?prefix=object&versions=True'),
+        ], self.swift.calls)
+
+    def test_object_DELETE_current_version_id_PUT_error(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPOk, self.response_headers, None)
+        resp_headers = {'X-Object-Current-Version-Id': 'null'}
+        self.swift.register('DELETE', '/v1/AUTH_test/bucket/object'
+                            '?symlink=get&version-id=1574358170.12293',
+                            swob.HTTPNoContent, resp_headers, None)
+        old_versions = [{
+            'name': 'object',
+            'version_id': '1574341899.21751',
+            'content_type': 'application/foo',
+        }]
+        self.swift.register('GET', '/v1/AUTH_test/bucket', swob.HTTPOk, {},
+                            json.dumps(old_versions))
+        self.swift.register('PUT', '/v1/AUTH_test/bucket/object'
+                            '?version-id=1574341899.21751',
+                            swob.HTTPServerError, {}, None)
+        req = Request.blank('/bucket/object?versionId=1574358170.12293',
+                            method='DELETE', headers={
+                                'Authorization': 'AWS test:tester:hmac',
+                                'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '500')
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('DELETE', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574358170.12293'),
+            ('GET', '/v1/AUTH_test/bucket'
+             '?prefix=object&versions=True'),
+            ('PUT', '/v1/AUTH_test/bucket/object'
+             '?version-id=1574341899.21751'),
+        ], self.swift.calls)
+
+    def test_object_DELETE_in_versioned_container_without_version(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket',
+                            swob.HTTPNoContent, {
+                                'X-Container-Sysmeta-Versions-Enabled': True},
+                            None)
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPNotFound, self.response_headers, None)
+        req = Request.blank('/bucket/object', method='DELETE', headers={
+            'Authorization': 'AWS test:tester:hmac',
+            'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '204')
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket/object'),
+            ('HEAD', '/v1/AUTH_test'),
+            ('HEAD', '/v1/AUTH_test/bucket'),
+            ('DELETE', '/v1/AUTH_test/bucket/object'),
+        ], self.swift.calls)
+
+    def test_object_DELETE_in_versioned_container_with_version_id(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket',
+                            swob.HTTPNoContent, {
+                                'X-Container-Sysmeta-Versions-Enabled': True},
+                            None)
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPNotFound, self.response_headers, None)
+        req = Request.blank('/bucket/object?versionId=1574701081.61553',
+                            method='DELETE', headers={
+                                'Authorization': 'AWS test:tester:hmac',
+                                'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '204')
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574701081.61553'),
+            ('HEAD', '/v1/AUTH_test'),
+            ('HEAD', '/v1/AUTH_test/bucket'),
+            ('DELETE', '/v1/AUTH_test/bucket/object'
+             '?symlink=get&version-id=1574701081.61553'),
+        ], self.swift.calls)
+
     @s3acl
     def test_object_DELETE_multipart(self):
         req = Request.blank('/bucket/object',
@@ -1017,10 +1320,11 @@ class TestS3ApiObj(S3ApiTestCase):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '204')
 
-        self.assertIn(('HEAD', '/v1/AUTH_test/bucket/object'),
-                      self.swift.calls)
-        self.assertNotIn(('DELETE', '/v1/AUTH_test/bucket/object'),
-                         self.swift.calls)
+        self.assertEqual(('HEAD', '/v1/AUTH_test/bucket/object'),
+                         self.swift.calls[0])
+        # the s3acl retests w/ a get_container_info HEAD @ self.swift.calls[1]
+        self.assertEqual(('DELETE', '/v1/AUTH_test/bucket/object'),
+                         self.swift.calls[-1])
 
     @s3acl
     def test_slo_object_DELETE(self):
