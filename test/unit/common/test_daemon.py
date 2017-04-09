@@ -147,9 +147,12 @@ class TestRunDaemon(unittest.TestCase):
         ])
 
     def test_run_daemon(self):
+        logging.logThreads = 1  # reset to default
         sample_conf = "[my-daemon]\nuser = %s\n" % getuser()
         with tmpfile(sample_conf) as conf_file, \
-                mock.patch('swift.common.daemon.use_hub') as mock_use_hub:
+                mock.patch('swift.common.utils.eventlet') as _utils_evt, \
+                mock.patch('eventlet.hubs.use_hub') as mock_use_hub, \
+                mock.patch('eventlet.debug') as _debug_evt:
             with mock.patch.dict('os.environ', {'TZ': ''}), \
                     mock.patch('time.tzset') as mock_tzset:
                 daemon.run_daemon(MyDaemon, conf_file)
@@ -159,6 +162,12 @@ class TestRunDaemon(unittest.TestCase):
                 self.assertEqual(mock_use_hub.mock_calls,
                                  [mock.call(utils.get_hub())])
             daemon.run_daemon(MyDaemon, conf_file, once=True)
+            _utils_evt.patcher.monkey_patch.assert_called_with(all=False,
+                                                               socket=True,
+                                                               select=True,
+                                                               thread=True)
+            self.assertEqual(0, logging.logThreads)  # fixed in monkey_patch
+            _debug_evt.hub_exceptions.assert_called_with(False)
             self.assertEqual(MyDaemon.once_called, True)
 
             # test raise in daemon code
@@ -195,7 +204,9 @@ class TestRunDaemon(unittest.TestCase):
 
             sample_conf = "[my-daemon]\nuser = %s\n" % getuser()
             with tmpfile(sample_conf) as conf_file, \
-                    mock.patch('swift.common.daemon.use_hub'):
+                    mock.patch('swift.common.utils.eventlet'), \
+                    mock.patch('eventlet.hubs.use_hub'), \
+                    mock.patch('eventlet.debug'):
                 daemon.run_daemon(MyDaemon, conf_file)
                 self.assertFalse(MyDaemon.once_called)
                 self.assertTrue(MyDaemon.forever_called)
@@ -228,6 +239,7 @@ class TestRunDaemon(unittest.TestCase):
             yield
 
     def test_fork_workers(self):
+        utils.logging_monkey_patch()  # needed to log at notice
         d = MyWorkerDaemon({'workers': 3})
         strategy = daemon.DaemonStrategy(d, d.logger)
         with self.mock_os():
