@@ -95,12 +95,8 @@ from swift.common.linkat import linkat
 # For backwards compatability with 3rd party middlewares
 from swift.common.registry import register_swift_info, get_swift_info # noqa
 
-# logging doesn't import patched as cleanly as one would like
 from logging.handlers import SysLogHandler
 import logging
-logging.thread = eventlet.green.thread
-logging.threading = eventlet.green.threading
-logging._lock = logging.threading.RLock()
 # setup notice level logging
 NOTICE = 25
 logging.addLevelName(NOTICE, 'NOTICE')
