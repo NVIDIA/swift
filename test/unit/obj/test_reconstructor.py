@@ -1778,9 +1778,14 @@ class TestWorkerReconstructor(unittest.TestCase):
         # a recon dump, but it'll get cleaned up in the next aggregation
         os.unlink(self.rcache)
         do_test(dict(devices='sdz'), 'sdz')
+        # repeat with no local devices
+        reconstructor.get_local_devices = lambda: set()
+        os.unlink(self.rcache)
+        do_test(dict(devices='sdz'), 'sdz')
 
         # now disable workers and check that inline run_once updates rcache
         # and clears out per disk stats
+        reconstructor.get_local_devices = lambda: {'sda'}
         now = time.time()
         later = now + 600  # 10 mins
         reconstructor.reconstructor_workers = 0
@@ -1972,6 +1977,63 @@ class TestWorkerReconstructor(unittest.TestCase):
                 },
             }
         }, data)
+
+    def test_run_forever_recon_no_devices(self):
+
+        class StopForever(Exception):
+            pass
+
+        reconstructor = object_reconstructor.ObjectReconstructor({
+            'reconstructor_workers': 2,
+            'recon_cache_path': self.recon_cache_path
+        }, logger=self.logger)
+
+        def run_forever_but_stop(pid, mock_times, worker_kwargs):
+            with mock.patch('swift.obj.reconstructor.time.time',
+                            side_effect=mock_times), \
+                    mock.patch('swift.obj.reconstructor.os.getpid',
+                               return_value=pid), \
+                    mock.patch('swift.obj.reconstructor.sleep',
+                               side_effect=[StopForever]), \
+                    Timeout(.3), quiet_eventlet_exceptions(), \
+                    self.assertRaises(StopForever):
+                gt = spawn(reconstructor.run_forever, **worker_kwargs)
+                gt.wait()
+
+        reconstructor.reconstruct = mock.MagicMock()
+        now = time.time()
+        # first run_forever with no devices
+        reconstructor.get_local_devices = lambda: []
+        later = now + 6  # 6 sec
+        worker_args = list(
+            # include 'devices' kwarg as a sanity check - it should be ignored
+            # in run_forever mode
+            reconstructor.get_worker_args(once=False, devices='sda'))
+        run_forever_but_stop('pid-1', [now, later, later], worker_args[0])
+        # override args are passed to reconstruct
+        self.assertEqual([mock.call(
+            override_devices=[],
+            override_partitions=[]
+        )], reconstructor.reconstruct.call_args_list)
+        # forever mode with no args, we expect total recon dumps
+        self.assertTrue(os.path.exists(self.rcache))
+        with open(self.rcache) as f:
+            data = json.load(f)
+        expected = {
+            'object_reconstruction_last': later,
+            'object_reconstruction_time': 0.1,
+        }
+        self.assertEqual(expected, data)
+        reconstructor.reconstruct.reset_mock()
+
+        # aggregation is done in the parent thread even later
+        now = later + 300
+        with mock.patch('swift.obj.reconstructor.time.time',
+                        side_effect=[now]):
+            reconstructor.aggregate_recon_update()
+        with open(self.rcache) as f:
+            data = json.load(f)
+        self.assertEqual(expected, data)
 
     def test_recon_aggregation_waits_for_all_devices(self):
         reconstructor = object_reconstructor.ObjectReconstructor({
