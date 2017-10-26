@@ -46,7 +46,9 @@ class TestObject(unittest2.TestCase):
 
         self.containers = []
         self._create_container(self.container)
-        self._create_container(self.container, use_account=2)
+
+        if not tf.skip2:
+            self._create_container(self.container, use_account=2)
 
         self.obj = uuid4().hex
 

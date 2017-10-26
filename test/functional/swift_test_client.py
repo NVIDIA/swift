@@ -548,7 +548,9 @@ class Container(Base):
                                       parms=parms) == 204
 
     def delete_files(self):
-        for f in listing_items(self.files):
+        files = sorted(listing_items(self.files), key=len, reverse=True)
+        print files
+        for f in files:
             file_item = self.file(f)
             if not file_item.delete():
                 return False
