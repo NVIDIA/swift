@@ -64,19 +64,21 @@ class TestSloEnv(BaseEnv):
 
         super(TestSloEnv, cls).setUp()
 
-        config2 = deepcopy(tf.config)
-        config2['account'] = tf.config['account2']
-        config2['username'] = tf.config['username2']
-        config2['password'] = tf.config['password2']
-        cls.conn2 = Connection(config2)
-        cls.conn2.authenticate()
-        cls.account2 = cls.conn2.get_account()
-        cls.account2.delete_containers()
-        config3 = tf.config.copy()
-        config3['username'] = tf.config['username3']
-        config3['password'] = tf.config['password3']
-        cls.conn3 = Connection(config3)
-        cls.conn3.authenticate()
+        if not tf.skip2:
+            config2 = deepcopy(tf.config)
+            config2['account'] = tf.config['account2']
+            config2['username'] = tf.config['username2']
+            config2['password'] = tf.config['password2']
+            cls.conn2 = Connection(config2)
+            cls.conn2.authenticate()
+            cls.account2 = cls.conn2.get_account()
+            cls.account2.delete_containers()
+        if not tf.skip3:
+            config3 = tf.config.copy()
+            config3['username'] = tf.config['username3']
+            config3['password'] = tf.config['password3']
+            cls.conn3 = Connection(config3)
+            cls.conn3.authenticate()
 
         cls.container = cls.account.container(Utils.create_name())
         cls.container2 = cls.account.container(Utils.create_name())

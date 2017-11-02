@@ -43,13 +43,14 @@ class TestObjectVersioningEnv(BaseEnv):
     @classmethod
     def setUp(cls):
         super(TestObjectVersioningEnv, cls).setUp()
-        # Second connection for ACL tests
-        config2 = deepcopy(tf.config)
-        config2['account'] = tf.config['account2']
-        config2['username'] = tf.config['username2']
-        config2['password'] = tf.config['password2']
-        cls.conn2 = Connection(config2)
-        cls.conn2.authenticate()
+        if not tf.skip2:
+            # Second connection for ACL tests
+            config2 = deepcopy(tf.config)
+            config2['account'] = tf.config['account2']
+            config2['username'] = tf.config['username2']
+            config2['password'] = tf.config['password2']
+            cls.conn2 = Connection(config2)
+            cls.conn2.authenticate()
 
         # avoid getting a prefix that stops halfway through an encoded
         # character
@@ -72,24 +73,26 @@ class TestObjectVersioningEnv(BaseEnv):
         # if versioning is off, then cls.location_header_key won't persist
         cls.versioning_enabled = 'versions' in container_info
 
-        # setup another account to test ACLs
-        config2 = deepcopy(tf.config)
-        config2['account'] = tf.config['account2']
-        config2['username'] = tf.config['username2']
-        config2['password'] = tf.config['password2']
-        cls.conn2 = Connection(config2)
-        cls.storage_url2, cls.storage_token2 = cls.conn2.authenticate()
-        cls.account2 = cls.conn2.get_account()
-        cls.account2.delete_containers()
+        if not tf.skip2:
+            # setup another account to test ACLs
+            config2 = deepcopy(tf.config)
+            config2['account'] = tf.config['account2']
+            config2['username'] = tf.config['username2']
+            config2['password'] = tf.config['password2']
+            cls.conn2 = Connection(config2)
+            cls.storage_url2, cls.storage_token2 = cls.conn2.authenticate()
+            cls.account2 = cls.conn2.get_account()
+            cls.account2.delete_containers()
 
-        # setup another account with no access to anything to test ACLs
-        config3 = deepcopy(tf.config)
-        config3['account'] = tf.config['account']
-        config3['username'] = tf.config['username3']
-        config3['password'] = tf.config['password3']
-        cls.conn3 = Connection(config3)
-        cls.storage_url3, cls.storage_token3 = cls.conn3.authenticate()
-        cls.account3 = cls.conn3.get_account()
+        if not tf.skip3:
+            # setup another account with no access to anything to test ACLs
+            config3 = deepcopy(tf.config)
+            config3['account'] = tf.config['account']
+            config3['username'] = tf.config['username3']
+            config3['password'] = tf.config['password3']
+            cls.conn3 = Connection(config3)
+            cls.storage_url3, cls.storage_token3 = cls.conn3.authenticate()
+            cls.account3 = cls.conn3.get_account()
 
     @classmethod
     def tearDown(cls):

@@ -1193,17 +1193,18 @@ class TestFileEnv(BaseEnv):
     @classmethod
     def setUp(cls):
         super(TestFileEnv, cls).setUp()
-        # creating another account and connection
-        # for account to account copy tests
-        config2 = deepcopy(tf.config)
-        config2['account'] = tf.config['account2']
-        config2['username'] = tf.config['username2']
-        config2['password'] = tf.config['password2']
-        cls.conn2 = Connection(config2)
-        cls.conn2.authenticate()
+        if not tf.skip2:
+            # creating another account and connection
+            # for account to account copy tests
+            config2 = deepcopy(tf.config)
+            config2['account'] = tf.config['account2']
+            config2['username'] = tf.config['username2']
+            config2['password'] = tf.config['password2']
+            cls.conn2 = Connection(config2)
+            cls.conn2.authenticate()
 
-        cls.account2 = cls.conn2.get_account()
-        cls.account2.delete_containers()
+            cls.account2 = cls.conn2.get_account()
+            cls.account2.delete_containers()
 
         cls.container = cls.account.container(Utils.create_name())
         if not cls.container.create():
@@ -1218,7 +1219,8 @@ class TestFileEnv(BaseEnv):
         # not have been known. So we ensure that the project domain id is
         # in sysmeta by making a POST to the accounts using an admin role.
         cls.account.update_metadata()
-        cls.account2.update_metadata()
+        if not tf.skip2:
+            cls.account2.update_metadata()
 
 
 class TestFileDev(Base):
@@ -1499,28 +1501,29 @@ class TestFile(Base):
                 self.assertTrue(file_item.initialize())
                 self.assertEqual(metadata, file_item.metadata)
 
-        dest_cont = self.env.account2.container(Utils.create_name())
-        self.assertTrue(dest_cont.create(hdrs={
-            'X-Container-Write': self.env.conn.user_acl
-        }))
+        if not tf.skip2:
+            dest_cont = self.env.account2.container(Utils.create_name())
+            self.assertTrue(dest_cont.create(hdrs={
+                'X-Container-Write': self.env.conn.user_acl
+            }))
 
-        acct = self.env.conn2.account_name
-        # copy both with and without initial slash
-        for prefix in ('', '/'):
-            dest_filename = Utils.create_name()
+            acct = self.env.conn2.account_name
+            # copy both with and without initial slash
+            for prefix in ('', '/'):
+                dest_filename = Utils.create_name()
 
-            file_item = self.env.container.file(source_filename)
-            file_item.copy_account(acct,
-                                   '%s%s' % (prefix, dest_cont),
-                                   dest_filename)
+                file_item = self.env.container.file(source_filename)
+                file_item.copy_account(acct,
+                                       '%s%s' % (prefix, dest_cont),
+                                       dest_filename)
 
-            self.assertIn(dest_filename, dest_cont.files())
+                self.assertIn(dest_filename, dest_cont.files())
 
-            file_item = dest_cont.file(dest_filename)
+                file_item = dest_cont.file(dest_filename)
 
-            self.assertEqual(data, file_item.read())
-            self.assertTrue(file_item.initialize())
-            self.assertEqual(metadata, file_item.metadata)
+                self.assertEqual(data, file_item.read())
+                self.assertTrue(file_item.initialize())
+                self.assertEqual(metadata, file_item.metadata)
 
     def testCopy404s(self):
         source_filename = Utils.create_name()
