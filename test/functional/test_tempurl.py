@@ -416,11 +416,17 @@ class TestContainerTempurlEnv(BaseEnv):
             cls.account2 = cls.conn2.get_account()
 
         cls.container = cls.account.container(Utils.create_name())
-        if not cls.container.create({
-                'x-container-meta-temp-url-key': cls.tempurl_key,
-                'x-container-meta-temp-url-key-2': cls.tempurl_key2,
-                'x-container-read': cls.account2.name}):
-            raise ResponseError(cls.conn.response)
+        if not tf.skip2:
+            if not cls.container.create({
+                    'x-container-meta-temp-url-key': cls.tempurl_key,
+                    'x-container-meta-temp-url-key-2': cls.tempurl_key2,
+                    'x-container-read': cls.account2.name}):
+                raise ResponseError(cls.conn.response)
+        else:
+            if not cls.container.create({
+                    'x-container-meta-temp-url-key': cls.tempurl_key,
+                    'x-container-meta-temp-url-key-2': cls.tempurl_key2}):
+                raise ResponseError(cls.conn.response)
 
         cls.obj = cls.container.file(Utils.create_name())
         cls.obj.write("obj contents")
