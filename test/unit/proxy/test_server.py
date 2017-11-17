@@ -53,7 +53,8 @@ from test import listen_zero
 from test.unit import (
     connect_tcp, readuntil2crlfs, FakeLogger, fake_http_connect, FakeRing,
     FakeMemcache, debug_logger, patch_policies, write_fake_ring,
-    mocked_http_conn, DEFAULT_TEST_EC_TYPE, make_timestamp_iter)
+    mocked_http_conn, DEFAULT_TEST_EC_TYPE, make_timestamp_iter,
+    skip_if_no_xattrs)
 from test.unit.helpers import setup_servers, teardown_servers
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers.obj import ReplicatedObjectController
@@ -237,6 +238,7 @@ def _limit_max_file_size(f):
 class TestController(unittest.TestCase):
 
     def setUp(self):
+        skip_if_no_xattrs()
         self.account_ring = FakeRing()
         self.container_ring = FakeRing()
         self.memcache = FakeMemcache()
@@ -1288,6 +1290,7 @@ class TestProxyServerLoading(unittest.TestCase):
 class TestProxyServerConfigLoading(unittest.TestCase):
 
     def setUp(self):
+        skip_if_no_xattrs()
         self.tempdir = mkdtemp()
         account_ring_path = os.path.join(self.tempdir, 'account.ring.gz')
         write_fake_ring(account_ring_path)
@@ -1987,6 +1990,7 @@ class TestReplicatedObjectController(
     Test suite for replication policy
     """
     def setUp(self):
+        skip_if_no_xattrs()
         self.app = proxy_server.Application(
             None, FakeMemcache(),
             logger=debug_logger('proxy-ut'),
@@ -6383,6 +6387,7 @@ class BaseTestECObjectController(BaseTestObjectController):
 
 class TestECObjectController(BaseTestECObjectController, unittest.TestCase):
     def setUp(self):
+        skip_if_no_xattrs()
         self.ec_policy = POLICIES[3]
         super(TestECObjectController, self).setUp()
 
@@ -6390,11 +6395,15 @@ class TestECObjectController(BaseTestECObjectController, unittest.TestCase):
 class TestECDuplicationObjectController(
         BaseTestECObjectController, unittest.TestCase):
     def setUp(self):
+        skip_if_no_xattrs()
         self.ec_policy = POLICIES[4]
         super(TestECDuplicationObjectController, self).setUp()
 
 
 class TestECMismatchedFA(unittest.TestCase):
+    def setUp(self):
+        skip_if_no_xattrs()
+
     def tearDown(self):
         prosrv = _test_servers[0]
         # don't leak error limits and poison other tests
@@ -6581,6 +6590,7 @@ class TestECMismatchedFA(unittest.TestCase):
 class TestECGets(unittest.TestCase):
     def setUp(self):
         super(TestECGets, self).setUp()
+        skip_if_no_xattrs()
         self.tempdir = mkdtemp()
 
     def tearDown(self):
@@ -6852,6 +6862,7 @@ class TestObjectDisconnectCleanup(unittest.TestCase):
                 mkdirs(data_path)
 
     def setUp(self):
+        skip_if_no_xattrs()
         debug.hub_exceptions(False)
         self._cleanup_devices()
 
@@ -6960,6 +6971,7 @@ class TestObjectECRangedGET(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        skip_if_no_xattrs()
         cls.obj_name = 'range-get-test'
         cls.tiny_obj_name = 'range-get-test-tiny'
         cls.aligned_obj_name = 'range-get-test-aligned'
@@ -7636,10 +7648,9 @@ class TestContainerController(unittest.TestCase):
             # return 404 (as account is not found) and don't cache container
             test_status_map((404, 404, 404), 404, None, 404)
 
-            # cache a 204 for the account because it's sort of like it
-            # exists
+            # cache a 200 for the account because it appears to be created
             self.app.account_autocreate = True
-            test_status_map((404, 404, 404), 404, None, 204)
+            test_status_map((404, 404, 404), 404, None, 200)
 
     def test_PUT_policy_headers(self):
         backend_requests = []
@@ -8809,14 +8820,38 @@ class TestAccountController(unittest.TestCase):
             # ALL nodes are asked to create the account
             # If successful, the GET request is repeated.
             controller.app.account_autocreate = True
-            self.assert_status_map(controller.GET,
-                                   (404, 404, 404), 204)
-            self.assert_status_map(controller.GET,
-                                   (404, 503, 404), 204)
-
+            expected = 200
+            self.assert_status_map(controller.GET, (404, 404, 404), expected)
+            self.assert_status_map(controller.GET, (404, 503, 404), expected)
             # We always return 503 if no majority between 4xx, 3xx or 2xx found
             self.assert_status_map(controller.GET,
                                    (500, 500, 400), 503)
+
+    def _check_autocreate_listing_with_query_string(self, query_string):
+        controller = proxy_server.AccountController(self.app, 'a')
+        controller.app.account_autocreate = True
+        statuses = (404, 404, 404)
+        expected = 200
+        # get the response to check it has json content
+        with save_globals():
+            set_http_connect(*statuses)
+            req = Request.blank('/v1/a' + query_string)
+            self.app.update_request(req)
+            res = controller.GET(req)
+            headers = res.headers
+            self.assertEqual(
+                'yes', headers.get('X-Backend-Fake-Account-Listing'))
+            self.assertEqual(
+                'application/json; charset=utf-8',
+                headers.get('Content-Type'))
+            self.assertEqual([], json.loads(res.body))
+            self.assertEqual(res.status_int, expected)
+
+    def test_auto_create_account_listing_response_is_json(self):
+        self._check_autocreate_listing_with_query_string('')
+        self._check_autocreate_listing_with_query_string('?format=plain')
+        self._check_autocreate_listing_with_query_string('?format=json')
+        self._check_autocreate_listing_with_query_string('?format=xml')
 
     def test_HEAD(self):
         # Same behaviour as GET
@@ -8846,9 +8881,9 @@ class TestAccountController(unittest.TestCase):
                                    (404, 404, 404), 404)
             controller.app.account_autocreate = True
             self.assert_status_map(controller.HEAD,
-                                   (404, 404, 404), 204)
+                                   (404, 404, 404), 200)
             self.assert_status_map(controller.HEAD,
-                                   (500, 404, 404), 204)
+                                   (500, 404, 404), 200)
             # We always return 503 if no majority between 4xx, 3xx or 2xx found
             self.assert_status_map(controller.HEAD,
                                    (500, 500, 400), 503)
@@ -9248,6 +9283,24 @@ class TestAccountControllerFakeGetResponse(unittest.TestCase):
             resp = req.get_response(self.app)
             self.assertEqual(406, resp.status_int)
 
+    def test_GET_autocreate_bad_accept(self):
+        with save_globals():
+            set_http_connect(*([404] * 100))  # nonexistent: all backends 404
+            req = Request.blank('/v1/a', headers={"Accept": "a/b;q=nope"},
+                                environ={'REQUEST_METHOD': 'GET',
+                                         'PATH_INFO': '/v1/a'})
+            resp = req.get_response(self.app)
+            self.assertEqual(400, resp.status_int)
+            self.assertEqual('Invalid Accept header', resp.body)
+
+            set_http_connect(*([404] * 100))  # nonexistent: all backends 404
+            req = Request.blank('/v1/a', headers={"Accept": "a/b;q=0.5;q=1"},
+                                environ={'REQUEST_METHOD': 'GET',
+                                         'PATH_INFO': '/v1/a'})
+            resp = req.get_response(self.app)
+            self.assertEqual(400, resp.status_int)
+            self.assertEqual('Invalid Accept header', resp.body)
+
     def test_GET_autocreate_format_invalid_utf8(self):
         with save_globals():
             set_http_connect(*([404] * 100))  # nonexistent: all backends 404
@@ -9447,6 +9500,7 @@ class TestProxyObjectPerformance(unittest.TestCase):
         # This is just a simple test that can be used to verify and debug the
         # various data paths between the proxy server and the object
         # server. Used as a play ground to debug buffer sizes for sockets.
+        skip_if_no_xattrs()
         prolis = _test_sockets[0]
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         # Client is transmitting in 2 MB chunks
@@ -9560,6 +9614,7 @@ class TestSocketObjectVersions(unittest.TestCase):
 
     def setUp(self):
         global _test_sockets
+        skip_if_no_xattrs()
         self.prolis = prolis = listen_zero()
         self._orig_prolis = _test_sockets[0]
         allowed_headers = ', '.join([

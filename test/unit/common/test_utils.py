@@ -15,7 +15,7 @@
 
 """Tests for swift.common.utils"""
 from __future__ import print_function
-from test.unit import temptree, debug_logger, make_timestamp_iter
+from test.unit import temptree, debug_logger, make_timestamp_iter, with_tempdir
 
 import ctypes
 import contextlib
@@ -30,6 +30,7 @@ import logging
 import platform
 import os
 import mock
+import pwd
 import random
 import re
 import socket
@@ -56,7 +57,6 @@ from functools import partial
 from tempfile import TemporaryFile, NamedTemporaryFile, mkdtemp
 from netifaces import AF_INET6
 from mock import MagicMock, patch
-from nose import SkipTest
 from six.moves.configparser import NoSectionError, NoOptionError
 from uuid import uuid4
 
@@ -70,7 +70,8 @@ from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import POLICIES, reload_storage_policies
 from swift.common.swob import Request, Response
-from test.unit import FakeLogger, requires_o_tmpfile_support
+from test.unit import FakeLogger, requires_o_tmpfile_support, \
+    quiet_eventlet_exceptions
 
 threading = eventlet.patcher.original('threading')
 
@@ -102,10 +103,10 @@ class MockOs(object):
     setgroups = chdir = setsid = setgid = setuid = umask = pass_func
 
     def called_func(self, name, *args, **kwargs):
-        self.called_funcs[name] = True
+        self.called_funcs[name] = args
 
     def raise_func(self, name, *args, **kwargs):
-        self.called_funcs[name] = True
+        self.called_funcs[name] = args
         raise OSError()
 
     def dup2(self, source, target):
@@ -922,24 +923,67 @@ class TestUtils(unittest.TestCase):
         utils.HASH_PATH_SUFFIX = 'endcap'
         utils.HASH_PATH_PREFIX = 'startcap'
 
-    def test_lock_path(self):
-        tmpdir = mkdtemp()
-        try:
-            with utils.lock_path(tmpdir, 0.1):
-                exc = None
-                success = False
-                try:
+    def test_get_zero_indexed_base_string(self):
+        self.assertEqual(utils.get_zero_indexed_base_string('something', 0),
+                         'something')
+        self.assertEqual(utils.get_zero_indexed_base_string('something', None),
+                         'something')
+        self.assertEqual(utils.get_zero_indexed_base_string('something', 1),
+                         'something-1')
+        self.assertRaises(ValueError, utils.get_zero_indexed_base_string,
+                          'something', 'not_integer')
+
+    @with_tempdir
+    def test_lock_path(self, tmpdir):
+        # 2 locks with limit=1 must fail
+        success = False
+        with utils.lock_path(tmpdir, 0.1):
+            with self.assertRaises(LockTimeout):
+                with utils.lock_path(tmpdir, 0.1):
+                    success = True
+        self.assertFalse(success)
+
+        # 2 locks with limit=2 must succeed
+        success = False
+        with utils.lock_path(tmpdir, 0.1, limit=2):
+            try:
+                with utils.lock_path(tmpdir, 0.1, limit=2):
+                    success = True
+            except LockTimeout as exc:
+                self.fail('Unexpected exception %s' % exc)
+        self.assertTrue(success)
+
+        # 3 locks with limit=2 must fail
+        success = False
+        with utils.lock_path(tmpdir, 0.1, limit=2):
+            with utils.lock_path(tmpdir, 0.1, limit=2):
+                with self.assertRaises(LockTimeout):
                     with utils.lock_path(tmpdir, 0.1):
                         success = True
-                except LockTimeout as err:
-                    exc = err
-                self.assertTrue(exc is not None)
-                self.assertTrue(not success)
-        finally:
-            shutil.rmtree(tmpdir)
+        self.assertFalse(success)
 
-    def test_lock_path_num_sleeps(self):
-        tmpdir = mkdtemp()
+    @with_tempdir
+    def test_lock_path_invalid_limit(self, tmpdir):
+        success = False
+        with self.assertRaises(ValueError):
+            with utils.lock_path(tmpdir, 0.1, limit=0):
+                success = True
+        self.assertFalse(success)
+        with self.assertRaises(ValueError):
+            with utils.lock_path(tmpdir, 0.1, limit=-1):
+                success = True
+        self.assertFalse(success)
+        with self.assertRaises(TypeError):
+            with utils.lock_path(tmpdir, 0.1, limit='1'):
+                success = True
+        self.assertFalse(success)
+        with self.assertRaises(TypeError):
+            with utils.lock_path(tmpdir, 0.1, limit=1.1):
+                success = True
+        self.assertFalse(success)
+
+    @with_tempdir
+    def test_lock_path_num_sleeps(self, tmpdir):
         num_short_calls = [0]
         exception_raised = [False]
 
@@ -957,43 +1001,38 @@ class TestUtils(unittest.TestCase):
         except Exception as e:
             exception_raised[0] = True
             self.assertTrue('sleep time changed' in str(e))
-        finally:
-            shutil.rmtree(tmpdir)
         self.assertEqual(num_short_calls[0], 11)
         self.assertTrue(exception_raised[0])
 
-    def test_lock_path_class(self):
-        tmpdir = mkdtemp()
-        try:
-            with utils.lock_path(tmpdir, 0.1, ReplicationLockTimeout):
-                exc = None
-                exc2 = None
-                success = False
-                try:
-                    with utils.lock_path(tmpdir, 0.1, ReplicationLockTimeout):
-                        success = True
-                except ReplicationLockTimeout as err:
-                    exc = err
-                except LockTimeout as err:
-                    exc2 = err
-                self.assertTrue(exc is not None)
-                self.assertTrue(exc2 is None)
-                self.assertTrue(not success)
-                exc = None
-                exc2 = None
-                success = False
-                try:
-                    with utils.lock_path(tmpdir, 0.1):
-                        success = True
-                except ReplicationLockTimeout as err:
-                    exc = err
-                except LockTimeout as err:
-                    exc2 = err
-                self.assertTrue(exc is None)
-                self.assertTrue(exc2 is not None)
-                self.assertTrue(not success)
-        finally:
-            shutil.rmtree(tmpdir)
+    @with_tempdir
+    def test_lock_path_class(self, tmpdir):
+        with utils.lock_path(tmpdir, 0.1, ReplicationLockTimeout):
+            exc = None
+            exc2 = None
+            success = False
+            try:
+                with utils.lock_path(tmpdir, 0.1, ReplicationLockTimeout):
+                    success = True
+            except ReplicationLockTimeout as err:
+                exc = err
+            except LockTimeout as err:
+                exc2 = err
+            self.assertTrue(exc is not None)
+            self.assertTrue(exc2 is None)
+            self.assertTrue(not success)
+            exc = None
+            exc2 = None
+            success = False
+            try:
+                with utils.lock_path(tmpdir, 0.1):
+                    success = True
+            except ReplicationLockTimeout as err:
+                exc = err
+            except LockTimeout as err:
+                exc2 = err
+            self.assertTrue(exc is None)
+            self.assertTrue(exc2 is not None)
+            self.assertTrue(not success)
 
     def test_normalize_timestamp(self):
         # Test swift.common.utils.normalize_timestamp
@@ -1501,8 +1540,8 @@ class TestUtils(unittest.TestCase):
         syslog_handler_catcher.LOG_LOCAL0 = orig_sysloghandler.LOG_LOCAL0
         syslog_handler_catcher.LOG_LOCAL3 = orig_sysloghandler.LOG_LOCAL3
 
-        try:
-            utils.ThreadSafeSysLogHandler = syslog_handler_catcher
+        with mock.patch.object(utils, 'ThreadSafeSysLogHandler',
+                               syslog_handler_catcher):
             utils.get_logger({
                 'log_facility': 'LOG_LOCAL3',
             }, 'server', log_route='server')
@@ -1551,8 +1590,6 @@ class TestUtils(unittest.TestCase):
                 ((), {'address': ('syslog.funtimes.com', 2123),
                       'facility': orig_sysloghandler.LOG_LOCAL0})],
                 syslog_handler_args)
-        finally:
-            utils.ThreadSafeSysLogHandler = orig_sysloghandler
 
     @reset_logger_state
     def test_clean_logger_exception(self):
@@ -1987,7 +2024,7 @@ foo = bar
 [section2]
 log_name = yarr'''
         # setup a real file
-        fd, temppath = tempfile.mkstemp(dir='/tmp')
+        fd, temppath = tempfile.mkstemp()
         with os.fdopen(fd, 'wb') as f:
             f.write(conf)
         make_filename = lambda: temppath
@@ -2036,7 +2073,7 @@ foo = bar
 [section2]
 log_name = %(yarr)s'''
         # setup a real file
-        fd, temppath = tempfile.mkstemp(dir='/tmp')
+        fd, temppath = tempfile.mkstemp()
         with os.fdopen(fd, 'wb') as f:
             f.write(conf)
         make_filename = lambda: temppath
@@ -2131,46 +2168,51 @@ log_name = %(yarr)s'''
         }
         self.assertEqual(conf, expected)
 
-    def test_drop_privileges(self):
+    def _check_drop_privileges(self, mock_os, required_func_calls,
+                               call_setsid=True):
         user = getuser()
+        user_data = pwd.getpwnam(user)
+        self.assertFalse(mock_os.called_funcs)  # sanity check
         # over-ride os with mock
+        with mock.patch('swift.common.utils.os', mock_os):
+            # exercise the code
+            utils.drop_privileges(user, call_setsid=call_setsid)
+
+        for func in required_func_calls:
+            self.assertIn(func, mock_os.called_funcs)
+        self.assertEqual(user_data[5], mock_os.environ['HOME'])
+        groups = {g.gr_gid for g in grp.getgrall() if user in g.gr_mem}
+        self.assertEqual(groups, set(mock_os.called_funcs['setgroups'][0]))
+        self.assertEqual(user_data[3], mock_os.called_funcs['setgid'][0])
+        self.assertEqual(user_data[2], mock_os.called_funcs['setuid'][0])
+        self.assertEqual('/', mock_os.called_funcs['chdir'][0])
+        self.assertEqual(0o22, mock_os.called_funcs['umask'][0])
+
+    def test_drop_privileges(self):
         required_func_calls = ('setgroups', 'setgid', 'setuid', 'setsid',
                                'chdir', 'umask')
-        utils.os = MockOs(called_funcs=required_func_calls)
-        # exercise the code
-        utils.drop_privileges(user)
-        for func in required_func_calls:
-            self.assertTrue(utils.os.called_funcs[func])
-        import pwd
-        self.assertEqual(pwd.getpwnam(user)[5], utils.os.environ['HOME'])
+        mock_os = MockOs(called_funcs=required_func_calls)
+        self._check_drop_privileges(mock_os, required_func_calls)
 
-        groups = [g.gr_gid for g in grp.getgrall() if user in g.gr_mem]
-        groups.append(pwd.getpwnam(user).pw_gid)
-        self.assertEqual(set(groups), set(os.getgroups()))
-
-        # reset; test same args, OSError trying to get session leader
-        utils.os = MockOs(called_funcs=required_func_calls,
-                          raise_funcs=('setsid',))
-        for func in required_func_calls:
-            self.assertFalse(utils.os.called_funcs.get(func, False))
-        utils.drop_privileges(user)
-        for func in required_func_calls:
-            self.assertTrue(utils.os.called_funcs[func])
+    def test_drop_privileges_setsid_error(self):
+        # OSError trying to get session leader
+        required_func_calls = ('setgroups', 'setgid', 'setuid', 'setsid',
+                               'chdir', 'umask')
+        mock_os = MockOs(called_funcs=required_func_calls,
+                         raise_funcs=('setsid',))
+        self._check_drop_privileges(mock_os, required_func_calls)
 
     def test_drop_privileges_no_call_setsid(self):
-        user = getuser()
-        # over-ride os with mock
         required_func_calls = ('setgroups', 'setgid', 'setuid', 'chdir',
                                'umask')
+        # OSError if trying to get session leader, but it shouldn't be called
         bad_func_calls = ('setsid',)
-        utils.os = MockOs(called_funcs=required_func_calls,
-                          raise_funcs=bad_func_calls)
-        # exercise the code
-        utils.drop_privileges(user, call_setsid=False)
-        for func in required_func_calls:
-            self.assertTrue(utils.os.called_funcs[func])
+        mock_os = MockOs(called_funcs=required_func_calls,
+                         raise_funcs=bad_func_calls)
+        self._check_drop_privileges(mock_os, required_func_calls,
+                                    call_setsid=False)
         for func in bad_func_calls:
-            self.assertNotIn(func, utils.os.called_funcs)
+            self.assertNotIn(func, mock_os.called_funcs)
 
     @reset_logger_state
     def test_capture_stdio(self):
@@ -2970,8 +3012,7 @@ cluster_dfw1 = http://dfw1.host/v1/
                 self.last_call[-1] = self.last_call[-1].value
                 return 0
 
-        orig__sys_fallocate = utils._sys_fallocate
-        try:
+        with patch.object(utils, '_sys_fallocate', FallocateWrapper()):
             utils._sys_fallocate = FallocateWrapper()
             # Ensure fallocate calls _sys_fallocate even with 0 bytes
             utils._sys_fallocate.last_call = None
@@ -2993,8 +3034,6 @@ cluster_dfw1 = http://dfw1.host/v1/
             utils.fallocate(1234, 10 * 1024 * 1024 * 1024)
             self.assertEqual(utils._sys_fallocate.last_call,
                              [1234, 1, 0, 10 * 1024 * 1024 * 1024])
-        finally:
-            utils._sys_fallocate = orig__sys_fallocate
 
     def test_generate_trans_id(self):
         fake_time = 1366428370.5163341
@@ -3242,7 +3281,7 @@ cluster_dfw1 = http://dfw1.host/v1/
         tmpdir = mkdtemp()
         try:
             link = os.path.join(tmpdir, "tmp")
-            os.symlink("/tmp", link)
+            os.symlink(tempfile.gettempdir(), link)
             self.assertFalse(utils.ismount(link))
         finally:
             shutil.rmtree(tmpdir)
@@ -3547,7 +3586,7 @@ cluster_dfw1 = http://dfw1.host/v1/
         tempdir = None
         fd = None
         try:
-            tempdir = mkdtemp(dir='/tmp')
+            tempdir = mkdtemp()
             fd, temppath = tempfile.mkstemp(dir=tempdir)
 
             _mock_fsync = mock.Mock()
@@ -3585,7 +3624,7 @@ cluster_dfw1 = http://dfw1.host/v1/
     def test_renamer_with_fsync_dir(self):
         tempdir = None
         try:
-            tempdir = mkdtemp(dir='/tmp')
+            tempdir = mkdtemp()
             # Simulate part of object path already existing
             part_dir = os.path.join(tempdir, 'objects/1234/')
             os.makedirs(part_dir)
@@ -3632,7 +3671,7 @@ cluster_dfw1 = http://dfw1.host/v1/
         tempdir = None
         fd = None
         try:
-            tempdir = mkdtemp(dir='/tmp')
+            tempdir = mkdtemp()
             os.makedirs(os.path.join(tempdir, 'a/b'))
             # 4 new dirs created
             dirpath = os.path.join(tempdir, 'a/b/1/2/3/4')
@@ -3664,7 +3703,7 @@ cluster_dfw1 = http://dfw1.host/v1/
         try:
             utils.NR_ioprio_set()
         except OSError as e:
-            raise SkipTest(e)
+            raise unittest.SkipTest(e)
 
         with patch('swift.common.utils._libc_setpriority',
                    _fake_setpriority), \
@@ -3755,7 +3794,7 @@ cluster_dfw1 = http://dfw1.host/v1/
 
     @requires_o_tmpfile_support
     def test_link_fd_to_path_linkat_success(self):
-        tempdir = mkdtemp(dir='/tmp')
+        tempdir = mkdtemp()
         fd = os.open(tempdir, utils.O_TMPFILE | os.O_WRONLY)
         data = "I'm whatever Gotham needs me to be"
         _m_fsync_dir = mock.Mock()
@@ -3775,7 +3814,7 @@ cluster_dfw1 = http://dfw1.host/v1/
 
     @requires_o_tmpfile_support
     def test_link_fd_to_path_target_exists(self):
-        tempdir = mkdtemp(dir='/tmp')
+        tempdir = mkdtemp()
         # Create and write to a file
         fd, path = tempfile.mkstemp(dir=tempdir)
         os.write(fd, "hello world")
@@ -3810,7 +3849,7 @@ cluster_dfw1 = http://dfw1.host/v1/
 
     @requires_o_tmpfile_support
     def test_linkat_race_dir_not_exists(self):
-        tempdir = mkdtemp(dir='/tmp')
+        tempdir = mkdtemp()
         target_dir = os.path.join(tempdir, uuid4().hex)
         target_path = os.path.join(target_dir, uuid4().hex)
         os.mkdir(target_dir)
@@ -6305,8 +6344,9 @@ class TestPipeMutex(unittest.TestCase):
 
     def test_wrong_releaser(self):
         self.mutex.acquire()
-        self.assertRaises(RuntimeError,
-                          eventlet.spawn(self.mutex.release).wait)
+        with quiet_eventlet_exceptions():
+            self.assertRaises(RuntimeError,
+                              eventlet.spawn(self.mutex.release).wait)
 
     def test_blocking(self):
         evt = eventlet.event.Event()

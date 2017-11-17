@@ -804,6 +804,21 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
             ring.rebalance()
             self.assertTrue(ring.validate())
 
+    def test_set_weight_old_format_two_devices(self):
+        # Would block without the 'yes' argument
+        self.create_sample_ring()
+        argv = ["", self.tmpfile, "set_weight",
+                "d2", "3.14", "d1", "6.28", "--yes"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        ring = RingBuilder.load(self.tmpfile)
+        # Check that weight was changed
+        self.assertEqual(ring.devs[2]['weight'], 3.14)
+        self.assertEqual(ring.devs[1]['weight'], 6.28)
+        # Check that other devices in ring are not affected
+        self.assertEqual(ring.devs[0]['weight'], 100)
+        self.assertEqual(ring.devs[3]['weight'], 100)
+
     def test_set_weight_ipv4_old_format(self):
         self.create_sample_ring()
         # Test ipv4(old format)
@@ -1410,7 +1425,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
 
     def test_validate_non_existent_file(self):
-        rand_file = '%s/%s' % ('/tmp', str(uuid.uuid4()))
+        rand_file = '%s/%s' % (tempfile.gettempdir(), str(uuid.uuid4()))
         argv = ["", rand_file, "validate"]
         self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
 

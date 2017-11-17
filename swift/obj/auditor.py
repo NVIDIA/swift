@@ -240,7 +240,7 @@ class AuditorWorker(object):
         df = diskfile_mgr.get_diskfile_from_audit_location(location)
         reader = None
         try:
-            with df.open():
+            with df.open(modernize=True):
                 metadata = df.get_metadata()
                 obj_size = int(metadata['Content-Length'])
                 if self.stats_sizes:
@@ -289,9 +289,9 @@ class AuditorWorker(object):
 class ObjectAuditor(Daemon):
     """Audit objects."""
 
-    def __init__(self, conf, **options):
+    def __init__(self, conf, logger=None, **options):
         self.conf = conf
-        self.logger = get_logger(conf, log_route='object-auditor')
+        self.logger = logger or get_logger(conf, log_route='object-auditor')
         self.devices = conf.get('devices', '/srv/node')
         self.concurrency = int(conf.get('concurrency', 1))
         self.conf_zero_byte_fps = int(

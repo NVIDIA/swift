@@ -26,14 +26,13 @@ import six
 import six.moves.cPickle as pickle
 import shutil
 
-from eventlet import (GreenPile, GreenPool, Timeout, sleep, hubs, tpool,
-                      spawn)
+from eventlet import (GreenPile, GreenPool, Timeout, sleep, tpool, spawn)
 from eventlet.support.greenlets import GreenletExit
 
 from swift import gettext_ as _
 from swift.common.utils import (
     whataremyips, unlink_older_than, compute_eta, get_logger,
-    dump_recon_cache, mkdirs, config_true_value, list_from_csv, get_hub,
+    dump_recon_cache, mkdirs, config_true_value, list_from_csv,
     tpool_reraise, GreenAsyncPile, Timestamp, remove_file)
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.bufferedhttp import http_connect
@@ -49,9 +48,6 @@ from swift.common.exceptions import ConnectionTimeout, DiskFileError, \
     SuffixSyncError
 
 SYNC, REVERT = ('sync_only', 'sync_revert')
-
-
-hubs.use_hub(get_hub())
 
 
 def _get_partners(frag_index, part_nodes):
@@ -1097,8 +1093,9 @@ class ObjectReconstructor(Daemon):
                 self.part_count += len(partitions)
                 for partition in partitions:
                     part_path = join(obj_path, partition)
-                    if partition in ('auditor_status_ALL.json',
-                                     'auditor_status_ZBF.json'):
+                    if (partition.startswith('auditor_status_') and
+                            partition.endswith('.json')):
+                        # ignore auditor status files
                         continue
                     if not partition.isdigit():
                         self.logger.warning(

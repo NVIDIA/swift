@@ -30,7 +30,8 @@ from eventlet.green import subprocess
 from eventlet import Timeout
 
 from test.unit import (debug_logger, patch_policies, make_timestamp_iter,
-                       mocked_http_conn, FakeLogger)
+                       mocked_http_conn, FakeLogger, mock_check_drive,
+                       skip_if_no_xattrs)
 from swift.common import utils
 from swift.common.utils import (hash_path, mkdirs, normalize_timestamp,
                                 storage_directory)
@@ -179,6 +180,7 @@ def _create_test_rings(path, devs=None, next_part_power=None):
 class TestObjectReplicator(unittest.TestCase):
 
     def setUp(self):
+        skip_if_no_xattrs()
         utils.HASH_PATH_SUFFIX = 'endcap'
         utils.HASH_PATH_PREFIX = ''
         # recon cache path
@@ -453,6 +455,20 @@ class TestObjectReplicator(unittest.TestCase):
                 self.assertEqual(node['device'], 'sda')
             self.assertEqual(jobs_by_pol_part[part]['path'],
                              os.path.join(self.objects_1, part[1:]))
+
+    def test_collect_jobs_unmounted(self):
+        with mock_check_drive() as mocks:
+            jobs = self.replicator.collect_jobs()
+        self.assertEqual(jobs, [])
+        self.assertEqual(mocks['ismount'].mock_calls, [])
+        self.assertEqual(len(mocks['isdir'].mock_calls), 2)
+
+        self.replicator.mount_check = True
+        with mock_check_drive() as mocks:
+            jobs = self.replicator.collect_jobs()
+        self.assertEqual(jobs, [])
+        self.assertEqual(mocks['isdir'].mock_calls, [])
+        self.assertEqual(len(mocks['ismount'].mock_calls), 2)
 
     def test_collect_jobs_failure_report_with_auditor_stats_json(self):
         devs = [
