@@ -1803,7 +1803,7 @@ class TestFile(Base):
                                                    (prefix,
                                                     src_cont,
                                                     Utils.create_name())})
-            self.assert_status(404)
+            self.assert_status([403, 404])
 
             # invalid destination container
             dest_cont = self.env.account.container(Utils.create_name())
@@ -1814,7 +1814,7 @@ class TestFile(Base):
                                                    (prefix,
                                                     src_cont,
                                                     source_filename)})
-            self.assert_status(404)
+            self.assert_status([403, 404])
 
     def testNameLimit(self):
         limit = load_constraint('max_object_name_length')
