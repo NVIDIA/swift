@@ -1412,6 +1412,18 @@ class TestObject(unittest2.TestCase):
             resp.read()
             self.assertIn(resp.status, (204, 404))
 
+        # Delete the subdirs
+        def delete(url, token, parsed, conn, path):
+            conn.request('DELETE', '%s/%s' % (parsed.path, path), '',
+                {'X-Auth-Token': token})
+            return check_response(conn)
+        for path in (self.container + '/segments1',
+                     self.container + '/segments2',
+                     acontainer + '/segments3'):
+            resp = retry(delete, path)
+            resp.read()
+            self.assertIn(resp.status, (204, 404))
+
         # Delete the extra container
         def delete(url, token, parsed, conn):
             conn.request('DELETE', '%s/%s' % (parsed.path, acontainer), '',
