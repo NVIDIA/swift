@@ -661,7 +661,7 @@ class TestContainer(Base):
         cont = self.env.account.container(Utils.create_name())
         self.assertTrue(cont.create())
 
-        delimiter = '/'
+        delimiter = '-'
         files = ['test', delimiter.join(['', 'test', 'bar']),
                  delimiter.join(['', 'test', 'bar', 'foo'])]
         for f in files:
@@ -1086,6 +1086,13 @@ class TestContainerPathsEnv(BaseEnv):
 
 class TestContainerPaths(Base):
     env = TestContainerPathsEnv
+
+    @classmethod
+    def setUpClass(cls):
+        pass
+
+    def setUp(self):
+        raise SkipTest('ProxyFS cannot support this')
 
     def testTraverseContainer(self):
         found_files = []
