@@ -1819,9 +1819,10 @@ class TestFile(Base):
 
     def testNameLimit(self):
         limit = load_constraint('max_object_name_length')
+        long_name = '/'.join('a' * 128 for x in range(limit // 64 + 1))
 
         for l in (1, 10, limit / 2, limit - 1, limit, limit + 1, limit * 2):
-            file_item = self.env.container.file('a' * l)
+            file_item = self.env.container.file(long_name[:l])
 
             if l <= limit:
                 self.assertTrue(file_item.write())
