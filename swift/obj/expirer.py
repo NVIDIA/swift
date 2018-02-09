@@ -272,12 +272,18 @@ class ObjectExpirer(Daemon):
             self.pop_queue(container, obj)
             self.report_objects += 1
             self.logger.increment('objects')
+        except UnexpectedResponse as err:
+            self.logger.increment('errors')
+            self.logger.error(
+                'Unexpected response while deleting object %(container)s '
+                '%(obj)s: %(err)s' % {'container': container, 'obj': obj,
+                                      'err': str(err.resp.status_int)})
         except (Exception, Timeout) as err:
             self.logger.increment('errors')
             self.logger.exception(
-                _('Exception while deleting object %(container)s %(obj)s'
-                  ' %(err)s') % {'container': container,
-                                 'obj': obj, 'err': str(err)})
+                'Exception while deleting object %(container)s %(obj)s'
+                ' %(err)s' % {'container': container,
+                              'obj': obj, 'err': str(err)})
         self.logger.timing_since('timing', start_time)
         self.report()
 
@@ -300,9 +306,13 @@ class ObjectExpirer(Daemon):
                            '<account>/<container>/<object>'
         :param timestamp: The timestamp the X-Delete-At value must match to
                           perform the actual delete.
+        :raises UnexpectedResponse: if the delete was unsuccessful and
+                                    should be retried later
         """
         path = '/v1/' + urllib.parse.quote(actual_obj.lstrip('/'))
-        self.swift.make_request('DELETE', path,
-                                {'X-If-Delete-At': str(timestamp),
-                                 'X-Timestamp': str(timestamp)},
-                                (2,))
+        self.swift.make_request(
+            'DELETE', path,
+            {'X-If-Delete-At': str(timestamp),
+             'X-Timestamp': str(timestamp),
+             'X-Backend-Clean-Expiring-Object-Queue': 'no'},
+            (2, HTTP_CONFLICT))
