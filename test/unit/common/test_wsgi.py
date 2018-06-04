@@ -15,6 +15,7 @@
 
 """Tests for swift.common.wsgi"""
 
+from argparse import Namespace
 import errno
 import logging
 import socket
@@ -22,6 +23,9 @@ import unittest
 import os
 from textwrap import dedent
 from collections import defaultdict
+import types
+
+import eventlet.wsgi
 
 import six
 from six import BytesIO
@@ -203,7 +207,7 @@ class TestWSGI(unittest.TestCase):
         conf_file = os.path.join(tempdir, 'file.conf')
 
         def _write_and_load_conf_file(conf):
-            with open(conf_file, 'wb') as fd:
+            with open(conf_file, 'wt') as fd:
                 fd.write(dedent(conf))
             return wsgi.load_app_config(conf_file)
 
@@ -474,21 +478,13 @@ class TestWSGI(unittest.TestCase):
             with mock.patch('swift.proxy.server.Application.'
                             'modify_wsgi_pipeline'), \
                     mock.patch('swift.common.wsgi.wsgi') as _wsgi, \
-                    mock.patch('swift.common.wsgi.eventlet') as _wsgi_evt, \
-                    mock.patch('swift.common.utils.eventlet') as _utils_evt, \
-                    mock.patch('swift.common.wsgi.inspect'):
+                    mock.patch('swift.common.wsgi.eventlet') as _wsgi_evt:
                 conf = wsgi.appconfig(conf_file)
                 logger = logging.getLogger('test')
                 sock = listen_zero()
                 wsgi.run_server(conf, logger, sock)
-        self.assertEqual('HTTP/1.0',
-                         _wsgi.HttpProtocol.default_request_version)
         self.assertEqual(30, _wsgi.WRITE_TIMEOUT)
         _wsgi_evt.hubs.use_hub.assert_called_with(utils.get_hub())
-        _utils_evt.patcher.monkey_patch.assert_called_with(all=False,
-                                                           socket=True,
-                                                           select=True,
-                                                           thread=True)
         _wsgi_evt.debug.hub_exceptions.assert_called_with(False)
         self.assertTrue(_wsgi.server.called)
         args, kwargs = _wsgi.server.call_args
@@ -499,6 +495,60 @@ class TestWSGI(unittest.TestCase):
         self.assertTrue(isinstance(server_logger, wsgi.NullLogger))
         self.assertTrue('custom_pool' in kwargs)
         self.assertEqual(1000, kwargs['custom_pool'].size)
+
+        proto_class = kwargs['protocol']
+        self.assertEqual(proto_class, wsgi.SwiftHttpProtocol)
+        self.assertEqual('HTTP/1.0', proto_class.default_request_version)
+
+    def test_run_server_proxied(self):
+        config = """
+        [DEFAULT]
+        client_timeout = 30
+        max_clients = 1000
+        swift_dir = TEMPDIR
+
+        [pipeline:main]
+        pipeline = proxy-server
+
+        [app:proxy-server]
+        use = egg:swift#proxy
+        # these "set" values override defaults
+        set client_timeout = 20
+        set max_clients = 10
+        require_proxy_protocol = true
+        """
+
+        contents = dedent(config)
+        with temptree(['proxy-server.conf']) as t:
+            conf_file = os.path.join(t, 'proxy-server.conf')
+            with open(conf_file, 'w') as f:
+                f.write(contents.replace('TEMPDIR', t))
+            _fake_rings(t)
+            with mock.patch('swift.proxy.server.Application.'
+                            'modify_wsgi_pipeline'), \
+                    mock.patch('swift.common.wsgi.wsgi') as _wsgi, \
+                    mock.patch('swift.common.wsgi.eventlet') as _eventlet:
+                conf = wsgi.appconfig(conf_file,
+                                      name='proxy-server')
+                logger = logging.getLogger('test')
+                sock = listen_zero()
+                wsgi.run_server(conf, logger, sock)
+        self.assertEqual(20, _wsgi.WRITE_TIMEOUT)
+        _eventlet.hubs.use_hub.assert_called_with(utils.get_hub())
+        _eventlet.debug.hub_exceptions.assert_called_with(False)
+        self.assertTrue(_wsgi.server.called)
+        args, kwargs = _wsgi.server.call_args
+        server_sock, server_app, server_logger = args
+        self.assertEqual(sock, server_sock)
+        self.assertTrue(isinstance(server_app, swift.proxy.server.Application))
+        self.assertEqual(20, server_app.client_timeout)
+        self.assertTrue(isinstance(server_logger, wsgi.NullLogger))
+        self.assertTrue('custom_pool' in kwargs)
+        self.assertEqual(10, kwargs['custom_pool'].size)
+
+        proto_class = kwargs['protocol']
+        self.assertEqual(proto_class, wsgi.SwiftHttpProxiedProtocol)
+        self.assertEqual('HTTP/1.0', proto_class.default_request_version)
 
     def test_run_server_with_latest_eventlet(self):
         config = """
@@ -512,9 +562,6 @@ class TestWSGI(unittest.TestCase):
         use = egg:swift#proxy
         """
 
-        def argspec_stub(server):
-            return mock.MagicMock(args=['capitalize_response_headers'])
-
         contents = dedent(config)
         with temptree(['proxy-server.conf']) as t:
             conf_file = os.path.join(t, 'proxy-server.conf')
@@ -524,9 +571,7 @@ class TestWSGI(unittest.TestCase):
             with mock.patch('swift.proxy.server.Application.'
                             'modify_wsgi_pipeline'), \
                     mock.patch('swift.common.wsgi.wsgi') as _wsgi, \
-                    mock.patch('swift.common.wsgi.eventlet'), \
-                    mock.patch('swift.common.wsgi.inspect',
-                               getargspec=argspec_stub):
+                    mock.patch('swift.common.wsgi.eventlet'):
                 conf = wsgi.appconfig(conf_file)
                 logger = logging.getLogger('test')
                 sock = listen_zero()
@@ -535,6 +580,9 @@ class TestWSGI(unittest.TestCase):
         self.assertTrue(_wsgi.server.called)
         args, kwargs = _wsgi.server.call_args
         self.assertEqual(kwargs.get('capitalize_response_headers'), False)
+        self.assertTrue('protocol' in kwargs)
+        self.assertEqual('HTTP/1.0',
+                         kwargs['protocol'].default_request_version)
 
     def test_run_server_conf_dir(self):
         config_dir = {
@@ -562,9 +610,7 @@ class TestWSGI(unittest.TestCase):
                             'modify_wsgi_pipeline'), \
                     mock.patch('swift.common.wsgi.wsgi') as _wsgi, \
                     mock.patch('swift.common.wsgi.eventlet') as _wsgi_evt, \
-                    mock.patch('swift.common.utils.eventlet') as _utils_evt, \
                     mock.patch.dict('os.environ', {'TZ': ''}), \
-                    mock.patch('swift.common.wsgi.inspect'), \
                     mock.patch('time.tzset'):
                 conf = wsgi.appconfig(conf_dir)
                 logger = logging.getLogger('test')
@@ -572,14 +618,8 @@ class TestWSGI(unittest.TestCase):
                 wsgi.run_server(conf, logger, sock)
                 self.assertTrue(os.environ['TZ'] is not '')
 
-        self.assertEqual('HTTP/1.0',
-                         _wsgi.HttpProtocol.default_request_version)
         self.assertEqual(30, _wsgi.WRITE_TIMEOUT)
         _wsgi_evt.hubs.use_hub.assert_called_with(utils.get_hub())
-        _utils_evt.patcher.monkey_patch.assert_called_with(all=False,
-                                                           socket=True,
-                                                           select=True,
-                                                           thread=True)
         _wsgi_evt.debug.hub_exceptions.assert_called_with(False)
         self.assertTrue(_wsgi.server.called)
         args, kwargs = _wsgi.server.call_args
@@ -588,6 +628,9 @@ class TestWSGI(unittest.TestCase):
         self.assertTrue(isinstance(server_app, swift.proxy.server.Application))
         self.assertTrue(isinstance(server_logger, wsgi.NullLogger))
         self.assertTrue('custom_pool' in kwargs)
+        self.assertTrue('protocol' in kwargs)
+        self.assertEqual('HTTP/1.0',
+                         kwargs['protocol'].default_request_version)
 
     def test_run_server_debug(self):
         config = """
@@ -617,7 +660,6 @@ class TestWSGI(unittest.TestCase):
             with mock.patch('swift.proxy.server.Application.'
                             'modify_wsgi_pipeline'), \
                     mock.patch('swift.common.wsgi.wsgi') as _wsgi, \
-                    mock.patch('swift.common.utils.eventlet') as _utils_evt, \
                     mock.patch('swift.common.wsgi.eventlet') as _wsgi_evt:
                 mock_server = _wsgi.server
                 _wsgi.server = lambda *args, **kwargs: mock_server(
@@ -626,14 +668,8 @@ class TestWSGI(unittest.TestCase):
                 logger = logging.getLogger('test')
                 sock = listen_zero()
                 wsgi.run_server(conf, logger, sock)
-        self.assertEqual('HTTP/1.0',
-                         _wsgi.HttpProtocol.default_request_version)
         self.assertEqual(30, _wsgi.WRITE_TIMEOUT)
         _wsgi_evt.hubs.use_hub.assert_called_with(utils.get_hub())
-        _utils_evt.patcher.monkey_patch.assert_called_with(all=False,
-                                                           socket=True,
-                                                           select=True,
-                                                           thread=True)
         _wsgi_evt.debug.hub_exceptions.assert_called_with(True)
         self.assertTrue(mock_server.called)
         args, kwargs = mock_server.call_args
@@ -644,6 +680,9 @@ class TestWSGI(unittest.TestCase):
         self.assertIsNone(server_logger)
         self.assertTrue('custom_pool' in kwargs)
         self.assertEqual(1000, kwargs['custom_pool'].size)
+        self.assertTrue('protocol' in kwargs)
+        self.assertEqual('HTTP/1.0',
+                         kwargs['protocol'].default_request_version)
 
     def test_appconfig_dir_ignores_hidden_files(self):
         config_dir = {
@@ -674,12 +713,12 @@ class TestWSGI(unittest.TestCase):
         oldenv = {}
         newenv = wsgi.make_pre_authed_env(oldenv)
         self.assertTrue('wsgi.input' in newenv)
-        self.assertEqual(newenv['wsgi.input'].read(), '')
+        self.assertEqual(newenv['wsgi.input'].read(), b'')
 
         oldenv = {'wsgi.input': BytesIO(b'original wsgi.input')}
         newenv = wsgi.make_pre_authed_env(oldenv)
         self.assertTrue('wsgi.input' in newenv)
-        self.assertEqual(newenv['wsgi.input'].read(), '')
+        self.assertEqual(newenv['wsgi.input'].read(), b'')
 
         oldenv = {'swift.source': 'UT'}
         newenv = wsgi.make_pre_authed_env(oldenv)
@@ -692,7 +731,7 @@ class TestWSGI(unittest.TestCase):
     def test_pre_auth_req(self):
         class FakeReq(object):
             @classmethod
-            def fake_blank(cls, path, environ=None, body='', headers=None):
+            def fake_blank(cls, path, environ=None, body=b'', headers=None):
                 if environ is None:
                     environ = {}
                 if headers is None:
@@ -702,7 +741,7 @@ class TestWSGI(unittest.TestCase):
         was_blank = Request.blank
         Request.blank = FakeReq.fake_blank
         wsgi.make_pre_authed_request({'HTTP_X_TRANS_ID': '1234'},
-                                     'PUT', '/', body='tester', headers={})
+                                     'PUT', '/', body=b'tester', headers={})
         wsgi.make_pre_authed_request({'HTTP_X_TRANS_ID': '1234'},
                                      'PUT', '/', headers={})
         Request.blank = was_blank
@@ -710,7 +749,7 @@ class TestWSGI(unittest.TestCase):
     def test_pre_auth_req_with_quoted_path(self):
         r = wsgi.make_pre_authed_request(
             {'HTTP_X_TRANS_ID': '1234'}, 'PUT', path=quote('/a space'),
-            body='tester', headers={})
+            body=b'tester', headers={})
         self.assertEqual(r.path, quote('/a space'))
 
     def test_pre_auth_req_drops_query(self):
@@ -726,8 +765,8 @@ class TestWSGI(unittest.TestCase):
 
     def test_pre_auth_req_with_body(self):
         r = wsgi.make_pre_authed_request(
-            {'QUERY_STRING': 'original'}, 'GET', 'path', 'the body')
-        self.assertEqual(r.body, 'the body')
+            {'QUERY_STRING': 'original'}, 'GET', 'path', b'the body')
+        self.assertEqual(r.body, b'the body')
 
     def test_pre_auth_creates_script_name(self):
         e = wsgi.make_pre_authed_env({})
@@ -745,9 +784,9 @@ class TestWSGI(unittest.TestCase):
 
     def test_pre_auth_req_swift_source(self):
         r = wsgi.make_pre_authed_request(
-            {'QUERY_STRING': 'original'}, 'GET', 'path', 'the body',
+            {'QUERY_STRING': 'original'}, 'GET', 'path', b'the body',
             swift_source='UT')
-        self.assertEqual(r.body, 'the body')
+        self.assertEqual(r.body, b'the body')
         self.assertEqual(r.environ['swift.source'], 'UT')
 
     def test_run_server_global_conf_callback(self):
@@ -777,12 +816,17 @@ class TestWSGI(unittest.TestCase):
                 mock.patch.object(wsgi, 'drop_privileges'), \
                 mock.patch.object(wsgi, 'loadapp', _loadapp), \
                 mock.patch.object(wsgi, 'capture_stdio'), \
-                mock.patch.object(wsgi, 'run_server'):
+                mock.patch.object(wsgi, 'run_server'), \
+                mock.patch('swift.common.utils.eventlet') as _utils_evt:
             wsgi.run_wsgi('conf_file', 'app_section',
                           global_conf_callback=_global_conf_callback)
 
         self.assertEqual(calls['_global_conf_callback'], 1)
         self.assertEqual(calls['_loadapp'], 1)
+        _utils_evt.patcher.monkey_patch.assert_called_with(all=False,
+                                                           socket=True,
+                                                           select=True,
+                                                           thread=True)
 
     def test_run_server_success(self):
         calls = defaultdict(lambda: 0)
@@ -802,11 +846,16 @@ class TestWSGI(unittest.TestCase):
                 mock.patch.object(wsgi, 'drop_privileges'), \
                 mock.patch.object(wsgi, 'loadapp', _loadapp), \
                 mock.patch.object(wsgi, 'capture_stdio'), \
-                mock.patch.object(wsgi, 'run_server'):
+                mock.patch.object(wsgi, 'run_server'), \
+                mock.patch('swift.common.utils.eventlet') as _utils_evt:
             rc = wsgi.run_wsgi('conf_file', 'app_section')
         self.assertEqual(calls['_initrp'], 1)
         self.assertEqual(calls['_loadapp'], 1)
         self.assertEqual(rc, 0)
+        _utils_evt.patcher.monkey_patch.assert_called_with(all=False,
+                                                           socket=True,
+                                                           select=True,
+                                                           thread=True)
 
     @mock.patch('swift.common.wsgi.run_server')
     @mock.patch('swift.common.wsgi.WorkersStrategy')
@@ -951,6 +1000,193 @@ class TestWSGI(unittest.TestCase):
         oldenv = {'swift.infocache': {}}
         newenv = wsgi.make_env(oldenv)
         self.assertIs(newenv.get('swift.infocache'), oldenv['swift.infocache'])
+
+
+class TestSwiftHttpProtocol(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch('swift.common.wsgi.wsgi.HttpProtocol')
+        self.mock_super = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _proto_obj(self):
+        # Make an object we can exercise... note the base class's __init__()
+        # does a bunch of work, so we just new up an object like eventlet.wsgi
+        # does.
+        proto_class = wsgi.SwiftHttpProtocol
+        try:
+            the_obj = types.InstanceType(proto_class)
+        except AttributeError:
+            the_obj = proto_class.__new__(proto_class)
+        # Install some convenience mocks
+        the_obj.server = Namespace(app=Namespace(logger=mock.Mock()),
+                                   url_length_limit=777,
+                                   log=mock.Mock())
+        the_obj.send_error = mock.Mock()
+
+        return the_obj
+
+    def test_swift_http_protocol_log_request(self):
+        proto_obj = self._proto_obj()
+        self.assertEqual(None, proto_obj.log_request('ignored'))
+
+    def test_swift_http_protocol_log_message(self):
+        proto_obj = self._proto_obj()
+
+        proto_obj.log_message('a%sc', 'b')
+        self.assertEqual([mock.call.error('ERROR WSGI: a%sc', 'b')],
+                         proto_obj.server.app.logger.mock_calls)
+
+    def test_swift_http_protocol_log_message_no_logger(self):
+        # If the app somehow had no logger attribute or it was None, don't blow
+        # up
+        proto_obj = self._proto_obj()
+        delattr(proto_obj.server.app, 'logger')
+
+        proto_obj.log_message('a%sc', 'b')
+        self.assertEqual([mock.call.error('ERROR WSGI: a%sc', 'b')],
+                         proto_obj.server.log.mock_calls)
+
+        proto_obj.server.log.reset_mock()
+        proto_obj.server.app.logger = None
+
+        proto_obj.log_message('a%sc', 'b')
+        self.assertEqual([mock.call.error('ERROR WSGI: a%sc', 'b')],
+                         proto_obj.server.log.mock_calls)
+
+    def test_swift_http_protocol_parse_request_no_proxy(self):
+        proto_obj = self._proto_obj()
+        proto_obj.raw_requestline = b'jimmy jam'
+        proto_obj.client_address = ('a', '123')
+
+        self.assertEqual(False, proto_obj.parse_request())
+
+        self.assertEqual([], self.mock_super.mock_calls)
+        self.assertEqual([
+            mock.call(400, "Bad HTTP/0.9 request type ('jimmy')"),
+        ], proto_obj.send_error.mock_calls)
+        self.assertEqual(('a', '123'), proto_obj.client_address)
+
+
+class TestProxyProtocol(unittest.TestCase):
+    def _run_bytes_through_protocol(self, bytes_from_client, protocol_class):
+        rfile = BytesIO(bytes_from_client)
+        wfile = BytesIO()
+
+        # All this fakery is needed to make the WSGI server process one
+        # connection, possibly with multiple requests, in the main
+        # greenthread. It doesn't hurt correctness if the function is called
+        # in a separate greenthread, but it makes using the debugger harder.
+        class FakeGreenthread(object):
+            def link(self, a_callable, *args):
+                a_callable(self, *args)
+
+        class FakePool(object):
+            def spawn(self, a_callable, *args, **kwargs):
+                a_callable(*args, **kwargs)
+                return FakeGreenthread()
+
+            def spawn_n(self, a_callable, *args, **kwargs):
+                a_callable(*args, **kwargs)
+
+            def waitall(self):
+                pass
+
+        def dinky_app(env, start_response):
+            start_response("200 OK", [])
+            body = "got addr: %s %s\r\n" % (
+                env.get("REMOTE_ADDR", "<missing>"),
+                env.get("REMOTE_PORT", "<missing>"))
+            return [body.encode("utf-8")]
+
+        fake_tcp_socket = mock.Mock(
+            setsockopt=lambda *a: None,
+            makefile=lambda mode, bufsize: rfile if 'r' in mode else wfile,
+        )
+        fake_listen_socket = mock.Mock(accept=mock.MagicMock(
+            side_effect=[[fake_tcp_socket, ('127.0.0.1', 8359)],
+                         # KeyboardInterrupt breaks the WSGI server out of
+                         # its infinite accept-process-close loop.
+                         KeyboardInterrupt]))
+
+        # If we let the WSGI server close rfile/wfile then we can't access
+        # their contents any more.
+        with mock.patch.object(wfile, 'close', lambda: None), \
+                mock.patch.object(rfile, 'close', lambda: None):
+            eventlet.wsgi.server(
+                fake_listen_socket, dinky_app,
+                protocol=protocol_class,
+                custom_pool=FakePool(),
+                log_output=False,  # quiet the test run
+            )
+        return wfile.getvalue()
+
+    def test_request_with_proxy(self):
+        bytes_out = self._run_bytes_through_protocol((
+            b"PROXY TCP4 192.168.0.1 192.168.0.11 56423 443\r\n"
+            b"GET /someurl HTTP/1.0\r\n"
+            b"User-Agent: something or other\r\n"
+            b"\r\n"
+        ), wsgi.SwiftHttpProxiedProtocol)
+
+        lines = [l for l in bytes_out.split(b"\r\n") if l]
+        self.assertEqual(lines[0], b"HTTP/1.1 200 OK")  # sanity check
+        self.assertEqual(lines[-1], b"got addr: 192.168.0.1 56423")
+
+    def test_multiple_requests_with_proxy(self):
+        bytes_out = self._run_bytes_through_protocol((
+            b"PROXY TCP4 192.168.0.1 192.168.0.11 56423 443\r\n"
+            b"GET /someurl HTTP/1.1\r\n"
+            b"User-Agent: something or other\r\n"
+            b"\r\n"
+            b"GET /otherurl HTTP/1.1\r\n"
+            b"User-Agent: something or other\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+        ), wsgi.SwiftHttpProxiedProtocol)
+
+        lines = bytes_out.split(b"\r\n")
+        self.assertEqual(lines[0], b"HTTP/1.1 200 OK")  # sanity check
+
+        # the address in the PROXY line is applied to every request
+        addr_lines = [l for l in lines if l.startswith(b"got addr")]
+        self.assertEqual(addr_lines, [b"got addr: 192.168.0.1 56423"] * 2)
+
+    def test_missing_proxy_line(self):
+        bytes_out = self._run_bytes_through_protocol((
+            # whoops, no PROXY line here
+            b"GET /someurl HTTP/1.0\r\n"
+            b"User-Agent: something or other\r\n"
+            b"\r\n"
+        ), wsgi.SwiftHttpProxiedProtocol)
+
+        lines = [l for l in bytes_out.split(b"\r\n") if l]
+        self.assertIn(b"400 Invalid PROXY line", lines[0])
+
+    def test_malformed_proxy_lines(self):
+        for bad_line in [b'PROXY jojo',
+                         b'PROXYjojo a b c d e',
+                         b'PROXY a b c d e',  # bad INET protocol and family
+                         ]:
+            bytes_out = self._run_bytes_through_protocol(
+                bad_line, wsgi.SwiftHttpProxiedProtocol)
+            lines = [l for l in bytes_out.split(b"\r\n") if l]
+            self.assertIn(b"400 Invalid PROXY line", lines[0])
+
+    def test_unknown_client_addr(self):
+        # For "UNKNOWN", the rest of the line before the CRLF may be omitted by
+        # the sender, and the receiver must ignore anything presented before
+        # the CRLF is found.
+        for unknown_line in [b'PROXY UNKNOWN',  # mimimal valid unknown
+                             b'PROXY UNKNOWNblahblah',  # also valid
+                             b'PROXY UNKNOWN a b c d']:
+            bytes_out = self._run_bytes_through_protocol((
+                unknown_line + (b"\r\n"
+                                b"GET /someurl HTTP/1.0\r\n"
+                                b"User-Agent: something or other\r\n"
+                                b"\r\n")
+            ), wsgi.SwiftHttpProxiedProtocol)
+            lines = [l for l in bytes_out.split(b"\r\n") if l]
+            self.assertIn(b"200 OK", lines[0])
 
 
 class TestServersPerPortStrategy(unittest.TestCase):
@@ -1275,9 +1511,10 @@ class TestWorkersStrategy(unittest.TestCase):
             pid += 1
             sock_count += 1
 
+        mypid = os.getpid()
         self.assertEqual([
-            'Started child %s' % 88,
-            'Started child %s' % 89,
+            'Started child %s from parent %s' % (88, mypid),
+            'Started child %s from parent %s' % (89, mypid),
         ], self.logger.get_lines_for_level('notice'))
 
         self.assertEqual(2, sock_count)
@@ -1287,7 +1524,7 @@ class TestWorkersStrategy(unittest.TestCase):
         self.strategy.register_worker_exit(88)
 
         self.assertEqual([
-            'Removing dead child %s' % 88,
+            'Removing dead child %s from parent %s' % (88, mypid)
         ], self.logger.get_lines_for_level('error'))
 
         for s, i in self.strategy.new_worker_socks():
@@ -1299,9 +1536,9 @@ class TestWorkersStrategy(unittest.TestCase):
 
         self.assertEqual(1, sock_count)
         self.assertEqual([
-            'Started child %s' % 88,
-            'Started child %s' % 89,
-            'Started child %s' % 90,
+            'Started child %s from parent %s' % (88, mypid),
+            'Started child %s from parent %s' % (89, mypid),
+            'Started child %s from parent %s' % (90, mypid),
         ], self.logger.get_lines_for_level('notice'))
 
     def test_post_fork_hook(self):
@@ -1368,7 +1605,8 @@ class TestWSGIContext(unittest.TestCase):
         self.assertEqual('aaaaa', next(iterator))
         self.assertEqual('bbbbb', next(iterator))
         iterable.close()
-        self.assertRaises(StopIteration, iterator.next)
+        with self.assertRaises(StopIteration):
+            next(iterator)
 
     def test_update_content_length(self):
         statuses = ['200 Ok']

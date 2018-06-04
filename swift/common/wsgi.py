@@ -18,7 +18,6 @@
 from __future__ import print_function
 
 import errno
-import inspect
 import os
 import signal
 import time
@@ -44,6 +43,9 @@ from swift.common.utils import capture_stdio, disable_fallocate, \
     drop_privileges, get_logger, NullLogger, config_true_value, \
     validate_configuration, get_hub, config_auto_int_value, \
     reiterate
+
+SIGNUM_TO_NAME = {getattr(signal, n): n for n in dir(signal)
+                  if n.startswith('SIG') and '_' not in n}
 
 # Set maximum line size of message headers to be accepted.
 wsgi.MAX_HEADER_LINE = constraints.MAX_HEADER_SIZE
@@ -119,6 +121,8 @@ class ConfigString(NamedConfigLoader):
         }
         self.parser = loadwsgi.NicerConfigParser("string", defaults=defaults)
         self.parser.optionxform = str  # Don't lower-case keys
+        # Defaults don't need interpolation (crazy PasteDeploy...)
+        self.parser.defaults = lambda: dict(self.parser._defaults, **defaults)
         self.parser.readfp(self.contents)
 
 
@@ -415,22 +419,102 @@ def load_app_config(conf_file):
     return app_conf
 
 
+class SwiftHttpProtocol(wsgi.HttpProtocol):
+    default_request_version = "HTTP/1.0"
+
+    def log_request(self, *a):
+        """
+        Turn off logging requests by the underlying WSGI software.
+        """
+        pass
+
+    def log_message(self, f, *a):
+        """
+        Redirect logging other messages by the underlying WSGI software.
+        """
+        logger = getattr(self.server.app, 'logger', None) or self.server.log
+        logger.error('ERROR WSGI: ' + f, *a)
+
+
+class SwiftHttpProxiedProtocol(SwiftHttpProtocol):
+    """
+    Protocol object that speaks HTTP, including multiple requests, but with
+    a single PROXY line as the very first thing coming in over the socket.
+    This is so we can learn what the client's IP address is when Swift is
+    behind a TLS terminator, like hitch, that does not understand HTTP and
+    so cannot add X-Forwarded-For or other similar headers.
+
+    See http://www.haproxy.org/download/1.7/doc/proxy-protocol.txt for
+    protocol details.
+    """
+    def handle_error(self, connection_line):
+        if not six.PY2:
+            connection_line = connection_line.decode('latin-1')
+
+        # No further processing will proceed on this connection under any
+        # circumstances.  We always send the request into the superclass to
+        # handle any cleanup - this ensures that the request will not be
+        # processed.
+        self.rfile.close()
+        # We don't really have any confidence that an HTTP Error will be
+        # processable by the client as our transmission broken down between
+        # ourselves and our gateway proxy before processing the client
+        # protocol request.  Hopefully the operator will know what to do!
+        msg = 'Invalid PROXY line %r' % connection_line
+        self.log_message(msg)
+        # Even assuming HTTP we don't even known what version of HTTP the
+        # client is sending?  This entire endeavor seems questionable.
+        self.request_version = self.default_request_version
+        # appease http.server
+        self.command = 'PROXY'
+        self.send_error(400, msg)
+
+    def handle(self):
+        """Handle multiple requests if necessary."""
+        # ensure the opening line for the connection is a valid PROXY protcol
+        # line; this is the only IO we do on this connection before any
+        # additional wrapping further pollutes the raw socket.
+        connection_line = self.rfile.readline(self.server.url_length_limit)
+
+        if connection_line.startswith(b'PROXY'):
+            proxy_parts = connection_line.split(b' ')
+            if len(proxy_parts) >= 2 and proxy_parts[0] == b'PROXY':
+                if proxy_parts[1] in (b'TCP4', b'TCP6') and \
+                        len(proxy_parts) == 6:
+                    if six.PY2:
+                        self.client_address = (proxy_parts[2], proxy_parts[4])
+                    else:
+                        self.client_address = (
+                            proxy_parts[2].decode('latin-1'),
+                            proxy_parts[4].decode('latin-1'))
+                elif proxy_parts[1].startswith(b'UNKNOWN'):
+                    # "UNKNOWN", in PROXY protocol version 1, means "not
+                    # TCP4 or TCP6". This includes completely legitimate
+                    # things like QUIC or Unix domain sockets. The PROXY
+                    # protocol (section 2.1) states that the receiver
+                    # (that's us) MUST ignore anything after "UNKNOWN" and
+                    # before the CRLF, essentially discarding the first
+                    # line.
+                    pass
+                else:
+                    self.handle_error(connection_line)
+            else:
+                self.handle_error(connection_line)
+        else:
+            self.handle_error(connection_line)
+
+        return SwiftHttpProtocol.handle(self)
+
+
 def run_server(conf, logger, sock, global_conf=None):
     # Ensure TZ environment variable exists to avoid stat('/etc/localtime') on
     # some platforms. This locks in reported times to UTC.
     os.environ['TZ'] = 'UTC+0'
     time.tzset()
 
-    wsgi.HttpProtocol.default_request_version = "HTTP/1.0"
-    # Turn off logging requests by the underlying WSGI software.
-    wsgi.HttpProtocol.log_request = lambda *a: None
-    # Redirect logging other messages by the underlying WSGI software.
-    wsgi.HttpProtocol.log_message = \
-        lambda s, f, *a: logger.error('ERROR WSGI: ' + f % a)
     wsgi.WRITE_TIMEOUT = int(conf.get('client_timeout') or 60)
 
     eventlet.hubs.use_hub(get_hub())
-    utils.eventlet_monkey_patch()
     eventlet_debug = config_true_value(conf.get('eventlet_debug', 'no'))
     eventlet.debug.hub_exceptions(eventlet_debug)
     wsgi_logger = NullLogger()
@@ -447,15 +531,24 @@ def run_server(conf, logger, sock, global_conf=None):
     app = loadapp(conf['__file__'], global_conf=global_conf)
     max_clients = int(conf.get('max_clients', '1024'))
     pool = RestrictedGreenPool(size=max_clients)
+
+    # Select which protocol class to use (normal or one expecting PROXY
+    # protocol)
+    if config_true_value(conf.get('require_proxy_protocol', 'no')):
+        protocol_class = SwiftHttpProxiedProtocol
+    else:
+        protocol_class = SwiftHttpProtocol
+
+    server_kwargs = {
+        'custom_pool': pool,
+        'protocol': protocol_class,
+        # Disable capitalizing headers in Eventlet. This is necessary for
+        # the AWS SDK to work with s3api middleware (it needs an "ETag"
+        # header; "Etag" just won't do).
+        'capitalize_response_headers': False,
+    }
     try:
-        # Disable capitalizing headers in Eventlet if possible.  This is
-        # necessary for the AWS SDK to work with swift3 middleware.
-        argspec = inspect.getargspec(wsgi.server)
-        if 'capitalize_response_headers' in argspec.args:
-            wsgi.server(sock, app, wsgi_logger, custom_pool=pool,
-                        capitalize_response_headers=False)
-        else:
-            wsgi.server(sock, app, wsgi_logger, custom_pool=pool)
+        wsgi.server(sock, app, wsgi_logger, **server_kwargs)
     except socket.error as err:
         if err[0] != errno.EINVAL:
             raise
@@ -558,7 +651,8 @@ class WorkersStrategy(object):
         :param int pid: The new worker process' PID
         """
 
-        self.logger.notice('Started child %s' % pid)
+        self.logger.notice('Started child %s from parent %s',
+                           pid, os.getpid())
         self.children.append(pid)
 
     def register_worker_exit(self, pid):
@@ -568,7 +662,8 @@ class WorkersStrategy(object):
         :param int pid: The PID of the worker that exited.
         """
 
-        self.logger.error('Removing dead child %s' % pid)
+        self.logger.error('Removing dead child %s from parent %s',
+                          pid, os.getpid())
         self.children.remove(pid)
 
     def shutdown_sockets(self):
@@ -905,6 +1000,9 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
     else:
         strategy = WorkersStrategy(conf, logger)
 
+    # patch event before loadapp
+    utils.eventlet_monkey_patch()
+
     # Ensure the configuration and application can be loaded before proceeding.
     global_conf = {'log_name': log_name}
     if 'global_conf_callback' in kwargs:
@@ -931,24 +1029,17 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
         run_server(conf, logger, no_fork_sock, global_conf=global_conf)
         return 0
 
-    def kill_children(*args):
-        """Kills the entire process group."""
-        logger.error('SIGTERM received')
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        running[0] = False
-        os.killpg(0, signal.SIGTERM)
+    def stop_with_signal(signum, *args):
+        """Set running flag to False and capture the signum"""
+        running_context[0] = False
+        running_context[1] = signum
 
-    def hup(*args):
-        """Shuts down the server, but allows running requests to complete"""
-        logger.error('SIGHUP received')
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
-        running[0] = False
+    # context to hold boolean running state and stop signum
+    running_context = [True, None]
+    signal.signal(signal.SIGTERM, stop_with_signal)
+    signal.signal(signal.SIGHUP, stop_with_signal)
 
-    running = [True]
-    signal.signal(signal.SIGTERM, kill_children)
-    signal.signal(signal.SIGHUP, hup)
-
-    while running[0]:
+    while running_context[0]:
         for sock, sock_info in strategy.new_worker_socks():
             pid = os.fork()
             if pid == 0:
@@ -988,11 +1079,23 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
                         sleep(0.01)
             except KeyboardInterrupt:
                 logger.notice('User quit')
-                running[0] = False
+                running_context[0] = False
                 break
 
+    if running_context[1] is not None:
+        try:
+            signame = SIGNUM_TO_NAME[running_context[1]]
+        except KeyError:
+            logger.error('Stopping with unexpected signal %r' %
+                         running_context[1])
+        else:
+            logger.error('%s received', signame)
+    if running_context[1] == signal.SIGTERM:
+        os.killpg(0, signal.SIGTERM)
+
     strategy.shutdown_sockets()
-    logger.notice('Exited')
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    logger.notice('Exited (%s)', os.getpid())
     return 0
 
 

@@ -1,3 +1,179 @@
+swift (2.18.0)
+
+    * Added container sharding, an operator controlled feature that
+      may be used to shard very large container databases into a
+      number of smaller shard containers. This mitigates the issues
+      with one large DB by distributing the data across multiple
+      smaller databases throughout the cluster. Please read the full
+      overview at
+      https://docs.openstack.org/swift/latest/overview_container_sharding.html
+
+    * Provide an S3 API compatibility layer. The external "swift3"
+      project has been imported into Swift's codebase as the "s3api"
+      middleware.
+
+    * Added "emergency mode" hooks in the account and container replicators.
+      These options may be used to prioritize moving handoff
+      partitions to primary locations more quickly. This helps when
+      adding capacity to a ring.
+
+      - Added `-d <devs>` and `-p <partitions>` command line options.
+
+      - Added a handoffs-only mode.
+
+    * Add a multiprocess mode to the object replicator. Setting the
+      "replicator_workers" setting to a positive value N will result
+      in the replicator using up to N worker processes to perform
+      replication tasks. At most one worker per disk will be spawned.
+
+      Worker process logs will have a bit of information prepended so
+      operators can tell which messages came from which worker. The
+      prefix is "[worker M/N pid=P] ", where M is the worker's index,
+      N is the total number of workers, and P is the process ID. Every
+      message from the replicator's logger will have the prefix
+
+    * The object reconstructor will now fork all available worker
+      processes when operating on a subset of local devices.
+
+    * Add support for PROXY protocol v1 to the proxy server. This
+      allows the Swift proxy server to log accurate client IP
+      addresses when there is a proxy or SSL-terminator between the
+      client and the Swift proxy server.  Example servers supporting
+      this PROXY protocol include stunnel, haproxy, hitch, and
+      varnish. See the sample proxy server config file for the
+      appropriate config setting to enable or disable this
+      functionality.
+
+    * In the ratelimit middleware, account whitelist and blacklist
+      settings have been deprecated and may be removed in a future
+      release. When found, a deprecation message will be logged.
+      Instead of these config file values, set X-Account-Sysmeta-
+      Global-Write-Ratelimit:WHITELIST and X-Account-Sysmeta-Global-
+      Write-Ratelimit:BLACKLIST on the particular accounts that need
+      to be whitelisted or blacklisted. System metadata cannot be added
+      or modified by standard clients. Use the internal client to set sysmeta.
+
+    * Add a --drop-prefixes flag to swift-account-info,
+      swift-container-info, and swift-object-info. This makes the
+      output between the three more consistent.
+
+    * statsd error messages correspond to 5xx responses only. This
+      makes monitoring more useful because actual errors (5xx) will
+      not be hidden by common user requests (4xx). Previously, some 4xx
+      responses would be included in timing information in the statsd
+      error messages.
+
+    * Truncate error logs to prevent log handler from running out of buffer.
+
+    * Updated requirements.txt to match global exclusions and formatting.
+
+    * tempauth user names now support unicode characters.
+
+    * Various other minor bug fixes and improvements.
+
+
+swift (2.17.0, OpenStack Queens)
+
+    * Added symlink objects support.
+
+      Symlink objects reference one other object. They are created by
+      creating an empty object with an X-Symlink-Target header. The value of
+      the header is of the format <container>/<object>, and the target does
+      not need to exist at the time of symlink creation. Cross-account
+      symlinks can be created by including the
+      X-Symlink-Target-Account header.
+
+      GET and HEAD requests to a symlink will operate on the
+      referenced object and require appropriate permission in the
+      target container. DELETE and PUT requests will operate on the
+      symlink object itself. POST requests are not forwarded to the
+      referenced object. POST requests sent to a symlink will result
+      in a 307 Temporary Redirect response.
+
+    * Added support for inline data segments in SLO manifests.
+
+      Upgrade impact: during a rolling upgrade, an updated proxy server
+      may write a manifest that an out-of-date proxy server will not be
+      able to read. This will resolve itself once the upgrade completes
+      on all nodes.
+
+    * The tempurl digest algorithm is now configurable, and Swift added
+      support for both SHA-256 and SHA-512. Supported tempurl digests
+      are exposed to clients in `/info`. Additionally, tempurl signatures
+      can now be base64 encoded.
+
+    * Object expiry improvements
+
+      - Disallow X-Delete-At header values equal to the X-Timestamp header.
+
+      - X-Delete-At computation now uses X-Timestamp instead of
+        system time. This prevents clock skew causing inconsistent
+        expiry data.
+
+      - Deleting an expiring object will now cause less work in the system.
+        The number of async pending files written has been reduced for all
+        objects and greatly reduced for erasure-coded objects. This
+        dramatically reduces the burden on container servers.
+
+      - Stopped logging tracebacks when receiving an unexpected response.
+
+      - Allow the expirer to gracefully move past updating stale work items.
+
+    * When the object auditor examines an object, it will now add any
+      missing metadata checksums.
+
+    * `swift-ring-builder` improvements
+
+      - Save the ring when dispersion improves, even if balance
+        doesn't improve.
+
+      - Improved the granularity of the ring dispersion metric so that
+        small improvements after a rebalance can show changes in the
+        dispersion number. Dispersion in existing and new rings can be
+        recalculated using the new '--recalculate' option to
+        `swift-ring-builder`.
+
+      - Display more info on empty rings.
+
+    * Fixed rare socket leak on range requests to erasure-coded objects.
+
+    * The number of container updates on object PUTs (ie to update listings)
+      has been recomputed to be far more efficient while maintaining
+      durability guarantees. Specifically, object PUTs to erasure-coded
+      policies will now normally result in far fewer container updates.
+
+    * Moved Zuul v3 tox jobs into the Swift code repo.
+
+    * Changed where liberasurecode-devel for CentOS 7 is referenced and
+      installed as a dependency.
+
+    * Added container/object listing with prefix to InternalClient.
+
+    * Added '--swift-versions' to `swift-recon` CLI to compare installed
+      versions in the cluster.
+
+    * Stop logging tracebacks in the `object-replicator` when it runs
+      out of handoff locations.
+
+    * Send ETag header in 206 Partial Content responses to SLO reads.
+
+    * Now `swift-recon-cron` works with conf.d configs.
+
+    * Improved `object-updater` stats logging. It now tells you all of
+      its stats (successes, failures, quarantines due to bad pickles,
+      unlinks, and errors), and it tells you incremental progress every
+      five minutes. The logging at the end of a pass remains and has
+      been expanded to also include all stats.
+
+    * If a proxy server is configured to autocreate accounts and the
+      account create fails, it will now return a server error (500)
+      instead of Not Found (404).
+
+    * Fractional replicas are no longer allowed for erasure code policies.
+
+    * Various other minor bug fixes and improvements.
+
+
 swift (2.16.0)
 
     * Add checksum to object extended attributes.
@@ -89,8 +265,8 @@ swift (2.16.0)
     * Various other minor bug fixes and improvements.
 
 
+swift (2.15.1, OpenStack Pike)
 
-swift (2.15.1)
     * Fixed a bug introduced in 2.15.0 where the object reconstructor
       would exit with a traceback if no EC policy was configured.
 
@@ -107,6 +283,7 @@ swift (2.15.1)
       expired object.
 
     * Various other minor bug fixes and improvements.
+
 
 swift (2.15.0)
 
@@ -270,6 +447,7 @@ swift (2.14.0)
 
     * Various other minor bug fixes and improvements.
 
+
 swift (2.13.0, OpenStack Ocata)
 
     * Improvements in key parts of the consistency engine
@@ -356,6 +534,7 @@ swift (2.13.0, OpenStack Ocata)
 
     * Various other minor bug fixes and improvements.
 
+
 swift (2.12.0)
 
     * Ring files now include byteorder information about the endian of
@@ -415,6 +594,7 @@ swift (2.12.0)
     * Remove empty db hash and suffix directories if a db gets quarantined.
 
     * Various other minor bug fixes and improvements.
+
 
 swift (2.11.0)
 
@@ -477,6 +657,7 @@ swift (2.11.0)
     * Suppress unexpected-file warnings for rsync temp files.
 
     * Various other minor bug fixes and improvements.
+
 
 swift (2.10.0, OpenStack Newton)
 
@@ -567,6 +748,7 @@ swift (2.9.0)
       source code repository.
 
     * Various other minor bug fixes and improvements.
+
 
 swift (2.8.0)
 
@@ -809,6 +991,7 @@ swift (2.7.0, OpenStack Mitaka)
 
     * Various other minor bug fixes and improvements.
 
+
 swift (2.6.0)
 
     * Dependency changes
@@ -898,6 +1081,7 @@ swift (2.6.0)
 
     * Various other minor bug fixes and improvements.
 
+
 swift (2.5.0, OpenStack Liberty)
 
     * Added the ability to specify ranges for Static Large Object (SLO)
@@ -925,6 +1109,7 @@ swift (2.5.0, OpenStack Liberty)
       available capacity).
 
     * Various other minor bug fixes and improvements.
+
 
 swift (2.4.0)
 
@@ -1277,6 +1462,7 @@ swift (2.2.0, OpenStack Juno)
 
     * Various other minor bug fixes and improvements.
 
+
 swift (2.1.0)
 
     * swift-ring-builder placement was improved to allow gradual addition
@@ -1338,6 +1524,7 @@ swift (2.1.0)
 
     * Various other minor bug fixes and improvements.
 
+
 swift (2.0.0)
 
     * Storage policies
@@ -1397,6 +1584,7 @@ swift (2.0.0)
 
     * Various other minor bug fixes and improvements
 
+
 swift (1.13.1, OpenStack Icehouse)
 
     * Change the behavior of CORS responses to better match the spec
@@ -1433,6 +1621,7 @@ swift (1.13.1, OpenStack Icehouse)
     * Make probetests work with conf.d configs
 
     * Various other minor bug fixes and improvements.
+
 
 swift (1.13.0)
 
@@ -1485,6 +1674,7 @@ swift (1.13.0)
     * Improved StaticWeb 404 error message on web-listings and index
 
     * Various other minor bug fixes and improvements.
+
 
 swift (1.12.0)
 
@@ -1607,7 +1797,7 @@ swift (1.11.0)
       from the codebase and is now in its own repository at
       https://github.com/openstack/swift-bench. New swift-bench
       binaries and packages may be found on PyPI at
-      https://pypi.python.org/pypi/swift-bench
+      https://pypi.org/project/swift-bench
 
     * Bulk delete now also supports the POST verb, in addition to DELETE
 
@@ -1664,6 +1854,7 @@ swift (1.11.0)
 
     * Various other bug fixes and improvements
 
+
 swift (1.10.0, OpenStack Havana)
 
     * Added support for pooling memcache connections
@@ -1707,6 +1898,7 @@ swift (1.10.0, OpenStack Havana)
 
     * Various other bug fixes and improvements, including support for running
       Swift under Pypy and continuing work to support storage policies
+
 
 swift (1.9.1)
 
@@ -1759,6 +1951,7 @@ swift (1.9.1)
     * Use OpenStack's "Hacking" guidelines for code formatting
 
     * Various other minor bug fixes and improvements
+
 
 swift (1.9.0)
 
@@ -1834,6 +2027,7 @@ swift (1.9.0)
       objects would not be listed
 
     * Various other minor bug fixes and improvements
+
 
 swift (1.8.0, OpenStack Grizzly)
 
@@ -1914,6 +2108,7 @@ swift (1.8.0, OpenStack Grizzly)
 
     * Various other minor bug fixes and improvements
 
+
 swift (1.7.6)
 
     * Better tempauth storage URL guessing
@@ -1955,6 +2150,7 @@ swift (1.7.6)
     * Fixed object-auditor logging to use a minimum of unix sockets
 
     * Various other minor bug fixes and improvements
+
 
 swift (1.7.5)
 
@@ -2006,14 +2202,17 @@ swift (1.7.5)
 
     * Various other minor bug fixes and improvements
 
+
 swift (1.7.4, OpenStack Folsom)
 
     * Fix issue where early client disconnects may have caused a memory leak
+
 
 swift (1.7.2)
 
     * Fix issue where memcache serialization was not properly loading
       the config value
+
 
 swift (1.7.0)
 
@@ -2085,6 +2284,7 @@ swift (1.7.0)
 
     * Various other minor bug fixes and improvements
 
+
 swift (1.6.0)
 
     * Removed bin/swift and swift/common/client.py from the swift repo. These
@@ -2143,6 +2343,7 @@ swift (1.6.0)
       with an empty ring.
 
     * Various other minor bug fixes and improvements
+
 
 swift (1.5.0)
 
@@ -2212,6 +2413,7 @@ swift (1.5.0)
 
     * Various other minor bug fixes and improvements
 
+
 swift (1.4.8, OpenStack Essex)
 
     * Added optional max_containers_per_account restriction
@@ -2243,6 +2445,7 @@ swift (1.4.8, OpenStack Essex)
 
     * Refactored some ring building functions for clarity and simplicity
 
+
 swift (1.4.7)
 
     * Improvements to account and container replication.
@@ -2260,6 +2463,7 @@ swift (1.4.7)
     * Removed old stats tools.
 
     * Other bug fixes and documentation updates.
+
 
 swift (1.4.6)
 
@@ -2284,6 +2488,7 @@ swift (1.4.6)
     * Removed tools/rfc.sh
 
     * Other minor bug fixes
+
 
 swift (1.4.5)
 
@@ -2312,6 +2517,7 @@ swift (1.4.5)
     * Fixed docstrings in the ring code.
 
     * PEP8 Updates.
+
 
 swift (1.4.4)
 
@@ -2355,6 +2561,7 @@ swift (1.4.4)
 
     * Query only specific zone via swift-recon.
 
+
 swift (1.4.3, OpenStack Diablo)
 
     * Additional quarantine catching code.
@@ -2378,6 +2585,7 @@ swift (1.4.3, OpenStack Diablo)
 
     * Fix to the swift tool to strip any leading slashes on file names when
       uploading.
+
 
 swift (1.4.2)
 
@@ -2406,6 +2614,7 @@ swift (1.4.2)
     * This fixes the bug that drop_buffer_cache() doesn't work on systems where
       off_t isn't 64 bits.
 
+
 swift (1.4.1)
 
     * st renamed to swift
@@ -2421,6 +2630,7 @@ swift (1.4.1)
 
     * Accounts are auto-created if an auth token is valid when the
       account_autocreate proxy config parameter is set to true.
+
 
 swift (1.4.0)
 
@@ -2481,7 +2691,7 @@ swift (1.4.0)
     * Stats uploaders now allow overrides for source_filename_pattern and
       new_log_cutoff values.
 
----
+----
 
 Changelog entries for previous versions are incomplete
 

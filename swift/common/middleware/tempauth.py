@@ -273,7 +273,7 @@ class TempAuth(object):
             return self.app(env, start_response)
         if env.get('PATH_INFO', '').startswith(self.auth_prefix):
             return self.handle(env, start_response)
-        s3 = env.get('swift3.auth_details')
+        s3 = env.get('s3api.auth_details')
         token = env.get('HTTP_X_AUTH_TOKEN', env.get('HTTP_X_STORAGE_TOKEN'))
         service_token = env.get('HTTP_X_SERVICE_TOKEN')
         if s3 or (token and token.startswith(self.reseller_prefix)):
@@ -284,7 +284,13 @@ class TempAuth(object):
                 if groups and service_groups:
                     groups += ',' + service_groups
             if groups:
-                user = groups and groups.split(',', 1)[0] or ''
+                group_list = groups.split(',', 2)
+                if len(group_list) > 1:
+                    user = group_list[1]
+                elif groups:
+                    user = group_list[0]
+                else:
+                    user = ''
                 trans_id = env.get('swift.trans_id')
                 self.logger.debug('User: %s uses token %s (trans_id %s)' %
                                   (user, 's3' if s3 else token, trans_id))
@@ -432,8 +438,10 @@ class TempAuth(object):
             expires, groups = cached_auth_data
             if expires < time():
                 groups = None
+            else:
+                groups = groups.encode('utf8')
 
-        s3_auth_details = env.get('swift3.auth_details')
+        s3_auth_details = env.get('s3api.auth_details')
         if s3_auth_details:
             if 'check_signature' not in s3_auth_details:
                 self.logger.warning(
@@ -788,7 +796,8 @@ class TempAuth(object):
             cached_auth_data = memcache_client.get(memcache_token_key)
             if cached_auth_data:
                 expires, old_groups = cached_auth_data
-                old_groups = old_groups.split(',')
+                old_groups = [group.encode('utf8')
+                              for group in old_groups.split(',')]
                 new_groups = self._get_user_groups(account, account_user,
                                                    account_id)
 

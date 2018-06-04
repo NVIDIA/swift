@@ -47,7 +47,7 @@ from eventlet.green import httplib
 from six import BytesIO
 from six import StringIO
 from six.moves import range
-from six.moves.urllib.parse import quote
+from six.moves.urllib.parse import quote, parse_qsl
 
 from test import listen_zero
 from test.unit import (
@@ -3222,95 +3222,197 @@ class TestReplicatedObjectController(
         # reset the router post patch_policies
         self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
         self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
-        backend_requests = []
 
-        def capture_requests(ip, port, method, path, headers, *args,
-                             **kwargs):
-            backend_requests.append((method, path, headers))
+        def do_test(resp_headers):
+            self.app.memcache.store = {}
+            backend_requests = []
 
-        req = Request.blank('/v1/a/c/o', {}, method='POST',
-                            headers={'X-Object-Meta-Color': 'Blue',
-                                     'Content-Type': 'text/plain'})
+            def capture_requests(ip, port, method, path, headers, *args,
+                                 **kwargs):
+                backend_requests.append((method, path, headers))
 
-        # we want the container_info response to says a policy index of 1
-        resp_headers = {'X-Backend-Storage-Policy-Index': 1}
-        with mocked_http_conn(
-                200, 200, 202, 202, 202,
-                headers=resp_headers, give_connect=capture_requests
-        ) as fake_conn:
-            resp = req.get_response(self.app)
-            self.assertRaises(StopIteration, fake_conn.code_iter.next)
+            req = Request.blank('/v1/a/c/o', {}, method='POST',
+                                headers={'X-Object-Meta-Color': 'Blue',
+                                         'Content-Type': 'text/plain'})
 
-        self.assertEqual(resp.status_int, 202)
-        self.assertEqual(len(backend_requests), 5)
+            # we want the container_info response to says a policy index of 1
+            with mocked_http_conn(
+                    200, 200, 202, 202, 202,
+                    headers=resp_headers, give_connect=capture_requests
+            ) as fake_conn:
+                resp = req.get_response(self.app)
+                self.assertRaises(StopIteration, fake_conn.code_iter.next)
 
-        def check_request(req, method, path, headers=None):
-            req_method, req_path, req_headers = req
-            self.assertEqual(method, req_method)
-            # caller can ignore leading path parts
-            self.assertTrue(req_path.endswith(path),
-                            'expected path to end with %s, it was %s' % (
-                                path, req_path))
-            headers = headers or {}
-            # caller can ignore some headers
-            for k, v in headers.items():
-                self.assertEqual(req_headers[k], v)
-        account_request = backend_requests.pop(0)
-        check_request(account_request, method='HEAD', path='/sda/0/a')
-        container_request = backend_requests.pop(0)
-        check_request(container_request, method='HEAD', path='/sda/0/a/c')
-        # make sure backend requests included expected container headers
-        container_headers = {}
-        for request in backend_requests:
-            req_headers = request[2]
-            device = req_headers['x-container-device']
-            host = req_headers['x-container-host']
-            container_headers[device] = host
-            expectations = {
-                'method': 'POST',
-                'path': '/0/a/c/o',
-                'headers': {
-                    'X-Container-Partition': '0',
-                    'Connection': 'close',
-                    'User-Agent': 'proxy-server %s' % os.getpid(),
-                    'Host': 'localhost:80',
-                    'Referer': 'POST http://localhost/v1/a/c/o',
-                    'X-Object-Meta-Color': 'Blue',
-                    'X-Backend-Storage-Policy-Index': '1'
-                },
-            }
-            check_request(request, **expectations)
+            self.assertEqual(resp.status_int, 202)
+            self.assertEqual(len(backend_requests), 5)
 
-        expected = {}
-        for i, device in enumerate(['sda', 'sdb', 'sdc']):
-            expected[device] = '10.0.0.%d:100%d' % (i, i)
-        self.assertEqual(container_headers, expected)
+            def check_request(req, method, path, headers=None):
+                req_method, req_path, req_headers = req
+                self.assertEqual(method, req_method)
+                # caller can ignore leading path parts
+                self.assertTrue(req_path.endswith(path),
+                                'expected path to end with %s, it was %s' % (
+                                    path, req_path))
+                headers = headers or {}
+                # caller can ignore some headers
+                for k, v in headers.items():
+                    self.assertEqual(req_headers[k], v)
+                self.assertNotIn('X-Backend-Container-Path', req_headers)
 
-        # and again with policy override
-        self.app.memcache.store = {}
-        backend_requests = []
-        req = Request.blank('/v1/a/c/o', {}, method='POST',
-                            headers={'X-Object-Meta-Color': 'Blue',
-                                     'Content-Type': 'text/plain',
-                                     'X-Backend-Storage-Policy-Index': 0})
-        with mocked_http_conn(
-                200, 200, 202, 202, 202,
-                headers=resp_headers, give_connect=capture_requests
-        ) as fake_conn:
-            resp = req.get_response(self.app)
-            self.assertRaises(StopIteration, fake_conn.code_iter.next)
-        self.assertEqual(resp.status_int, 202)
-        self.assertEqual(len(backend_requests), 5)
-        for request in backend_requests[2:]:
-            expectations = {
-                'method': 'POST',
-                'path': '/0/a/c/o',  # ignore device bit
-                'headers': {
-                    'X-Object-Meta-Color': 'Blue',
-                    'X-Backend-Storage-Policy-Index': '0',
+            account_request = backend_requests.pop(0)
+            check_request(account_request, method='HEAD', path='/sda/0/a')
+            container_request = backend_requests.pop(0)
+            check_request(container_request, method='HEAD', path='/sda/0/a/c')
+            # make sure backend requests included expected container headers
+            container_headers = {}
+            for request in backend_requests:
+                req_headers = request[2]
+                device = req_headers['x-container-device']
+                host = req_headers['x-container-host']
+                container_headers[device] = host
+                expectations = {
+                    'method': 'POST',
+                    'path': '/0/a/c/o',
+                    'headers': {
+                        'X-Container-Partition': '0',
+                        'Connection': 'close',
+                        'User-Agent': 'proxy-server %s' % os.getpid(),
+                        'Host': 'localhost:80',
+                        'Referer': 'POST http://localhost/v1/a/c/o',
+                        'X-Object-Meta-Color': 'Blue',
+                        'X-Backend-Storage-Policy-Index': '1'
+                    },
                 }
-            }
-            check_request(request, **expectations)
+                check_request(request, **expectations)
+
+            expected = {}
+            for i, device in enumerate(['sda', 'sdb', 'sdc']):
+                expected[device] = '10.0.0.%d:100%d' % (i, i)
+            self.assertEqual(container_headers, expected)
+
+            # and again with policy override
+            self.app.memcache.store = {}
+            backend_requests = []
+            req = Request.blank('/v1/a/c/o', {}, method='POST',
+                                headers={'X-Object-Meta-Color': 'Blue',
+                                         'Content-Type': 'text/plain',
+                                         'X-Backend-Storage-Policy-Index': 0})
+            with mocked_http_conn(
+                    200, 200, 202, 202, 202,
+                    headers=resp_headers, give_connect=capture_requests
+            ) as fake_conn:
+                resp = req.get_response(self.app)
+                self.assertRaises(StopIteration, fake_conn.code_iter.next)
+            self.assertEqual(resp.status_int, 202)
+            self.assertEqual(len(backend_requests), 5)
+            for request in backend_requests[2:]:
+                expectations = {
+                    'method': 'POST',
+                    'path': '/0/a/c/o',  # ignore device bit
+                    'headers': {
+                        'X-Object-Meta-Color': 'Blue',
+                        'X-Backend-Storage-Policy-Index': '0',
+                    }
+                }
+                check_request(request, **expectations)
+
+        resp_headers = {'X-Backend-Storage-Policy-Index': 1}
+        do_test(resp_headers)
+        resp_headers['X-Backend-Sharding-State'] = 'unsharded'
+        do_test(resp_headers)
+
+    @patch_policies([
+        StoragePolicy(0, 'zero', is_default=True, object_ring=FakeRing()),
+        StoragePolicy(1, 'one', object_ring=FakeRing()),
+    ])
+    def test_backend_headers_update_shard_container(self):
+        # verify that when container is sharded the backend container update is
+        # directed to the shard container
+        # reset the router post patch_policies
+        self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
+        self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
+
+        def do_test(method, sharding_state):
+            self.app.memcache.store = {}
+            req = Request.blank('/v1/a/c/o', {}, method=method, body='',
+                                headers={'Content-Type': 'text/plain'})
+
+            # we want the container_info response to say policy index of 1 and
+            # sharding state
+            # acc HEAD, cont HEAD, cont shard GET, obj POSTs
+            status_codes = (200, 200, 200, 202, 202, 202)
+            resp_headers = {'X-Backend-Storage-Policy-Index': 1,
+                            'x-backend-sharding-state': sharding_state,
+                            'X-Backend-Record-Type': 'shard'}
+            shard_range = utils.ShardRange(
+                '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u')
+            body = json.dumps([dict(shard_range)])
+            with mocked_http_conn(*status_codes, headers=resp_headers,
+                                  body=body) as fake_conn:
+                resp = req.get_response(self.app)
+
+            self.assertEqual(resp.status_int, 202)
+            backend_requests = fake_conn.requests
+
+            def check_request(req, method, path, headers=None, params=None):
+                self.assertEqual(method, req['method'])
+                # caller can ignore leading path parts
+                self.assertTrue(req['path'].endswith(path),
+                                'expected path to end with %s, it was %s' % (
+                                    path, req['path']))
+                headers = headers or {}
+                # caller can ignore some headers
+                for k, v in headers.items():
+                    self.assertEqual(req['headers'][k], v,
+                                     'Expected %s but got %s for key %s' %
+                                     (v, req['headers'][k], k))
+                params = params or {}
+                req_params = dict(parse_qsl(req['qs'])) if req['qs'] else {}
+                for k, v in params.items():
+                    self.assertEqual(req_params[k], v,
+                                     'Expected %s but got %s for key %s' %
+                                     (v, req_params[k], k))
+
+            account_request = backend_requests[0]
+            check_request(account_request, method='HEAD', path='/sda/0/a')
+            container_request = backend_requests[1]
+            check_request(container_request, method='HEAD', path='/sda/0/a/c')
+            container_request_shard = backend_requests[2]
+            check_request(
+                container_request_shard, method='GET', path='/sda/0/a/c',
+                params={'includes': 'o'})
+
+            # make sure backend requests included expected container headers
+            container_headers = {}
+
+            for request in backend_requests[3:]:
+                req_headers = request['headers']
+                device = req_headers['x-container-device']
+                container_headers[device] = req_headers['x-container-host']
+                expectations = {
+                    'method': method,
+                    'path': '/0/a/c/o',
+                    'headers': {
+                        'X-Container-Partition': '0',
+                        'Host': 'localhost:80',
+                        'Referer': '%s http://localhost/v1/a/c/o' % method,
+                        'X-Backend-Storage-Policy-Index': '1',
+                        'X-Backend-Container-Path': shard_range.name
+                    },
+                }
+                check_request(request, **expectations)
+
+            expected = {}
+            for i, device in enumerate(['sda', 'sdb', 'sdc']):
+                expected[device] = '10.0.0.%d:100%d' % (i, i)
+            self.assertEqual(container_headers, expected)
+
+        do_test('POST', 'sharding')
+        do_test('POST', 'sharded')
+        do_test('DELETE', 'sharding')
+        do_test('DELETE', 'sharded')
+        do_test('PUT', 'sharding')
+        do_test('PUT', 'sharded')
 
     def test_DELETE(self):
         with save_globals():
@@ -7025,6 +7127,7 @@ class TestObjectECRangedGET(unittest.TestCase):
         cls.obj_name = 'range-get-test'
         cls.tiny_obj_name = 'range-get-test-tiny'
         cls.aligned_obj_name = 'range-get-test-aligned'
+        cls.zero_byte_obj_name = 'range-get-test-zero-byte'
 
         # Note: only works if called with unpatched policies
         prolis = _test_sockets[0]
@@ -7060,7 +7163,8 @@ class TestObjectECRangedGET(unittest.TestCase):
 
         for obj_name, obj in ((cls.obj_name, cls.obj),
                               (cls.tiny_obj_name, cls.tiny_obj),
-                              (cls.aligned_obj_name, cls.aligned_obj)):
+                              (cls.aligned_obj_name, cls.aligned_obj),
+                              (cls.zero_byte_obj_name, b"")):
             sock = connect_tcp(('localhost', prolis.getsockname()[1]))
             fd = sock.makefile()
             fd.write('PUT /v1/a/ec-con/%s HTTP/1.1\r\n'
@@ -7324,6 +7428,13 @@ class TestObjectECRangedGET(unittest.TestCase):
         self.assertEqual(headers['Content-Length'], '100')
         self.assertEqual(headers['Content-Range'], 'bytes 8092-8191/8192')
         self.assertEqual(len(gotten_obj), 100)
+
+    def test_suffix_zero_byte_object(self):
+        status, headers, gotten_obj = self._get_obj("bytes=-100",
+                                                    self.zero_byte_obj_name)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(gotten_obj), 0)
+        self.assertEqual(gotten_obj, b"")
 
     def test_suffix_two_segs(self):
         # Ask for enough data that we need the last two segments. The last
@@ -7643,10 +7754,9 @@ class TestContainerController(unittest.TestCase):
     def assert_status_map(self, method, statuses, expected,
                           raise_exc=False, missing_container=False):
         with save_globals():
-            kwargs = {}
+            kwargs = {'missing_container': missing_container}
             if raise_exc:
                 kwargs['raise_exc'] = raise_exc
-            kwargs['missing_container'] = missing_container
             set_http_connect(*statuses, **kwargs)
             self.app.memcache.store = {}
             req = Request.blank('/v1/a/c', headers={'Content-Length': '0',
@@ -7954,17 +8064,36 @@ class TestContainerController(unittest.TestCase):
                                    missing_container=True)
 
     def test_PUT_max_container_name_length(self):
-        with save_globals():
-            limit = constraints.MAX_CONTAINER_NAME_LENGTH
-            controller = proxy_server.ContainerController(self.app, 'account',
-                                                          '1' * limit)
-            self.assert_status_map(controller.PUT,
-                                   (200, 201, 201, 201), 201,
-                                   missing_container=True)
-            controller = proxy_server.ContainerController(self.app, 'account',
-                                                          '2' * (limit + 1))
-            self.assert_status_map(controller.PUT, (201, 201, 201), 400,
-                                   missing_container=True)
+        limit = constraints.MAX_CONTAINER_NAME_LENGTH
+        controller = proxy_server.ContainerController(self.app, 'account',
+                                                      '1' * limit)
+        self.assert_status_map(controller.PUT, (200, 201, 201, 201), 201,
+                               missing_container=True)
+        controller = proxy_server.ContainerController(self.app, 'account',
+                                                      '2' * (limit + 1))
+        self.assert_status_map(controller.PUT, (), 400,
+                               missing_container=True)
+
+        # internal auto-created-accounts get higher limits
+        limit *= 2
+        controller = proxy_server.ContainerController(self.app, '.account',
+                                                      '3' * limit)
+        self.assert_status_map(controller.PUT, (200, 201, 201, 201), 201,
+                               missing_container=True)
+        controller = proxy_server.ContainerController(self.app, '.account',
+                                                      '4' * (limit + 1))
+        self.assert_status_map(controller.PUT, (), 400,
+                               missing_container=True)
+
+        self.app.auto_create_account_prefix = 'acc'
+        controller = proxy_server.ContainerController(self.app, 'account',
+                                                      '1' * limit)
+        self.assert_status_map(controller.PUT, (200, 201, 201, 201), 201,
+                               missing_container=True)
+        controller = proxy_server.ContainerController(self.app, 'account',
+                                                      '2' * (limit + 1))
+        self.assert_status_map(controller.PUT, (), 400,
+                               missing_container=True)
 
     def test_PUT_connect_exceptions(self):
         with save_globals():
@@ -8335,6 +8464,29 @@ class TestContainerController(unittest.TestCase):
             self.assertEqual(res.status_int, 204)
             ic = res.environ['swift.infocache']
             self.assertEqual(ic['container/a/c']['status'], 204)
+            self.assertEqual(res.content_length, 0)
+            self.assertNotIn('transfer-encoding', res.headers)
+
+    def test_GET_account_non_existent(self):
+        with save_globals():
+            set_http_connect(404, 404, 404)
+            controller = proxy_server.ContainerController(self.app, 'a', 'c')
+            req = Request.blank('/v1/a/c')
+            self.app.update_request(req)
+            res = controller.GET(req)
+            self.assertEqual(res.status_int, 404)
+            self.assertNotIn('container/a/c', res.environ['swift.infocache'])
+
+    def test_GET_auto_create_prefix_account_non_existent(self):
+        with save_globals():
+            set_http_connect(404, 404, 404, 204, 204, 204)
+            controller = proxy_server.ContainerController(self.app, '.a', 'c')
+            req = Request.blank('/v1/a/c')
+            self.app.update_request(req)
+            res = controller.GET(req)
+            self.assertEqual(res.status_int, 204)
+            ic = res.environ['swift.infocache']
+            self.assertEqual(ic['container/.a/c']['status'], 204)
             self.assertEqual(res.content_length, 0)
             self.assertNotIn('transfer-encoding', res.headers)
 
@@ -9093,14 +9245,39 @@ class TestAccountController(unittest.TestCase):
             test_status_map((204, 500, 404), 503)
 
     def test_PUT_max_account_name_length(self):
-        with save_globals():
-            self.app.allow_account_management = True
-            limit = constraints.MAX_ACCOUNT_NAME_LENGTH
-            controller = proxy_server.AccountController(self.app, '1' * limit)
-            self.assert_status_map(controller.PUT, (201, 201, 201), 201)
-            controller = proxy_server.AccountController(
-                self.app, '2' * (limit + 1))
-            self.assert_status_map(controller.PUT, (201, 201, 201), 400)
+        self.app.allow_account_management = True
+        limit = constraints.MAX_ACCOUNT_NAME_LENGTH
+        controller = proxy_server.AccountController(self.app, '1' * limit)
+        self.assert_status_map(controller.PUT, (201, 201, 201), 201)
+        controller = proxy_server.AccountController(
+            self.app, '2' * (limit + 1))
+        self.assert_status_map(controller.PUT, (), 400)
+
+        # internal auto-created accounts get higher limits
+        limit *= 2
+        controller = proxy_server.AccountController(
+            self.app, '.' + '3' * (limit - 1))
+        self.assert_status_map(controller.PUT, (201, 201, 201), 201)
+        controller = proxy_server.AccountController(
+            self.app, '.' + '4' * limit)
+        self.assert_status_map(controller.PUT, (), 400)
+
+        self.app.auto_create_account_prefix = 'FOO_'
+        limit /= 2
+        controller = proxy_server.AccountController(
+            self.app, '.' + '5' * (limit - 1))
+        self.assert_status_map(controller.PUT, (201, 201, 201), 201)
+        controller = proxy_server.AccountController(
+            self.app, '.' + '6' * limit)
+        self.assert_status_map(controller.PUT, (), 400)
+
+        limit *= 2
+        controller = proxy_server.AccountController(
+            self.app, 'FOO_' + '7' * (limit - 4))
+        self.assert_status_map(controller.PUT, (201, 201, 201), 201)
+        controller = proxy_server.AccountController(
+            self.app, 'FOO_' + '8' * (limit - 3))
+        self.assert_status_map(controller.PUT, (), 400)
 
     def test_PUT_connect_exceptions(self):
         with save_globals():

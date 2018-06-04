@@ -434,7 +434,7 @@ X-Container-Meta-Access-Control-Expose-Headers:
     request response, separated by spaces.  By default the Object
     Storage service returns the following headers:
 
-    - All “simple response headers” as listed on
+    - All "simple response headers" as listed on
       `http://www.w3.org/TR/cors/#simple-response-header
       <http://www.w3.org/TR/cors/#simple-response-header>`_.
     - The headers ``etag``, ``x-timestamp``, ``x-trans-id``,
@@ -1013,8 +1013,8 @@ delimiter:
   type: string
 end_marker:
   description: |
-    For a string value, x , returns container names
-    that are less than the marker value.
+    For a string value, `x` , constrains the list to items whose names
+    are less than `x`.
   in: query
   required: false
   type: string
@@ -1061,8 +1061,8 @@ limit:
   type: integer
 marker:
   description: |
-    For a string value, x , returns container names
-    that are greater than the marker value.
+    For a string value, `x` , constrains the list to items whose names
+    are greater than `x`.
   in: query
   required: false
   type: string

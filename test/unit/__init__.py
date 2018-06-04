@@ -71,7 +71,7 @@ EMPTY_ETAG = md5().hexdigest()
 # try not to import this module from swift
 if not os.path.basename(sys.argv[0]).startswith('swift'):
     # never patch HASH_PATH_SUFFIX AGAIN!
-    utils.HASH_PATH_SUFFIX = 'endcap'
+    utils.HASH_PATH_SUFFIX = b'endcap'
 
 
 EC_TYPE_PREFERENCE = [
@@ -751,6 +751,8 @@ class FakeStatus(object):
         :param response_sleep: float, time to eventlet sleep during response
         """
         # connect exception
+        if inspect.isclass(status) and issubclass(status, Exception):
+            raise status('FakeStatus Error')
         if isinstance(status, (Exception, eventlet.Timeout)):
             raise status
         if isinstance(status, tuple):
@@ -1063,6 +1065,15 @@ def make_timestamp_iter(offset=0):
                 for t in itertools.count(int(time.time()) + offset))
 
 
+@contextmanager
+def mock_timestamp_now(now=None):
+    if now is None:
+        now = Timestamp.now()
+    with mocklib.patch('swift.common.utils.Timestamp.now',
+                       classmethod(lambda c: now)):
+        yield now
+
+
 class Timeout(object):
     def __init__(self, seconds):
         self.seconds = seconds
@@ -1078,6 +1089,15 @@ class Timeout(object):
         class TimeoutException(Exception):
             pass
         raise TimeoutException
+
+
+def requires_o_tmpfile_support_in_tmp(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not utils.o_tmpfile_in_tmpdir_supported():
+            raise SkipTest('Requires O_TMPFILE support in TMPDIR')
+        return func(*args, **kwargs)
+    return wrapper
 
 
 def requires_o_tmpfile_support(func):
@@ -1292,7 +1312,7 @@ def xattr_supported_check():
     # assume the worst -- xattrs aren't supported
     supports_xattr_cached_val = False
 
-    big_val = 'x' * (4096 + 1)  # more than 4k of metadata
+    big_val = b'x' * (4096 + 1)  # more than 4k of metadata
     try:
         fd, tmppath = mkstemp()
         xattr.setxattr(fd, 'user.swift.testing_key', big_val)
@@ -1314,3 +1334,55 @@ def skip_if_no_xattrs():
     if not xattr_supported_check():
         raise SkipTest('Large xattrs not supported in `%s`. Skipping test' %
                        gettempdir())
+
+
+def unlink_files(paths):
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError as err:
+            if err.errno != errno.ENOENT:
+                raise
+
+
+class FakeHTTPResponse(object):
+
+    def __init__(self, resp):
+        self.resp = resp
+
+    @property
+    def status(self):
+        return self.resp.status_int
+
+    @property
+    def data(self):
+        return self.resp.body
+
+
+def attach_fake_replication_rpc(rpc, replicate_hook=None, errors=None):
+    class FakeReplConnection(object):
+
+        def __init__(self, node, partition, hash_, logger):
+            self.logger = logger
+            self.node = node
+            self.partition = partition
+            self.path = '/%s/%s/%s' % (node['device'], partition, hash_)
+            self.host = node['replication_ip']
+
+        def replicate(self, op, *sync_args):
+            print('REPLICATE: %s, %s, %r' % (self.path, op, sync_args))
+            resp = None
+            if errors and op in errors and errors[op]:
+                resp = errors[op].pop(0)
+            if not resp:
+                replicate_args = self.path.lstrip('/').split('/')
+                args = [op] + copy.deepcopy(list(sync_args))
+                with mock_check_drive(isdir=not rpc.mount_check,
+                                      ismount=rpc.mount_check):
+                    swob_response = rpc.dispatch(replicate_args, args)
+                resp = FakeHTTPResponse(swob_response)
+            if replicate_hook:
+                replicate_hook(op, *sync_args)
+            return resp
+
+    return FakeReplConnection

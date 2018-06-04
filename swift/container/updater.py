@@ -29,7 +29,7 @@ import swift.common.db
 from swift.common.constraints import check_drive
 from swift.container.backend import ContainerBroker, DATADIR
 from swift.common.bufferedhttp import http_connect
-from swift.common.exceptions import ConnectionTimeout
+from swift.common.exceptions import ConnectionTimeout, LockTimeout
 from swift.common.ring import Ring
 from swift.common.utils import get_logger, config_true_value, \
     dump_recon_cache, majority_size, Timestamp, ratelimit_sleep, \
@@ -218,7 +218,12 @@ class ContainerUpdater(Daemon):
         for root, dirs, files in os.walk(path):
             for file in files:
                 if file.endswith('.db'):
-                    self.process_container(os.path.join(root, file))
+                    dbfile = os.path.join(root, file)
+                    try:
+                        self.process_container(dbfile)
+                    except (Exception, Timeout) as e:
+                        self.logger.exception(
+                            "Error processing container %s: %s", dbfile, e)
 
                     self.containers_running_time = ratelimit_sleep(
                         self.containers_running_time,
@@ -232,7 +237,13 @@ class ContainerUpdater(Daemon):
         """
         start_time = time.time()
         broker = ContainerBroker(dbfile, logger=self.logger)
-        info = broker.get_info()
+        try:
+            info = broker.get_info()
+        except LockTimeout as e:
+            self.logger.info(
+                "Failed to get container info (Lock timeout: %s); skipping.",
+                str(e))
+            return
         # Don't send updates if the container was auto-created since it
         # definitely doesn't have up to date statistics.
         if Timestamp(info['put_timestamp']) <= 0:

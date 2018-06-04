@@ -15,6 +15,7 @@
 
 """ Object Server for Swift """
 
+import six
 import six.moves.cPickle as pickle
 import json
 import os
@@ -34,7 +35,7 @@ from swift.common.utils import public, get_logger, \
     normalize_delete_at_timestamp, get_log_line, Timestamp, \
     get_expirer_container, parse_mime_headers, \
     iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads, \
-    config_auto_int_value
+    config_auto_int_value, split_path, get_redirect_data, normalize_timestamp
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_object_creation, \
     valid_timestamp, check_utf8
@@ -43,7 +44,7 @@ from swift.common.exceptions import ConnectionTimeout, DiskFileQuarantined, \
     DiskFileDeviceUnavailable, DiskFileExpired, ChunkReadTimeout, \
     ChunkReadError, DiskFileXattrNotSupported
 from swift.obj import ssync_receiver
-from swift.common.http import is_success
+from swift.common.http import is_success, HTTP_MOVED_PERMANENTLY
 from swift.common.base_storage_server import BaseStorageServer
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.request_helpers import get_name_and_placement, \
@@ -140,6 +141,10 @@ class ObjectController(BaseStorageServer):
             x-delete-at,
             x-object-manifest,
             x-static-large-object,
+            cache-control,
+            content-language,
+            expires,
+            x-robots-tag
         '''
         extra_allowed_headers = [
             header.strip().lower() for header in conf.get(
@@ -170,7 +175,9 @@ class ObjectController(BaseStorageServer):
         # disk_chunk_size parameter. However, it affects all created sockets
         # using this class so we have chosen to tie it to the
         # network_chunk_size parameter value instead.
-        socket._fileobject.default_bufsize = self.network_chunk_size
+        if six.PY2:
+            socket._fileobject.default_bufsize = self.network_chunk_size
+        # TODO: find a way to enable similar functionality in py3
 
         # Provide further setup specific to an object server implementation.
         self.setup(conf)
@@ -242,7 +249,7 @@ class ObjectController(BaseStorageServer):
 
     def async_update(self, op, account, container, obj, host, partition,
                      contdevice, headers_out, objdevice, policy,
-                     logger_thread_locals=None):
+                     logger_thread_locals=None, container_path=None):
         """
         Sends or saves an async update.
 
@@ -260,11 +267,21 @@ class ObjectController(BaseStorageServer):
         :param logger_thread_locals: The thread local values to be set on the
                                      self.logger to retain transaction
                                      logging information.
+        :param container_path: optional path in the form `<account/container>`
+            to which the update should be sent. If given this path will be used
+            instead of constructing a path from the ``account`` and
+            ``container`` params.
         """
         if logger_thread_locals:
             self.logger.thread_locals = logger_thread_locals
         headers_out['user-agent'] = 'object-server %s' % os.getpid()
-        full_path = '/%s/%s/%s' % (account, container, obj)
+        if container_path:
+            # use explicitly specified container path
+            full_path = '/%s/%s' % (container_path, obj)
+        else:
+            full_path = '/%s/%s/%s' % (account, container, obj)
+
+        redirect_data = None
         if all([host, partition, contdevice]):
             try:
                 with ConnectionTimeout(self.conn_timeout):
@@ -274,15 +291,23 @@ class ObjectController(BaseStorageServer):
                 with Timeout(self.node_timeout):
                     response = conn.getresponse()
                     response.read()
-                    if is_success(response.status):
-                        return
-                    else:
-                        self.logger.error(_(
-                            'ERROR Container update failed '
-                            '(saving for async update later): %(status)d '
-                            'response from %(ip)s:%(port)s/%(dev)s'),
-                            {'status': response.status, 'ip': ip, 'port': port,
-                             'dev': contdevice})
+                if is_success(response.status):
+                    return
+
+                if response.status == HTTP_MOVED_PERMANENTLY:
+                    try:
+                        redirect_data = get_redirect_data(response)
+                    except ValueError as err:
+                        self.logger.error(
+                            'Container update failed for %r; problem with '
+                            'redirect location: %s' % (obj, err))
+                else:
+                    self.logger.error(_(
+                        'ERROR Container update failed '
+                        '(saving for async update later): %(status)d '
+                        'response from %(ip)s:%(port)s/%(dev)s'),
+                        {'status': response.status, 'ip': ip, 'port': port,
+                         'dev': contdevice})
             except (Exception, Timeout):
                 self.logger.exception(_(
                     'ERROR container update failed with '
@@ -290,6 +315,13 @@ class ObjectController(BaseStorageServer):
                     {'ip': ip, 'port': port, 'dev': contdevice})
         data = {'op': op, 'account': account, 'container': container,
                 'obj': obj, 'headers': headers_out}
+        if redirect_data:
+            self.logger.debug(
+                'Update to %(path)s redirected to %(redirect)s',
+                {'path': full_path, 'redirect': redirect_data[0]})
+            container_path = redirect_data[0]
+        if container_path:
+            data['container_path'] = container_path
         timestamp = headers_out.get('x-meta-timestamp',
                                     headers_out.get('x-timestamp'))
         self._diskfile_router[policy].pickle_async_update(
@@ -316,6 +348,7 @@ class ObjectController(BaseStorageServer):
         contdevices = [d.strip() for d in
                        headers_in.get('X-Container-Device', '').split(',')]
         contpartition = headers_in.get('X-Container-Partition', '')
+        contpath = headers_in.get('X-Backend-Container-Path')
 
         if len(conthosts) != len(contdevices):
             # This shouldn't happen unless there's a bug in the proxy,
@@ -327,6 +360,21 @@ class ObjectController(BaseStorageServer):
                     'hosts': headers_in.get('X-Container-Host', ''),
                     'devices': headers_in.get('X-Container-Device', '')})
             return
+
+        if contpath:
+            try:
+                # TODO: this is very late in request handling to be validating
+                # a header - if we did *not* check and the header was bad
+                # presumably the update would fail and we would fall back to an
+                # async update to the root container, which might be best
+                # course of action rather than aborting update altogether?
+                split_path('/' + contpath, minsegs=2, maxsegs=2)
+            except ValueError:
+                self.logger.error(
+                    "Invalid X-Backend-Container-Path, should be of the form "
+                    "'account/container' but got %r." % contpath)
+                # fall back to updating root container
+                contpath = None
 
         if contpartition:
             updates = zip(conthosts, contdevices)
@@ -341,7 +389,8 @@ class ObjectController(BaseStorageServer):
             gt = spawn(self.async_update, op, account, container, obj,
                        conthost, contpartition, contdevice, headers_out,
                        objdevice, policy,
-                       logger_thread_locals=self.logger.thread_locals)
+                       logger_thread_locals=self.logger.thread_locals,
+                       container_path=contpath)
             update_greenthreads.append(gt)
         # Wait a little bit to see if the container updates are successful.
         # If we immediately return after firing off the greenthread above, then
@@ -546,7 +595,7 @@ class ObjectController(BaseStorageServer):
             get_name_and_placement(request, 5, 5, True)
         req_timestamp = valid_timestamp(request)
         new_delete_at = int(request.headers.get('X-Delete-At') or 0)
-        if new_delete_at and new_delete_at < time.time():
+        if new_delete_at and new_delete_at < req_timestamp:
             return HTTPBadRequest(body='X-Delete-At in past', request=request,
                                   content_type='text/plain')
         next_part_power = request.headers.get('X-Backend-Next-Part-Power')
@@ -559,7 +608,7 @@ class ObjectController(BaseStorageServer):
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
-            orig_metadata = disk_file.read_metadata()
+            orig_metadata = disk_file.read_metadata(current_time=req_timestamp)
         except DiskFileXattrNotSupported:
             return HTTPInsufficientStorage(drive=device, request=request)
         except (DiskFileNotExist, DiskFileQuarantined):
@@ -721,7 +770,7 @@ class ObjectController(BaseStorageServer):
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
-            orig_metadata = disk_file.read_metadata()
+            orig_metadata = disk_file.read_metadata(current_time=req_timestamp)
             orig_timestamp = disk_file.data_timestamp
         except DiskFileXattrNotSupported:
             return HTTPInsufficientStorage(drive=device, request=request)
@@ -909,6 +958,9 @@ class ObjectController(BaseStorageServer):
         """Handle HTTP GET requests for the Swift Object Server."""
         device, partition, account, container, obj, policy = \
             get_name_and_placement(request, 5, 5, True)
+        request.headers.setdefault('X-Timestamp',
+                                   normalize_timestamp(time.time()))
+        req_timestamp = valid_timestamp(request)
         frag_prefs = safe_json_loads(
             request.headers.get('X-Backend-Fragment-Preferences'))
         try:
@@ -920,7 +972,7 @@ class ObjectController(BaseStorageServer):
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
-            with disk_file.open():
+            with disk_file.open(current_time=req_timestamp):
                 metadata = disk_file.get_metadata()
                 obj_size = int(metadata['Content-Length'])
                 file_x_ts = Timestamp(metadata['X-Timestamp'])
@@ -973,6 +1025,9 @@ class ObjectController(BaseStorageServer):
         """Handle HTTP HEAD requests for the Swift Object Server."""
         device, partition, account, container, obj, policy = \
             get_name_and_placement(request, 5, 5, True)
+        request.headers.setdefault('X-Timestamp',
+                                   normalize_timestamp(time.time()))
+        req_timestamp = valid_timestamp(request)
         frag_prefs = safe_json_loads(
             request.headers.get('X-Backend-Fragment-Preferences'))
         try:
@@ -984,7 +1039,7 @@ class ObjectController(BaseStorageServer):
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
-            metadata = disk_file.read_metadata()
+            metadata = disk_file.read_metadata(current_time=req_timestamp)
         except DiskFileXattrNotSupported:
             return HTTPInsufficientStorage(drive=device, request=request)
         except (DiskFileNotExist, DiskFileQuarantined) as e:
@@ -1038,7 +1093,7 @@ class ObjectController(BaseStorageServer):
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
-            orig_metadata = disk_file.read_metadata()
+            orig_metadata = disk_file.read_metadata(current_time=req_timestamp)
         except DiskFileXattrNotSupported:
             return HTTPInsufficientStorage(drive=device, request=request)
         except DiskFileExpired as e:
@@ -1060,10 +1115,10 @@ class ObjectController(BaseStorageServer):
             else:
                 response_class = HTTPConflict
         response_timestamp = max(orig_timestamp, req_timestamp)
-        orig_delete_at = int(orig_metadata.get('X-Delete-At') or 0)
+        orig_delete_at = Timestamp(orig_metadata.get('X-Delete-At') or 0)
         try:
             req_if_delete_at_val = request.headers['x-if-delete-at']
-            req_if_delete_at = int(req_if_delete_at_val)
+            req_if_delete_at = Timestamp(req_if_delete_at_val)
         except KeyError:
             pass
         except ValueError:

@@ -150,11 +150,11 @@ class ObjectControllerRouter(object):
     def __init__(self):
         self.policy_to_controller_cls = {}
         for policy in POLICIES:
-            self.policy_to_controller_cls[policy] = \
+            self.policy_to_controller_cls[int(policy)] = \
                 self.policy_type_to_controller_map[policy.policy_type]
 
     def __getitem__(self, policy):
-        return self.policy_to_controller_cls[policy]
+        return self.policy_to_controller_cls[int(policy)]
 
 
 class BaseObjectController(Controller):
@@ -266,6 +266,20 @@ class BaseObjectController(Controller):
         """Handler for HTTP HEAD requests."""
         return self.GETorHEAD(req)
 
+    def _get_update_target(self, req, container_info):
+        # find the sharded container to which we'll send the update
+        db_state = container_info.get('sharding_state', 'unsharded')
+        if db_state in ('sharded', 'sharding'):
+            shard_ranges = self._get_shard_ranges(
+                req, self.account_name, self.container_name,
+                includes=self.object_name, states='updating')
+            if shard_ranges:
+                partition, nodes = self.app.container_ring.get_nodes(
+                    shard_ranges[0].account, shard_ranges[0].container)
+                return partition, nodes, shard_ranges[0].name
+
+        return container_info['partition'], container_info['nodes'], None
+
     @public
     @cors_validation
     @delay_denial
@@ -273,8 +287,8 @@ class BaseObjectController(Controller):
         """HTTP POST request handler."""
         container_info = self.container_info(
             self.account_name, self.container_name, req)
-        container_partition = container_info['partition']
-        container_nodes = container_info['nodes']
+        container_partition, container_nodes, container_path = \
+            self._get_update_target(req, container_info)
         req.acl = container_info['write_acl']
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
@@ -304,13 +318,14 @@ class BaseObjectController(Controller):
 
         headers = self._backend_requests(
             req, len(nodes), container_partition, container_nodes,
-            delete_at_container, delete_at_part, delete_at_nodes)
+            delete_at_container, delete_at_part, delete_at_nodes,
+            container_path=container_path)
         return self._post_object(req, obj_ring, partition, headers)
 
     def _backend_requests(self, req, n_outgoing,
                           container_partition, containers,
                           delete_at_container=None, delete_at_partition=None,
-                          delete_at_nodes=None):
+                          delete_at_nodes=None, container_path=None):
         policy_index = req.headers['X-Backend-Storage-Policy-Index']
         policy = POLICIES.get_by_index(policy_index)
         headers = [self.generate_request_headers(req, additional=req.headers)
@@ -324,6 +339,8 @@ class BaseObjectController(Controller):
             headers[index]['X-Container-Device'] = csv_append(
                 headers[index].get('X-Container-Device'),
                 container['device'])
+            if container_path:
+                headers[index]['X-Backend-Container-Path'] = container_path
 
         def set_delete_at_headers(index, delete_at_node):
             headers[index]['X-Delete-At-Container'] = delete_at_container
@@ -752,8 +769,8 @@ class BaseObjectController(Controller):
         policy_index = req.headers.get('X-Backend-Storage-Policy-Index',
                                        container_info['storage_policy'])
         obj_ring = self.app.get_object_ring(policy_index)
-        container_nodes = container_info['nodes']
-        container_partition = container_info['partition']
+        container_partition, container_nodes, container_path = \
+            self._get_update_target(req, container_info)
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
 
@@ -800,7 +817,8 @@ class BaseObjectController(Controller):
         # add special headers to be handled by storage nodes
         outgoing_headers = self._backend_requests(
             req, len(nodes), container_partition, container_nodes,
-            delete_at_container, delete_at_part, delete_at_nodes)
+            delete_at_container, delete_at_part, delete_at_nodes,
+            container_path=container_path)
 
         # send object to storage nodes
         resp = self._store_object(
@@ -823,8 +841,8 @@ class BaseObjectController(Controller):
         next_part_power = getattr(obj_ring, 'next_part_power', None)
         if next_part_power:
             req.headers['X-Backend-Next-Part-Power'] = next_part_power
-        container_partition = container_info['partition']
-        container_nodes = container_info['nodes']
+        container_partition, container_nodes, container_path = \
+            self._get_update_target(req, container_info)
         req.acl = container_info['write_acl']
         req.environ['swift_sync_key'] = container_info['sync_key']
         if 'swift.authorize' in req.environ:
@@ -851,7 +869,8 @@ class BaseObjectController(Controller):
             node_count += local_handoffs
 
         headers = self._backend_requests(
-            req, node_count, container_partition, container_nodes)
+            req, node_count, container_partition, container_nodes,
+            container_path=container_path)
         return self._delete_object(req, obj_ring, partition, headers)
 
 
@@ -1103,20 +1122,30 @@ class ECAppIter(object):
         return headers, frag_iters
 
     def _actual_range(self, req_start, req_end, entity_length):
+        # Takes 3 args: (requested-first-byte, requested-last-byte,
+        # actual-length).
+        #
+        # Returns a 3-tuple (first-byte, last-byte, satisfiable).
+        #
+        # It is possible to get (None, None, True). This means that the last
+        # N>0 bytes of a 0-byte object were requested, and we are able to
+        # satisfy that request by returning nothing.
         try:
             rng = Range("bytes=%s-%s" % (
                 req_start if req_start is not None else '',
                 req_end if req_end is not None else ''))
         except ValueError:
-            return (None, None)
+            return (None, None, False)
 
         rfl = rng.ranges_for_length(entity_length)
-        if not rfl:
-            return (None, None)
+        if rfl and entity_length == 0:
+            return (None, None, True)
+        elif not rfl:
+            return (None, None, False)
         else:
             # ranges_for_length() adds 1 to the last byte's position
             # because webob once made a mistake
-            return (rfl[0][0], rfl[0][1] - 1)
+            return (rfl[0][0], rfl[0][1] - 1, True)
 
     def _fill_out_range_specs_from_obj_length(self, range_specs):
         # Add a few fields to each range spec:
@@ -1143,21 +1172,23 @@ class ECAppIter(object):
         # _fill_out_range_specs_from_fa_length() requires the beginnings of
         # the response bodies.
         for spec in range_specs:
-            cstart, cend = self._actual_range(
+            cstart, cend, csat = self._actual_range(
                 spec['req_client_start'],
                 spec['req_client_end'],
                 self.obj_length)
             spec['resp_client_start'] = cstart
             spec['resp_client_end'] = cend
-            spec['satisfiable'] = (cstart is not None and cend is not None)
+            spec['satisfiable'] = csat
 
-            sstart, send = self._actual_range(
+            sstart, send, _junk = self._actual_range(
                 spec['req_segment_start'],
                 spec['req_segment_end'],
                 self.obj_length)
 
             seg_size = self.policy.ec_segment_size
-            if spec['req_segment_start'] is None and sstart % seg_size != 0:
+            if (spec['req_segment_start'] is None and
+                    sstart is not None and
+                    sstart % seg_size != 0):
                 # Segment start may, in the case of a suffix request, need
                 # to be rounded up (not down!) to the nearest segment boundary.
                 # This reflects the trimming of leading garbage (partial
@@ -1179,7 +1210,7 @@ class ECAppIter(object):
         # are omitted from the response entirely and also to put the right
         # Content-Range headers in a multipart/byteranges response.
         for spec in range_specs:
-            fstart, fend = self._actual_range(
+            fstart, fend, _junk = self._actual_range(
                 spec['req_fragment_start'],
                 spec['req_fragment_end'],
                 fa_length)
@@ -1341,16 +1372,21 @@ class ECAppIter(object):
         client_end = (min(client_end, self.obj_length - 1)
                       if client_end is not None
                       else self.obj_length - 1)
-        num_segments = int(
-            math.ceil(float(segment_end + 1 - segment_start)
-                      / self.policy.ec_segment_size))
-        # We get full segments here, but the client may have requested a
-        # byte range that begins or ends in the middle of a segment.
-        # Thus, we have some amount of overrun (extra decoded bytes)
-        # that we trim off so the client gets exactly what they
-        # requested.
-        start_overrun = client_start - segment_start
-        end_overrun = segment_end - client_end
+        if segment_start is None:
+            num_segments = 0
+            start_overrun = 0
+            end_overrun = 0
+        else:
+            num_segments = int(
+                math.ceil(float(segment_end + 1 - segment_start)
+                          / self.policy.ec_segment_size))
+            # We get full segments here, but the client may have requested a
+            # byte range that begins or ends in the middle of a segment.
+            # Thus, we have some amount of overrun (extra decoded bytes)
+            # that we trim off so the client gets exactly what they
+            # requested.
+            start_overrun = client_start - segment_start
+            end_overrun = segment_end - client_end
 
         for i, next_seg in enumerate(segment_iter):
             # We may have a start_overrun of more than one segment in
@@ -2263,7 +2299,7 @@ class ECObjectController(BaseObjectController):
         for client_start, client_end in req.range.ranges:
             # TODO: coalesce ranges that overlap segments. For
             # example, "bytes=0-10,20-30,40-50" with a 64 KiB
-            # segment size will result in a a Range header in the
+            # segment size will result in a Range header in the
             # object request of "bytes=0-65535,0-65535,0-65535",
             # which is wasteful. We should be smarter and only
             # request that first segment once.

@@ -49,16 +49,6 @@ class RingValidationWarning(Warning):
     pass
 
 
-try:
-    # python 2.7+
-    from logging import NullHandler
-except ImportError:
-    # python 2.6
-    class NullHandler(logging.Handler):
-        def emit(self, *a, **kw):
-            pass
-
-
 @contextlib.contextmanager
 def _set_random_seed(seed):
     # If random seed is set when entering this context then reset original
@@ -148,7 +138,7 @@ class RingBuilder(object):
         if not self.logger.handlers:
             self.logger.disabled = True
             # silence "no handler for X" error messages
-            self.logger.addHandler(NullHandler())
+            self.logger.addHandler(logging.NullHandler())
 
     @property
     def id(self):
@@ -696,7 +686,7 @@ class RingBuilder(object):
                     (dev['id'], dev['port']))
 
         int_replicas = int(math.ceil(self.replicas))
-        rep2part_len = map(len, self._replica2part2dev)
+        rep2part_len = list(map(len, self._replica2part2dev))
         # check the assignments of each part's replicas
         for part in range(self.parts):
             devs_for_part = []
@@ -872,7 +862,7 @@ class RingBuilder(object):
         device is "overweight" and wishes to give partitions away if possible.
 
         :param replica_plan: a dict of dicts, as returned from
-                             _build_replica_plan, that that maps
+                             _build_replica_plan, that maps
                              each tier to it's target replicanths.
         """
         tier2children = self._build_tier2children()
@@ -932,7 +922,7 @@ class RingBuilder(object):
         more recently than min_part_hours.
         """
         self._part_moved_bitmap = bytearray(max(2 ** (self.part_power - 3), 1))
-        elapsed_hours = int(time() - self._last_part_moves_epoch) / 3600
+        elapsed_hours = int(time() - self._last_part_moves_epoch) // 3600
         if elapsed_hours <= 0:
             return
         for part in range(self.parts):
@@ -1182,7 +1172,7 @@ class RingBuilder(object):
         """
         # pick a random starting point on the other side of the ring
         quarter_turn = (self.parts // 4)
-        random_half = random.randint(0, self.parts / 2)
+        random_half = random.randint(0, self.parts // 2)
         start = (self._last_part_gather_start + quarter_turn +
                  random_half) % self.parts
         self.logger.debug('Gather start is %(start)s '
