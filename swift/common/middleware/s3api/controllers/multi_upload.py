@@ -375,9 +375,12 @@ class UploadsController(Controller):
         req.headers['Content-Type'] = 'application/directory'
 
         try:
-            req.get_response(self.app, 'PUT', container, '')
-        except (BucketAlreadyExists, BucketAlreadyOwnedByYou):
-            pass
+            req.get_response(self.app, 'HEAD', container, '')
+        except NoSuchBucket:
+            try:
+                req.get_response(self.app, 'PUT', container, '')
+            except (BucketAlreadyExists, BucketAlreadyOwnedByYou):
+                pass
 
         obj = '%s/%s' % (req.object_name, upload_id)
 

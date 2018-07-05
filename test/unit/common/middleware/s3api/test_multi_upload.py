@@ -539,7 +539,8 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
 
     @patch('swift.common.middleware.s3api.controllers.'
            'multi_upload.unique_id', lambda: 'X')
-    def _test_object_multipart_upload_initiate(self, headers):
+    def _test_object_multipart_upload_initiate(self, headers,
+                                               bucket_exists=True):
         headers.update({
             'Authorization': 'AWS test:tester:hmac',
             'Date': self.get_date_header(),
@@ -556,25 +557,45 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
         self.assertEqual(req_headers.get('X-Object-Meta-Foo'), 'bar')
         self.assertNotIn('Etag', req_headers)
         self.assertNotIn('Content-MD5', req_headers)
-        self.assertEqual([
-            ('HEAD', '/v1/AUTH_test/bucket'),
-            ('PUT', '/v1/AUTH_test/bucket+segments'),
-            ('HEAD', '/v1/AUTH_test'),
-            ('HEAD', '/v1/AUTH_test/bucket+segments'),
-            ('PUT', '/v1/AUTH_test/bucket+segments/object/X'),
-        ], self.swift.calls)
+        if bucket_exists:
+            self.assertEqual([
+                ('HEAD', '/v1/AUTH_test/bucket'),
+                ('HEAD', '/v1/AUTH_test/bucket+segments'),
+                ('PUT', '/v1/AUTH_test/bucket+segments/object/X'),
+            ], self.swift.calls)
+        else:
+            self.assertEqual([
+                ('HEAD', '/v1/AUTH_test/bucket'),
+                ('HEAD', '/v1/AUTH_test/bucket+segments'),
+                ('PUT', '/v1/AUTH_test/bucket+segments'),
+                ('PUT', '/v1/AUTH_test/bucket+segments/object/X'),
+            ], self.swift.calls)
         self.swift.clear_calls()
 
-    def test_object_multipart_upload_initiate(self):
+    def test_object_multipart_upload_initiate_with_segment_bucket(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket+segments',
+                            swob.HTTPNoContent, {}, None)
         self._test_object_multipart_upload_initiate({})
         self._test_object_multipart_upload_initiate({'Etag': 'blahblahblah'})
         self._test_object_multipart_upload_initiate({
             'Content-MD5': base64.b64encode(b'blahblahblahblah').strip()})
 
+    def test_object_multipart_upload_initiate_without_segment_bucket(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket+segments',
+                            swob.HTTPNotFound, {}, None)
+        self.swift.register('PUT', '/v1/AUTH_test/bucket+segments',
+                            swob.HTTPCreated, {}, None)
+        self._test_object_multipart_upload_initiate({}, bucket_exists=False)
+        self._test_object_multipart_upload_initiate({'Etag': 'blahblahblah'},
+                                                    bucket_exists=False)
+        self._test_object_multipart_upload_initiate(
+            {'Content-MD5': base64.b64encode(b'blahblahblahblah').strip()},
+            bucket_exists=False)
+
     @s3acl(s3acl_only=True)
     @patch('swift.common.middleware.s3api.controllers.multi_upload.'
            'unique_id', lambda: 'X')
-    def test_object_multipart_upload_initiate_s3acl(self):
+    def _test_object_multipart_upload_initiate_s3acl(self):
         req = Request.blank('/bucket/object?uploads',
                             environ={'REQUEST_METHOD': 'POST'},
                             headers={'Authorization':
@@ -600,6 +621,19 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
                                                     'test:tester')))
         self.assertEqual(acl_header.get(sysmeta_header('object', 'acl')),
                          tmpacl_header)
+
+    def test_object_multipart_upload_initiate_s3acl_with_segment_bucket(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket+segments',
+                            swob.HTTPNoContent, {}, None)
+        self._test_object_multipart_upload_initiate_s3acl()
+
+    def test_object_multipart_upload_initiate_s3acl_without_segment_bucket(
+            self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket+segments',
+                            swob.HTTPNotFound, {}, None)
+        self.swift.register('PUT', '/v1/AUTH_test/bucket+segments',
+                            swob.HTTPCreated, {}, None)
+        self._test_object_multipart_upload_initiate_s3acl()
 
     @s3acl(s3acl_only=True)
     @patch('swift.common.middleware.s3api.controllers.'

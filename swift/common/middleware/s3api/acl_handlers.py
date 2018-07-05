@@ -373,8 +373,8 @@ class UploadsAclHandler(MultiUploadAclHandler):
         # List Multipart Upload
         self._handle_acl(app, 'GET', self.container, '')
 
-    def PUT(self, app):
-        if not self.acl_checked:
+    def HEAD(self, app):
+        if self.method == 'POST' and not self.acl_checked:
             resp = self._handle_acl(app, 'HEAD', obj='')
             req_acl = ACL.from_headers(self.req.headers,
                                        resp.bucket_acl.owner,
