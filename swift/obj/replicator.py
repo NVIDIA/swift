@@ -34,7 +34,7 @@ from swift.common.ring.utils import is_local_device
 from swift.common.utils import whataremyips, unlink_older_than, \
     compute_eta, get_logger, dump_recon_cache, \
     rsync_module_interpolation, mkdirs, config_true_value, \
-    tpool_reraise, config_auto_int_value, storage_directory, \
+    config_auto_int_value, storage_directory, \
     load_recon_cache, PrefixLoggerAdapter, parse_override_options, \
     distribute_evenly
 from swift.common.bufferedhttp import http_connect
@@ -146,6 +146,12 @@ class ObjectReplicator(Daemon):
         self.partition_times = []
         self.interval = int(conf.get('interval') or
                             conf.get('run_pause') or 30)
+        if 'run_pause' in conf and 'interval' not in conf:
+            self.logger.warning('Option object-replicator/run_pause '
+                                'is deprecated and will be removed in a '
+                                'future version. Update your configuration'
+                                ' to use option object-replicator/'
+                                'interval.')
         self.rsync_timeout = int(conf.get('rsync_timeout',
                                           DEFAULT_RSYNC_TIMEOUT))
         self.rsync_io_timeout = conf.get('rsync_io_timeout', '30')
@@ -227,13 +233,10 @@ class ObjectReplicator(Daemon):
 
             reaped_procs = set()
             for proc in procs:
-                try:
-                    # this will reap the process if it has exited, but
-                    # otherwise will not wait
-                    proc.wait(timeout=0)
+                # this will reap the process if it has exited, but
+                # otherwise will not wait
+                if proc.poll() is not None:
                     reaped_procs.add(proc)
-                except subprocess.TimeoutExpired:
-                    pass
             procs -= reaped_procs
 
     def get_worker_args(self, once=False, **kwargs):
@@ -610,7 +613,7 @@ class ObjectReplicator(Daemon):
         begin = time.time()
         df_mgr = self._df_router[job['policy']]
         try:
-            hashed, local_hash = tpool_reraise(
+            hashed, local_hash = tpool.execute(
                 df_mgr._get_hashes, job['device'],
                 job['partition'], job['policy'],
                 do_listdir=_do_listdir(
@@ -664,7 +667,7 @@ class ObjectReplicator(Daemon):
                     if not suffixes:
                         stats.hashmatch += 1
                         continue
-                    hashed, recalc_hash = tpool_reraise(
+                    hashed, recalc_hash = tpool.execute(
                         df_mgr._get_hashes,
                         job['device'], job['partition'], job['policy'],
                         recalculate=suffixes)
@@ -786,17 +789,17 @@ class ObjectReplicator(Daemon):
                               and (override_devices is None
                                    or dev['device'] in override_devices))]:
             found_local = True
-            dev_path = check_drive(self.devices_dir, local_dev['device'],
-                                   self.mount_check)
             local_dev_stats = self.stats_for_dev[local_dev['device']]
-            if not dev_path:
+            try:
+                dev_path = check_drive(self.devices_dir, local_dev['device'],
+                                       self.mount_check)
+            except ValueError as err:
                 local_dev_stats.add_failure_stats(
                     [(failure_dev['replication_ip'],
                       failure_dev['device'])
                      for failure_dev in policy.object_ring.devs
                      if failure_dev])
-                self.logger.warning(
-                    _('%s is not mounted'), local_dev['device'])
+                self.logger.warning("%s", err)
                 continue
             obj_path = join(dev_path, data_dir)
             tmp_path = join(dev_path, get_tmp_dir(policy))
@@ -927,13 +930,14 @@ class ObjectReplicator(Daemon):
                 dev_stats = self.stats_for_dev[job['device']]
                 num_jobs += 1
                 current_nodes = job['nodes']
-                dev_path = check_drive(self.devices_dir, job['device'],
-                                       self.mount_check)
-                if not dev_path:
+                try:
+                    check_drive(self.devices_dir, job['device'],
+                                self.mount_check)
+                except ValueError as err:
                     dev_stats.add_failure_stats([
                         (failure_dev['replication_ip'], failure_dev['device'])
                         for failure_dev in job['nodes']])
-                    self.logger.warning(_('%s is not mounted'), job['device'])
+                    self.logger.warning("%s", err)
                     continue
                 if self.handoffs_first and not job['delete']:
                     # in handoffs first mode, we won't process primary

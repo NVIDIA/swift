@@ -29,6 +29,7 @@ import json
 
 import mock
 from mock import patch, call
+import six
 from six.moves import reload_module
 
 from swift.container.backend import DATADIR
@@ -159,6 +160,8 @@ def _mock_process(*args):
 
 class ReplHttp(object):
     def __init__(self, response=None, set_status=200):
+        if isinstance(response, six.text_type):
+            response = response.encode('ascii')
         self.response = response
         self.set_status = set_status
     replicated = False
@@ -321,6 +324,7 @@ class TestDBReplicator(unittest.TestCase):
         # later config should be extended to assert more config options
         replicator = TestReplicator({'node_timeout': '3.5'})
         self.assertEqual(replicator.node_timeout, 3.5)
+        self.assertEqual(replicator.databases_per_second, 50)
 
     def test_repl_connection(self):
         node = {'replication_ip': '127.0.0.1', 'replication_port': 80,
@@ -545,11 +549,13 @@ class TestDBReplicator(unittest.TestCase):
         self.assertEqual(replicator.mount_check, True)
         self.assertEqual(replicator.port, 6200)
 
+        err = ValueError('Boom!')
+
         def mock_check_drive(root, device, mount_check):
             self.assertEqual(root, replicator.root)
             self.assertEqual(device, replicator.ring.devs[0]['device'])
             self.assertEqual(mount_check, True)
-            return None
+            raise err
 
         self._patch(patch.object, db_replicator, 'check_drive',
                     mock_check_drive)
@@ -557,8 +563,7 @@ class TestDBReplicator(unittest.TestCase):
 
         self.assertEqual(
             replicator.logger.log_dict['warning'],
-            [(('Skipping %(device)s as it is not mounted' %
-               replicator.ring.devs[0],), {})])
+            [(('Skipping: %s', (err, )), {})])
 
     def test_run_once_node_is_mounted(self):
         db_replicator.ring = FakeRingWithSingleNode()
@@ -687,7 +692,7 @@ class TestDBReplicator(unittest.TestCase):
         class FakeResponse(object):
             def __init__(self, status, rinfo):
                 self._status = status
-                self.data = json.dumps(rinfo)
+                self.data = json.dumps(rinfo).encode('ascii')
 
             @property
             def status(self):
@@ -1119,7 +1124,7 @@ class TestDBReplicator(unittest.TestCase):
                                           mount_check=False)
         with unit.mock_check_drive(isdir=True):
             response = rpc.dispatch(('a',), 'arg')
-        self.assertEqual('Invalid object type', response.body)
+        self.assertEqual(b'Invalid object type', response.body)
         self.assertEqual(400, response.status_int)
 
     def test_dispatch_drive_not_mounted(self):

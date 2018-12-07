@@ -17,9 +17,10 @@ Pluggable Back-end for Account Server
 """
 
 from uuid import uuid4
-import six.moves.cPickle as pickle
 
 import sqlite3
+
+import six
 
 from swift.common.utils import Timestamp
 from swift.common.db import DatabaseBroker, utf8encode, zero_like
@@ -204,12 +205,11 @@ class AccountBroker(DatabaseBroker):
 
     def _commit_puts_load(self, item_list, entry):
         """See :func:`swift.common.db.DatabaseBroker._commit_puts_load`"""
-        loaded = pickle.loads(entry.decode('base64'))
         # check to see if the update includes policy_index or not
         (name, put_timestamp, delete_timestamp, object_count, bytes_used,
-         deleted) = loaded[:6]
-        if len(loaded) > 6:
-            storage_policy_index = loaded[6]
+         deleted) = entry[:6]
+        if len(entry) > 6:
+            storage_policy_index = entry[6]
         else:
             # legacy support during upgrade until first non legacy storage
             # policy is defined
@@ -246,7 +246,7 @@ class AccountBroker(DatabaseBroker):
         """
         Create a container with the given attributes.
 
-        :param name: name of the container to create
+        :param name: name of the container to create (a native string)
         :param put_timestamp: put_timestamp of the container to create
         :param delete_timestamp: delete_timestamp of the container to create
         :param object_count: number of objects in the container
@@ -336,7 +336,12 @@ class AccountBroker(DatabaseBroker):
                     else:
                         columns.remove('container_count')
                     info = run_query()
-                elif "no such table: policy_stat" not in str(err):
+                elif "no such table: policy_stat" in str(err):
+                    if do_migrations:
+                        self.create_policy_stat_table(conn)
+                        info = run_query()
+                    # else, pass and let the results be empty
+                else:
                     raise
 
         policy_stats = {}
@@ -381,8 +386,9 @@ class AccountBroker(DatabaseBroker):
                   put_timestamp, 0)
         """
         delim_force_gte = False
-        (marker, end_marker, prefix, delimiter) = utf8encode(
-            marker, end_marker, prefix, delimiter)
+        if six.PY2:
+            (marker, end_marker, prefix, delimiter) = utf8encode(
+                marker, end_marker, prefix, delimiter)
         if reverse:
             # Reverse the markers if we are reversing the listing.
             marker, end_marker = end_marker, marker
@@ -412,7 +418,7 @@ class AccountBroker(DatabaseBroker):
                     query_args.append(marker)
                     # Always set back to False
                     delim_force_gte = False
-                elif marker and marker >= prefix:
+                elif marker and (not prefix or marker >= prefix):
                     query += ' name > ? AND'
                     query_args.append(marker)
                 elif prefix:

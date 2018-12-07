@@ -59,7 +59,8 @@ import eventlet.debug
 import eventlet.greenthread
 import eventlet.patcher
 import eventlet.semaphore
-from eventlet import GreenPool, sleep, Timeout, tpool
+import pkg_resources
+from eventlet import GreenPool, sleep, Timeout
 from eventlet.green import socket, threading
 from eventlet.hubs import trampoline
 import eventlet.queue
@@ -114,6 +115,10 @@ FALLOCATE_RESERVE = 0
 # Indicates if FALLOCATE_RESERVE is the percentage of free space (True) or
 # the number of bytes (False).
 FALLOCATE_IS_PERCENT = False
+
+# from /usr/include/linux/falloc.h
+FALLOC_FL_KEEP_SIZE = 1
+FALLOC_FL_PUNCH_HOLE = 2
 
 # from /usr/src/linux-headers-*/include/uapi/linux/resource.h
 PRIO_PROCESS = 0
@@ -255,7 +260,8 @@ except InvalidHashPathConfigError:
     pass
 
 
-def get_hmac(request_method, path, expires, key, digest=sha1):
+def get_hmac(request_method, path, expires, key, digest=sha1,
+             ip_range=None):
     """
     Returns the hexdigest string of the HMAC (see RFC 2104) for
     the request.
@@ -267,18 +273,31 @@ def get_hmac(request_method, path, expires, key, digest=sha1):
     :param key: HMAC shared secret.
     :param digest: constructor for the digest to use in calculating the HMAC
                    Defaults to SHA1
-
+    :param ip_range: The ip range from which the resource is allowed
+                     to be accessed. We need to put the ip_range as the
+                     first argument to hmac to avoid manipulation of the path
+                     due to newlines being valid in paths
+                     e.g. /v1/a/c/o\\n127.0.0.1
     :returns: hexdigest str of the HMAC for the request using the specified
               digest algorithm.
     """
-    parts = (request_method, str(expires), path)
+    # These are the three mandatory fields.
+    parts = [request_method, str(expires), path]
+    formats = [b"%s", b"%s", b"%s"]
+
+    if ip_range:
+        parts.insert(0, ip_range)
+        formats.insert(0, b"ip=%s")
+
     if not isinstance(key, six.binary_type):
         key = key.encode('utf8')
-    return hmac.new(
-        key, b'\n'.join(
-            x if isinstance(x, six.binary_type) else x.encode('utf8')
-            for x in parts),
-        digest).hexdigest()
+
+    message = b'\n'.join(
+        fmt % (part if isinstance(part, six.binary_type)
+               else part.encode("utf-8"))
+        for fmt, part in zip(formats, parts))
+
+    return hmac.new(key, message, digest).hexdigest()
 
 
 # Used by get_swift_info and register_swift_info to store information about
@@ -646,8 +665,10 @@ class FileLikeIter(object):
         """
         Wraps an iterable to behave as a file-like object.
 
-        The iterable must yield bytes strings.
+        The iterable must be a byte string or yield byte strings.
         """
+        if isinstance(iterable, bytes):
+            iterable = (iterable, )
         self.iterator = iter(iterable)
         self.buf = None
         self.closed = False
@@ -759,70 +780,192 @@ class FileLikeIter(object):
         self.closed = True
 
 
-class FallocateWrapper(object):
+def fs_has_free_space(fs_path, space_needed, is_percent):
+    """
+    Check to see whether or not a filesystem has the given amount of space
+    free. Unlike fallocate(), this does not reserve any space.
 
-    def __init__(self, noop=False):
-        self.noop = noop
-        if self.noop:
-            self.func_name = 'posix_fallocate'
-            self.fallocate = noop_libc_function
-            return
-        # fallocate is preferred because we need the on-disk size to match
-        # the allocated size. Older versions of sqlite require that the
-        # two sizes match. However, fallocate is Linux only.
-        for func in ('fallocate', 'posix_fallocate'):
-            self.func_name = func
-            self.fallocate = load_libc_function(func, log_error=False)
-            if self.fallocate is not noop_libc_function:
-                break
-        if self.fallocate is noop_libc_function:
-            logging.warning(_("Unable to locate fallocate, posix_fallocate in "
-                            "libc.  Leaving as a no-op."))
+    :param fs_path: path to a file or directory on the filesystem; typically
+        the path to the filesystem's mount point
 
-    def __call__(self, fd, mode, offset, length):
-        """The length parameter must be a ctypes.c_uint64."""
-        if not self.noop:
-            if FALLOCATE_RESERVE > 0:
-                st = os.fstatvfs(fd)
-                free = st.f_frsize * st.f_bavail - length.value
-                if FALLOCATE_IS_PERCENT:
-                    free = \
-                        (float(free) / float(st.f_frsize * st.f_blocks)) * 100
-                if float(free) <= float(FALLOCATE_RESERVE):
-                    raise OSError(
-                        errno.ENOSPC,
-                        'FALLOCATE_RESERVE fail %g <= %g' %
-                        (free, FALLOCATE_RESERVE))
-        args = {
-            'fallocate': (fd, mode, offset, length),
-            'posix_fallocate': (fd, offset, length)
-        }
-        return self.fallocate(*args[self.func_name])
+    :param space_needed: minimum bytes or percentage of free space
+
+    :param is_percent: if True, then space_needed is treated as a percentage
+        of the filesystem's capacity; if False, space_needed is a number of
+        free bytes.
+
+    :returns: True if the filesystem has at least that much free space,
+        False otherwise
+
+    :raises OSError: if fs_path does not exist
+    """
+    st = os.statvfs(fs_path)
+    free_bytes = st.f_frsize * st.f_bavail
+    if is_percent:
+        size_bytes = st.f_frsize * st.f_blocks
+        free_percent = float(free_bytes) / float(size_bytes) * 100
+        return free_percent >= space_needed
+    else:
+        return free_bytes >= space_needed
+
+
+class _LibcWrapper(object):
+    """
+    A callable object that forwards its calls to a C function from libc.
+
+    These objects are lazy. libc will not be checked until someone tries to
+    either call the function or check its availability.
+
+    _LibcWrapper objects have an "available" property; if true, then libc
+    has the function of that name. If false, then calls will fail with a
+    NotImplementedError.
+    """
+    def __init__(self, func_name):
+        self._func_name = func_name
+        self._func_handle = None
+        self._loaded = False
+
+    def _ensure_loaded(self):
+        if not self._loaded:
+            func_name = self._func_name
+            try:
+                # Keep everything in this try-block in local variables so
+                # that a typo in self.some_attribute_name doesn't raise a
+                # spurious AttributeError.
+                func_handle = load_libc_function(
+                    func_name, fail_if_missing=True)
+            except AttributeError:
+                # We pass fail_if_missing=True to load_libc_function and
+                # then ignore the error. It's weird, but otherwise we have
+                # to check if self._func_handle is noop_libc_function, and
+                # that's even weirder.
+                pass
+            else:
+                self._func_handle = func_handle
+            self._loaded = True
+
+    @property
+    def available(self):
+        self._ensure_loaded()
+        return bool(self._func_handle)
+
+    def __call__(self, *args):
+        if self.available:
+            return self._func_handle(*args)
+        else:
+            raise NotImplementedError(
+                "No function %r found in libc" % self._func_name)
+
+
+_fallocate_enabled = True
+_fallocate_warned_about_missing = False
+_sys_fallocate = _LibcWrapper('fallocate')
+_sys_posix_fallocate = _LibcWrapper('posix_fallocate')
 
 
 def disable_fallocate():
-    global _sys_fallocate
-    _sys_fallocate = FallocateWrapper(noop=True)
+    global _fallocate_enabled
+    _fallocate_enabled = False
 
 
-def fallocate(fd, size):
+def fallocate(fd, size, offset=0):
     """
     Pre-allocate disk space for a file.
+
+    This function can be disabled by calling disable_fallocate(). If no
+    suitable C function is available in libc, this function is a no-op.
 
     :param fd: file descriptor
     :param size: size to allocate (in bytes)
     """
-    global _sys_fallocate
-    if _sys_fallocate is None:
-        _sys_fallocate = FallocateWrapper()
+    global _fallocate_enabled
+    if not _fallocate_enabled:
+        return
+
     if size < 0:
-        size = 0
-    # 1 means "FALLOC_FL_KEEP_SIZE", which means it pre-allocates invisibly
-    ret = _sys_fallocate(fd, 1, 0, ctypes.c_uint64(size))
-    err = ctypes.get_errno()
+        size = 0  # Done historically; not really sure why
+    if size >= (1 << 63):
+        raise ValueError('size must be less than 2 ** 63')
+    if offset < 0:
+        raise ValueError('offset must be non-negative')
+    if offset >= (1 << 63):
+        raise ValueError('offset must be less than 2 ** 63')
+
+    # Make sure there's some (configurable) amount of free space in
+    # addition to the number of bytes we're allocating.
+    if FALLOCATE_RESERVE:
+        st = os.fstatvfs(fd)
+        free = st.f_frsize * st.f_bavail - size
+        if FALLOCATE_IS_PERCENT:
+            free = \
+                (float(free) / float(st.f_frsize * st.f_blocks)) * 100
+        if float(free) <= float(FALLOCATE_RESERVE):
+            raise OSError(
+                errno.ENOSPC,
+                'FALLOCATE_RESERVE fail %g <= %g' %
+                (free, FALLOCATE_RESERVE))
+
+    if _sys_fallocate.available:
+        # Parameters are (fd, mode, offset, length).
+        #
+        # mode=FALLOC_FL_KEEP_SIZE pre-allocates invisibly (without
+        # affecting the reported file size).
+        ret = _sys_fallocate(
+            fd, FALLOC_FL_KEEP_SIZE, ctypes.c_uint64(offset),
+            ctypes.c_uint64(size))
+        err = ctypes.get_errno()
+    elif _sys_posix_fallocate.available:
+        # Parameters are (fd, offset, length).
+        ret = _sys_posix_fallocate(fd, ctypes.c_uint64(offset),
+                                   ctypes.c_uint64(size))
+        err = ctypes.get_errno()
+    else:
+        # No suitable fallocate-like function is in our libc. Warn about it,
+        # but just once per process, and then do nothing.
+        global _fallocate_warned_about_missing
+        if not _fallocate_warned_about_missing:
+            logging.warning(_("Unable to locate fallocate, posix_fallocate in "
+                              "libc.  Leaving as a no-op."))
+            _fallocate_warned_about_missing = True
+        return
+
     if ret and err not in (0, errno.ENOSYS, errno.EOPNOTSUPP,
                            errno.EINVAL):
         raise OSError(err, 'Unable to fallocate(%s)' % size)
+
+
+def punch_hole(fd, offset, length):
+    """
+    De-allocate disk space in the middle of a file.
+
+    :param fd: file descriptor
+    :param offset: index of first byte to de-allocate
+    :param length: number of bytes to de-allocate
+    """
+    if offset < 0:
+        raise ValueError('offset must be non-negative')
+    if offset >= (1 << 63):
+        raise ValueError('offset must be less than 2 ** 63')
+    if length <= 0:
+        raise ValueError('length must be positive')
+    if length >= (1 << 63):
+        raise ValueError('length must be less than 2 ** 63')
+
+    if _sys_fallocate.available:
+        # Parameters are (fd, mode, offset, length).
+        ret = _sys_fallocate(
+            fd,
+            FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+            ctypes.c_uint64(offset),
+            ctypes.c_uint64(length))
+        err = ctypes.get_errno()
+        if ret and err:
+            mode_str = "FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE"
+            raise OSError(err, "Unable to fallocate(%d, %s, %d, %d)" % (
+                fd, mode_str, offset, length))
+    else:
+        raise OSError(errno.ENOTSUP,
+                      'No suitable C function found for hole punching')
 
 
 def fsync(fd):
@@ -1945,6 +2088,25 @@ class SwiftLogFormatter(logging.Formatter):
         return msg
 
 
+class LogLevelFilter(object):
+    """
+    Drop messages for the logger based on level.
+
+    This is useful when dependencies log too much information.
+
+    :param level: All messages at or below this level are dropped
+                  (DEBUG < INFO < WARN < ERROR < CRITICAL|FATAL)
+                  Default: DEBUG
+    """
+    def __init__(self, level=logging.DEBUG):
+        self.level = level
+
+    def filter(self, record):
+        if record.levelno <= self.level:
+            return 0
+        return 1
+
+
 def get_logger(conf, name=None, log_to_console=False, log_route=None,
                fmt="%(server)s: %(message)s"):
     """
@@ -2101,9 +2263,18 @@ def get_hub():
 
     In contrast, both poll() and select() specify the set of interesting
     file descriptors with each call, so there's no problem with forking.
+
+    As eventlet monkey patching is now done before call get_hub() in wsgi.py
+    if we use 'import select' we get the eventlet version, but since version
+    0.20.0 eventlet removed select.poll() function in patched select (see:
+    http://eventlet.net/doc/changelog.html and
+    https://github.com/eventlet/eventlet/commit/614a20462).
+
+    We use eventlet.patcher.original function to get python select module
+    to test if poll() is available on platform.
     """
     try:
-        import select
+        select = eventlet.patcher.original('select')
         if hasattr(select, "poll"):
             return "poll"
         return "selects"
@@ -2773,6 +2944,18 @@ def remove_file(path):
         pass
 
 
+def remove_directory(path):
+    """Wrapper for os.rmdir, ENOENT and ENOTEMPTY are ignored
+
+    :param path: first and only argument passed to os.rmdir
+    """
+    try:
+        os.rmdir(path)
+    except OSError as e:
+        if e.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+            raise
+
+
 def audit_location_generator(devices, datadir, suffix='',
                              mount_check=True, logger=None):
     """
@@ -3303,7 +3486,7 @@ def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2,
             try:
                 existing_entry = cf.readline()
                 if existing_entry:
-                    cache_entry = json.loads(existing_entry.decode('utf8'))
+                    cache_entry = json.loads(existing_entry)
             except ValueError:
                 # file doesn't have a valid entry, we'll recreate it
                 pass
@@ -3771,21 +3954,6 @@ class Spliterator(object):
             self._iterator_in_progress = False
 
 
-def tpool_reraise(func, *args, **kwargs):
-    """
-    Hack to work around Eventlet's tpool not catching and reraising Timeouts.
-    """
-    def inner():
-        try:
-            return func(*args, **kwargs)
-        except BaseException as err:
-            return err
-    resp = tpool.execute(inner)
-    if isinstance(resp, BaseException):
-        raise resp
-    return resp
-
-
 def ismount(path):
     """
     Test whether a path is a mount point. This will catch any
@@ -3816,7 +3984,13 @@ def ismount_raw(path):
         raise
 
     if stat.S_ISLNK(s1.st_mode):
-        # A symlink can never be a mount point
+        # Some environments (like vagrant-swift-all-in-one) use a symlink at
+        # the device level but could still provide a stubfile in the target
+        # to indicate that it should be treated as a mount point for swift's
+        # purposes.
+        if os.path.isfile(os.path.join(path, ".ismount")):
+            return True
+        # Otherwise, a symlink can never be a mount point
         return False
 
     s2 = os.lstat(os.path.join(path, '..'))
@@ -3968,7 +4142,7 @@ def quote(value, safe='/'):
 
 def get_expirer_container(x_delete_at, expirer_divisor, acc, cont, obj):
     """
-    Returns a expiring object container name for given X-Delete-At and
+    Returns an expiring object container name for given X-Delete-At and
     a/c/o.
     """
     shard_int = int(hash_path(acc, cont, obj), 16) % 100
@@ -4159,7 +4333,7 @@ def maybe_multipart_byteranges_to_document_iters(app_iter, content_type):
     body_file = FileLikeIter(app_iter)
     boundary = dict(params_list)['boundary']
     for _headers, body in mime_to_document_iters(body_file, boundary):
-        yield (chunk for chunk in iter(lambda: body.read(65536), ''))
+        yield (chunk for chunk in iter(lambda: body.read(65536), b''))
 
 
 def document_iters_to_multipart_byteranges(ranges_iter, boundary):
@@ -4169,9 +4343,11 @@ def document_iters_to_multipart_byteranges(ranges_iter, boundary):
 
     See document_iters_to_http_response_body for parameter descriptions.
     """
+    if not isinstance(boundary, bytes):
+        boundary = boundary.encode('ascii')
 
-    divider = "--" + boundary + "\r\n"
-    terminator = "--" + boundary + "--"
+    divider = b"--" + boundary + b"\r\n"
+    terminator = b"--" + boundary + b"--"
 
     for range_spec in ranges_iter:
         start_byte = range_spec["start_byte"]
@@ -4179,19 +4355,23 @@ def document_iters_to_multipart_byteranges(ranges_iter, boundary):
         entity_length = range_spec.get("entity_length", "*")
         content_type = range_spec["content_type"]
         part_iter = range_spec["part_iter"]
+        if not isinstance(content_type, bytes):
+            content_type = str(content_type).encode('utf-8')
+        if not isinstance(entity_length, bytes):
+            entity_length = str(entity_length).encode('utf-8')
 
-        part_header = ''.join((
+        part_header = b''.join((
             divider,
-            "Content-Type: ", str(content_type), "\r\n",
-            "Content-Range: ", "bytes %d-%d/%s\r\n" % (
+            b"Content-Type: ", content_type, b"\r\n",
+            b"Content-Range: ", b"bytes %d-%d/%s\r\n" % (
                 start_byte, end_byte, entity_length),
-            "\r\n"
+            b"\r\n"
         ))
         yield part_header
 
         for chunk in part_iter:
             yield chunk
-        yield "\r\n"
+        yield b"\r\n"
     yield terminator
 
 
@@ -5119,6 +5299,25 @@ def replace_partition_in_path(path, part_power):
     path_components[-4] = "%d" % part
 
     return os.sep.join(path_components)
+
+
+def load_pkg_resource(group, uri):
+    if '#' in uri:
+        uri, name = uri.split('#', 1)
+    else:
+        name = uri
+        uri = 'egg:swift'
+
+    if ':' in uri:
+        scheme, dist = uri.split(':', 1)
+        scheme = scheme.lower()
+    else:
+        scheme = 'egg'
+        dist = uri
+
+    if scheme != 'egg':
+        raise TypeError('Unhandled URI scheme: %r' % scheme)
+    return pkg_resources.load_entry_point(dist, group, name)
 
 
 class PipeMutex(object):

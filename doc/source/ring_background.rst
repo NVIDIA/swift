@@ -2,13 +2,22 @@
 Building a Consistent Hashing Ring
 ==================================
 
----------------------
-Authored by Greg Holt
----------------------
+------------------------------------
+Authored by Greg Holt, February 2011
+------------------------------------
 
 This is a compilation of five posts I made earlier discussing how to build
 a consistent hashing ring. The posts seemed to be accessed quite frequently,
 so I've gathered them all here on one page for easier reading.
+
+.. note::
+    This is an historical document; as such, all code examples are Python 2.
+    If this makes you squirm, think of it as pseudo-code. Regardless of
+    implementation language, the state of the art in consistent-hashing and
+    distributed systems more generally has advanced. We hope that this
+    introduction from first principles will still prove informative,
+    particularly with regard to how data is distributed within a Swift
+    cluster.
 
 Part 1
 ======
@@ -46,7 +55,7 @@ Here is a simple example of this in action:
   DATA_ID_COUNT = 10000000
 
   node_counts = [0] * NODE_COUNT
-  for data_id in xrange(DATA_ID_COUNT):
+  for data_id in range(DATA_ID_COUNT):
       data_id = str(data_id)
       # This just pulls part of the hash out as an integer
       hsh = unpack_from('>I', md5(data_id).digest())[0]
@@ -107,7 +116,7 @@ Let's examine this at a larger scale:
   DATA_ID_COUNT = 10000000
 
   moved_ids = 0
-  for data_id in xrange(DATA_ID_COUNT):
+  for data_id in range(DATA_ID_COUNT):
       data_id = str(data_id)
       hsh = unpack_from('>I', md5(str(data_id)).digest())[0]
       node_id = hsh % NODE_COUNT
@@ -146,15 +155,15 @@ Let's examine this at a larger scale:
   DATA_ID_COUNT = 10000000
 
   node_range_starts = []
-  for node_id in xrange(NODE_COUNT):
+  for node_id in range(NODE_COUNT):
       node_range_starts.append(DATA_ID_COUNT /
                                NODE_COUNT * node_id)
   new_node_range_starts = []
-  for new_node_id in xrange(NEW_NODE_COUNT):
+  for new_node_id in range(NEW_NODE_COUNT):
       new_node_range_starts.append(DATA_ID_COUNT /
                                 NEW_NODE_COUNT * new_node_id)
   moved_ids = 0
-  for data_id in xrange(DATA_ID_COUNT):
+  for data_id in range(DATA_ID_COUNT):
       data_id = str(data_id)
       hsh = unpack_from('>I', md5(str(data_id)).digest())[0]
       node_id = bisect_left(node_range_starts,
@@ -192,7 +201,7 @@ be done by creating "virtual nodes" for each node. So 100 nodes might have
 
   vnode_range_starts = []
   vnode2node = []
-  for vnode_id in xrange(VNODE_COUNT):
+  for vnode_id in range(VNODE_COUNT):
       vnode_range_starts.append(DATA_ID_COUNT /
                                 VNODE_COUNT * vnode_id)
       vnode2node.append(vnode_id % NODE_COUNT)
@@ -201,7 +210,7 @@ be done by creating "virtual nodes" for each node. So 100 nodes might have
   NEW_NODE_COUNT = NODE_COUNT + 1
   vnodes_to_reassign = VNODE_COUNT / NEW_NODE_COUNT
   while vnodes_to_reassign > 0:
-      for node_to_take_from in xrange(NODE_COUNT):
+      for node_to_take_from in range(NODE_COUNT):
           for vnode_id, node_id in enumerate(new_vnode2node):
               if node_id == node_to_take_from:
                   new_vnode2node[vnode_id] = new_node_id
@@ -210,7 +219,7 @@ be done by creating "virtual nodes" for each node. So 100 nodes might have
           if vnodes_to_reassign <= 0:
               break
   moved_ids = 0
-  for data_id in xrange(DATA_ID_COUNT):
+  for data_id in range(DATA_ID_COUNT):
       data_id = str(data_id)
       hsh = unpack_from('>I', md5(str(data_id)).digest())[0]
       vnode_id = bisect_left(vnode_range_starts,
@@ -242,13 +251,13 @@ optimize that out.
   VNODE_COUNT = 1000
 
   vnode2node = []
-  for vnode_id in xrange(VNODE_COUNT):
+  for vnode_id in range(VNODE_COUNT):
       vnode2node.append(vnode_id % NODE_COUNT)
   new_vnode2node = list(vnode2node)
   new_node_id = NODE_COUNT
   vnodes_to_reassign = VNODE_COUNT / (NODE_COUNT + 1)
   while vnodes_to_reassign > 0:
-      for node_to_take_from in xrange(NODE_COUNT):
+      for node_to_take_from in range(NODE_COUNT):
           for vnode_id, node_id in enumerate(vnode2node):
               if node_id == node_to_take_from:
                   vnode2node[vnode_id] = new_node_id
@@ -257,7 +266,7 @@ optimize that out.
           if vnodes_to_reassign <= 0:
               break
   moved_ids = 0
-  for data_id in xrange(DATA_ID_COUNT):
+  for data_id in range(DATA_ID_COUNT):
       data_id = str(data_id)
       hsh = unpack_from('>I', md5(str(data_id)).digest())[0]
       vnode_id = hsh % VNODE_COUNT
@@ -356,10 +365,10 @@ distribution to make sure we haven't broken anything.
   DATA_ID_COUNT = 100000000
 
   part2node = array('H')
-  for part in xrange(2 ** PARTITION_POWER):
+  for part in range(2 ** PARTITION_POWER):
       part2node.append(part % NODE_COUNT)
   node_counts = [0] * NODE_COUNT
-  for data_id in xrange(DATA_ID_COUNT):
+  for data_id in range(DATA_ID_COUNT):
       data_id = str(data_id)
       part = unpack_from('>I',
           md5(str(data_id)).digest())[0] >> PARTITION_SHIFT
@@ -437,16 +446,16 @@ testing):
   DATA_ID_COUNT = 10000000
 
   part2node = array('H')
-  for part in xrange(2 ** PARTITION_POWER):
+  for part in range(2 ** PARTITION_POWER):
       part2node.append(part % NODE_COUNT)
   node_counts = [0] * NODE_COUNT
-  for data_id in xrange(DATA_ID_COUNT):
+  for data_id in range(DATA_ID_COUNT):
       data_id = str(data_id)
       part = unpack_from('>I',
           md5(str(data_id)).digest())[0] >> PARTITION_SHIFT
       node_ids = [part2node[part]]
       node_counts[node_ids[0]] += 1
-      for replica in xrange(1, REPLICAS):
+      for replica in range(1, REPLICAS):
           while part2node[part] in node_ids:
               part += 1
               if part > PARTITION_MAX:
@@ -511,12 +520,12 @@ in distinct zones.
           node2zone.append(zone)
           zone += 1
   part2node = array('H')
-  for part in xrange(2 ** PARTITION_POWER):
+  for part in range(2 ** PARTITION_POWER):
       part2node.append(part % NODE_COUNT)
   shuffle(part2node)
   node_counts = [0] * NODE_COUNT
   zone_counts = [0] * ZONE_COUNT
-  for data_id in xrange(DATA_ID_COUNT):
+  for data_id in range(DATA_ID_COUNT):
       data_id = str(data_id)
       part = unpack_from('>I',
           md5(str(data_id)).digest())[0] >> PARTITION_SHIFT
@@ -524,7 +533,7 @@ in distinct zones.
       zones = [node2zone[node_ids[0]]]
       node_counts[node_ids[0]] += 1
       zone_counts[zones[0]] += 1
-      for replica in xrange(1, REPLICAS):
+      for replica in range(1, REPLICAS):
           while part2node[part] in node_ids and \
                   node2zone[part2node[part]] in zones:
               part += 1
@@ -596,8 +605,8 @@ each real node is assigned multiple anchors.
           zone += 1
   hash2index = []
   index2node = []
-  for node in xrange(NODE_COUNT):
-      for vnode in xrange(VNODE_COUNT):
+  for node in range(NODE_COUNT):
+      for vnode in range(VNODE_COUNT):
           hsh = unpack_from('>I', md5(str(node)).digest())[0]
           index = bisect_left(hash2index, hsh)
           if index > len(hash2index):
@@ -606,7 +615,7 @@ each real node is assigned multiple anchors.
           index2node.insert(index, node)
   node_counts = [0] * NODE_COUNT
   zone_counts = [0] * ZONE_COUNT
-  for data_id in xrange(DATA_ID_COUNT):
+  for data_id in range(DATA_ID_COUNT):
       data_id = str(data_id)
       hsh = unpack_from('>I', md5(str(data_id)).digest())[0]
       index = bisect_left(hash2index, hsh)
@@ -616,7 +625,7 @@ each real node is assigned multiple anchors.
       zones = [node2zone[node_ids[0]]]
       node_counts[node_ids[0]] += 1
       zone_counts[zones[0]] += 1
-      for replica in xrange(1, REPLICAS):
+      for replica in range(1, REPLICAS):
           while index2node[index] in node_ids and \
                   node2zone[index2node[index]] in zones:
               index += 1
@@ -703,7 +712,7 @@ the ring and its testing.
              md5(data_id).digest())[0] >> self.partition_shift
           node_ids = [self.part2node[part]]
           zones = [self.nodes[node_ids[0]]]
-          for replica in xrange(1, self.replicas):
+          for replica in range(1, self.replicas):
               while self.part2node[part] in node_ids and \
                      self.nodes[self.part2node[part]] in zones:
                   part += 1
@@ -716,7 +725,7 @@ the ring and its testing.
   def build_ring(nodes, partition_power, replicas):
       begin = time()
       part2node = array('H')
-      for part in xrange(2 ** partition_power):
+      for part in range(2 ** partition_power):
           part2node.append(part % len(nodes))
       shuffle(part2node)
       ring = Ring(nodes, part2node, replicas)
@@ -728,7 +737,7 @@ the ring and its testing.
       DATA_ID_COUNT = 10000000
       node_counts = {}
       zone_counts = {}
-      for data_id in xrange(DATA_ID_COUNT):
+      for data_id in range(DATA_ID_COUNT):
           for node in ring.get_nodes(data_id):
               node_counts[node['id']] = \
                   node_counts.get(node['id'], 0) + 1
@@ -738,27 +747,27 @@ the ring and its testing.
       desired_count = \
           DATA_ID_COUNT / len(ring.nodes) * REPLICAS
       print '%d: Desired data ids per node' % desired_count
-      max_count = max(node_counts.itervalues())
+      max_count = max(node_counts.values())
       over = \
           100.0 * (max_count - desired_count) / desired_count
       print '%d: Most data ids on one node, %.02f%% over' % \
           (max_count, over)
-      min_count = min(node_counts.itervalues())
+      min_count = min(node_counts.values())
       under = \
           100.0 * (desired_count - min_count) / desired_count
       print '%d: Least data ids on one node, %.02f%% under' % \
           (min_count, under)
       zone_count = \
-          len(set(n['zone'] for n in ring.nodes.itervalues()))
+          len(set(n['zone'] for n in ring.nodes.values()))
       desired_count = \
           DATA_ID_COUNT / zone_count * ring.replicas
       print '%d: Desired data ids per zone' % desired_count
-      max_count = max(zone_counts.itervalues())
+      max_count = max(zone_counts.values())
       over = \
           100.0 * (max_count - desired_count) / desired_count
       print '%d: Most data ids in one zone, %.02f%% over' % \
           (max_count, over)
-      min_count = min(zone_counts.itervalues())
+      min_count = min(zone_counts.values())
       under = \
           100.0 * (desired_count - min_count) / desired_count
       print '%d: Least data ids in one zone, %.02f%% under' % \
@@ -832,7 +841,7 @@ we've changed so much I'll just post the entire module again:
              md5(data_id).digest())[0] >> self.partition_shift
           node_ids = [self.part2node[part]]
           zones = [self.nodes[node_ids[0]]]
-          for replica in xrange(1, self.replicas):
+          for replica in range(1, self.replicas):
               while self.part2node[part] in node_ids and \
                      self.nodes[self.part2node[part]] in zones:
                   part += 1
@@ -846,19 +855,19 @@ we've changed so much I'll just post the entire module again:
       begin = time()
       parts = 2 ** partition_power
       total_weight = \
-          float(sum(n['weight'] for n in nodes.itervalues()))
-      for node in nodes.itervalues():
+          float(sum(n['weight'] for n in nodes.values()))
+      for node in nodes.values():
           node['desired_parts'] = \
               parts / total_weight * node['weight']
       part2node = array('H')
-      for part in xrange(2 ** partition_power):
-          for node in nodes.itervalues():
+      for part in range(2 ** partition_power):
+          for node in nodes.values():
               if node['desired_parts'] >= 1:
                   node['desired_parts'] -= 1
                   part2node.append(node['id'])
                   break
           else:
-              for node in nodes.itervalues():
+              for node in nodes.values():
                   if node['desired_parts'] >= 0:
                       node['desired_parts'] -= 1
                       part2node.append(node['id'])
@@ -873,7 +882,7 @@ we've changed so much I'll just post the entire module again:
       DATA_ID_COUNT = 10000000
       node_counts = {}
       zone_counts = {}
-      for data_id in xrange(DATA_ID_COUNT):
+      for data_id in range(DATA_ID_COUNT):
           for node in ring.get_nodes(data_id):
               node_counts[node['id']] = \
                   node_counts.get(node['id'], 0) + 1
@@ -881,10 +890,10 @@ we've changed so much I'll just post the entire module again:
                   zone_counts.get(node['zone'], 0) + 1
       print '%ds to test ring' % (time() - begin)
       total_weight = float(sum(n['weight'] for n in
-                               ring.nodes.itervalues()))
+                               ring.nodes.values()))
       max_over = 0
       max_under = 0
-      for node in ring.nodes.itervalues():
+      for node in ring.nodes.values():
           desired = DATA_ID_COUNT * REPLICAS * \
               node['weight'] / total_weight
           diff = node_counts[node['id']] - desired
@@ -901,9 +910,9 @@ we've changed so much I'll just post the entire module again:
       max_over = 0
       max_under = 0
       for zone in set(n['zone'] for n in
-                      ring.nodes.itervalues()):
+                      ring.nodes.values()):
           zone_weight = sum(n['weight'] for n in
-              ring.nodes.itervalues() if n['zone'] == zone)
+              ring.nodes.values() if n['zone'] == zone)
           desired = DATA_ID_COUNT * REPLICAS * \
               zone_weight / total_weight
           diff = zone_counts[zone] - desired

@@ -139,8 +139,8 @@ class TestObjectController(unittest.TestCase):
     def setUp(self):
         """Set up for testing swift.object.server.ObjectController"""
         skip_if_no_xattrs()
-        utils.HASH_PATH_SUFFIX = 'endcap'
-        utils.HASH_PATH_PREFIX = 'startcap'
+        utils.HASH_PATH_SUFFIX = b'endcap'
+        utils.HASH_PATH_PREFIX = b'startcap'
         self.tmpdir = mkdtemp()
         self.testdir = os.path.join(self.tmpdir,
                                     'tmp_test_object_server_ObjectController')
@@ -958,7 +958,7 @@ class TestObjectController(unittest.TestCase):
                             headers=put_headers, body='test')
 
         with mock.patch('swift.obj.server.http_connect', fake_http_connect), \
-                mock.patch('swift.common.utils.HASH_PATH_PREFIX', ''), \
+                mock.patch('swift.common.utils.HASH_PATH_PREFIX', b''), \
                 fake_spawn():
             resp = req.get_response(self.object_controller)
 
@@ -1002,7 +1002,7 @@ class TestObjectController(unittest.TestCase):
                             headers=post_headers)
 
         with mock.patch('swift.obj.server.http_connect', fake_http_connect), \
-                mock.patch('swift.common.utils.HASH_PATH_PREFIX', ''), \
+                mock.patch('swift.common.utils.HASH_PATH_PREFIX', b''), \
                 fake_spawn():
             resp = req.get_response(self.object_controller)
 
@@ -1112,7 +1112,7 @@ class TestObjectController(unittest.TestCase):
                         'X-Backend-Redirect-Timestamp': next(self.ts).internal}
 
         with mocked_http_conn(301, headers=[resp_headers]) as conn, \
-                mock.patch('swift.common.utils.HASH_PATH_PREFIX', ''),\
+                mock.patch('swift.common.utils.HASH_PATH_PREFIX', b''),\
                 fake_spawn():
             resp = req.get_response(self.object_controller)
 
@@ -1705,8 +1705,8 @@ class TestObjectController(unittest.TestCase):
         req.headers.pop("Content-Length", None)
 
         resp = req.get_response(self.object_controller)
-        self.assertEqual(resp.etag, obj_etag)
         self.assertEqual(resp.status_int, 201)
+        self.assertEqual(resp.etag, obj_etag)
 
         objfile = os.path.join(
             self.testdir, 'sda1',
@@ -2038,10 +2038,7 @@ class TestObjectController(unittest.TestCase):
 
             def __exit__(self, typ, value, tb):
                 pass
-        # This is just so the test fails when run on older object server code
-        # instead of exploding.
-        if not hasattr(object_server, 'ChunkReadTimeout'):
-            object_server.ChunkReadTimeout = None
+
         with mock.patch.object(object_server, 'ChunkReadTimeout', FakeTimeout):
             timestamp = normalize_timestamp(time())
             req = Request.blank(
@@ -5091,7 +5088,7 @@ class TestObjectController(unittest.TestCase):
         policy = random.choice(list(POLICIES))
         self._stage_tmp_dir(policy)
         _prefix = utils.HASH_PATH_PREFIX
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_PREFIX = b''
 
         def fake_http_connect(*args):
             raise Exception('test')
@@ -5122,7 +5119,7 @@ class TestObjectController(unittest.TestCase):
         policy = random.choice(list(POLICIES))
         self._stage_tmp_dir(policy)
         _prefix = utils.HASH_PATH_PREFIX
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_PREFIX = b''
 
         def fake_http_connect(status):
 
@@ -5167,7 +5164,7 @@ class TestObjectController(unittest.TestCase):
 
     def test_async_update_does_not_save_on_2xx(self):
         _prefix = utils.HASH_PATH_PREFIX
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_PREFIX = b''
 
         def fake_http_connect(status):
 
@@ -5203,7 +5200,7 @@ class TestObjectController(unittest.TestCase):
         policy = random.choice(list(POLICIES))
         self._stage_tmp_dir(policy)
         _prefix = utils.HASH_PATH_PREFIX
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_PREFIX = b''
 
         def fake_http_connect():
 
@@ -6872,12 +6869,7 @@ class TestObjectController(unittest.TestCase):
                 resp = delete_request.get_response(self.object_controller)
                 # we won't even create the tombstone
                 self.assertFalse(os.path.exists(tombstone_file))
-                # hashdir sticks around tho
-                self.assertTrue(os.path.exists(objfile._datadir))
-                # REPLICATE will clean it all up
-                resp = replicate_request.get_response(self.object_controller)
-                self.assertEqual(resp.status_int, 200)
-                self.assertEqual({}, pickle.loads(resp.body))
+                # hashdir's empty, so it gets cleaned up
                 self.assertFalse(os.path.exists(objfile._datadir))
 
     def test_SSYNC_can_be_called(self):

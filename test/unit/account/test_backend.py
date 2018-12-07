@@ -32,6 +32,8 @@ import random
 import mock
 import base64
 
+import six
+
 from swift.account.backend import AccountBroker
 from swift.common.utils import Timestamp
 from test.unit import patch_policies, with_tempdir, make_timestamp_iter
@@ -720,26 +722,23 @@ class TestAccountBroker(unittest.TestCase):
         broker.put_container('b', Timestamp(2).internal,
                              Timestamp(0).internal, 0, 0,
                              POLICIES.default.idx)
-        hasha = hashlib.md5(
-            '%s-%s' % ('a', "%s-%s-%s-%s" % (
-                Timestamp(1).internal, Timestamp(0).internal, 0, 0))
-        ).digest()
-        hashb = hashlib.md5(
-            '%s-%s' % ('b', "%s-%s-%s-%s" % (
-                Timestamp(2).internal, Timestamp(0).internal, 0, 0))
-        ).digest()
-        hashc = \
-            ''.join(('%02x' % (ord(a) ^ ord(b)) for a, b in zip(hasha, hashb)))
+        text = '%s-%s' % ('a', "%s-%s-%s-%s" % (
+               Timestamp(1).internal, Timestamp(0).internal, 0, 0))
+        hasha = hashlib.md5(text.encode('ascii')).digest()
+        text = '%s-%s' % ('b', "%s-%s-%s-%s" % (
+               Timestamp(2).internal, Timestamp(0).internal, 0, 0))
+        hashb = hashlib.md5(text.encode('ascii')).digest()
+        hashc = ''.join(('%02x' % (ord(a) ^ ord(b) if six.PY2 else a ^ b)
+                         for a, b in zip(hasha, hashb)))
         self.assertEqual(broker.get_info()['hash'], hashc)
         broker.put_container('b', Timestamp(3).internal,
                              Timestamp(0).internal, 0, 0,
                              POLICIES.default.idx)
-        hashb = hashlib.md5(
-            '%s-%s' % ('b', "%s-%s-%s-%s" % (
-                Timestamp(3).internal, Timestamp(0).internal, 0, 0))
-        ).digest()
-        hashc = \
-            ''.join(('%02x' % (ord(a) ^ ord(b)) for a, b in zip(hasha, hashb)))
+        text = '%s-%s' % ('b', "%s-%s-%s-%s" % (
+               Timestamp(3).internal, Timestamp(0).internal, 0, 0))
+        hashb = hashlib.md5(text.encode('ascii')).digest()
+        hashc = ''.join(('%02x' % (ord(a) ^ ord(b) if six.PY2 else a ^ b)
+                         for a, b in zip(hasha, hashb)))
         self.assertEqual(broker.get_info()['hash'], hashc)
 
     def test_merge_items(self):
@@ -767,7 +766,9 @@ class TestAccountBroker(unittest.TestCase):
                          sorted([rec['name'] for rec in items]))
 
     def test_merge_items_overwrite_unicode(self):
-        snowman = u'\N{SNOWMAN}'.encode('utf-8')
+        snowman = u'\N{SNOWMAN}'
+        if six.PY2:
+            snowman = snowman.encode('utf-8')
         broker1 = AccountBroker(':memory:', account='a')
         broker1.initialize(Timestamp('1').internal, 0)
         id1 = broker1.get_info()['id']
@@ -1174,21 +1175,27 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
         # first init an acct DB without the policy_stat table present
         broker = AccountBroker(db_path, account='a')
         broker.initialize(Timestamp('1').internal)
-        with broker.get() as conn:
-            try:
-                conn.execute('''
-                    SELECT * FROM policy_stat
-                    ''').fetchone()[0]
-            except sqlite3.OperationalError as err:
-                # confirm that the table really isn't there
-                self.assertIn('no such table: policy_stat', str(err))
-            else:
-                self.fail('broker did not raise sqlite3.OperationalError '
-                          'trying to select from policy_stat table!')
+
+        def confirm_no_table():
+            with broker.get() as conn:
+                try:
+                    conn.execute('''
+                        SELECT * FROM policy_stat
+                        ''').fetchone()[0]
+                except sqlite3.OperationalError as err:
+                    # confirm that the table really isn't there
+                    self.assertIn('no such table: policy_stat', str(err))
+                else:
+                    self.fail('broker did not raise sqlite3.OperationalError '
+                              'trying to select from policy_stat table!')
+
+        confirm_no_table()
 
         # make sure we can HEAD this thing w/o the table
         stats = broker.get_policy_stats()
         self.assertEqual(len(stats), 0)
+
+        confirm_no_table()
 
         # now do a PUT to create the table
         broker.put_container('o', Timestamp.now().internal, 0, 0, 0,
@@ -1201,6 +1208,54 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
 
         stats = broker.get_policy_stats()
         self.assertEqual(len(stats), 1)
+
+    @with_tempdir
+    def test_policy_table_migration_in_get_policy_stats(self, tempdir):
+        db_path = os.path.join(tempdir, 'account.db')
+
+        # first init an acct DB without the policy_stat table present
+        broker = AccountBroker(db_path, account='a')
+        broker.initialize(Timestamp('1').internal)
+
+        # And manually add some container records for the default policy
+        with broker.get() as conn:
+            conn.execute('''
+                INSERT INTO container (
+                    name, put_timestamp, delete_timestamp,
+                    object_count, bytes_used
+                ) VALUES (
+                    'c', '%s', '0', 0, 0
+                )''' % Timestamp.now().internal).fetchone()
+            conn.commit()
+
+        def confirm_no_table():
+            with broker.get() as conn:
+                try:
+                    conn.execute('''
+                        SELECT * FROM policy_stat
+                        ''').fetchone()[0]
+                except sqlite3.OperationalError as err:
+                    # confirm that the table really isn't there
+                    self.assertIn('no such table: policy_stat', str(err))
+                else:
+                    self.fail('broker did not raise sqlite3.OperationalError '
+                              'trying to select from policy_stat table!')
+
+        confirm_no_table()
+
+        # make sure we can HEAD this thing w/o the table
+        stats = broker.get_policy_stats()
+        self.assertEqual(len(stats), 0)
+
+        confirm_no_table()
+
+        # but if we pass in do_migrations (like in the auditor), it comes in
+        stats = broker.get_policy_stats(do_migrations=True)
+        self.assertEqual(len(stats), 1)
+
+        # double check that it really exists
+        with broker.get() as conn:
+            conn.execute('SELECT * FROM policy_stat')
 
     @patch_policies
     @with_tempdir
@@ -1675,7 +1730,7 @@ class TestAccountBrokerBeforePerPolicyContainerTrack(
                                       0, 0, int(policy))
 
         total_container_count = self.broker.get_info()['container_count']
-        self.assertEqual(total_container_count, num_containers / 2)
+        self.assertEqual(total_container_count, num_containers // 2)
 
         # trigger migration
         policy_info = self.broker.get_policy_stats(do_migrations=True)

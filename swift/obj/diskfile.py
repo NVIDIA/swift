@@ -39,7 +39,7 @@ import os
 import re
 import time
 import uuid
-import hashlib
+from hashlib import md5
 import logging
 import traceback
 import xattr
@@ -50,7 +50,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from datetime import timedelta
 
-from eventlet import Timeout
+from eventlet import Timeout, tpool
 from eventlet.hubs import trampoline
 import six
 from pyeclib.ec_iface import ECDriverError, ECInvalidFragmentMetadata, \
@@ -64,8 +64,8 @@ from swift.common.utils import mkdirs, Timestamp, \
     fsync_dir, drop_buffer_cache, lock_path, write_pickle, \
     config_true_value, listdir, split_path, remove_file, \
     get_md5_socket, F_SETPIPE_SZ, decode_timestamps, encode_timestamps, \
-    tpool_reraise, MD5_OF_EMPTY_STRING, link_fd_to_path, o_tmpfile_supported, \
-    O_TMPFILE, makedirs_count, replace_partition_in_path
+    MD5_OF_EMPTY_STRING, link_fd_to_path, o_tmpfile_supported, \
+    O_TMPFILE, makedirs_count, replace_partition_in_path, remove_directory
 from swift.common.splice import splice, tee
 from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
@@ -99,6 +99,14 @@ get_tmp_dir = partial(get_policy_string, TMP_BASE)
 MIN_TIME_UPDATE_AUDITOR_STATUS = 60
 # This matches rsync tempfiles, like ".<timestamp>.data.Xy095a"
 RE_RSYNC_TEMPFILE = re.compile(r'^\..*\.([a-zA-Z0-9_]){6}$')
+
+
+def _unlink_if_present(filename):
+    try:
+        os.unlink(filename)
+    except OSError as err:
+        if err.errno != errno.ENOENT:
+            raise
 
 
 def _get_filename(fd):
@@ -186,14 +194,14 @@ def read_metadata(fd, add_missing_checksum=False):
         # exist. This is fine; it just means that this object predates the
         # introduction of metadata checksums.
         if add_missing_checksum:
-            new_checksum = hashlib.md5(metadata).hexdigest()
+            new_checksum = md5(metadata).hexdigest()
             try:
                 xattr.setxattr(fd, METADATA_CHECKSUM_KEY, new_checksum)
             except (IOError, OSError) as e:
                 logging.error("Error adding metadata: %s" % e)
 
     if metadata_checksum:
-        computed_checksum = hashlib.md5(metadata).hexdigest().encode('ascii')
+        computed_checksum = md5(metadata).hexdigest().encode('ascii')
         if metadata_checksum != computed_checksum:
             raise DiskFileBadMetadataChecksum(
                 "Metadata checksum mismatch for %s: "
@@ -218,7 +226,7 @@ def write_metadata(fd, metadata, xattr_size=65536):
     :param metadata: metadata to write
     """
     metastr = pickle.dumps(_encode_metadata(metadata), PICKLE_PROTOCOL)
-    metastr_md5 = hashlib.md5(metastr).hexdigest().encode('ascii')
+    metastr_md5 = md5(metastr).hexdigest().encode('ascii')
     key = 0
     try:
         while metastr:
@@ -484,11 +492,11 @@ def object_audit_location_generator(devices, datadir, mount_check=True,
 
     base, policy = split_policy_string(datadir)
     for device in device_dirs:
-        if not check_drive(devices, device, mount_check):
+        try:
+            check_drive(devices, device, mount_check)
+        except ValueError as err:
             if logger:
-                logger.debug(
-                    'Skipping %s as it is not %s', device,
-                    'mounted' if mount_check else 'a dir')
+                logger.debug('Skipping: %s', err)
             continue
 
         datadir_path = os.path.join(devices, device, datadir)
@@ -594,29 +602,12 @@ def strip_self(f):
 
 class DiskFileRouter(object):
 
-    policy_type_to_manager_cls = {}
-
-    @classmethod
-    def register(cls, policy_type):
-        """
-        Decorator for Storage Policy implementations to register
-        their DiskFile implementation.
-        """
-        def register_wrapper(diskfile_cls):
-            if policy_type in cls.policy_type_to_manager_cls:
-                raise PolicyError(
-                    '%r is already registered for the policy_type %r' % (
-                        cls.policy_type_to_manager_cls[policy_type],
-                        policy_type))
-            cls.policy_type_to_manager_cls[policy_type] = diskfile_cls
-            return diskfile_cls
-        return register_wrapper
-
     def __init__(self, *args, **kwargs):
         self.policy_to_manager = {}
         for policy in POLICIES:
-            manager_cls = self.policy_type_to_manager_cls[policy.policy_type]
-            self.policy_to_manager[int(policy)] = manager_cls(*args, **kwargs)
+            # create diskfile managers now to provoke any errors
+            self.policy_to_manager[int(policy)] = \
+                policy.get_diskfile_manager(*args, **kwargs)
 
     def __getitem__(self, policy):
         return self.policy_to_manager[int(policy)]
@@ -646,6 +637,7 @@ class BaseDiskFileManager(object):
     """
 
     diskfile_cls = None  # must be set by subclasses
+    policy = None  # must be set by subclasses
 
     invalidate_hash = strip_self(invalidate_hash)
     consolidate_hashes = strip_self(consolidate_hashes)
@@ -713,6 +705,11 @@ class BaseDiskFileManager(object):
                     max_pipe_size = int(f.read())
                 self.pipe_size = min(max_pipe_size, self.disk_chunk_size)
         self.use_linkat = o_tmpfile_supported()
+
+    @classmethod
+    def check_policy(cls, policy):
+        if policy.policy_type != cls.policy:
+            raise ValueError('Invalid policy_type: %s' % policy.policy_type)
 
     def make_on_disk_filename(self, timestamp, ext=None,
                               ctype_timestamp=None, *a, **kw):
@@ -1023,7 +1020,17 @@ class BaseDiskFileManager(object):
         def is_reclaimable(timestamp):
             return (time.time() - float(timestamp)) > self.reclaim_age
 
-        files = listdir(hsh_path)
+        try:
+            files = os.listdir(hsh_path)
+        except OSError as err:
+            if err.errno == errno.ENOENT:
+                results = self.get_ondisk_files(
+                    [], hsh_path, verify=False, **kwargs)
+                results['files'] = []
+                return results
+            else:
+                raise
+
         files.sort(reverse=True)
         results = self.get_ondisk_files(
             files, hsh_path, verify=False, **kwargs)
@@ -1039,6 +1046,15 @@ class BaseDiskFileManager(object):
             remove_file(join(hsh_path, file_info['filename']))
             files.remove(file_info['filename'])
         results['files'] = files
+        if not files:  # everything got unlinked
+            try:
+                os.rmdir(hsh_path)
+            except OSError as err:
+                if err.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+                    self.logger.debug(
+                        'Error cleaning up empty hash directory %s: %s',
+                        hsh_path, err)
+                # else, no real harm; pass
         return results
 
     def _update_suffix_hashes(self, hashes, ondisk_info):
@@ -1057,7 +1073,7 @@ class BaseDiskFileManager(object):
 
         :param path: full path to directory
         """
-        hashes = defaultdict(hashlib.md5)
+        hashes = defaultdict(md5)
         try:
             path_contents = sorted(os.listdir(path))
         except OSError as err:
@@ -1081,10 +1097,6 @@ class BaseDiskFileManager(object):
                     continue
                 raise
             if not ondisk_info['files']:
-                try:
-                    os.rmdir(hsh_path)
-                except OSError:
-                    pass
                 continue
 
             # ondisk_info has info dicts containing timestamps for those
@@ -1248,11 +1260,11 @@ class BaseDiskFileManager(object):
             # explicitly forbidden from syscall, just return path
             return join(self.devices, device)
         # we'll do some kind of check if not explicitly forbidden
-        if mount_check or self.mount_check:
-            mount_check = True
-        else:
-            mount_check = False
-        return check_drive(self.devices, device, mount_check)
+        try:
+            return check_drive(self.devices, device,
+                               mount_check or self.mount_check)
+        except ValueError:
+            return None
 
     @contextmanager
     def replication_lock(self, device):
@@ -1320,8 +1332,7 @@ class BaseDiskFileManager(object):
         return self.diskfile_cls(self, dev_path,
                                  partition, account, container, obj,
                                  policy=policy, use_splice=self.use_splice,
-                                 pipe_size=self.pipe_size,
-                                 use_linkat=self.use_linkat, **kwargs)
+                                 pipe_size=self.pipe_size, **kwargs)
 
     def clear_auditor_status(self, policy, auditor_type="ALL"):
         datadir = get_data_dir(policy)
@@ -1419,7 +1430,7 @@ class BaseDiskFileManager(object):
         partition_path = get_part_path(dev_path, policy, partition)
         if not os.path.exists(partition_path):
             mkdirs(partition_path)
-        _junk, hashes = tpool_reraise(
+        _junk, hashes = tpool.execute(
             self._get_hashes, device, partition, policy, recalculate=suffixes)
         return hashes
 
@@ -1486,25 +1497,37 @@ class BaseDiskFileManager(object):
         dev_path = self.get_dev_path(device)
         if not dev_path:
             raise DiskFileDeviceUnavailable()
+
+        partition_path = get_part_path(dev_path, policy, partition)
         if suffixes is None:
             suffixes = self.yield_suffixes(device, partition, policy)
+            considering_all_suffixes = True
         else:
-            partition_path = get_part_path(dev_path, policy, partition)
             suffixes = (
                 (os.path.join(partition_path, suffix), suffix)
                 for suffix in suffixes)
+            considering_all_suffixes = False
+
         key_preference = (
             ('ts_meta', 'meta_info', 'timestamp'),
             ('ts_data', 'data_info', 'timestamp'),
             ('ts_data', 'ts_info', 'timestamp'),
             ('ts_ctype', 'ctype_info', 'ctype_timestamp'),
         )
+
+        # We delete as many empty directories as we can.
+        # cleanup_ondisk_files() takes care of the hash dirs, and we take
+        # care of the suffix dirs and possibly even the partition dir.
+        have_nonempty_suffix = False
         for suffix_path, suffix in suffixes:
+            have_nonempty_hashdir = False
             for object_hash in self._listdir(suffix_path):
                 object_path = os.path.join(suffix_path, object_hash)
                 try:
                     results = self.cleanup_ondisk_files(
                         object_path, **kwargs)
+                    if results['files']:
+                        have_nonempty_hashdir = True
                     timestamps = {}
                     for ts_key, info_key, info_ts_key in key_preference:
                         if info_key not in results:
@@ -1523,6 +1546,37 @@ class BaseDiskFileManager(object):
                     self.logger.debug(
                         'Invalid diskfile filename in %r (%s)' % (
                             object_path, err))
+
+            if have_nonempty_hashdir:
+                have_nonempty_suffix = True
+            else:
+                try:
+                    os.rmdir(suffix_path)
+                except OSError as err:
+                    if err.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+                        self.logger.debug(
+                            'Error cleaning up empty suffix directory %s: %s',
+                            suffix_path, err)
+                    # cleanup_ondisk_files tries to remove empty hash dirs,
+                    # but if it fails, so will we. An empty directory
+                    # structure won't cause errors (just slowdown), so we
+                    # ignore the exception.
+        if considering_all_suffixes and not have_nonempty_suffix:
+            # There's nothing of interest in the partition, so delete it
+            try:
+                # Remove hashes.pkl *then* hashes.invalid; otherwise, if we
+                # remove hashes.invalid but leave hashes.pkl, that makes it
+                # look as though the invalidations in hashes.invalid never
+                # occurred.
+                _unlink_if_present(os.path.join(partition_path, HASH_FILE))
+                _unlink_if_present(os.path.join(partition_path,
+                                                HASH_INVALIDATIONS_FILE))
+                # This lock is only held by people dealing with the hashes
+                # or the hash invalidations, and we've just removed those.
+                _unlink_if_present(os.path.join(partition_path, ".lock"))
+                os.rmdir(partition_path)
+            except OSError as err:
+                self.logger.debug("Error cleaning up empty partition: %s", err)
 
 
 class BaseDiskFileWriter(object):
@@ -1553,13 +1607,15 @@ class BaseDiskFileWriter(object):
     :param next_part_power: the next partition power to be used
     """
 
-    def __init__(self, name, datadir, fd, tmppath, bytes_per_sync, diskfile,
+    def __init__(self, name, datadir, size, bytes_per_sync, diskfile,
                  next_part_power):
         # Parameter tracking
         self._name = name
         self._datadir = datadir
-        self._fd = fd
-        self._tmppath = tmppath
+        self._fd = None
+        self._tmppath = None
+        self._size = size
+        self._chunks_etag = md5()
         self._bytes_per_sync = bytes_per_sync
         self._diskfile = diskfile
         self.next_part_power = next_part_power
@@ -1575,8 +1631,72 @@ class BaseDiskFileWriter(object):
         return self._diskfile.manager
 
     @property
-    def put_succeeded(self):
-        return self._put_succeeded
+    def logger(self):
+        return self.manager.logger
+
+    def _get_tempfile(self):
+        fallback_to_mkstemp = False
+        tmppath = None
+        if self.manager.use_linkat:
+            self._dirs_created = makedirs_count(self._datadir)
+            try:
+                fd = os.open(self._datadir, O_TMPFILE | os.O_WRONLY)
+            except OSError as err:
+                if err.errno in (errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL):
+                    msg = 'open(%s, O_TMPFILE | O_WRONLY) failed: %s \
+                           Falling back to using mkstemp()' \
+                           % (self._datadir, os.strerror(err.errno))
+                    self.logger.warning(msg)
+                    fallback_to_mkstemp = True
+                else:
+                    raise
+        if not self.manager.use_linkat or fallback_to_mkstemp:
+            tmpdir = join(self._diskfile._device_path,
+                          get_tmp_dir(self._diskfile.policy))
+            if not exists(tmpdir):
+                mkdirs(tmpdir)
+            fd, tmppath = mkstemp(dir=tmpdir)
+        return fd, tmppath
+
+    def open(self):
+        if self._fd is not None:
+            raise ValueError('DiskFileWriter is already open')
+
+        try:
+            self._fd, self._tmppath = self._get_tempfile()
+        except OSError as err:
+            if err.errno in (errno.ENOSPC, errno.EDQUOT):
+                # No more inodes in filesystem
+                raise DiskFileNoSpace()
+            raise
+        if self._size is not None and self._size > 0:
+            try:
+                fallocate(self._fd, self._size)
+            except OSError as err:
+                if err.errno in (errno.ENOSPC, errno.EDQUOT):
+                    raise DiskFileNoSpace()
+                raise
+        return self
+
+    def close(self):
+        if self._fd:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        if self._tmppath and not self._put_succeeded:
+            # Try removing the temp file only if put did NOT succeed.
+            #
+            # dfw.put_succeeded is set to True after renamer() succeeds in
+            # DiskFileWriter._finalize_put()
+            try:
+                # when mkstemp() was used
+                os.unlink(self._tmppath)
+            except OSError:
+                self.logger.exception('Error removing tempfile: %s' %
+                                      self._tmppath)
+            self._tmppath = None
 
     def write(self, chunk):
         """
@@ -1586,10 +1706,10 @@ class BaseDiskFileWriter(object):
         For this implementation, the data is written into a temporary file.
 
         :param chunk: the chunk of data to write as a string object
-
-        :returns: the total number of bytes written to an object
         """
-
+        if not self._fd:
+            raise ValueError('Writer is not open')
+        self._chunks_etag.update(chunk)
         while chunk:
             written = os.write(self._fd, chunk)
             self._upload_size += written
@@ -1598,11 +1718,17 @@ class BaseDiskFileWriter(object):
         # For large files sync every 512MB (by default) written
         diff = self._upload_size - self._last_sync
         if diff >= self._bytes_per_sync:
-            tpool_reraise(fdatasync, self._fd)
+            tpool.execute(fdatasync, self._fd)
             drop_buffer_cache(self._fd, self._last_sync, diff)
             self._last_sync = self._upload_size
 
-        return self._upload_size
+    def chunks_finished(self):
+        """
+        Expose internal stats about written chunks.
+
+        :returns: a tuple, (upload_size, etag)
+        """
+        return self._upload_size, self._chunks_etag.hexdigest()
 
     def _finalize_put(self, metadata, target_path, cleanup):
         # Write the metadata before calling fsync() so that both data and
@@ -1678,7 +1804,7 @@ class BaseDiskFileWriter(object):
         metadata['name'] = self._name
         target_path = join(self._datadir, filename)
 
-        tpool_reraise(self._finalize_put, metadata, target_path, cleanup)
+        tpool.execute(self._finalize_put, metadata, target_path, cleanup)
 
     def put(self, metadata):
         """
@@ -1807,7 +1933,7 @@ class BaseDiskFileReader(object):
     def _init_checks(self):
         if self._fp.tell() == 0:
             self._started_at_0 = True
-            self._iter_etag = hashlib.md5()
+            self._iter_etag = md5()
 
     def _update_checks(self, chunk):
         if self._iter_etag:
@@ -2071,7 +2197,6 @@ class BaseDiskFile(object):
     :param policy: the StoragePolicy instance
     :param use_splice: if true, use zero-copy splice() to send data
     :param pipe_size: size of pipe buffer used in zero-copy operations
-    :param use_linkat: if True, use open() with linkat() to create obj file
     :param open_expired: if True, open() will not raise a DiskFileExpired if
                          object is expired
     :param next_part_power: the next partition power to be used
@@ -2082,7 +2207,7 @@ class BaseDiskFile(object):
     def __init__(self, mgr, device_path, partition,
                  account=None, container=None, obj=None, _datadir=None,
                  policy=None, use_splice=False, pipe_size=None,
-                 use_linkat=False, open_expired=False, next_part_power=None,
+                 open_expired=False, next_part_power=None,
                  **kwargs):
         self._manager = mgr
         self._device_path = device_path
@@ -2091,7 +2216,6 @@ class BaseDiskFile(object):
         self._bytes_per_sync = mgr.bytes_per_sync
         self._use_splice = use_splice
         self._pipe_size = pipe_size
-        self._use_linkat = use_linkat
         self._open_expired = open_expired
         # This might look a lttle hacky i.e tracking number of newly created
         # dirs to fsync only those many later. If there is a better way,
@@ -2621,27 +2745,10 @@ class BaseDiskFile(object):
         self._fp = None
         return dr
 
-    def _get_tempfile(self):
-        fallback_to_mkstemp = False
-        tmppath = None
-        if self._use_linkat:
-            self._dirs_created = makedirs_count(self._datadir)
-            try:
-                fd = os.open(self._datadir, O_TMPFILE | os.O_WRONLY)
-            except OSError as err:
-                if err.errno in (errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL):
-                    msg = 'open(%s, O_TMPFILE | O_WRONLY) failed: %s \
-                           Falling back to using mkstemp()' \
-                           % (self._datadir, os.strerror(err.errno))
-                    self._logger.warning(msg)
-                    fallback_to_mkstemp = True
-                else:
-                    raise
-        if not self._use_linkat or fallback_to_mkstemp:
-            if not exists(self._tmpdir):
-                mkdirs(self._tmpdir)
-            fd, tmppath = mkstemp(dir=self._tmpdir)
-        return fd, tmppath
+    def writer(self, size=None):
+        return self.writer_cls(self._name, self._datadir, size,
+                               self._bytes_per_sync, self,
+                               self.next_part_power)
 
     @contextmanager
     def create(self, size=None):
@@ -2659,44 +2766,11 @@ class BaseDiskFile(object):
                      disk
         :raises DiskFileNoSpace: if a size is specified and allocation fails
         """
+        dfw = self.writer(size)
         try:
-            fd, tmppath = self._get_tempfile()
-        except OSError as err:
-            if err.errno in (errno.ENOSPC, errno.EDQUOT):
-                # No more inodes in filesystem
-                raise DiskFileNoSpace()
-            raise
-        dfw = None
-        try:
-            if size is not None and size > 0:
-                try:
-                    fallocate(fd, size)
-                except OSError as err:
-                    if err.errno in (errno.ENOSPC, errno.EDQUOT):
-                        raise DiskFileNoSpace()
-                    raise
-            dfw = self.writer_cls(self._name, self._datadir, fd, tmppath,
-                                  bytes_per_sync=self._bytes_per_sync,
-                                  diskfile=self,
-                                  next_part_power=self.next_part_power)
-            yield dfw
+            yield dfw.open()
         finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            if (dfw is None) or (not dfw.put_succeeded):
-                # Try removing the temp file only if put did NOT succeed.
-                #
-                # dfw.put_succeeded is set to True after renamer() succeeds in
-                # DiskFileWriter._finalize_put()
-                try:
-                    if tmppath:
-                        # when mkstemp() was used
-                        os.unlink(tmppath)
-                except OSError:
-                    self._logger.exception('Error removing tempfile: %s' %
-                                           tmppath)
+            dfw.close()
 
     def write_metadata(self, metadata):
         """
@@ -2760,9 +2834,9 @@ class DiskFile(BaseDiskFile):
         return self._ondisk_info
 
 
-@DiskFileRouter.register(REPL_POLICY)
 class DiskFileManager(BaseDiskFileManager):
     diskfile_cls = DiskFile
+    policy = REPL_POLICY
 
     def _process_ondisk_files(self, exts, results, **kwargs):
         """
@@ -2839,7 +2913,7 @@ class ECDiskFileReader(BaseDiskFileReader):
         # TODO: reset frag buf to '' if tell() shows that start is on a frag
         # boundary so that we check frags selected by a range not starting at 0
         if self._started_at_0:
-            self.frag_buf = ''
+            self.frag_buf = b''
         else:
             self.frag_buf = None
 
@@ -2851,7 +2925,7 @@ class ECDiskFileReader(BaseDiskFileReader):
             # format so for safety, check the input chunk if it's binary to
             # avoid quarantining a valid fragment archive.
             self._diskfile._logger.warn(
-                _('Unexpected fragment data type (not quarantined)'
+                _('Unexpected fragment data type (not quarantined) '
                   '%(datadir)s: %(type)s at offset 0x%(offset)x'),
                 {'datadir': self._diskfile._datadir,
                  'type': type(frag),
@@ -2967,7 +3041,7 @@ class ECDiskFileWriter(BaseDiskFileWriter):
         durable_data_file_path = os.path.join(
             self._datadir, self.manager.make_on_disk_filename(
                 timestamp, '.data', self._diskfile._frag_index, durable=True))
-        tpool_reraise(
+        tpool.execute(
             self._finalize_durable, data_file_path, durable_data_file_path)
 
     def put(self, metadata):
@@ -3095,8 +3169,8 @@ class ECDiskFile(BaseDiskFile):
         remove a tombstone or fragment from a handoff node after
         reverting it to its primary node.
 
-        The hash will be invalidated, and if empty or invalid the
-        hsh_path will be removed on next cleanup_ondisk_files.
+        The hash will be invalidated, and if empty the hsh_path will
+        be removed immediately.
 
         :param timestamp: the object timestamp, an instance of
                           :class:`~swift.common.utils.Timestamp`
@@ -3115,12 +3189,13 @@ class ECDiskFile(BaseDiskFile):
             purge_file = self.manager.make_on_disk_filename(
                 timestamp, ext='.data', frag_index=frag_index, durable=True)
             remove_file(os.path.join(self._datadir, purge_file))
+            remove_directory(self._datadir)
         self.manager.invalidate_hash(dirname(self._datadir))
 
 
-@DiskFileRouter.register(EC_POLICY)
 class ECDiskFileManager(BaseDiskFileManager):
     diskfile_cls = ECDiskFile
+    policy = EC_POLICY
 
     def validate_fragment_index(self, frag_index):
         """

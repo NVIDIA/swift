@@ -101,9 +101,10 @@ class ContainerUpdater(Daemon):
         """
         paths = []
         for device in self._listdir(self.devices):
-            dev_path = check_drive(self.devices, device, self.mount_check)
-            if not dev_path:
-                self.logger.warning(_('%s is not mounted'), device)
+            try:
+                dev_path = check_drive(self.devices, device, self.mount_check)
+            except ValueError as err:
+                self.logger.warning("%s", err)
                 continue
             con_path = os.path.join(dev_path, DATADIR)
             if not os.path.exists(con_path):
@@ -250,6 +251,13 @@ class ContainerUpdater(Daemon):
             return
         if self.account_suppressions.get(info['account'], 0) > time.time():
             return
+
+        if not broker.is_root_container():
+            # Don't double-up account stats.
+            # The sharder should get these stats to the root container,
+            # and the root's updater will get them to the right account.
+            info['object_count'] = info['bytes_used'] = 0
+
         if info['put_timestamp'] > info['reported_put_timestamp'] or \
                 info['delete_timestamp'] > info['reported_delete_timestamp'] \
                 or info['object_count'] != info['reported_object_count'] or \

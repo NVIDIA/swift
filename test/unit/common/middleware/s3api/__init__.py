@@ -20,10 +20,11 @@ import time
 
 from swift.common import swob
 
-from swift.common.middleware.s3api.s3api import S3ApiMiddleware
-from helpers import FakeSwift
+from swift.common.middleware.s3api.s3api import filter_factory
 from swift.common.middleware.s3api.etree import fromstring
 from swift.common.middleware.s3api.utils import Config
+
+from test.unit.common.middleware.s3api.helpers import FakeSwift
 
 
 class FakeApp(object):
@@ -59,7 +60,7 @@ class S3ApiTestCase(unittest.TestCase):
         # setup default config
         self.conf = Config({
             'allow_no_owner': False,
-            'location': 'US',
+            'location': 'us-east-1',
             'dns_compliant_bucket_names': True,
             'max_bucket_listing': 1000,
             'max_parts_listing': 1000,
@@ -78,7 +79,7 @@ class S3ApiTestCase(unittest.TestCase):
 
         self.app = FakeApp()
         self.swift = self.app.swift
-        self.s3api = S3ApiMiddleware(self.app, self.conf)
+        self.s3api = filter_factory({}, **self.conf)(self.app)
 
         self.swift.register('HEAD', '/v1/AUTH_test',
                             swob.HTTPOk, {}, None)
@@ -92,9 +93,9 @@ class S3ApiTestCase(unittest.TestCase):
                             swob.HTTPNoContent, {}, None)
 
         self.swift.register('GET', '/v1/AUTH_test/bucket/object',
-                            swob.HTTPOk, {}, "")
+                            swob.HTTPOk, {'etag': 'object etag'}, "")
         self.swift.register('PUT', '/v1/AUTH_test/bucket/object',
-                            swob.HTTPCreated, {}, None)
+                            swob.HTTPCreated, {'etag': 'object etag'}, None)
         self.swift.register('DELETE', '/v1/AUTH_test/bucket/object',
                             swob.HTTPNoContent, {}, None)
 
@@ -106,7 +107,8 @@ class S3ApiTestCase(unittest.TestCase):
         elem = fromstring(body, 'Error')
         return elem.find('./Message').text
 
-    def _test_method_error(self, method, path, response_class, headers={}):
+    def _test_method_error(self, method, path, response_class, headers={},
+                           env={}, expected_xml_tags=None):
         if not path.startswith('/'):
             path = '/' + path  # add a missing slash before the path
 
@@ -117,9 +119,13 @@ class S3ApiTestCase(unittest.TestCase):
         self.swift.register(method, uri, response_class, headers, None)
         headers.update({'Authorization': 'AWS test:tester:hmac',
                         'Date': self.get_date_header()})
-        req = swob.Request.blank(path, environ={'REQUEST_METHOD': method},
-                                 headers=headers)
+        env.update({'REQUEST_METHOD': method})
+        req = swob.Request.blank(path, environ=env, headers=headers)
         status, headers, body = self.call_s3api(req)
+        if expected_xml_tags is not None:
+            elem = fromstring(body, 'Error')
+            self.assertEqual(set(expected_xml_tags),
+                             {x.tag for x in elem})
         return self._get_error_code(body)
 
     def get_date_header(self):
@@ -143,7 +149,7 @@ class S3ApiTestCase(unittest.TestCase):
             headers[0] = swob.HeaderKeyDict(h)
 
         body_iter = app(req.environ, start_response)
-        body = ''
+        body = b''
         caught_exc = None
         try:
             for chunk in body_iter:

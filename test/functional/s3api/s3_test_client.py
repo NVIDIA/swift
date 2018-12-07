@@ -17,6 +17,8 @@ import os
 import test.functional as tf
 from boto.s3.connection import S3Connection, OrdinaryCallingFormat, \
     BotoClientError, S3ResponseError
+import six
+
 
 RETRY_COUNT = 3
 
@@ -59,7 +61,7 @@ class Connection(object):
             S3Connection(aws_access_key, aws_secret_key, is_secure=False,
                          host=self.host, port=self.port,
                          calling_format=OrdinaryCallingFormat())
-        self.conn.auth_region_name = 'US'
+        self.conn.auth_region_name = 'us-east-1'
 
     def reset(self):
         """
@@ -75,6 +77,9 @@ class Connection(object):
                     break
 
                 for bucket in buckets:
+                    if not isinstance(bucket.name, six.binary_type):
+                        bucket.name = bucket.name.encode('utf-8')
+
                     try:
                         for upload in bucket.list_multipart_uploads():
                             upload.cancel_upload()

@@ -31,9 +31,8 @@ def create_bucket_list_json(buckets):
     :param buckets: a list of tuples (or lists) consist of elements orderd as
                     name, count, bytes
     """
-    bucket_list = map(
-        lambda item: {'name': item[0], 'count': item[1], 'bytes': item[2]},
-        list(buckets))
+    bucket_list = [{'name': item[0], 'count': item[1], 'bytes': item[2]}
+                   for item in buckets]
     return json.dumps(bucket_list)
 
 
@@ -50,7 +49,10 @@ class TestS3ApiService(S3ApiTestCase):
         self.setup_buckets()
 
     def test_service_GET_error(self):
-        code = self._test_method_error('GET', '', swob.HTTPUnauthorized)
+        code = self._test_method_error(
+            'GET', '', swob.HTTPUnauthorized, expected_xml_tags=(
+                'Code', 'Message', 'AWSAccessKeyId', 'StringToSign',
+                'StringToSignBytes', 'SignatureProvided'))
         self.assertEqual(code, 'SignatureDoesNotMatch')
         code = self._test_method_error('GET', '', swob.HTTPForbidden)
         self.assertEqual(code, 'AccessDenied')

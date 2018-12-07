@@ -28,7 +28,8 @@ from swift.common.request_helpers import get_param, \
     split_and_validate_path
 from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, config_true_value, \
-    json, timing_stats, replication, get_log_line
+    json, timing_stats, replication, get_log_line, \
+    config_fallocate_value, fs_has_free_space
 from swift.common.constraints import valid_timestamp, check_utf8, check_drive
 from swift.common import constraints
 from swift.common.db_replicator import ReplicatorRpc
@@ -60,6 +61,8 @@ class AccountController(BaseStorageServer):
             conf.get('auto_create_account_prefix') or '.'
         swift.common.db.DB_PREALLOCATION = \
             config_true_value(conf.get('db_preallocation', 'f'))
+        self.fallocate_reserve, self.fallocate_is_percent = \
+            config_fallocate_value(conf.get('fallocate_reserve', '1%'))
 
     def _get_account_broker(self, drive, part, account, **kwargs):
         hsh = hash_path(account)
@@ -83,12 +86,19 @@ class AccountController(BaseStorageServer):
             pass
         return resp(request=req, headers=headers, charset='utf-8', body=body)
 
+    def check_free_space(self, drive):
+        drive_root = os.path.join(self.root, drive)
+        return fs_has_free_space(
+            drive_root, self.fallocate_reserve, self.fallocate_is_percent)
+
     @public
     @timing_stats()
     def DELETE(self, req):
         """Handle HTTP DELETE request."""
         drive, part, account = split_and_validate_path(req, 3)
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
         req_timestamp = valid_timestamp(req)
         broker = self._get_account_broker(drive, part, account)
@@ -102,7 +112,11 @@ class AccountController(BaseStorageServer):
     def PUT(self, req):
         """Handle HTTP PUT request."""
         drive, part, account, container = split_and_validate_path(req, 3, 4)
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
+            return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         if container:   # put account container
             if 'x-timestamp' not in req.headers:
@@ -169,7 +183,9 @@ class AccountController(BaseStorageServer):
         """Handle HTTP HEAD request."""
         drive, part, account = split_and_validate_path(req, 3)
         out_content_type = listing_formats.get_listing_content_type(req)
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_account_broker(drive, part, account,
                                           pending_timeout=0.1,
@@ -204,7 +220,9 @@ class AccountController(BaseStorageServer):
         end_marker = get_param(req, 'end_marker')
         out_content_type = listing_formats.get_listing_content_type(req)
 
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_account_broker(drive, part, account,
                                           pending_timeout=0.1,
@@ -225,7 +243,11 @@ class AccountController(BaseStorageServer):
         """
         post_args = split_and_validate_path(req, 3)
         drive, partition, hash = post_args
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
+            return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         try:
             args = json.load(req.environ['wsgi.input'])
@@ -241,7 +263,11 @@ class AccountController(BaseStorageServer):
         """Handle HTTP POST request."""
         drive, part, account = split_and_validate_path(req, 3)
         req_timestamp = valid_timestamp(req)
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
+            return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_account_broker(drive, part, account)
         if broker.is_deleted():

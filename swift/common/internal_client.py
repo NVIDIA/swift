@@ -28,7 +28,7 @@ from zlib import compressobj
 from swift.common.exceptions import ClientException
 from swift.common.http import (HTTP_NOT_FOUND, HTTP_MULTIPLE_CHOICES,
                                is_server_error)
-from swift.common.swob import Request
+from swift.common.swob import Request, bytes_to_wsgi
 from swift.common.utils import quote, closing_if_possible
 from swift.common.wsgi import loadapp, pipeline_property
 
@@ -95,7 +95,7 @@ class CompressingFileReader(object):
         """
 
         if self.done:
-            return ''
+            return b''
         x = self._f.read(*a, **kw)
         if x:
             self.crc32 = zlib.crc32(x, self.crc32) & 0xffffffff
@@ -112,18 +112,20 @@ class CompressingFileReader(object):
             self.done = True
         if self.first:
             self.first = False
-            header = '\037\213\010\000\000\000\000\000\002\377'
+            header = b'\037\213\010\000\000\000\000\000\002\377'
             compressed = header + compressed
         return compressed
 
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         chunk = self.read(self.chunk_size)
         if chunk:
             return chunk
         raise StopIteration
+
+    next = __next__
 
     def seek(self, offset, whence=0):
         if not (offset == 0 and whence == 0):
@@ -145,6 +147,8 @@ class InternalClient(object):
 
     def __init__(self, conf_path, user_agent, request_tries,
                  allow_modify_pipeline=False):
+        if request_tries < 1:
+            raise ValueError('request_tries must be positive')
         self.app = loadapp(conf_path,
                            allow_modify_pipeline=allow_modify_pipeline)
         self.user_agent = user_agent
@@ -221,7 +225,7 @@ class InternalClient(object):
             raise UnexpectedResponse(msg, resp)
         if exc_type:
             # To make pep8 tool happy, in place of raise t, v, tb:
-            six.reraise(exc_type(*exc_value.args), None, exc_traceback)
+            six.reraise(exc_type, exc_value, exc_traceback)
 
     def _get_metadata(
             self, path, metadata_prefix='', acceptable_statuses=(2,),
@@ -276,15 +280,23 @@ class InternalClient(object):
         :raises Exception: Exception is raised when code fails in an
                            unexpected way.
         """
+        if not isinstance(marker, bytes):
+            marker = marker.encode('utf8')
+        if not isinstance(end_marker, bytes):
+            end_marker = end_marker.encode('utf8')
+        if not isinstance(prefix, bytes):
+            prefix = prefix.encode('utf8')
 
         while True:
             resp = self.make_request(
                 'GET', '%s?format=json&marker=%s&end_marker=%s&prefix=%s' %
-                (path, quote(marker), quote(end_marker), quote(prefix)),
+                (path, bytes_to_wsgi(quote(marker)),
+                 bytes_to_wsgi(quote(end_marker)),
+                 bytes_to_wsgi(quote(prefix))),
                 {}, acceptable_statuses)
             if not resp.status_int == 200:
                 if resp.status_int >= HTTP_MULTIPLE_CHOICES:
-                    ''.join(resp.app_iter)
+                    b''.join(resp.app_iter)
                 break
             data = json.loads(resp.body)
             if not data:
@@ -685,7 +697,7 @@ class InternalClient(object):
         if not resp.status_int // 100 == 2:
             return
 
-        last_part = ''
+        last_part = b''
         compressed = obj.endswith('.gz')
         # magic in the following zlib.decompressobj argument is courtesy of
         # Python decompressing gzip chunk-by-chunk
@@ -694,7 +706,7 @@ class InternalClient(object):
         for chunk in resp.app_iter:
             if compressed:
                 chunk = d.decompress(chunk)
-            parts = chunk.split('\n')
+            parts = chunk.split(b'\n')
             if len(parts) == 1:
                 last_part = last_part + parts[0]
             else:

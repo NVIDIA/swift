@@ -30,7 +30,7 @@ where multipart upload is initiated.
 [bucket]+segments/[upload_id]
 -----------------------------
 
-A object of the ongoing upload id. The object is empty and used for
+An object of the ongoing upload id. The object is empty and used for
 checking the target upload status. If the object exists, it means that the
 upload is initiated but not either completed or aborted.
 
@@ -59,15 +59,15 @@ Static Large Object when the multipart upload is completed.
 
 """
 
+from hashlib import md5
 import os
 import re
-import sys
 
 from swift.common.swob import Range
 from swift.common.utils import json, public
 from swift.common.db import utf8encode
 
-from six.moves.urllib.parse import urlparse  # pylint: disable=F0401
+from six.moves.urllib.parse import quote, urlparse
 
 from swift.common.middleware.s3api.controllers.base import Controller, \
     bucket_operation, object_operation, check_container_existence
@@ -75,7 +75,7 @@ from swift.common.middleware.s3api.s3response import InvalidArgument, \
     ErrorResponse, MalformedXML, \
     InvalidPart, BucketAlreadyExists, EntityTooSmall, InvalidPartOrder, \
     InvalidRequest, HTTPOk, HTTPNoContent, NoSuchKey, NoSuchUpload, \
-    NoSuchBucket
+    NoSuchBucket, BucketAlreadyOwnedByYou
 from swift.common.middleware.s3api.exception import BadSwiftRequest
 from swift.common.middleware.s3api.utils import unique_id, \
     MULTIUPLOAD_SUFFIX, S3Timestamp, sysmeta_header
@@ -319,7 +319,10 @@ class UploadsController(Controller):
         # created.
         for u in uploads:
             upload_elem = SubElement(result_elem, 'Upload')
-            SubElement(upload_elem, 'Key').text = u['key']
+            name = u['key']
+            if encoding_type == 'url':
+                name = quote(name)
+            SubElement(upload_elem, 'Key').text = name
             SubElement(upload_elem, 'UploadId').text = u['upload_id']
             initiator_elem = SubElement(upload_elem, 'Initiator')
             SubElement(initiator_elem, 'ID').text = req.user_id
@@ -335,7 +338,7 @@ class UploadsController(Controller):
             elem = SubElement(result_elem, 'CommonPrefixes')
             SubElement(elem, 'Prefix').text = p
 
-        body = tostring(result_elem, encoding_type=encoding_type)
+        body = tostring(result_elem)
 
         return HTTPOk(body=body, content_type='application/xml')
 
@@ -362,7 +365,7 @@ class UploadsController(Controller):
 
         try:
             req.get_response(self.app, 'PUT', container, '')
-        except BucketAlreadyExists:
+        except (BucketAlreadyExists, BucketAlreadyOwnedByYou):
             pass
 
         obj = '%s/%s' % (req.object_name, upload_id)
@@ -456,7 +459,10 @@ class UploadController(Controller):
 
         result_elem = Element('ListPartsResult')
         SubElement(result_elem, 'Bucket').text = req.container_name
-        SubElement(result_elem, 'Key').text = req.object_name
+        name = req.object_name
+        if encoding_type == 'url':
+            name = quote(name)
+        SubElement(result_elem, 'Key').text = name
         SubElement(result_elem, 'UploadId').text = upload_id
 
         initiator_elem = SubElement(result_elem, 'Initiator')
@@ -484,7 +490,7 @@ class UploadController(Controller):
             SubElement(part_elem, 'ETag').text = '"%s"' % i['hash']
             SubElement(part_elem, 'Size').text = str(i['bytes'])
 
-        body = tostring(result_elem, encoding_type=encoding_type)
+        body = tostring(result_elem)
 
         return HTTPOk(body=body, content_type='application/xml')
 
@@ -535,7 +541,7 @@ class UploadController(Controller):
         upload_id = req.params['uploadId']
         resp = _get_upload_info(req, self.app, upload_id)
         headers = {}
-        for key, val in resp.headers.iteritems():
+        for key, val in resp.headers.items():
             _key = key.lower()
             if _key.startswith('x-amz-meta-'):
                 headers['x-object-meta-' + _key[11:]] = val
@@ -571,6 +577,7 @@ class UploadController(Controller):
                           'etag': o['hash'],
                           'size_bytes': o['bytes']}) for o in objinfo)
 
+        s3_etag_hasher = md5()
         manifest = []
         previous_number = 0
         try:
@@ -598,6 +605,7 @@ class UploadController(Controller):
                     raise InvalidPart(upload_id=upload_id,
                                       part_number=part_number)
 
+                s3_etag_hasher.update(etag.decode('hex'))
                 info['size_bytes'] = int(info['size_bytes'])
                 manifest.append(info)
         except (XMLSyntaxError, DocumentInvalid):
@@ -605,9 +613,14 @@ class UploadController(Controller):
         except ErrorResponse:
             raise
         except Exception as e:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
             self.logger.error(e)
-            raise exc_type, exc_value, exc_traceback
+            raise
+
+        s3_etag = '%s-%d' % (s3_etag_hasher.hexdigest(), len(manifest))
+        headers[sysmeta_header('object', 'etag')] = s3_etag
+        # Leave base header value blank; SLO will populate
+        c_etag = '; s3_etag=%s' % s3_etag
+        headers['X-Object-Sysmeta-Container-Update-Override-Etag'] = c_etag
 
         # Check the size of each segment except the last and make sure they are
         # all more than the minimum upload chunk size
@@ -662,7 +675,8 @@ class UploadController(Controller):
         SubElement(result_elem, 'Location').text = host_url + req.path
         SubElement(result_elem, 'Bucket').text = req.container_name
         SubElement(result_elem, 'Key').text = req.object_name
-        SubElement(result_elem, 'ETag').text = resp.etag
+        SubElement(result_elem, 'ETag').text = '"%s"' % s3_etag
+        del resp.headers['ETag']
 
         resp.body = tostring(result_elem)
         resp.status = 200

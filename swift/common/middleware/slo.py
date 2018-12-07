@@ -313,6 +313,7 @@ metadata which can be used for stats and billing purposes.
 """
 
 import base64
+from cgi import parse_header
 from collections import defaultdict
 from datetime import datetime
 import json
@@ -322,6 +323,8 @@ import six
 import time
 from hashlib import md5
 from swift.common.exceptions import ListingIterError, SegmentError
+from swift.common.middleware.listing_formats import \
+    MAX_CONTAINER_LISTING_CONTENT_LENGTH
 from swift.common.swob import Request, HTTPBadRequest, HTTPServerError, \
     HTTPMethodNotAllowed, HTTPRequestEntityTooLarge, HTTPLengthRequired, \
     HTTPOk, HTTPPreconditionFailed, HTTPException, HTTPNotFound, \
@@ -398,7 +401,7 @@ def parse_and_validate_input(req_body, req_path):
     errors = []
     for seg_index, seg_dict in enumerate(parsed_data):
         if not isinstance(seg_dict, dict):
-            errors.append("Index %d: not a JSON object" % seg_index)
+            errors.append(b"Index %d: not a JSON object" % seg_index)
             continue
 
         for required in SLO_KEYS:
@@ -407,36 +410,36 @@ def parse_and_validate_input(req_body, req_path):
                 break
         else:
             errors.append(
-                "Index %d: expected keys to include one of %s"
+                b"Index %d: expected keys to include one of %s"
                 % (seg_index,
-                   " or ".join(repr(required) for required in SLO_KEYS)))
+                   b" or ".join(repr(required) for required in SLO_KEYS)))
             continue
 
         allowed_keys = SLO_KEYS[segment_type].union([segment_type])
         extraneous_keys = [k for k in seg_dict if k not in allowed_keys]
         if extraneous_keys:
             errors.append(
-                "Index %d: extraneous keys %s"
+                b"Index %d: extraneous keys %s"
                 % (seg_index,
-                   ", ".join('"%s"' % (ek,)
-                             for ek in sorted(extraneous_keys))))
+                   b", ".join(json.dumps(ek).encode('ascii')
+                              for ek in sorted(extraneous_keys))))
             continue
 
         if segment_type == 'path':
             if not isinstance(seg_dict['path'], six.string_types):
-                errors.append("Index %d: \"path\" must be a string" %
+                errors.append(b"Index %d: \"path\" must be a string" %
                               seg_index)
                 continue
             if not (seg_dict.get('etag') is None or
                     isinstance(seg_dict['etag'], six.string_types)):
-                errors.append('Index %d: "etag" must be a string or null '
-                              '(if provided)' % seg_index)
+                errors.append(b'Index %d: "etag" must be a string or null '
+                              b'(if provided)' % seg_index)
                 continue
 
             if '/' not in seg_dict['path'].strip('/'):
                 errors.append(
-                    "Index %d: path does not refer to an object. Path must "
-                    "be of the form /container/object." % seg_index)
+                    b"Index %d: path does not refer to an object. Path must "
+                    b"be of the form /container/object." % seg_index)
                 continue
 
             seg_size = seg_dict.get('size_bytes')
@@ -445,11 +448,11 @@ def parse_and_validate_input(req_body, req_path):
                     seg_size = int(seg_size)
                     seg_dict['size_bytes'] = seg_size
                 except (TypeError, ValueError):
-                    errors.append("Index %d: invalid size_bytes" % seg_index)
+                    errors.append(b"Index %d: invalid size_bytes" % seg_index)
                     continue
                 if seg_size < 1 and seg_index != (len(parsed_data) - 1):
-                    errors.append("Index %d: too small; each segment must be "
-                                  "at least 1 byte."
+                    errors.append(b"Index %d: too small; each segment must be "
+                                  b"at least 1 byte."
                                   % (seg_index,))
                     continue
 
@@ -457,7 +460,7 @@ def parse_and_validate_input(req_body, req_path):
                                  seg_dict['path'].lstrip('/')])
             if req_path == quote(obj_path):
                 errors.append(
-                    "Index %d: manifest must not include itself as a segment"
+                    b"Index %d: manifest must not include itself as a segment"
                     % seg_index)
                 continue
 
@@ -465,12 +468,12 @@ def parse_and_validate_input(req_body, req_path):
                 try:
                     seg_dict['range'] = Range('bytes=%s' % seg_dict['range'])
                 except ValueError:
-                    errors.append("Index %d: invalid range" % seg_index)
+                    errors.append(b"Index %d: invalid range" % seg_index)
                     continue
 
                 if len(seg_dict['range'].ranges) > 1:
-                    errors.append("Index %d: multiple ranges "
-                                  "(only one allowed)" % seg_index)
+                    errors.append(b"Index %d: multiple ranges "
+                                  b"(only one allowed)" % seg_index)
                     continue
 
                 # If the user *told* us the object's size, we can check range
@@ -478,7 +481,7 @@ def parse_and_validate_input(req_body, req_path):
                 # fail that validation later.
                 if (seg_size is not None and 1 != len(
                         seg_dict['range'].ranges_for_length(seg_size))):
-                    errors.append("Index %d: unsatisfiable range" % seg_index)
+                    errors.append(b"Index %d: unsatisfiable range" % seg_index)
                     continue
 
         elif segment_type == 'data':
@@ -487,22 +490,22 @@ def parse_and_validate_input(req_body, req_path):
                 data = strict_b64decode(seg_dict['data'])
             except ValueError:
                 errors.append(
-                    "Index %d: data must be valid base64" % seg_index)
+                    b"Index %d: data must be valid base64" % seg_index)
                 continue
             if len(data) < 1:
-                errors.append("Index %d: too small; each segment must be "
-                              "at least 1 byte."
+                errors.append(b"Index %d: too small; each segment must be "
+                              b"at least 1 byte."
                               % (seg_index,))
                 continue
             # re-encode to normalize padding
             seg_dict['data'] = base64.b64encode(data)
 
     if parsed_data and all('data' in d for d in parsed_data):
-        errors.append("Inline data segments require at least one "
-                      "object-backed segment.")
+        errors.append(b"Inline data segments require at least one "
+                      b"object-backed segment.")
 
     if errors:
-        error_message = "".join(e + "\n" for e in errors)
+        error_message = b"".join(e + b"\n" for e in errors)
         raise HTTPBadRequest(error_message,
                              headers={"Content-Type": "text/plain"})
 
@@ -1276,6 +1279,14 @@ class StaticLargeObject(object):
                 'Etag': md5(json_data).hexdigest(),
             })
 
+            # Ensure container listings have both etags. However, if any
+            # middleware to the left of us touched the base value, trust them.
+            override_header = 'X-Object-Sysmeta-Container-Update-Override-Etag'
+            val, sep, params = req.headers.get(
+                override_header, '').partition(';')
+            req.headers[override_header] = '%s; slo_etag=%s' % (
+                (val or req.headers['Etag']) + sep + params, slo_etag)
+
             env = req.environ
             if not env.get('CONTENT_TYPE'):
                 guessed_type, _junk = mimetypes.guess_type(req.path_info)
@@ -1408,6 +1419,30 @@ class StaticLargeObject(object):
             out_content_type=out_content_type)
         return resp
 
+    def handle_container_listing(self, req, start_response):
+        resp = req.get_response(self.app)
+        if not resp.is_success or resp.content_type != 'application/json':
+            return resp(req.environ, start_response)
+        if resp.content_length is None or \
+                resp.content_length > MAX_CONTAINER_LISTING_CONTENT_LENGTH:
+            return resp(req.environ, start_response)
+        try:
+            listing = json.loads(resp.body)
+        except ValueError:
+            return resp(req.environ, start_response)
+
+        for item in listing:
+            if 'subdir' in item:
+                continue
+            etag, params = parse_header(item['hash'])
+            if 'slo_etag' in params:
+                item['slo_etag'] = '"%s"' % params.pop('slo_etag')
+                item['hash'] = etag + ''.join(
+                    '; %s=%s' % kv for kv in params.items())
+
+        resp.body = json.dumps(listing).encode('ascii')
+        return resp(req.environ, start_response)
+
     def __call__(self, env, start_response):
         """
         WSGI entry point
@@ -1417,8 +1452,13 @@ class StaticLargeObject(object):
 
         req = Request(env)
         try:
-            vrs, account, container, obj = req.split_path(4, 4, True)
+            vrs, account, container, obj = req.split_path(3, 4, True)
         except ValueError:
+            return self.app(env, start_response)
+
+        if not obj:
+            if req.method == 'GET':
+                return self.handle_container_listing(req, start_response)
             return self.app(env, start_response)
 
         try:

@@ -23,7 +23,7 @@ import os
 import six
 from eventlet import Timeout
 
-from swift.common import internal_client, db_replicator
+from swift.common import internal_client
 from swift.common.constraints import check_drive
 from swift.common.direct_client import (direct_put_container,
                                         DirectClientException)
@@ -493,18 +493,22 @@ class ContainerSharder(ContainerReplicator):
             self._report_stats()
 
     def _check_node(self, node):
+        """
+        :return: The path to the device, if the node is mounted.
+            Returns False if the node is unmounted.
+        """
         if not node:
             return False
         if not is_local_device(self.ips, self.port,
                                node['replication_ip'],
                                node['replication_port']):
             return False
-        if not check_drive(self.root, node['device'],
-                           self.mount_check):
+        try:
+            return check_drive(self.root, node['device'], self.mount_check)
+        except ValueError:
             self.logger.warning(
                 'Skipping %(device)s as it is not mounted' % node)
             return False
-        return True
 
     def _fetch_shard_ranges(self, broker, newest=False, params=None,
                             include_deleted=False):
@@ -603,7 +607,7 @@ class ContainerSharder(ContainerReplicator):
         node = self.find_local_handoff_for_part(part)
         if not node:
             raise DeviceUnavailable(
-                'No mounted devices found suitable for creating shard broker'
+                'No mounted devices found suitable for creating shard broker '
                 'for %s in partition %s' % (shard_range.name, part))
 
         shard_broker = ContainerBroker.create_broker(
@@ -1485,9 +1489,10 @@ class ContainerSharder(ContainerReplicator):
         dirs = []
         self.ips = whataremyips(bind_ip=self.bind_ip)
         for node in self.ring.devs:
-            if not self._check_node(node):
+            device_path = self._check_node(node)
+            if not device_path:
                 continue
-            datadir = os.path.join(self.root, node['device'], self.datadir)
+            datadir = os.path.join(device_path, self.datadir)
             if os.path.isdir(datadir):
                 # Populate self._local_device_ids so we can find devices for
                 # shard containers later
@@ -1500,7 +1505,7 @@ class ContainerSharder(ContainerReplicator):
                 dirs.append((datadir, node, part_filt))
         if not dirs:
             self.logger.warning('Found no data dirs!')
-        for part, path, node in db_replicator.roundrobin_datadirs(dirs):
+        for part, path, node in self.roundrobin_datadirs(dirs):
             # NB: get_part_nodes always provides an 'index' key;
             # this will be used in leader selection
             for primary in self.ring.get_part_nodes(int(part)):

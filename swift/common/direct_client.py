@@ -54,6 +54,12 @@ class DirectClientException(ClientException):
             http_reason=resp.reason, http_headers=headers)
 
 
+def _make_path(*components):
+    return u'/' + u'/'.join(
+        x.decode('utf-8') if isinstance(x, six.binary_type) else x
+        for x in components)
+
+
 def _make_req(node, part, method, path, headers, stype,
               conn_timeout=5, response_timeout=15, send_timeout=15,
               contents=None, content_length=None, chunk_size=65535):
@@ -105,9 +111,9 @@ def _make_req(node, part, method, path, headers, stype,
             if content_length is None:
                 chunk = contents_f.read(chunk_size)
                 while chunk:
-                    conn.send('%x\r\n%s\r\n' % (len(chunk), chunk))
+                    conn.send(b'%x\r\n%s\r\n' % (len(chunk), chunk))
                     chunk = contents_f.read(chunk_size)
-                conn.send('0\r\n\r\n')
+                conn.send(b'0\r\n\r\n')
             else:
                 left = content_length
                 while left > 0:
@@ -171,11 +177,21 @@ def _get_direct_account_container(path, stype, node, part,
     return resp_headers, json.loads(resp.read())
 
 
-def gen_headers(hdrs_in=None, add_ts=False, add_user_agent=True):
+def gen_headers(hdrs_in=None, add_ts=True):
+    """
+    Get the headers ready for a request. All requests should have a User-Agent
+    string, but if one is passed in don't over-write it. Not all requests will
+    need an X-Timestamp, but if one is passed in do not over-write it.
+
+    :param headers: dict or None, base for HTTP headers
+    :param add_ts: boolean, should be True for any "unsafe" HTTP request
+
+    :returns: HeaderKeyDict based on headers and ready for the request
+    """
     hdrs_out = HeaderKeyDict(hdrs_in) if hdrs_in else HeaderKeyDict()
-    if add_ts:
+    if add_ts and 'X-Timestamp' not in hdrs_out:
         hdrs_out['X-Timestamp'] = Timestamp.now().internal
-    if add_user_agent:
+    if 'user-agent' not in hdrs_out:
         hdrs_out['User-Agent'] = 'direct-client %s' % os.getpid()
     return hdrs_out
 
@@ -200,7 +216,7 @@ def direct_get_account(node, part, account, marker=None, limit=None,
     :returns: a tuple of (response headers, a list of containers) The response
               headers will HeaderKeyDict.
     """
-    path = '/' + account
+    path = _make_path(account)
     return _get_direct_account_container(path, "Account", node, part,
                                          marker=marker,
                                          limit=limit, prefix=prefix,
@@ -216,7 +232,7 @@ def direct_delete_account(node, part, account, conn_timeout=5,
     if headers is None:
         headers = {}
 
-    path = '/%s' % account
+    path = _make_path(account)
     _make_req(node, part, 'DELETE', path, gen_headers(headers, True),
               'Account', conn_timeout, response_timeout)
 
@@ -235,7 +251,7 @@ def direct_head_container(node, part, account, container, conn_timeout=5,
     :returns: a dict containing the response's headers in a HeaderKeyDict
     :raises ClientException: HTTP HEAD request failed
     """
-    path = '/%s/%s' % (account, container)
+    path = _make_path(account, container)
     resp = _make_req(node, part, 'HEAD', path, gen_headers(),
                      'Container', conn_timeout, response_timeout)
 
@@ -268,7 +284,7 @@ def direct_get_container(node, part, account, container, marker=None,
     :returns: a tuple of (response headers, a list of objects) The response
               headers will be a HeaderKeyDict.
     """
-    path = '/%s/%s' % (account, container)
+    path = _make_path(account, container)
     return _get_direct_account_container(path, "Container", node,
                                          part, marker=marker,
                                          limit=limit, prefix=prefix,
@@ -297,7 +313,7 @@ def direct_delete_container(node, part, account, container, conn_timeout=5,
     if headers is None:
         headers = {}
 
-    path = '/%s/%s' % (account, container)
+    path = _make_path(account, container)
     add_timestamp = 'x-timestamp' not in (k.lower() for k in headers)
     _make_req(node, part, 'DELETE', path, gen_headers(headers, add_timestamp),
               'Container', conn_timeout, response_timeout)
@@ -326,9 +342,8 @@ def direct_put_container(node, part, account, container, conn_timeout=5,
 
     lower_headers = set(k.lower() for k in headers)
     headers_out = gen_headers(headers,
-                              add_ts='x-timestamp' not in lower_headers,
-                              add_user_agent='user-agent' not in lower_headers)
-    path = '/%s/%s' % (account, container)
+                              add_ts='x-timestamp' not in lower_headers)
+    path = _make_path(account, container)
     _make_req(node, part, 'PUT', path, headers_out, 'Container', conn_timeout,
               response_timeout, contents=contents,
               content_length=content_length, chunk_size=chunk_size)
@@ -342,7 +357,7 @@ def direct_put_container_object(node, part, account, container, obj,
 
     have_x_timestamp = 'x-timestamp' in (k.lower() for k in headers)
 
-    path = '/%s/%s/%s' % (account, container, obj)
+    path = _make_path(account, container, obj)
     _make_req(node, part, 'PUT', path,
               gen_headers(headers, add_ts=(not have_x_timestamp)),
               'Container', conn_timeout, response_timeout)
@@ -357,7 +372,7 @@ def direct_delete_container_object(node, part, account, container, obj,
     headers = gen_headers(headers, add_ts='x-timestamp' not in (
         k.lower() for k in headers))
 
-    path = '/%s/%s/%s' % (account, container, obj)
+    path = _make_path(account, container, obj)
     _make_req(node, part, 'DELETE', path, headers,
               'Container', conn_timeout, response_timeout)
 
@@ -383,7 +398,7 @@ def direct_head_object(node, part, account, container, obj, conn_timeout=5,
 
     headers = gen_headers(headers)
 
-    path = '/%s/%s/%s' % (account, container, obj)
+    path = _make_path(account, container, obj)
     resp = _make_req(node, part, 'HEAD', path, headers,
                      'Object', conn_timeout, response_timeout)
 
@@ -414,7 +429,7 @@ def direct_get_object(node, part, account, container, obj, conn_timeout=5,
     if headers is None:
         headers = {}
 
-    path = '/%s/%s/%s' % (account, container, obj)
+    path = _make_path(account, container, obj)
     with Timeout(conn_timeout):
         conn = http_connect(node['ip'], node['port'], node['device'], part,
                             'GET', path, headers=gen_headers(headers))
@@ -464,7 +479,7 @@ def direct_put_object(node, part, account, container, name, contents,
     :raises ClientException: HTTP PUT request failed
     """
 
-    path = '/%s/%s/%s' % (account, container, name)
+    path = _make_path(account, container, name)
     if headers is None:
         headers = {}
     if etag:
@@ -499,7 +514,7 @@ def direct_post_object(node, part, account, container, name, headers,
     :param response_timeout: timeout in seconds for getting the response
     :raises ClientException: HTTP POST request failed
     """
-    path = '/%s/%s/%s' % (account, container, name)
+    path = _make_path(account, container, name)
     _make_req(node, part, 'POST', path, gen_headers(headers, True),
               'Object', conn_timeout, response_timeout)
 
@@ -524,7 +539,7 @@ def direct_delete_object(node, part, account, container, obj,
     headers = gen_headers(headers, add_ts='x-timestamp' not in (
         k.lower() for k in headers))
 
-    path = '/%s/%s/%s' % (account, container, obj)
+    path = _make_path(account, container, obj)
     _make_req(node, part, 'DELETE', path, headers,
               'Object', conn_timeout, response_timeout)
 

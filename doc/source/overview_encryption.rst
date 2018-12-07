@@ -82,15 +82,21 @@ and in the order shown in this example::
 See the `proxy-server.conf-sample` file for further details on the middleware
 configuration options.
 
-The keymaster config option ``encryption_root_secret`` MUST be set to a value
-of at least 44 valid base-64 characters before the middleware is used and
+Keymaster middleware
+--------------------
+
+The `keymaster` middleware must be configured with a root secret before it is
+used. By default the `keymaster` middleware will use the root secret configured
+using the ``encryption_root_secret`` option in the middleware filter section of
+the `proxy-server.conf` file, for example::
+
+  [filter:keymaster]
+  use = egg:swift#keymaster
+  encryption_root_secret = your_secret
+
+Root secret values MUST be at least 44 valid base-64 characters and
 should be consistent across all proxy servers. The minimum length of 44 has
 been chosen because it is the length of a base-64 encoded 32 byte value.
-Alternatives to specifying the encryption root secret directly in the
-`proxy-server.conf` file are storing it in a separate file, or storing it in
-an :ref:`external key management system
-<encryption_root_secret_in_external_kms>` such as `Barbican
-<https://docs.openstack.org/barbican>`_.
 
 .. note::
 
@@ -117,6 +123,39 @@ use the ``openssl`` command line tool::
 
     openssl rand -base64 32
 
+
+Separate keymaster configuration file
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The ``encryption_root_secret`` option may alternatively be specified in a
+separate config file at a path specified by the ``keymaster_config_path``
+option, for example::
+
+  [filter:keymaster]
+  use = egg:swift#keymaster
+  keymaster_config_path = /etc/swift/keymaster.conf
+
+This has the advantage of allowing multiple processes which need to be
+encryption-aware (for example, proxy-server and container-sync) to share the
+same config file, ensuring that consistent encryption keys are used by those
+processes. It also allows the keymaster configuration file to have different
+permissions than the `proxy-server.conf` file.
+
+A separate keymaster config file should have a ``[keymaster]`` section
+containing the ``encryption_root_secret`` option::
+
+  [keymaster]
+  encryption_root_secret = your_secret
+
+
+.. note::
+
+    Alternative keymaster middleware is available to retrieve encryption root
+    secrets from an :ref:`external key management system
+    <encryption_root_secret_in_external_kms>` such as `Barbican
+    <https://docs.openstack.org/barbican>`_ rather than storing root secrets in
+    configuration files.
+
 Once deployed, the encryption filter will by default encrypt object data and
 metadata when handling PUT and POST requests and decrypt object data and
 metadata when handling GET and HEAD requests. COPY requests are transformed
@@ -124,19 +163,97 @@ into GET and PUT requests by the :ref:`copy` middleware before reaching the
 encryption middleware and as a result object data and metadata is decrypted and
 re-encrypted when copied.
 
+.. _changing_the_root_secret:
+
+Changing the encryption root secret
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+From time to time it may be desirable to change the root secret that is used to
+derive encryption keys for new data written to the cluster. The `keymaster`
+middleware allows alternative root secrets to be specified in its configuration
+using options of the form::
+
+    encryption_root_secret_<secret_id> = <secret value>
+
+where ``secret_id`` is a unique identifier for the root secret and ``secret
+value`` is a value that meets the requirements for a root secret described
+above.
+
+Only one root secret is used to encrypt new data at any moment in time. This
+root secret is specified using the ``active_root_secret_id`` option. If
+specified, the value of this option should be one of the configured root secret
+``secret_id`` values; otherwise the value of ``encryption_root_secret`` will be
+taken as the default active root secret.
+
+.. note::
+
+    The active root secret is only used to derive keys for new data written to
+    the cluster. Changing the active root secret does not cause any existing
+    data to be re-encrypted.
+
+Existing encrypted data will be decrypted using the root secret that was active
+when that data was written. All previous active root secrets must therefore
+remain in the middleware configuration in order for decryption of existing data
+to succeed.  Existing encrypted data will reference previous root secret by
+the ``secret_id`` so it must be kept consistent in the configuration.
+
+.. note::
+
+    Do not remove or change any previously active ``<secret value>`` or ``<secret_id>``.
+
+For example, the following keymaster configuration file specifies three root
+secrets, with the value of ``encryption_root_secret_2`` being the current
+active root secret::
+
+    [keymaster]
+    active_root_secret_id = 2
+    encryption_root_secret = your_secret
+    encryption_root_secret_1 = your_secret_1
+    encryption_root_secret_2 = your_secret_2
+
+.. note::
+
+    To ensure there is no loss of data availability, deploying a new key to
+    your cluster requires a two-stage config change. First, add the new key
+    to the ``encryption_root_secret_<secret_id>`` option and restart the
+    proxy-server. Do this for all proxies. Next, set the
+    ``active_root_secret_id`` option to the new secret id and restart the
+    proxy. Again, do this for all proxies. This process ensures that all
+    proxies will have the new key available for *decryption* before any proxy
+    uses it for *encryption*.
+
+Encryption middleware
+---------------------
+
+Once deployed, the encryption filter will by default encrypt object data and
+metadata when handling PUT and POST requests and decrypt object data and
+metadata when handling GET and HEAD requests. COPY requests are transformed
+into GET and PUT requests by the :ref:`copy` middleware before reaching the
+encryption middleware and as a result object data and metadata is decrypted and
+re-encrypted when copied.
+
+
 .. _encryption_root_secret_in_external_kms:
 
 Encryption Root Secret in External Key Management System
 --------------------------------------------------------
 
-The benefits of using
-a dedicated system for storing the encryption root secret include the
-auditing and access control infrastructure that are already in place in such a
-system, and the fact that an encryption root secret stored in a key management
-system (KMS) may be backed by a hardware security module (HSM) for additional
-security. Another significant benefit of storing the root encryption secret in
-an external KMS is that it is in this case never stored on a disk in the Swift
-cluster.
+The benefits of using a dedicated system for storing the encryption root secret
+include the auditing and access control infrastructure that are already in
+place in such a system, and the fact that an encryption root secret stored in a
+key management system (KMS) may be backed by a hardware security module (HSM)
+for additional security. Another significant benefit of storing the root
+encryption secret in an external KMS is that it is in this case never stored on
+a disk in the Swift cluster.
+
+Swift supports fetching encryption root secrets from a `Barbican
+<https://docs.openstack.org/barbican>`_ service or a KMIP_ service using the
+``kms_keymaster`` or ``kmip_keymaster`` middleware respectively.
+
+.. _KMIP: https://www.oasis-open.org/committees/kmip/
+
+Encryption Root Secret in a Barbican KMS
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Make sure the required dependencies are installed for retrieving an encryption
 root secret from an external KMS. This can be done when installing Swift (add
@@ -252,6 +369,89 @@ successfully, it is cached in memory in the proxy server.
 For further details on the configuration options, see the
 `[filter:kms_keymaster]` section in the `proxy-server.conf-sample` file, and
 the `keymaster.conf-sample` file.
+
+
+Encryption Root Secret in a KMIP service
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This middleware enables Swift to fetch a root secret from a KMIP_ service. The
+root secret is expected to have been previously created in the KMIP_ service
+and is referenced by its unique identifier. The secret should be an AES-256
+symmetric key.
+
+To use this middleware Swift must be installed with the extra required
+dependencies::
+
+    sudo pip install .[kmip_keymaster]
+
+Add the ``-e`` flag to install as a development version.
+
+Edit the swift `proxy-server.conf` file to insert the middleware in the wsgi
+pipeline, replacing any other keymaster middleware::
+
+    [pipeline:main]
+    pipeline = catch_errors gatekeeper healthcheck proxy-logging \
+        <other middleware> kmip_keymaster encryption proxy-logging proxy-server
+
+and add a new filter section::
+
+    [filter:kmip_keymaster]
+    use = egg:swift#kmip_keymaster
+    key_id = <unique id of secret to be fetched from the KMIP service>
+    host = <KMIP server host>
+    port = <KMIP server port>
+    certfile = /path/to/client/cert.pem
+    keyfile = /path/to/client/key.pem
+    ca_certs = /path/to/server/cert.pem
+    username = <KMIP username>
+    password = <KMIP password>
+
+Apart from ``use`` and ``key_id`` the options are as defined for a PyKMIP
+client. The authoritative definition of these options can be found at
+`<https://pykmip.readthedocs.io/en/latest/client.html>`_.
+
+The value of the ``key_id`` option should be the unique identifier for a secret
+that will be retrieved from the KMIP_ service.
+
+The keymaster configuration can alternatively be defined in a separate config
+file by using the ``keymaster_config_path`` option::
+
+    [filter:kmip_keymaster]
+    use = egg:swift#kmip_keymaster
+    keymaster_config_path = /etc/swift/kmip_keymaster.conf
+
+In this case, the ``filter:kmip_keymaster`` section should contain no other
+options than ``use`` and ``keymaster_config_path``. All other options should be
+defined in the separate config file in a section named ``kmip_keymaster``. For
+example::
+
+    [kmip_keymaster]
+    key_id = 1234567890
+    host = 127.0.0.1
+    port = 5696
+    certfile = /etc/swift/kmip_client.crt
+    keyfile = /etc/swift/kmip_client.key
+    ca_certs = /etc/swift/kmip_server.crt
+    username = swift
+    password = swift_password
+
+Changing the encryption root secret of external KMS's
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Because the KMS and KMIP keymaster's derive from the default KeyMaster they
+also have to ability to define multiple keys. The only difference is the key
+option names. Instead of using the form `encryption_root_secret_<secret_id>`
+both external KMS's use `key_id_<secret_id>`, as it is an extension of their
+existing configuration. For example::
+
+  ...
+  key_id = 1234567890
+  key_id_foo = 0987654321
+  key_id_bar = 5432106789
+  active_root_secret_id = foo
+  ...
+
+Other then that, the process is the same as :ref:`changing_the_root_secret`.
 
 Upgrade Considerations
 ----------------------

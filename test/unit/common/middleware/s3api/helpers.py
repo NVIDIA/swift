@@ -35,6 +35,7 @@ class FakeSwift(object):
         # mapping of (method, path) --> (response class, headers, body)
         self._responses = {}
         self.s3_acl = s3_acl
+        self.remote_user = 'authorized'
 
     def _fake_auth_middleware(self, env):
         if 'swift.authorize_override' in env:
@@ -50,12 +51,19 @@ class FakeSwift(object):
         path = env['PATH_INFO']
         env['PATH_INFO'] = path.replace(tenant_user, 'AUTH_' + tenant)
 
-        env['REMOTE_USER'] = 'authorized'
+        if self.remote_user:
+            env['REMOTE_USER'] = self.remote_user
 
         if env['REQUEST_METHOD'] == 'TEST':
-            # AccessDenied by default at s3acl authenticate
-            env['swift.authorize'] = \
-                lambda req: swob.HTTPForbidden(request=req)
+
+            def authorize_cb(req):
+                # Assume swift owner, if not yet set
+                req.environ.setdefault('swift_owner', True)
+                # But then default to blocking authz, to ensure we've replaced
+                # the default auth system
+                return swob.HTTPForbidden(request=req)
+
+            env['swift.authorize'] = authorize_cb
         else:
             env['swift.authorize'] = lambda req: None
 
@@ -139,13 +147,12 @@ class FakeSwift(object):
     def register(self, method, path, response_class, headers, body):
         # assuming the path format like /v1/account/container/object
         resource_map = ['account', 'container', 'object']
-        acos = filter(None, split_path(path, 0, 4, True)[1:])
-        index = len(acos) - 1
+        index = len(list(filter(None, split_path(path, 0, 4, True)[1:]))) - 1
         resource = resource_map[index]
         if (method, path) in self._responses:
             old_headers = self._responses[(method, path)][1]
             headers = headers.copy()
-            for key, value in old_headers.iteritems():
+            for key, value in old_headers.items():
                 if is_sys_meta(resource, key) and key not in headers:
                     # keep old sysmeta for s3acl
                     headers.update({key: value})

@@ -1,6 +1,7 @@
 [DEFAULT]
 # bind_ip = 0.0.0.0
 bind_port = 6202
+# keep_idle = 600
 # bind_timeout = 30
 # backlog = 4096
 # user = swift
@@ -97,6 +98,13 @@ use = egg:swift#account
 # Work only with ionice_class.
 # ionice_class =
 # ionice_priority =
+#
+# You can set fallocate_reserve to the number of bytes or percentage
+# of disk space you'd like kept free at all times. If the disk's free
+# space falls below this value, then PUT, POST, and REPLICATE requests
+# will be denied until the disk ha s more space available. Percentage
+# will be used if the value ends with a '%'.
+# fallocate_reserve = 1%
 
 [filter:healthcheck]
 use = egg:swift#healthcheck
@@ -134,6 +142,9 @@ use = egg:swift#recon
 # interval = 30
 # run_pause is deprecated, use interval instead
 # run_pause = 30
+#
+# Process at most this many databases per second
+# databases_per_second = 50
 #
 # node_timeout = 10
 # conn_timeout = 0.5

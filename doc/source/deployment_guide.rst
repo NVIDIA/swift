@@ -437,6 +437,7 @@ mount_check                      true        Whether or not check if the devices
                                              to the root device
 bind_ip                          0.0.0.0     IP Address for server to bind to
 bind_port                        6200        Port for server to bind to
+keep_idle                        600         Value to set for socket TCP_KEEPIDLE
 bind_timeout                     30          Seconds to attempt bind before giving up
 backlog                          4096        Maximum number of allowed pending
                                              connections
@@ -909,7 +910,9 @@ log_facility        LOG_LOCAL0          Syslog log facility
 log_level           INFO                Logging level
 log_address         /dev/log            Logging directory
 interval            300                 Minimum time for a pass to take
-concurrency         1                   Number of updater workers to spawn
+updater_workers     1                   Number of worker processes
+concurrency         8                   Number of updates to run concurrently in
+                                        each worker process
 node_timeout        DEFAULT or 10       Request timeout to external services. This
                                         uses what's set here, or what's set in the
                                         DEFAULT section, or 10 (though other
@@ -1030,6 +1033,7 @@ mount_check                      true        Whether or not check if the devices
                                              to the root device
 bind_ip                          0.0.0.0     IP Address for server to bind to
 bind_port                        6201        Port for server to bind to
+keep_idle                        600         Value to set for socket TCP_KEEPIDLE
 bind_timeout                     30          Seconds to attempt bind before giving up
 backlog                          4096        Maximum number of allowed pending
                                              connections
@@ -1169,94 +1173,98 @@ ionice_priority                 None              I/O scheduling priority of ser
 [container-replicator]
 **********************
 
-==================  ===========================  =============================
-Option              Default                      Description
-------------------  ---------------------------  -----------------------------
-log_name            container-replicator         Label used when logging
-log_facility        LOG_LOCAL0                   Syslog log facility
-log_level           INFO                         Logging level
-log_address         /dev/log                     Logging directory
-per_diff            1000                         Maximum number of database
-                                                 rows that will be sync'd in a
-                                                 single HTTP replication
-                                                 request. Databases with less
-                                                 than or equal to this number
-                                                 of differing rows will always
-                                                 be sync'd using an HTTP
-                                                 replication request rather
-                                                 than using rsync.
-max_diffs           100                          Maximum number of HTTP
-                                                 replication requests attempted
-                                                 on each replication pass for
-                                                 any one container. This caps
-                                                 how long the replicator will
-                                                 spend trying to sync a given
-                                                 database per pass so the other
-                                                 databases don't get starved.
-concurrency         8                            Number of replication workers
-                                                 to spawn
-interval            30                           Time in seconds to wait
-                                                 between replication passes
-node_timeout        10                           Request timeout to external
-                                                 services
-conn_timeout        0.5                          Connection timeout to external
-                                                 services
-reclaim_age         604800                       Time elapsed in seconds before
-                                                 a container can be reclaimed
-rsync_module        {replication_ip}::container  Format of the rsync module
-                                                 where the replicator will send
-                                                 data. The configuration value
-                                                 can include some variables
-                                                 that will be extracted from
-                                                 the ring. Variables must
-                                                 follow the format {NAME} where
-                                                 NAME is one of: ip, port,
-                                                 replication_ip,
-                                                 replication_port, region,
-                                                 zone, device, meta. See
-                                                 etc/rsyncd.conf-sample for
-                                                 some examples.
-rsync_compress      no                           Allow rsync to compress data
-                                                 which is transmitted to
-                                                 destination node during sync.
-                                                 However, this is applicable
-                                                 only when destination node is
-                                                 in a different region than the
-                                                 local one. NOTE: Objects that
-                                                 are already compressed (for
-                                                 example: .tar.gz, mp3) might
-                                                 slow down the syncing process.
-recon_cache_path    /var/cache/swift             Path to recon cache
-nice_priority       None                         Scheduling priority of server
-                                                 processes. Niceness values
-                                                 range from -20 (most favorable
-                                                 to the process) to 19 (least
-                                                 favorable to the process).
-                                                 The default does not modify
-                                                 priority.
-ionice_class        None                         I/O scheduling class of server
-                                                 processes. I/O niceness class
-                                                 values are
-                                                 IOPRIO_CLASS_RT (realtime),
-                                                 IOPRIO_CLASS_BE (best-effort),
-                                                 and IOPRIO_CLASS_IDLE (idle).
-                                                 The default does not modify
-                                                 class and priority. Linux
-                                                 supports io scheduling
-                                                 priorities and classes since
-                                                 2.6.13 with the CFQ io
-                                                 scheduler.
-                                                 Work only with ionice_priority.
-ionice_priority     None                         I/O scheduling priority of
-                                                 server processes. I/O niceness
-                                                 priority is a number which goes
-                                                 from 0 to 7.
-                                                 The higher the value, the lower
-                                                 the I/O priority of the process.
-                                                 Work only with ionice_class.
-                                                 Ignored if IOPRIO_CLASS_IDLE
-                                                 is set.
-==================  ===========================  =============================
+==================== ===========================  =============================
+Option               Default                      Description
+-------------------- ---------------------------  -----------------------------
+log_name             container-replicator         Label used when logging
+log_facility         LOG_LOCAL0                   Syslog log facility
+log_level            INFO                         Logging level
+log_address          /dev/log                     Logging directory
+per_diff             1000                         Maximum number of database
+                                                  rows that will be sync'd in a
+                                                  single HTTP replication
+                                                  request. Databases with less
+                                                  than or equal to this number
+                                                  of differing rows will always
+                                                  be sync'd using an HTTP
+                                                  replication request rather
+                                                  than using rsync.
+max_diffs            100                          Maximum number of HTTP
+                                                  replication requests attempted
+                                                  on each replication pass for
+                                                  any one container. This caps
+                                                  how long the replicator will
+                                                  spend trying to sync a given
+                                                  database per pass so the other
+                                                  databases don't get starved.
+concurrency          8                            Number of replication workers
+                                                  to spawn
+interval             30                           Time in seconds to wait
+                                                  between replication passes
+databases_per_second 50                           Maximum databases to process
+                                                  per second.  Should be tuned
+                                                  according to individual
+                                                  system specs.  0 is unlimited.
+node_timeout         10                           Request timeout to external
+                                                  services
+conn_timeout         0.5                          Connection timeout to external
+                                                  services
+reclaim_age          604800                       Time elapsed in seconds before
+                                                  a container can be reclaimed
+rsync_module         {replication_ip}::container  Format of the rsync module
+                                                  where the replicator will send
+                                                  data. The configuration value
+                                                  can include some variables
+                                                  that will be extracted from
+                                                  the ring. Variables must
+                                                  follow the format {NAME} where
+                                                  NAME is one of: ip, port,
+                                                  replication_ip,
+                                                  replication_port, region,
+                                                  zone, device, meta. See
+                                                  etc/rsyncd.conf-sample for
+                                                  some examples.
+rsync_compress       no                           Allow rsync to compress data
+                                                  which is transmitted to
+                                                  destination node during sync.
+                                                  However, this is applicable
+                                                  only when destination node is
+                                                  in a different region than the
+                                                  local one. NOTE: Objects that
+                                                  are already compressed (for
+                                                  example: .tar.gz, mp3) might
+                                                  slow down the syncing process.
+recon_cache_path     /var/cache/swift             Path to recon cache
+nice_priority        None                         Scheduling priority of server
+                                                  processes. Niceness values
+                                                  range from -20 (most favorable
+                                                  to the process) to 19 (least
+                                                  favorable to the process).
+                                                  The default does not modify
+                                                  priority.
+ionice_class         None                         I/O scheduling class of server
+                                                  processes. I/O niceness class
+                                                  values are
+                                                  IOPRIO_CLASS_RT (realtime),
+                                                  IOPRIO_CLASS_BE (best-effort),
+                                                  and IOPRIO_CLASS_IDLE (idle).
+                                                  The default does not modify
+                                                  class and priority. Linux
+                                                  supports io scheduling
+                                                  priorities and classes since
+                                                  2.6.13 with the CFQ io
+                                                  scheduler.
+                                                  Work only with ionice_priority.
+ionice_priority      None                         I/O scheduling priority of
+                                                  server processes. I/O niceness
+                                                  priority is a number which goes
+                                                  from 0 to 7.
+                                                  The higher the value, the lower
+                                                  the I/O priority of the process.
+                                                  Work only with ionice_class.
+                                                  Ignored if IOPRIO_CLASS_IDLE
+                                                  is set.
+==================== ===========================  =============================
 
 *******************
 [container-updater]
@@ -1383,6 +1391,7 @@ mount_check                      true        Whether or not check if the devices
                                              to the root device
 bind_ip                          0.0.0.0     IP Address for server to bind to
 bind_port                        6202        Port for server to bind to
+keep_idle                        600         Value to set for socket TCP_KEEPIDLE
 bind_timeout                     30          Seconds to attempt bind before giving up
 backlog                          4096        Maximum number of allowed pending
                                              connections
@@ -1519,89 +1528,93 @@ ionice_priority                None            I/O scheduling priority of server
 [account-replicator]
 ********************
 
-==================  =========================  ===============================
-Option              Default                    Description
-------------------  -------------------------  -------------------------------
-log_name            account-replicator         Label used when logging
-log_facility        LOG_LOCAL0                 Syslog log facility
-log_level           INFO                       Logging level
-log_address         /dev/log                   Logging directory
-per_diff            1000                       Maximum number of database rows
-                                               that will be sync'd in a single
-                                               HTTP replication request.
-                                               Databases with less than or
-                                               equal to this number of
-                                               differing rows will always be
-                                               sync'd using an HTTP replication
-                                               request rather than using rsync.
-max_diffs           100                        Maximum number of HTTP
-                                               replication requests attempted
-                                               on each replication pass for any
-                                               one container. This caps how
-                                               long the replicator will spend
-                                               trying to sync a given database
-                                               per pass so the other databases
-                                               don't get starved.
-concurrency         8                          Number of replication workers
-                                               to spawn
-interval            30                         Time in seconds to wait between
-                                               replication passes
-node_timeout        10                         Request timeout to external
-                                               services
-conn_timeout        0.5                        Connection timeout to external
-                                               services
-reclaim_age         604800                     Time elapsed in seconds before
-                                               an account can be reclaimed
-rsync_module        {replication_ip}::account  Format of the rsync module where
-                                               the replicator will send data.
-                                               The configuration value can
-                                               include some variables that will
-                                               be extracted from the ring.
-                                               Variables must follow the format
-                                               {NAME} where NAME is one of: ip,
-                                               port, replication_ip,
-                                               replication_port, region, zone,
-                                               device, meta. See
-                                               etc/rsyncd.conf-sample for some
-                                               examples.
-rsync_compress      no                         Allow rsync to compress data
-                                               which is transmitted to
-                                               destination node during sync.
-                                               However, this is applicable only
-                                               when destination node is in a
-                                               different region than the local
-                                               one. NOTE: Objects that are
-                                               already compressed (for example:
-                                               .tar.gz, mp3) might slow down
-                                               the syncing process.
-recon_cache_path    /var/cache/swift           Path to recon cache
-nice_priority       None                       Scheduling priority of server
-                                               processes. Niceness values
-                                               range from -20 (most favorable
-                                               to the process) to 19 (least
-                                               favorable to the process).
-                                               The default does not modify
-                                               priority.
-ionice_class        None                       I/O scheduling class of server
-                                               processes. I/O niceness class
-                                               values are IOPRIO_CLASS_RT
-                                               (realtime), IOPRIO_CLASS_BE
-                                               (best-effort), and IOPRIO_CLASS_IDLE
-                                               (idle).
-                                               The default does not modify
-                                               class and priority. Linux supports
-                                               io scheduling priorities and classes
-                                               since 2.6.13 with the CFQ io scheduler.
-                                               Work only with ionice_priority.
-ionice_priority     None                       I/O scheduling priority of server
-                                               processes. I/O niceness priority
-                                               is a number which goes from 0 to 7.
-                                               The higher the value, the lower
-                                               the I/O priority of the process.
-                                               Work only with ionice_class.
-                                               Ignored if IOPRIO_CLASS_IDLE
-                                               is set.
-==================  =========================  ===============================
+==================== =========================  ===============================
+Option               Default                    Description
+-------------------- -------------------------  -------------------------------
+log_name             account-replicator         Label used when logging
+log_facility         LOG_LOCAL0                 Syslog log facility
+log_level            INFO                       Logging level
+log_address          /dev/log                   Logging directory
+per_diff             1000                       Maximum number of database rows
+                                                that will be sync'd in a single
+                                                HTTP replication request.
+                                                Databases with less than or
+                                                equal to this number of
+                                                differing rows will always be
+                                                sync'd using an HTTP replication
+                                                request rather than using rsync.
+max_diffs            100                        Maximum number of HTTP
+                                                replication requests attempted
+                                                on each replication pass for any
+                                                one container. This caps how
+                                                long the replicator will spend
+                                                trying to sync a given database
+                                                per pass so the other databases
+                                                don't get starved.
+concurrency          8                          Number of replication workers
+                                                to spawn
+interval             30                         Time in seconds to wait between
+                                                replication passes
+databases_per_second 50                         Maximum databases to process
+                                                per second.  Should be tuned
+                                                according to individual
+                                                system specs.  0 is unlimited.
+node_timeout         10                         Request timeout to external
+                                                services
+conn_timeout         0.5                        Connection timeout to external
+                                                services
+reclaim_age          604800                     Time elapsed in seconds before
+                                                an account can be reclaimed
+rsync_module         {replication_ip}::account  Format of the rsync module where
+                                                the replicator will send data.
+                                                The configuration value can
+                                                include some variables that will
+                                                be extracted from the ring.
+                                                Variables must follow the format
+                                                {NAME} where NAME is one of: ip,
+                                                port, replication_ip,
+                                                replication_port, region, zone,
+                                                device, meta. See
+                                                etc/rsyncd.conf-sample for some
+                                                examples.
+rsync_compress       no                         Allow rsync to compress data
+                                                which is transmitted to
+                                                destination node during sync.
+                                                However, this is applicable only
+                                                when destination node is in a
+                                                different region than the local
+                                                one. NOTE: Objects that are
+                                                already compressed (for example:
+                                                .tar.gz, mp3) might slow down
+                                                the syncing process.
+recon_cache_path     /var/cache/swift           Path to recon cache
+nice_priority        None                       Scheduling priority of server
+                                                processes. Niceness values
+                                                range from -20 (most favorable
+                                                to the process) to 19 (least
+                                                favorable to the process).
+                                                The default does not modify
+                                                priority.
+ionice_class         None                       I/O scheduling class of server
+                                                processes. I/O niceness class
+                                                values are IOPRIO_CLASS_RT
+                                                (realtime), IOPRIO_CLASS_BE
+                                                (best-effort), and IOPRIO_CLASS_IDLE
+                                                (idle).
+                                                The default does not modify
+                                                class and priority. Linux supports
+                                                io scheduling priorities and classes
+                                                since 2.6.13 with the CFQ io scheduler.
+                                                Work only with ionice_priority.
+ionice_priority      None                       I/O scheduling priority of server
+                                                processes. I/O niceness priority
+                                                is a number which goes from 0 to 7.
+                                                The higher the value, the lower
+                                                the I/O priority of the process.
+                                                Work only with ionice_class.
+                                                Ignored if IOPRIO_CLASS_IDLE
+                                                is set.
+==================== =========================  ===============================
 
 *****************
 [account-auditor]
@@ -1729,6 +1742,7 @@ Option                                Default                   Description
 bind_ip                               0.0.0.0                   IP Address for server to
                                                                 bind to
 bind_port                             80                        Port for server to bind to
+keep_idle                             600                       Value to set for socket TCP_KEEPIDLE
 bind_timeout                          30                        Seconds to attempt bind before
                                                                 giving up
 backlog                               4096                      Maximum number of allowed pending
@@ -1759,14 +1773,14 @@ cert_file                                                       Path to the ssl 
 key_file                                                        Path to the ssl .key. This
                                                                 should be enabled for testing
                                                                 purposes only.
-cors_allow_origin                                               This is a list of hosts that
-                                                                are included with any CORS
-                                                                request by default and
-                                                                returned with the
-                                                                Access-Control-Allow-Origin
-                                                                header in addition to what
+cors_allow_origin                                               List of origin hosts that are allowed
+                                                                for CORS requests in addition to what
                                                                 the container has set.
-strict_cors_mode                      True
+strict_cors_mode                      True                      If True (default) then CORS
+                                                                requests are only allowed if their
+                                                                Origin header matches an allowed
+                                                                origin. Otherwise, any Origin is
+                                                                allowed.
 cors_expose_headers                                             This is a list of headers that
                                                                 are included in the header
                                                                 Access-Control-Expose-Headers

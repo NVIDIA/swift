@@ -21,7 +21,6 @@ import os
 from uuid import uuid4
 
 import six
-import six.moves.cPickle as pickle
 from six.moves import range
 import sqlite3
 from eventlet import tpool
@@ -643,17 +642,16 @@ class ContainerBroker(DatabaseBroker):
 
     def _commit_puts_load(self, item_list, entry):
         """See :func:`swift.common.db.DatabaseBroker._commit_puts_load`"""
-        data = pickle.loads(entry.decode('base64'))
-        (name, timestamp, size, content_type, etag, deleted) = data[:6]
-        if len(data) > 6:
-            storage_policy_index = data[6]
+        (name, timestamp, size, content_type, etag, deleted) = entry[:6]
+        if len(entry) > 6:
+            storage_policy_index = entry[6]
         else:
             storage_policy_index = 0
         content_type_timestamp = meta_timestamp = None
-        if len(data) > 7:
-            content_type_timestamp = data[7]
-        if len(data) > 8:
-            meta_timestamp = data[8]
+        if len(entry) > 7:
+            content_type_timestamp = entry[7]
+        if len(entry) > 8:
+            meta_timestamp = entry[8]
         item_list.append({'name': name,
                           'created_at': timestamp,
                           'size': size,
@@ -838,7 +836,7 @@ class ContainerBroker(DatabaseBroker):
 
     def get_replication_info(self):
         info = super(ContainerBroker, self).get_replication_info()
-        info['shard_max_row'] = self.get_max_row('shard_ranges')
+        info['shard_max_row'] = self.get_max_row(SHARD_RANGE_TABLE)
         return info
 
     def _do_get_info_query(self, conn):
@@ -1268,7 +1266,7 @@ class ContainerBroker(DatabaseBroker):
         :param source: if defined, update incoming_sync with the source
         """
         for item in item_list:
-            if isinstance(item['name'], six.text_type):
+            if six.PY2 and isinstance(item['name'], six.text_type):
                 item['name'] = item['name'].encode('utf-8')
 
         def _really_really_merge_items(conn):
@@ -1312,7 +1310,7 @@ class ContainerBroker(DatabaseBroker):
             if to_add:
                 curs.executemany(
                     'INSERT INTO object (name, created_at, size, content_type,'
-                    'etag, deleted, storage_policy_index)'
+                    'etag, deleted, storage_policy_index) '
                     'VALUES (?, ?, ?, ?, ?, ?, ?)',
                     ((rec['name'], rec['created_at'], rec['size'],
                       rec['content_type'], rec['etag'], rec['deleted'],
@@ -1364,7 +1362,7 @@ class ContainerBroker(DatabaseBroker):
             if isinstance(item, ShardRange):
                 item = dict(item)
             for col in ('name', 'lower', 'upper'):
-                if isinstance(item[col], six.text_type):
+                if six.PY2 and isinstance(item[col], six.text_type):
                     item[col] = item[col].encode('utf-8')
             item_list.append(item)
 
@@ -1740,31 +1738,22 @@ class ContainerBroker(DatabaseBroker):
             shard_range = find_shard_range(includes, shard_ranges)
             return [shard_range] if shard_range else []
 
-        if reverse:
-            shard_ranges.reverse()
         if marker or end_marker:
             shard_ranges = list(filter(shard_range_filter, shard_ranges))
-
         if fill_gaps:
-            if reverse:
-                if shard_ranges:
-                    last_upper = shard_ranges[0].upper
-                else:
-                    last_upper = marker or ShardRange.MIN
-                required_upper = end_marker or ShardRange.MAX
-                filler_index = 0
+            if shard_ranges:
+                last_upper = shard_ranges[-1].upper
             else:
-                if shard_ranges:
-                    last_upper = shard_ranges[-1].upper
-                else:
-                    last_upper = marker or ShardRange.MIN
-                required_upper = end_marker or ShardRange.MAX
-                filler_index = len(shard_ranges)
+                last_upper = marker or ShardRange.MIN
+            required_upper = end_marker or ShardRange.MAX
             if required_upper > last_upper:
                 filler_sr = self.get_own_shard_range()
                 filler_sr.lower = last_upper
                 filler_sr.upper = required_upper
-                shard_ranges.insert(filler_index, filler_sr)
+                shard_ranges.append(filler_sr)
+
+        if reverse:
+            shard_ranges.reverse()
 
         return shard_ranges
 

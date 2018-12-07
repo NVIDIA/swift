@@ -22,6 +22,8 @@ from swift import gettext_ as _
 
 from eventlet import Timeout
 
+import six
+
 import swift.common.db
 from swift.container.sync_store import ContainerSyncStore
 from swift.container.backend import ContainerBroker, DATADIR, \
@@ -34,8 +36,9 @@ from swift.common.request_helpers import get_param, \
 from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, validate_sync_to, \
     config_true_value, timing_stats, replication, \
-    override_bytes_from_content_type, get_log_line, ShardRange, list_from_csv
-
+    override_bytes_from_content_type, get_log_line, \
+    config_fallocate_value, fs_has_free_space, list_from_csv, \
+    ShardRange
 from swift.common.constraints import valid_timestamp, check_utf8, check_drive
 from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
@@ -124,6 +127,8 @@ class ContainerController(BaseStorageServer):
         self.sync_store = ContainerSyncStore(self.root,
                                              self.logger,
                                              self.mount_check)
+        self.fallocate_reserve, self.fallocate_is_percent = \
+            config_fallocate_value(conf.get('fallocate_reserve', '1%'))
 
     def _get_container_broker(self, drive, part, account, container, **kwargs):
         """
@@ -298,6 +303,11 @@ class ContainerController(BaseStorageServer):
         req.environ['swift.leave_relative_location'] = True
         return HTTPMovedPermanently(headers=headers, request=req)
 
+    def check_free_space(self, drive):
+        drive_root = os.path.join(self.root, drive)
+        return fs_has_free_space(
+            drive_root, self.fallocate_reserve, self.fallocate_is_percent)
+
     @public
     @timing_stats()
     def DELETE(self, req):
@@ -305,7 +315,9 @@ class ContainerController(BaseStorageServer):
         drive, part, account, container, obj = split_and_validate_path(
             req, 4, 5, True)
         req_timestamp = valid_timestamp(req)
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
         # policy index is only relevant for delete_obj (and transitively for
         # auto create accounts)
@@ -432,7 +444,11 @@ class ContainerController(BaseStorageServer):
                 self.realms_conf)
             if err:
                 return HTTPBadRequest(err)
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
+            return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         requested_policy_index = self.get_and_validate_policy_index(req)
         broker = self._get_container_broker(drive, part, account, container)
@@ -502,7 +518,9 @@ class ContainerController(BaseStorageServer):
         drive, part, account, container, obj = split_and_validate_path(
             req, 4, 5, True)
         out_content_type = listing_formats.get_listing_content_type(req)
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_container_broker(drive, part, account, container,
                                             pending_timeout=0.1,
@@ -537,10 +555,11 @@ class ContainerController(BaseStorageServer):
             response = dict(record)
         else:
             (name, created, size, content_type, etag) = record[:5]
+            name_ = name.decode('utf8') if six.PY2 else name
             if content_type is None:
-                return {'subdir': name.decode('utf8')}
+                return {'subdir': name_}
             response = {
-                'bytes': size, 'hash': etag, 'name': name.decode('utf8'),
+                'bytes': size, 'hash': etag, 'name': name_,
                 'content_type': content_type}
             override_bytes_from_content_type(response, logger=self.logger)
         response['last_modified'] = Timestamp(created).isoformat
@@ -635,7 +654,9 @@ class ContainerController(BaseStorageServer):
                     body='Maximum limit is %d'
                     % constraints.CONTAINER_LISTING_LIMIT)
         out_content_type = listing_formats.get_listing_content_type(req)
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_container_broker(drive, part, account, container,
                                             pending_timeout=0.1,
@@ -694,7 +715,7 @@ class ContainerController(BaseStorageServer):
         if out_content_type.endswith('/xml'):
             body = listing_formats.container_to_xml(listing, container)
         elif out_content_type.endswith('/json'):
-            body = json.dumps(listing)
+            body = json.dumps(listing).encode('ascii')
         else:
             body = listing_formats.listing_to_text(listing)
 
@@ -714,7 +735,11 @@ class ContainerController(BaseStorageServer):
         """
         post_args = split_and_validate_path(req, 3)
         drive, partition, hash = post_args
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
+            return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         try:
             args = json.load(req.environ['wsgi.input'])
@@ -736,7 +761,11 @@ class ContainerController(BaseStorageServer):
                 self.realms_conf)
             if err:
                 return HTTPBadRequest(err)
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
+            return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_container_broker(drive, part, account, container)
         if broker.is_deleted():

@@ -36,7 +36,14 @@ def requires_domain_remap(func):
     def wrapper(*args, **kwargs):
         if 'domain_remap' not in cluster_info:
             raise SkipTest('Domain Remap is not enabled')
+        # domain_remap middleware does not advertise its storage_domain values
+        # in swift /info responses so a storage_domain must be configured in
+        # test.conf for these tests to succeed
+        if not tf.config.get('storage_domain'):
+            raise SkipTest('Domain Remap storage_domain not configured in %s' %
+                           tf.config['__file__'])
         return func(*args, **kwargs)
+
     return wrapper
 
 
@@ -72,7 +79,6 @@ class TestStaticWebEnv(BaseEnv):
 
         cls.objects = {}
         for item in sorted(objects):
-            parent = None
             if '/' in item.rstrip('/'):
                 parent, _ = item.rstrip('/').rsplit('/', 1)
                 path = '%s/%s' % (cls.objects[parent + '/'].name,
@@ -103,12 +109,20 @@ class TestStaticWeb(Base):
                 "Expected static_web_enabled to be True/False, got %r" %
                 (self.env.static_web_enabled,))
 
-        _, _, acct = self.env.account.conn.storage_url.split('/')
+    @property
+    def domain_remap_acct(self):
+        # the storage_domain option is test.conf must be set to one of the
+        # domain_remap middleware storage_domain values
+        return '.'.join((self.env.account.conn.account_name,
+                         tf.config.get('storage_domain')))
 
-        self.domain_remap_acct = '%s.example.com' % acct
-
-        self.domain_remap_cont = '%s.%s.example.com' % (
-            self.env.container.name, acct)
+    @property
+    def domain_remap_cont(self):
+        # the storage_domain option is test.conf must be set to one of the
+        # domain_remap middleware storage_domain values
+        return '.'.join(
+            (self.env.container.name, self.env.account.conn.account_name,
+             tf.config.get('storage_domain')))
 
     def _set_staticweb_headers(self, index=False, listings=False,
                                listings_css=False, error=False):
@@ -146,16 +160,18 @@ class TestStaticWeb(Base):
                                                 'absolute_path': True})
 
         self.assert_status(301)
-        self.assertRegexpMatches(self.env.conn.response.getheader('location'),
-                                 'http[s]?://%s%s/' % (host, path))
+        expected = '%s://%s%s/' % (
+            self.env.account.conn.storage_scheme, host, path)
+        self.assertEqual(self.env.conn.response.getheader('location'),
+                         expected)
 
     def _test_redirect_slash_direct(self, anonymous):
         host = self.env.account.conn.storage_netloc
-        path = '%s/%s' % (self.env.account.conn.storage_url,
+        path = '%s/%s' % (self.env.account.conn.storage_path,
                           self.env.container.name)
         self._test_redirect_with_slash(host, path, anonymous=anonymous)
 
-        path = '%s/%s/%s' % (self.env.account.conn.storage_url,
+        path = '%s/%s/%s' % (self.env.account.conn.storage_path,
                              self.env.container.name,
                              self.env.objects['dir/'].name)
         self._test_redirect_with_slash(host, path, anonymous=anonymous)
@@ -227,7 +243,7 @@ class TestStaticWeb(Base):
     def _test_listing_direct(self, anonymous, listings_css):
         objects = self.env.objects
         host = self.env.account.conn.storage_netloc
-        path = '%s/%s/' % (self.env.account.conn.storage_url,
+        path = '%s/%s/' % (self.env.account.conn.storage_path,
                            self.env.container.name)
         css = objects['listings_css'].name if listings_css else None
         self._test_listing(host, path, anonymous=True, css=css,
@@ -235,7 +251,7 @@ class TestStaticWeb(Base):
                                   objects['dir/'].name + '/'],
                            notins=[objects['dir/obj'].name])
 
-        path = '%s/%s/%s/' % (self.env.account.conn.storage_url,
+        path = '%s/%s/%s/' % (self.env.account.conn.storage_path,
                               self.env.container.name,
                               objects['dir/'].name)
         css = '../%s' % objects['listings_css'].name if listings_css else None
@@ -264,7 +280,7 @@ class TestStaticWeb(Base):
         host = self.domain_remap_acct
         path = '/%s/' % self.env.container.name
         css = objects['listings_css'].name if listings_css else None
-        title = '%s/%s/' % (self.env.account.conn.storage_url,
+        title = '%s/%s/' % (self.env.account.conn.storage_path,
                             self.env.container.name)
         self._test_listing(host, path, title=title, anonymous=anonymous,
                            css=css,
@@ -274,7 +290,7 @@ class TestStaticWeb(Base):
 
         path = '/%s/%s/' % (self.env.container.name, objects['dir/'].name)
         css = '../%s' % objects['listings_css'].name if listings_css else None
-        title = '%s/%s/%s/' % (self.env.account.conn.storage_url,
+        title = '%s/%s/%s/' % (self.env.account.conn.storage_path,
                                self.env.container.name,
                                objects['dir/'])
         self._test_listing(host, path, title=title, anonymous=anonymous,
@@ -303,7 +319,7 @@ class TestStaticWeb(Base):
         host = self.domain_remap_cont
         path = '/'
         css = objects['listings_css'].name if listings_css else None
-        title = '%s/%s/' % (self.env.account.conn.storage_url,
+        title = '%s/%s/' % (self.env.account.conn.storage_path,
                             self.env.container.name)
         self._test_listing(host, path, title=title, anonymous=anonymous,
                            css=css,
@@ -313,7 +329,7 @@ class TestStaticWeb(Base):
 
         path = '/%s/' % objects['dir/'].name
         css = '../%s' % objects['listings_css'].name if listings_css else None
-        title = '%s/%s/%s/' % (self.env.account.conn.storage_url,
+        title = '%s/%s/%s/' % (self.env.account.conn.storage_path,
                                self.env.container.name,
                                objects['dir/'])
         self._test_listing(host, path, title=title, anonymous=anonymous,
@@ -352,11 +368,11 @@ class TestStaticWeb(Base):
     def _test_index_direct(self, anonymous):
         objects = self.env.objects
         host = self.env.account.conn.storage_netloc
-        path = '%s/%s/' % (self.env.account.conn.storage_url,
+        path = '%s/%s/' % (self.env.account.conn.storage_path,
                            self.env.container.name)
         self._test_index(host, path, anonymous=anonymous)
 
-        path = '%s/%s/%s/' % (self.env.account.conn.storage_url,
+        path = '%s/%s/%s/' % (self.env.account.conn.storage_path,
                               self.env.container.name,
                               objects['dir/'].name)
         self._test_index(host, path, anonymous=anonymous, expected_status=404)

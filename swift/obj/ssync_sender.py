@@ -69,6 +69,61 @@ def decode_wanted(parts):
     return wanted
 
 
+class SsyncBufferedHTTPResponse(bufferedhttp.BufferedHTTPResponse, object):
+    def __init__(self, *args, **kwargs):
+        super(SsyncBufferedHTTPResponse, self).__init__(*args, **kwargs)
+        self.ssync_response_buffer = ''
+        self.ssync_response_chunk_left = 0
+
+    def readline(self, size=1024):
+        """
+        Reads a line from the SSYNC response body.
+
+        httplib has no readline and will block on read(x) until x is
+        read, so we have to do the work ourselves. A bit of this is
+        taken from Python's httplib itself.
+        """
+        data = self.ssync_response_buffer
+        self.ssync_response_buffer = ''
+        while '\n' not in data and len(data) < size:
+            if self.ssync_response_chunk_left == -1:  # EOF-already indicator
+                break
+            if self.ssync_response_chunk_left == 0:
+                line = self.fp.readline()
+                i = line.find(';')
+                if i >= 0:
+                    line = line[:i]  # strip chunk-extensions
+                try:
+                    self.ssync_response_chunk_left = int(line.strip(), 16)
+                except ValueError:
+                    # close the connection as protocol synchronisation is
+                    # probably lost
+                    self.close()
+                    raise exceptions.ReplicationException('Early disconnect')
+                if self.ssync_response_chunk_left == 0:
+                    self.ssync_response_chunk_left = -1
+                    break
+            chunk = self.fp.read(min(self.ssync_response_chunk_left,
+                                     size - len(data)))
+            if not chunk:
+                # close the connection as protocol synchronisation is
+                # probably lost
+                self.close()
+                raise exceptions.ReplicationException('Early disconnect')
+            self.ssync_response_chunk_left -= len(chunk)
+            if self.ssync_response_chunk_left == 0:
+                self.fp.read(2)  # discard the trailing \r\n
+            data += chunk
+        if '\n' in data:
+            data, self.ssync_response_buffer = data.split('\n', 1)
+            data += '\n'
+        return data
+
+
+class SsyncBufferedHTTPConnection(bufferedhttp.BufferedHTTPConnection):
+    response_class = SsyncBufferedHTTPResponse
+
+
 class Sender(object):
     """
     Sends SSYNC requests to the object server.
@@ -84,21 +139,9 @@ class Sender(object):
         self.node = node
         self.job = job
         self.suffixes = suffixes
-        self.connection = None
-        self.response = None
-        self.response_buffer = ''
-        self.response_chunk_left = 0
-        # available_map has an entry for each object in given suffixes that
-        # is available to be sync'd; each entry is a hash => dict of timestamps
-        # of data file or tombstone file and/or meta file
-        self.available_map = {}
         # When remote_check_objs is given in job, ssync_sender trys only to
         # make sure those objects exist or not in remote.
         self.remote_check_objs = remote_check_objs
-        # send_map has an entry for each object that the receiver wants to
-        # be sync'ed; each entry maps an object hash => dict of wanted parts
-        self.send_map = {}
-        self.failures = 0
 
     def __call__(self):
         """
@@ -112,6 +155,7 @@ class Sender(object):
         """
         if not self.suffixes:
             return True, {}
+        connection = response = None
         try:
             # Double try blocks in case our main error handler fails.
             try:
@@ -120,23 +164,28 @@ class Sender(object):
                 # exceptions.ReplicationException for common issues that will
                 # abort the replication attempt and log a simple error. All
                 # other exceptions will be logged with a full stack trace.
-                self.connect()
-                self.missing_check()
+                connection, response = self.connect()
+                # available_map has an entry for each object in given suffixes
+                # that is available to be sync'd;
+                # each entry is a hash => dict of timestamps of data file or
+                # tombstone file and/or meta file
+                # send_map has an entry for each object that the receiver wants
+                # to be sync'ed;
+                # each entry maps an object hash => dict of wanted parts
+                available_map, send_map = self.missing_check(connection,
+                                                             response)
                 if self.remote_check_objs is None:
-                    self.updates()
-                    can_delete_obj = self.available_map
+                    self.updates(connection, response, send_map)
+                    can_delete_obj = available_map
                 else:
                     # when we are initialized with remote_check_objs we don't
                     # *send* any requested updates; instead we only collect
                     # what's already in sync and safe for deletion
-                    in_sync_hashes = (set(self.available_map.keys()) -
-                                      set(self.send_map.keys()))
-                    can_delete_obj = dict((hash_, self.available_map[hash_])
+                    in_sync_hashes = (set(available_map.keys()) -
+                                      set(send_map.keys()))
+                    can_delete_obj = dict((hash_, available_map[hash_])
                                           for hash_ in in_sync_hashes)
-                if not self.failures:
-                    return True, can_delete_obj
-                else:
-                    return False, {}
+                return True, can_delete_obj
             except (exceptions.MessageTimeout,
                     exceptions.ReplicationException) as err:
                 self.daemon.logger.error(
@@ -154,7 +203,7 @@ class Sender(object):
                     self.node.get('replication_port'),
                     self.node.get('device'), self.job.get('partition'))
             finally:
-                self.disconnect()
+                self.disconnect(connection)
         except Exception:
             # We don't want any exceptions to escape our code and possibly
             # mess up the original replicator code that called us since it
@@ -171,16 +220,17 @@ class Sender(object):
         Establishes a connection and starts an SSYNC request
         with the object server.
         """
+        connection = response = None
         with exceptions.MessageTimeout(
                 self.daemon.conn_timeout, 'connect send'):
-            self.connection = bufferedhttp.BufferedHTTPConnection(
+            connection = SsyncBufferedHTTPConnection(
                 '%s:%s' % (self.node['replication_ip'],
                            self.node['replication_port']))
-            self.connection.putrequest('SSYNC', '/%s/%s' % (
+            connection.putrequest('SSYNC', '/%s/%s' % (
                 self.node['device'], self.job['partition']))
-            self.connection.putheader('Transfer-Encoding', 'chunked')
-            self.connection.putheader('X-Backend-Storage-Policy-Index',
-                                      int(self.job['policy']))
+            connection.putheader('Transfer-Encoding', 'chunked')
+            connection.putheader('X-Backend-Storage-Policy-Index',
+                                 int(self.job['policy']))
             # a sync job must use the node's index for the frag_index of the
             # rebuilt fragments instead of the frag_index from the job which
             # will be rebuilding them
@@ -192,67 +242,22 @@ class Sender(object):
                 # cases on the wire we write the empty string which
                 # ssync_receiver will translate to None
                 frag_index = ''
-            self.connection.putheader('X-Backend-Ssync-Frag-Index',
-                                      frag_index)
+            connection.putheader('X-Backend-Ssync-Frag-Index', frag_index)
             # a revert job to a handoff will not have a node index
-            self.connection.putheader('X-Backend-Ssync-Node-Index',
-                                      self.node.get('index', ''))
-            self.connection.endheaders()
+            connection.putheader('X-Backend-Ssync-Node-Index',
+                                 self.node.get('index', ''))
+            connection.endheaders()
         with exceptions.MessageTimeout(
                 self.daemon.node_timeout, 'connect receive'):
-            self.response = self.connection.getresponse()
-            if self.response.status != http.HTTP_OK:
-                err_msg = self.response.read()[:1024]
+            response = connection.getresponse()
+            if response.status != http.HTTP_OK:
+                err_msg = response.read()[:1024]
                 raise exceptions.ReplicationException(
                     'Expected status %s; got %s (%s)' %
-                    (http.HTTP_OK, self.response.status, err_msg))
+                    (http.HTTP_OK, response.status, err_msg))
+        return connection, response
 
-    def readline(self):
-        """
-        Reads a line from the SSYNC response body.
-
-        httplib has no readline and will block on read(x) until x is
-        read, so we have to do the work ourselves. A bit of this is
-        taken from Python's httplib itself.
-        """
-        data = self.response_buffer
-        self.response_buffer = ''
-        while '\n' not in data and len(data) < self.daemon.network_chunk_size:
-            if self.response_chunk_left == -1:  # EOF-already indicator
-                break
-            if self.response_chunk_left == 0:
-                line = self.response.fp.readline()
-                i = line.find(';')
-                if i >= 0:
-                    line = line[:i]  # strip chunk-extensions
-                try:
-                    self.response_chunk_left = int(line.strip(), 16)
-                except ValueError:
-                    # close the connection as protocol synchronisation is
-                    # probably lost
-                    self.response.close()
-                    raise exceptions.ReplicationException('Early disconnect')
-                if self.response_chunk_left == 0:
-                    self.response_chunk_left = -1
-                    break
-            chunk = self.response.fp.read(min(
-                self.response_chunk_left,
-                self.daemon.network_chunk_size - len(data)))
-            if not chunk:
-                # close the connection as protocol synchronisation is
-                # probably lost
-                self.response.close()
-                raise exceptions.ReplicationException('Early disconnect')
-            self.response_chunk_left -= len(chunk)
-            if self.response_chunk_left == 0:
-                self.response.fp.read(2)  # discard the trailing \r\n
-            data += chunk
-        if '\n' in data:
-            data, self.response_buffer = data.split('\n', 1)
-            data += '\n'
-        return data
-
-    def missing_check(self):
+    def missing_check(self, connection, response):
         """
         Handles the sender-side of the MISSING_CHECK step of a
         SSYNC request.
@@ -260,11 +265,13 @@ class Sender(object):
         Full documentation of this can be found at
         :py:meth:`.Receiver.missing_check`.
         """
+        available_map = {}
+        send_map = {}
         # First, send our list.
         with exceptions.MessageTimeout(
                 self.daemon.node_timeout, 'missing_check start'):
             msg = ':MISSING_CHECK: START\r\n'
-            self.connection.send('%x\r\n%s\r\n' % (len(msg), msg))
+            connection.send('%x\r\n%s\r\n' % (len(msg), msg))
         hash_gen = self.df_mgr.yield_hashes(
             self.job['device'], self.job['partition'],
             self.job['policy'], self.suffixes,
@@ -275,21 +282,21 @@ class Sender(object):
                 objhash_timestamps[0] in
                 self.remote_check_objs, hash_gen)
         for object_hash, timestamps in hash_gen:
-            self.available_map[object_hash] = timestamps
+            available_map[object_hash] = timestamps
             with exceptions.MessageTimeout(
                     self.daemon.node_timeout,
                     'missing_check send line'):
                 msg = '%s\r\n' % encode_missing(object_hash, **timestamps)
-                self.connection.send('%x\r\n%s\r\n' % (len(msg), msg))
+                connection.send('%x\r\n%s\r\n' % (len(msg), msg))
         with exceptions.MessageTimeout(
                 self.daemon.node_timeout, 'missing_check end'):
             msg = ':MISSING_CHECK: END\r\n'
-            self.connection.send('%x\r\n%s\r\n' % (len(msg), msg))
+            connection.send('%x\r\n%s\r\n' % (len(msg), msg))
         # Now, retrieve the list of what they want.
         while True:
             with exceptions.MessageTimeout(
                     self.daemon.http_timeout, 'missing_check start wait'):
-                line = self.readline()
+                line = response.readline(size=self.daemon.network_chunk_size)
             if not line:
                 raise exceptions.ReplicationException('Early disconnect')
             line = line.strip()
@@ -301,7 +308,7 @@ class Sender(object):
         while True:
             with exceptions.MessageTimeout(
                     self.daemon.http_timeout, 'missing_check line wait'):
-                line = self.readline()
+                line = response.readline(size=self.daemon.network_chunk_size)
             if not line:
                 raise exceptions.ReplicationException('Early disconnect')
             line = line.strip()
@@ -309,9 +316,10 @@ class Sender(object):
                 break
             parts = line.split()
             if parts:
-                self.send_map[parts[0]] = decode_wanted(parts[1:])
+                send_map[parts[0]] = decode_wanted(parts[1:])
+        return available_map, send_map
 
-    def updates(self):
+    def updates(self, connection, response, send_map):
         """
         Handles the sender-side of the UPDATES step of an SSYNC
         request.
@@ -323,8 +331,8 @@ class Sender(object):
         with exceptions.MessageTimeout(
                 self.daemon.node_timeout, 'updates start'):
             msg = ':UPDATES: START\r\n'
-            self.connection.send('%x\r\n%s\r\n' % (len(msg), msg))
-        for object_hash, want in self.send_map.items():
+            connection.send('%x\r\n%s\r\n' % (len(msg), msg))
+        for object_hash, want in send_map.items():
             object_hash = urllib.parse.unquote(object_hash)
             try:
                 df = self.df_mgr.get_diskfile_from_hash(
@@ -344,12 +352,12 @@ class Sender(object):
                     df_alt = self.job.get(
                         'sync_diskfile_builder', lambda *args: df)(
                             self.job, self.node, df.get_datafile_metadata())
-                    self.send_put(url_path, df_alt)
+                    self.send_put(connection, url_path, df_alt)
                 if want.get('meta') and df.data_timestamp != df.timestamp:
-                    self.send_post(url_path, df)
+                    self.send_post(connection, url_path, df)
             except exceptions.DiskFileDeleted as err:
                 if want.get('data'):
-                    self.send_delete(url_path, err.timestamp)
+                    self.send_delete(connection, url_path, err.timestamp)
             except exceptions.DiskFileError:
                 # DiskFileErrors are expected while opening the diskfile,
                 # before any data is read and sent. Since there is no partial
@@ -360,12 +368,12 @@ class Sender(object):
         with exceptions.MessageTimeout(
                 self.daemon.node_timeout, 'updates end'):
             msg = ':UPDATES: END\r\n'
-            self.connection.send('%x\r\n%s\r\n' % (len(msg), msg))
+            connection.send('%x\r\n%s\r\n' % (len(msg), msg))
         # Now, read their response for any issues.
         while True:
             with exceptions.MessageTimeout(
                     self.daemon.http_timeout, 'updates start wait'):
-                line = self.readline()
+                line = response.readline(size=self.daemon.network_chunk_size)
             if not line:
                 raise exceptions.ReplicationException('Early disconnect')
             line = line.strip()
@@ -377,7 +385,7 @@ class Sender(object):
         while True:
             with exceptions.MessageTimeout(
                     self.daemon.http_timeout, 'updates line wait'):
-                line = self.readline()
+                line = response.readline(size=self.daemon.network_chunk_size)
             if not line:
                 raise exceptions.ReplicationException('Early disconnect')
             line = line.strip()
@@ -387,69 +395,69 @@ class Sender(object):
                 raise exceptions.ReplicationException(
                     'Unexpected response: %r' % line[:1024])
 
-    def send_delete(self, url_path, timestamp):
+    def send_subrequest(self, connection, method, url_path, headers, df):
+        msg = ['%s %s' % (method, url_path)]
+        for key, value in sorted(headers.items()):
+            msg.append('%s: %s' % (key, value))
+        msg = '\r\n'.join(msg) + '\r\n\r\n'
+        with exceptions.MessageTimeout(self.daemon.node_timeout,
+                                       'send_%s' % method.lower()):
+            connection.send('%x\r\n%s\r\n' % (len(msg), msg))
+
+        if df:
+            bytes_read = 0
+            for chunk in df.reader():
+                bytes_read += len(chunk)
+                with exceptions.MessageTimeout(self.daemon.node_timeout,
+                                               'send_%s chunk' %
+                                               method.lower()):
+                    connection.send('%x\r\n%s\r\n' % (len(chunk), chunk))
+            if bytes_read != df.content_length:
+                # Since we may now have partial state on the receiver we have
+                # to prevent the receiver finalising what may well be a bad or
+                # partially written diskfile. Unfortunately we have no other
+                # option than to pull the plug on this ssync session. If ssync
+                # supported multiphase PUTs like the proxy uses for EC we could
+                # send a bad etag in a footer of this subrequest, but that is
+                # not supported.
+                raise exceptions.ReplicationException(
+                    'Sent data length does not match content-length')
+
+    def send_delete(self, connection, url_path, timestamp):
         """
         Sends a DELETE subrequest with the given information.
         """
-        msg = ['DELETE ' + url_path, 'X-Timestamp: ' + timestamp.internal]
-        msg = '\r\n'.join(msg) + '\r\n\r\n'
-        with exceptions.MessageTimeout(
-                self.daemon.node_timeout, 'send_delete'):
-            self.connection.send('%x\r\n%s\r\n' % (len(msg), msg))
+        headers = {'X-Timestamp': timestamp.internal}
+        self.send_subrequest(connection, 'DELETE', url_path, headers, None)
 
-    def send_put(self, url_path, df):
+    def send_put(self, connection, url_path, df):
         """
         Sends a PUT subrequest for the url_path using the source df
         (DiskFile) and content_length.
         """
-        msg = ['PUT ' + url_path, 'Content-Length: ' + str(df.content_length)]
-        # Sorted to make it easier to test.
-        for key, value in sorted(df.get_datafile_metadata().items()):
+        headers = {'Content-Length': str(df.content_length)}
+        for key, value in df.get_datafile_metadata().items():
             if key not in ('name', 'Content-Length'):
-                msg.append('%s: %s' % (key, value))
-        msg = '\r\n'.join(msg) + '\r\n\r\n'
-        with exceptions.MessageTimeout(self.daemon.node_timeout, 'send_put'):
-            self.connection.send('%x\r\n%s\r\n' % (len(msg), msg))
-        bytes_read = 0
-        for chunk in df.reader():
-            bytes_read += len(chunk)
-            with exceptions.MessageTimeout(
-                    self.daemon.node_timeout, 'send_put chunk'):
-                self.connection.send('%x\r\n%s\r\n' % (len(chunk), chunk))
-        if bytes_read != df.content_length:
-            # Since we may now have partial state on the receiver we have to
-            # prevent the receiver finalising what may well be a bad or
-            # partially written diskfile. Unfortunately we have no other option
-            # than to pull the plug on this ssync session. If ssync supported
-            # multiphase PUTs like the proxy uses for EC we could send a bad
-            # etag in a footer of this subrequest, but that is not supported.
-            raise exceptions.ReplicationException(
-                'Sent data length does not match content-length')
+                headers[key] = value
+        self.send_subrequest(connection, 'PUT', url_path, headers, df)
 
-    def send_post(self, url_path, df):
+    def send_post(self, connection, url_path, df):
         metadata = df.get_metafile_metadata()
         if metadata is None:
             return
+        self.send_subrequest(connection, 'POST', url_path, metadata, None)
 
-        msg = ['POST ' + url_path]
-        # Sorted to make it easier to test.
-        for key, value in sorted(metadata.items()):
-            msg.append('%s: %s' % (key, value))
-        msg = '\r\n'.join(msg) + '\r\n\r\n'
-        with exceptions.MessageTimeout(self.daemon.node_timeout, 'send_post'):
-            self.connection.send('%x\r\n%s\r\n' % (len(msg), msg))
-
-    def disconnect(self):
+    def disconnect(self, connection):
         """
         Closes down the connection to the object server once done
         with the SSYNC request.
         """
-        if not self.connection:
+        if not connection:
             return
         try:
             with exceptions.MessageTimeout(
                     self.daemon.node_timeout, 'disconnect'):
-                self.connection.send('0\r\n\r\n')
+                connection.send('0\r\n\r\n')
         except (Exception, exceptions.Timeout):
             pass  # We're okay with the above failing.
-        self.connection.close()
+        connection.close()

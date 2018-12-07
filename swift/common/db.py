@@ -16,6 +16,7 @@
 """ Database code for Swift """
 
 from contextlib import contextmanager, closing
+import base64
 import hashlib
 import json
 import logging
@@ -692,10 +693,10 @@ class DatabaseBroker(object):
                 with open(self.pending_file, 'a+b') as fp:
                     # Colons aren't used in base64 encoding; so they are our
                     # delimiter
-                    fp.write(':')
-                    fp.write(pickle.dumps(
+                    fp.write(b':')
+                    fp.write(base64.b64encode(pickle.dumps(
                         self.make_tuple_for_pickle(record),
-                        protocol=PICKLE_PROTOCOL).encode('base64'))
+                        protocol=PICKLE_PROTOCOL)))
                     fp.flush()
 
     def _skip_commit_puts(self):
@@ -726,10 +727,11 @@ class DatabaseBroker(object):
                 self.merge_items(item_list)
             return
         with open(self.pending_file, 'r+b') as fp:
-            for entry in fp.read().split(':'):
+            for entry in fp.read().split(b':'):
                 if entry:
                     try:
-                        self._commit_puts_load(item_list, entry)
+                        data = pickle.loads(base64.b64decode(entry))
+                        self._commit_puts_load(item_list, data)
                     except Exception:
                         self.logger.exception(
                             _('Invalid pending entry %(file)s: %(entry)s'),
@@ -759,7 +761,7 @@ class DatabaseBroker(object):
 
     def _commit_puts_load(self, item_list, entry):
         """
-        Unmarshall the :param:entry and append it to :param:item_list.
+        Unmarshall the :param:entry tuple and append it to :param:item_list.
         This is implemented by a particular broker to be compatible
         with its :func:`merge_items`.
         """
@@ -873,19 +875,24 @@ class DatabaseBroker(object):
         meta_count = 0
         meta_size = 0
         for key, (value, timestamp) in metadata.items():
+            if key and not isinstance(key, six.text_type):
+                if not check_utf8(key):
+                    raise HTTPBadRequest('Metadata must be valid UTF-8')
+                # Promote to a natural string for the checks below
+                if six.PY3:
+                    key = key.decode('utf8')
+            if value and not isinstance(value, six.text_type):
+                if not check_utf8(value):
+                    raise HTTPBadRequest('Metadata must be valid UTF-8')
             key = key.lower()
-            if value != '' and (key.startswith('x-account-meta') or
-                                key.startswith('x-container-meta')):
+            if value and key.startswith(('x-account-meta-',
+                                         'x-container-meta-')):
                 prefix = 'x-account-meta-'
                 if key.startswith('x-container-meta-'):
                     prefix = 'x-container-meta-'
                 key = key[len(prefix):]
                 meta_count = meta_count + 1
                 meta_size = meta_size + len(key) + len(value)
-            bad_key = key and not check_utf8(key)
-            bad_value = value and not check_utf8(value)
-            if bad_key or bad_value:
-                raise HTTPBadRequest('Metadata must be valid UTF-8')
         if meta_count > MAX_META_COUNT:
             raise HTTPBadRequest('Too many metadata items; max %d'
                                  % MAX_META_COUNT)
@@ -990,6 +997,7 @@ class DatabaseBroker(object):
                           timestamp will be removed.
         :returns: True if conn.commit() should be called
         """
+        timestamp = Timestamp(timestamp)
         try:
             row = conn.execute('SELECT metadata FROM %s_stat' %
                                self.db_type).fetchone()
@@ -1001,7 +1009,7 @@ class DatabaseBroker(object):
                 md = json.loads(md)
                 keys_to_delete = []
                 for key, (value, value_timestamp) in md.items():
-                    if value == '' and value_timestamp < timestamp:
+                    if value == '' and Timestamp(value_timestamp) < timestamp:
                         keys_to_delete.append(key)
                 if keys_to_delete:
                     for key in keys_to_delete:

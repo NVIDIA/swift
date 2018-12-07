@@ -32,9 +32,9 @@ from swift import gettext_ as _
 from swift.common.utils import (
     whataremyips, unlink_older_than, compute_eta, get_logger,
     dump_recon_cache, mkdirs, config_true_value,
-    tpool_reraise, GreenAsyncPile, Timestamp, remove_file,
+    GreenAsyncPile, Timestamp, remove_file,
     load_recon_cache, parse_override_options, distribute_evenly,
-    PrefixLoggerAdapter)
+    PrefixLoggerAdapter, remove_directory)
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.bufferedhttp import http_connect
 from swift.common.daemon import Daemon
@@ -165,6 +165,12 @@ class ObjectReconstructor(Daemon):
         self.partition_times = []
         self.interval = int(conf.get('interval') or
                             conf.get('run_pause') or 30)
+        if 'run_pause' in conf and 'interval' not in conf:
+            self.logger.warning('Option object-reconstructor/run_pause '
+                                'is deprecated and will be removed in a '
+                                'future version. Update your configuration'
+                                ' to use option object-reconstructor/'
+                                'interval.')
         self.http_timeout = int(conf.get('http_timeout', 60))
         self.lockup_timeout = int(conf.get('lockup_timeout', 1800))
         self.recon_cache_path = conf.get('recon_cache_path',
@@ -616,7 +622,7 @@ class ObjectReconstructor(Daemon):
     def _get_hashes(self, device, partition, policy, recalculate=None,
                     do_listdir=False):
         df_mgr = self._df_router[policy]
-        hashed, suffix_hashes = tpool_reraise(
+        hashed, suffix_hashes = tpool.execute(
             df_mgr._get_hashes, device, partition, policy,
             recalculate=recalculate, do_listdir=do_listdir)
         self.logger.update_stats('suffix.hashes', hashed)
@@ -647,13 +653,15 @@ class ObjectReconstructor(Daemon):
         return suffixes
 
     def rehash_remote(self, node, job, suffixes):
+        headers = self.headers.copy()
+        headers['X-Backend-Storage-Policy-Index'] = int(job['policy'])
         try:
             with Timeout(self.http_timeout):
                 conn = http_connect(
                     node['replication_ip'], node['replication_port'],
                     node['device'], job['partition'], 'REPLICATE',
                     '/' + '-'.join(sorted(suffixes)),
-                    headers=self.headers)
+                    headers=headers)
                 conn.getresponse().read()
         except (Exception, Timeout):
             self.logger.exception(
@@ -674,12 +682,14 @@ class ObjectReconstructor(Daemon):
         """
         # get hashes from the remote node
         remote_suffixes = None
+        headers = self.headers.copy()
+        headers['X-Backend-Storage-Policy-Index'] = int(job['policy'])
         try:
             with Timeout(self.http_timeout):
                 resp = http_connect(
                     node['replication_ip'], node['replication_port'],
                     node['device'], job['partition'], 'REPLICATE',
-                    '', headers=self.headers).getresponse()
+                    '', headers=headers).getresponse()
             if resp.status == HTTP_INSUFFICIENT_STORAGE:
                 self.logger.error(
                     _('%s responded as unmounted'),
@@ -735,6 +745,7 @@ class ObjectReconstructor(Daemon):
         :param frag_index: (int) the fragment index of data files to be deleted
         """
         df_mgr = self._df_router[job['policy']]
+        suffixes_to_delete = set()
         for object_hash, timestamps in objects.items():
             try:
                 df = df_mgr.get_diskfile_from_hash(
@@ -746,6 +757,10 @@ class ObjectReconstructor(Daemon):
                 self.logger.exception(
                     'Unable to purge DiskFile (%r %r %r)',
                     object_hash, timestamps['ts_data'], frag_index)
+            suffixes_to_delete.add(object_hash[-3:])
+
+        for suffix in suffixes_to_delete:
+            remove_directory(os.path.join(job['path'], suffix))
 
     def process_job(self, job):
         """
@@ -768,7 +783,6 @@ class ObjectReconstructor(Daemon):
 
         :param: the job dict, with the keys defined in ``_get_job_info``
         """
-        self.headers['X-Backend-Storage-Policy-Index'] = int(job['policy'])
         begin = time.time()
         if job['job_type'] == REVERT:
             self._revert(job, begin)
@@ -1010,9 +1024,10 @@ class ObjectReconstructor(Daemon):
     def get_local_devices(self):
         """Returns a set of all local devices in all EC policies."""
         policy2devices = self.get_policy2devices()
-        return reduce(set.union, (
-            set(d['device'] for d in devices)
-            for devices in policy2devices.values()), set())
+        local_devices = set()
+        for devices in policy2devices.values():
+            local_devices.update(d['device'] for d in devices)
+        return local_devices
 
     def collect_parts(self, override_devices=None, override_partitions=None):
         """
@@ -1180,7 +1195,7 @@ class ObjectReconstructor(Daemon):
             with Timeout(self.lockup_timeout):
                 self.run_pool.waitall()
         except (Exception, Timeout):
-            self.logger.exception(_("Exception in top-level"
+            self.logger.exception(_("Exception in top-level "
                                     "reconstruction loop"))
             self.kill_coros()
         finally:
@@ -1224,6 +1239,10 @@ class ObjectReconstructor(Daemon):
             # if not running in worker mode, kill any per_disk stats
             recon_update['object_reconstruction_per_disk'] = {}
         dump_recon_cache(recon_update, self.rcache, self.logger)
+
+    def post_multiprocess_run(self):
+        # This method is called after run_once when using multiple workers.
+        self.aggregate_recon_update()
 
     def run_once(self, multiprocess_worker_index=None, *args, **kwargs):
         if multiprocess_worker_index is not None:

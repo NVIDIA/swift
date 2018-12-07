@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import random
+import sys
 import socket
 import time
 
@@ -123,21 +124,46 @@ class Connection(object):
         self.password = config['password']
 
         self.storage_netloc = None
-        self.storage_url = None
-
+        self.storage_path = None
         self.conn_class = None
+
+    @property
+    def storage_url(self):
+        return '%s://%s/%s' % (self.storage_scheme, self.storage_netloc,
+                               self.storage_path)
+
+    @storage_url.setter
+    def storage_url(self, value):
+        url = urllib.parse.urlparse(value)
+
+        if url.scheme == 'http':
+            self.conn_class = http_client.HTTPConnection
+        elif url.scheme == 'https':
+            self.conn_class = http_client.HTTPSConnection
+        else:
+            raise ValueError('unexpected protocol %s' % (url.scheme))
+
+        self.storage_netloc = url.netloc
+        # Make sure storage_path is a string and not unicode, since
+        # keystoneclient (called by swiftclient) returns them in
+        # unicode and this would cause troubles when doing
+        # no_safe_quote query.
+        x = url.path.split('/')
+        self.storage_path = str('/%s/%s' % (x[1], x[2]))
+        self.account_name = str(x[2])
+
+    @property
+    def storage_scheme(self):
+        if self.conn_class is None:
+            return None
+        if issubclass(self.conn_class, http_client.HTTPSConnection):
+            return 'https'
+        return 'http'
 
     def get_account(self):
         return Account(self, self.account)
 
-    def authenticate(self, clone_conn=None):
-        if clone_conn:
-            self.conn_class = clone_conn.conn_class
-            self.storage_netloc = clone_conn.storage_netloc
-            self.storage_url = clone_conn.storage_url
-            self.storage_token = clone_conn.storage_token
-            return
-
+    def authenticate(self):
         if self.auth_version == "1":
             auth_path = '%sv1.0' % (self.auth_prefix)
             if self.account:
@@ -151,6 +177,16 @@ class Connection(object):
         auth_netloc = "%s:%d" % (self.auth_host, self.auth_port)
         auth_url = auth_scheme + auth_netloc + auth_path
 
+        if self.insecure:
+            try:
+                import requests
+                from requests.packages.urllib3.exceptions import \
+                    InsecureRequestWarning
+            except ImportError:
+                pass
+            else:
+                requests.packages.urllib3.disable_warnings(
+                    InsecureRequestWarning)
         authargs = dict(snet=False, tenant_name=self.account,
                         auth_version=self.auth_version, os_options={},
                         insecure=self.insecure)
@@ -160,23 +196,7 @@ class Connection(object):
         if not (storage_url and storage_token):
             raise AuthenticationFailed()
 
-        url = urllib.parse.urlparse(storage_url)
-
-        if url.scheme == 'http':
-            self.conn_class = http_client.HTTPConnection
-        elif url.scheme == 'https':
-            self.conn_class = http_client.HTTPSConnection
-        else:
-            raise ValueError('unexpected protocol %s' % (url.scheme))
-
-        self.storage_netloc = url.netloc
-        # Make sure storage_url is a string and not unicode, since
-        # keystoneclient (called by swiftclient) returns them in
-        # unicode and this would cause troubles when doing
-        # no_safe_quote query.
-        x = url.path.split('/')
-        self.storage_url = str('/%s/%s' % (x[1], x[2]))
-        self.account_name = str(x[2])
+        self.storage_url = storage_url
         self.auth_user = auth_user
         # With v2 keystone, storage_token is unicode.
         # We want it to be string otherwise this would cause
@@ -186,7 +206,7 @@ class Connection(object):
         self.user_acl = '%s:%s' % (self.account, self.username)
 
         self.http_connect()
-        return self.storage_url, self.storage_token
+        return self.storage_path, self.storage_token
 
     def cluster_info(self):
         """
@@ -201,7 +221,14 @@ class Connection(object):
         return json.loads(self.response.read())
 
     def http_connect(self):
-        self.connection = self.conn_class(self.storage_netloc)
+        if self.storage_scheme == 'https' and \
+                self.insecure and sys.version_info >= (2, 7, 9):
+            import ssl
+            self.connection = self.conn_class(
+                self.storage_netloc,
+                context=ssl._create_unverified_context())
+        else:
+            self.connection = self.conn_class(self.storage_netloc)
 
     def make_path(self, path=None, cfg=None):
         if path is None:
@@ -210,16 +237,16 @@ class Connection(object):
             cfg = {}
 
         if cfg.get('version_only_path'):
-            return '/' + self.storage_url.split('/')[1]
+            return '/' + self.storage_path.split('/')[1]
 
         if path:
             quote = urllib.parse.quote
             if cfg.get('no_quote') or cfg.get('no_path_quote'):
                 quote = lambda x: x
-            return '%s/%s' % (self.storage_url,
+            return '%s/%s' % (self.storage_path,
                               '/'.join([quote(i) for i in path]))
         else:
-            return self.storage_url
+            return self.storage_path
 
     def make_headers(self, hdrs, cfg=None):
         if cfg is None:
@@ -328,7 +355,6 @@ class Connection(object):
                           for (x, y) in parms.items()]
             path = '%s?%s' % (path, '&'.join(query_args))
 
-        self.connection = self.conn_class(self.storage_netloc)
         self.connection.putrequest('PUT', path)
         for key, value in headers.items():
             self.connection.putheader(key, value)
@@ -466,7 +492,8 @@ class Account(Base):
     def delete_containers(self):
         for c in listing_items(self.containers):
             cont = self.container(c)
-            cont.update_metadata(hdrs={'x-versions-location': ''})
+            cont.update_metadata(hdrs={'x-versions-location': ''},
+                                 tolerate_missing=True)
             if not cont.delete_recursive():
                 return False
 
@@ -520,17 +547,19 @@ class Container(Base):
         return self.conn.make_request('PUT', self.path, hdrs=hdrs,
                                       parms=parms, cfg=cfg) in (201, 202)
 
-    def update_metadata(self, hdrs=None, cfg=None):
+    def update_metadata(self, hdrs=None, cfg=None, tolerate_missing=False):
         if hdrs is None:
             hdrs = {}
         if cfg is None:
             cfg = {}
 
         self.conn.make_request('POST', self.path, hdrs=hdrs, cfg=cfg)
-        if not 200 <= self.conn.response.status <= 299:
-            raise ResponseError(self.conn.response, 'POST',
-                                self.conn.make_path(self.path))
-        return True
+        if 200 <= self.conn.response.status <= 299:
+            return True
+        if tolerate_missing and self.conn.response.status == 404:
+            return True
+        raise ResponseError(self.conn.response, 'POST',
+                            self.conn.make_path(self.path))
 
     def delete(self, hdrs=None, parms=None):
         if hdrs is None:
@@ -806,7 +835,7 @@ class File(Base):
 
         header_fields = self.header_fields(fields,
                                            optional_fields=optional_fields)
-        header_fields['etag'] = header_fields['etag'].strip('"')
+        header_fields['etag'] = header_fields['etag']
         return header_fields
 
     def initialize(self, hdrs=None, parms=None):
@@ -831,7 +860,7 @@ class File(Base):
             if hdr[0].lower().startswith('x-object-meta-'):
                 self.metadata[hdr[0][14:]] = hdr[1]
             if hdr[0].lower() == 'etag':
-                self.etag = hdr[1].strip('"')
+                self.etag = hdr[1]
             if hdr[0].lower() == 'content-length':
                 self.size = int(hdr[1])
             if hdr[0].lower() == 'last-modified':
@@ -939,7 +968,7 @@ class File(Base):
             self.conn.make_request('POST', self.path, hdrs=headers,
                                    parms=parms, cfg=cfg)
 
-            if self.conn.response.status not in (201, 202):
+            if self.conn.response.status != 202:
                 raise ResponseError(self.conn.response, 'POST',
                                     self.conn.make_path(self.path))
 
@@ -1076,7 +1105,7 @@ class File(Base):
         self.conn.make_request('POST', self.path, hdrs=headers,
                                parms=parms, cfg=cfg)
 
-        if self.conn.response.status not in (201, 202):
+        if self.conn.response.status != 202:
             raise ResponseError(self.conn.response, 'POST',
                                 self.conn.make_path(self.path))
 

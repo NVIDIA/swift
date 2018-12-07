@@ -491,6 +491,8 @@ class TestObjectVersioning(Base):
         self.assertEqual("old content", man_file.read())
 
     def test_versioning_container_acl(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
         # create versions container and DO NOT give write access to account2
         versions_container = self.env.account.container(Utils.create_name())
         location_header_val = quote(str(versions_container))
@@ -629,6 +631,8 @@ class TestObjectVersioning(Base):
         return versioned_obj
 
     def test_versioning_check_acl(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
         versioned_obj = self._test_versioning_check_acl_setup()
         versioned_obj.delete()
         self.assertEqual("aaaaa", versioned_obj.read())
@@ -902,6 +906,8 @@ class TestObjectVersioningHistoryMode(TestObjectVersioning):
         self.assertEqual(expected, bodies)
 
     def test_versioning_check_acl(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
         versioned_obj = self._test_versioning_check_acl_setup()
         versioned_obj.delete()
         with self.assertRaises(ResponseError) as cm:

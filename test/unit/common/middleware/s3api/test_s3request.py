@@ -322,7 +322,7 @@ class TestRequest(S3ApiTestCase):
                 'swift.common.middleware.s3api.s3request.get_container_info',
                 return_value={'status': 204}) as mock_info:
             # Then all calls goes to get_container_info
-            for x in xrange(10):
+            for x in range(10):
                 info = s3_req.get_container_info(self.swift)
                 self.assertTrue('status' in info)  # sanity
                 self.assertEqual(204, info['status'])  # sanity
@@ -400,9 +400,11 @@ class TestRequest(S3ApiTestCase):
         headers = {
             'Authorization':
                 'AWS4-HMAC-SHA256 '
-                'Credential=test/20130524/US/s3/aws4_request, '
+                'Credential=test/%s/us-east-1/s3/aws4_request, '
                 'SignedHeaders=%s,'
-                'Signature=X' % ';'.join(sorted(['host', included_header])),
+                'Signature=X' % (
+                    self.get_v4_amz_date_header().split('T', 1)[0],
+                    ';'.join(sorted(['host', included_header]))),
             'X-Amz-Content-SHA256': '0123456789'}
 
         headers.update(date_header)
@@ -460,6 +462,12 @@ class TestRequest(S3ApiTestCase):
 
         self.assertEqual('403 Forbidden', cm.exception.message)
         self.assertIn(access_denied_message, cm.exception.body)
+
+        # near-future X-Amz-Date header
+        dt = self.get_v4_amz_date_header()
+        date_header = {'X-Amz-Date': '%d%s' % (int(dt[:4]) + 1, dt[4:])}
+        with self.assertRaises(RequestTimeTooSkewed) as cm:
+            self._test_request_timestamp_sigv4(date_header)
 
         # far-future Date header
         date_header = {'Date': 'Tue, 07 Jul 9999 21:53:04 GMT'}
@@ -550,9 +558,9 @@ class TestRequest(S3ApiTestCase):
         headers = {
             'Authorization':
                 'AWS4-HMAC-SHA256 '
-                'Credential=test/20130524/US/s3/aws4_request, '
+                'Credential=test/%s/us-east-1/s3/aws4_request, '
                 'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
-                'Signature=X',
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0],
             'X-Amz-Content-SHA256': '0123456789',
             'Date': self.get_date_header(),
             'X-Amz-Date': x_amz_date}
@@ -570,9 +578,9 @@ class TestRequest(S3ApiTestCase):
         headers = {
             'Authorization':
                 'AWS4-HMAC-SHA256 '
-                'Credential=test/20130524/US/s3/aws4_request, '
+                'Credential=test/%s/us-east-1/s3/aws4_request, '
                 'SignedHeaders=host;x-amz-content-sha256,'
-                'Signature=X',
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0],
             'X-Amz-Content-SHA256': '0123456789',
             'Date': self.get_date_header()}
 
@@ -589,9 +597,9 @@ class TestRequest(S3ApiTestCase):
         headers = {
             'Authorization':
                 'AWS4-HMAC-SHA256 '
-                'Credential=test/20130524/US/s3/aws4_request, '
+                'Credential=test/%s/us-east-1/s3/aws4_request, '
                 'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
-                'Signature=X',
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0],
             'X-Amz-Content-SHA256': '0123456789',
             'Date': self.get_date_header()}
 
@@ -653,9 +661,9 @@ class TestRequest(S3ApiTestCase):
         headers = {
             'Authorization':
                 'AWS4-HMAC-SHA256 '
-                'Credential=test/20130524/US/s3/aws4_request, '
+                'Credential=test/%s/us-east-1/s3/aws4_request, '
                 'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
-                'Signature=X',
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0],
             'X-Amz-Content-SHA256': '0123456789',
             'Date': self.get_date_header(),
             'X-Amz-Date': x_amz_date}
@@ -698,8 +706,8 @@ class TestRequest(S3ApiTestCase):
         self.assertEqual(uri, '/bucket/obj1')
         self.assertEqual(req.environ['PATH_INFO'], '/bucket/obj1')
 
-    @patch.object(S3Request, '_validate_headers', lambda *a: None)
-    def test_check_signature_sigv2(self):
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def _test_check_signature_sigv2(self, secret):
         # See https://web.archive.org/web/20151226025049/http://
         # docs.aws.amazon.com//AmazonS3/latest/dev/RESTAuthentication.html
         req = Request.blank('/photos/puppy.jpg', headers={
@@ -717,8 +725,7 @@ class TestRequest(S3ApiTestCase):
             '/johnsmith/photos/puppy.jpg',
         ])
         self.assertEqual(expected_sts, sigv2_req._string_to_sign())
-        self.assertTrue(sigv2_req.check_signature(
-            'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'))
+        self.assertTrue(sigv2_req.check_signature(secret))
 
         req = Request.blank('/photos/puppy.jpg', method='PUT', headers={
             'Content-Type': 'image/jpeg',
@@ -737,8 +744,7 @@ class TestRequest(S3ApiTestCase):
             '/johnsmith/photos/puppy.jpg',
         ])
         self.assertEqual(expected_sts, sigv2_req._string_to_sign())
-        self.assertTrue(sigv2_req.check_signature(
-            'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'))
+        self.assertTrue(sigv2_req.check_signature(secret))
 
         req = Request.blank(
             '/?prefix=photos&max-keys=50&marker=puppy',
@@ -758,8 +764,47 @@ class TestRequest(S3ApiTestCase):
             '/johnsmith/',
         ])
         self.assertEqual(expected_sts, sigv2_req._string_to_sign())
-        self.assertTrue(sigv2_req.check_signature(
-            'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'))
+        self.assertTrue(sigv2_req.check_signature(secret))
+
+    def test_check_signature_sigv2(self):
+        self._test_check_signature_sigv2(
+            'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')
+
+    def test_check_signature_sigv2_unicode_string(self):
+        self._test_check_signature_sigv2(
+            u'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_check_signature_multi_bytes_secret_failure(self):
+        # Test v2 check_signature with multi bytes invalid secret
+        req = Request.blank('/photos/puppy.jpg', headers={
+            'Host': 'johnsmith.s3.amazonaws.com',
+            'Date': 'Tue, 27 Mar 2007 19:36:42 +0000',
+            'Authorization': ('AWS AKIAIOSFODNN7EXAMPLE:'
+                              'bWq2s1WEIj+Ydj0vQ697zp+IXMU='),
+        })
+        sigv2_req = S3Request(req.environ, storage_domain='s3.amazonaws.com')
+        # This is a failure case with utf-8 non-ascii multi-bytes charactor
+        # but we expect to return just False instead of exceptions
+        self.assertFalse(sigv2_req.check_signature(
+            u'\u30c9\u30e9\u30b4\u30f3'))
+
+        # Test v4 check_signature with multi bytes invalid secret
+        amz_date_header = self.get_v4_amz_date_header()
+        req = Request.blank('/photos/puppy.jpg', headers={
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/%s/us-east-1/s3/aws4_request, '
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=X' % amz_date_header.split('T', 1)[0],
+            'X-Amz-Content-SHA256': '0123456789',
+            'X-Amz-Date': amz_date_header
+        })
+        sigv4_req = SigV4Request(
+            req.environ, storage_domain='s3.amazonaws.com')
+        self.assertFalse(sigv4_req.check_signature(
+            u'\u30c9\u30e9\u30b4\u30f3'))
+
 
 if __name__ == '__main__':
     unittest.main()

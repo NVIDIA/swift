@@ -114,7 +114,7 @@ greater than 5GB.
 
 """
 
-from six.moves.urllib.parse import quote
+from six.moves.urllib.parse import quote, unquote
 
 from swift.common.utils import get_logger, config_true_value, FileLikeIter, \
     close_if_possible
@@ -125,7 +125,7 @@ from swift.common.constraints import check_account_format, MAX_FILE_SIZE
 from swift.common.request_helpers import copy_header_subset, remove_items, \
     is_sys_meta, is_sys_or_user_meta, is_object_transient_sysmeta, \
     check_path_header
-from swift.common.wsgi import WSGIContext, make_subrequest, load_app_config
+from swift.common.wsgi import WSGIContext, make_subrequest
 
 
 def _check_copy_from_header(req):
@@ -183,7 +183,7 @@ class ServerSideCopyWebContext(WSGIContext):
 
     def get_source_resp(self, req):
         sub_req = make_subrequest(
-            req.environ, path=req.path_info, headers=req.headers,
+            req.environ, path=quote(req.path_info), headers=req.headers,
             swift_source='SSC')
         return sub_req.get_response(self.app)
 
@@ -221,24 +221,6 @@ class ServerSideCopyMiddleware(object):
     def __init__(self, app, conf):
         self.app = app
         self.logger = get_logger(conf, log_route="copy")
-        self._load_object_post_as_copy_conf(conf)
-        self.object_post_as_copy = \
-            config_true_value(conf.get('object_post_as_copy', 'false'))
-        if self.object_post_as_copy:
-            msg = ('object_post_as_copy=true is deprecated; This '
-                   'option is now ignored')
-            self.logger.warning(msg)
-
-    def _load_object_post_as_copy_conf(self, conf):
-        if ('object_post_as_copy' in conf or '__file__' not in conf):
-            # Option is explicitly set in middleware conf. In that case,
-            # we assume operator knows what he's doing.
-            # This takes preference over the one set in proxy app
-            return
-
-        proxy_conf = load_app_config(conf['__file__'])
-        if 'object_post_as_copy' in proxy_conf:
-            conf['object_post_as_copy'] = proxy_conf['object_post_as_copy']
 
     def __call__(self, env, start_response):
         req = Request(env)
@@ -248,10 +230,6 @@ class ServerSideCopyMiddleware(object):
             # If obj component is not present in req, do not proceed further.
             return self.app(env, start_response)
 
-        self.account_name = account
-        self.container_name = container
-        self.object_name = obj
-
         try:
             # In some cases, save off original request method since it gets
             # mutated into PUT during handling. This way logging can display
@@ -260,7 +238,8 @@ class ServerSideCopyMiddleware(object):
                 return self.handle_PUT(req, start_response)
             elif req.method == 'COPY':
                 req.environ['swift.orig_req_method'] = req.method
-                return self.handle_COPY(req, start_response)
+                return self.handle_COPY(req, start_response,
+                                        account, container, obj)
             elif req.method == 'OPTIONS':
                 # Does not interfere with OPTIONS response from
                 # (account,container) servers and /info response.
@@ -271,30 +250,30 @@ class ServerSideCopyMiddleware(object):
 
         return self.app(env, start_response)
 
-    def handle_COPY(self, req, start_response):
+    def handle_COPY(self, req, start_response, account, container, obj):
         if not req.headers.get('Destination'):
             return HTTPPreconditionFailed(request=req,
                                           body='Destination header required'
                                           )(req.environ, start_response)
-        dest_account = self.account_name
+        dest_account = account
         if 'Destination-Account' in req.headers:
-            dest_account = req.headers.get('Destination-Account')
+            dest_account = unquote(req.headers.get('Destination-Account'))
             dest_account = check_account_format(req, dest_account)
-            req.headers['X-Copy-From-Account'] = self.account_name
-            self.account_name = dest_account
+            req.headers['X-Copy-From-Account'] = quote(account)
+            account = dest_account
             del req.headers['Destination-Account']
         dest_container, dest_object = _check_destination_header(req)
-        source = '/%s/%s' % (self.container_name, self.object_name)
-        self.container_name = dest_container
-        self.object_name = dest_object
+        source = '/%s/%s' % (container, obj)
+        container = dest_container
+        obj = dest_object
         # re-write the existing request as a PUT instead of creating a new one
         req.method = 'PUT'
         # As this the path info is updated with destination container,
         # the proxy server app will use the right object controller
         # implementation corresponding to the container's policy type.
         ver, _junk = req.split_path(1, 2, rest_with_last=True)
-        req.path_info = '/%s/%s/%s/%s' % \
-                        (ver, dest_account, dest_container, dest_object)
+        req.path_info = '/%s/%s/%s/%s' % (
+            ver, dest_account, dest_container, dest_object)
         req.headers['Content-Length'] = 0
         req.headers['X-Copy-From'] = quote(source)
         del req.headers['Destination']
@@ -305,7 +284,7 @@ class ServerSideCopyMiddleware(object):
 
         # make sure the source request uses it's container_info
         source_req.headers.pop('X-Backend-Storage-Policy-Index', None)
-        source_req.path_info = quote(source_path)
+        source_req.path_info = source_path
         source_req.headers['X-Newest'] = 'true'
 
         # in case we are copying an SLO manifest, set format=raw parameter
@@ -354,7 +333,8 @@ class ServerSideCopyMiddleware(object):
         ver, acct, _rest = req.split_path(2, 3, True)
         src_account_name = req.headers.get('X-Copy-From-Account')
         if src_account_name:
-            src_account_name = check_account_format(req, src_account_name)
+            src_account_name = check_account_format(
+                req, unquote(src_account_name))
         else:
             src_account_name = acct
         src_container_name, src_obj_name = _check_copy_from_header(req)

@@ -324,6 +324,12 @@ Each policy section contains the following options:
       policy types.
     - The default value is ``replication``.
     - When defining an EC policy use the value ``erasure_coding``.
+* ``diskfile_module = <entry point>`` (optional)
+    - The option ``diskfile_module`` is used to load an alternate backend
+      object storage plug-in architecture.
+    - The default value is ``egg:swift#replication.fs`` or
+      ``egg:swift#erasure_coding.fs`` depending on the policy type. The scheme
+      and package name are optionals and default to ``egg`` and ``swift``.
 
 The EC policy type has additional required options. See
 :ref:`using_ec_policy` for details.
@@ -347,6 +353,7 @@ this example configuration.::
         [storage-policy:1]
         name = silver
         policy_type = replication
+        diskfile_module = replication.fs
         deprecated = yes
 
 
@@ -561,7 +568,7 @@ included implementation of :class:`.Diskfile` lays out the directory structure
 described earlier but that's owned within :class:`.Diskfile`; external modules
 have no visibility into that detail.  A common function is provided to map
 various directory names and/or strings based on their policy index. For example
-:class:`.Diskfile` defines :func:`.get_data_dir` which builds off of a generic
+:class:`.Diskfile` defines ``get_data_dir`` which builds off of a generic
 :func:`.get_policy_string` to consistently build policy aware strings for
 various usage.
 

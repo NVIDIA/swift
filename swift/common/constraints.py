@@ -24,7 +24,7 @@ from six.moves import urllib
 from swift.common import utils, exceptions
 from swift.common.swob import HTTPBadRequest, HTTPLengthRequired, \
     HTTPRequestEntityTooLarge, HTTPPreconditionFailed, HTTPNotImplemented, \
-    HTTPException
+    HTTPException, wsgi_to_str, wsgi_to_bytes
 
 MAX_FILE_SIZE = 5368709122
 MAX_META_NAME_LENGTH = 128
@@ -132,8 +132,8 @@ def check_metadata(req, target_type):
         if (isinstance(value, six.string_types)
            and len(value) > MAX_HEADER_SIZE):
 
-            return HTTPBadRequest(body='Header value too long: %s' %
-                                  key[:MAX_META_NAME_LENGTH],
+            return HTTPBadRequest(body=b'Header value too long: %s' %
+                                  wsgi_to_bytes(key[:MAX_META_NAME_LENGTH]),
                                   request=req, content_type='text/plain')
         if not key.lower().startswith(prefix):
             continue
@@ -141,8 +141,8 @@ def check_metadata(req, target_type):
         if not key:
             return HTTPBadRequest(body='Metadata name cannot be empty',
                                   request=req, content_type='text/plain')
-        bad_key = not check_utf8(key)
-        bad_value = value and not check_utf8(value)
+        bad_key = not check_utf8(wsgi_to_str(key))
+        bad_value = value and not check_utf8(wsgi_to_str(value))
         if target_type in ('account', 'container') and (bad_key or bad_value):
             return HTTPBadRequest(body='Metadata must be valid UTF-8',
                                   request=req, content_type='text/plain')
@@ -150,12 +150,13 @@ def check_metadata(req, target_type):
         meta_size += len(key) + len(value)
         if len(key) > MAX_META_NAME_LENGTH:
             return HTTPBadRequest(
-                body='Metadata name too long: %s%s' % (prefix, key),
+                body=wsgi_to_bytes('Metadata name too long: %s%s' % (
+                    prefix, key)),
                 request=req, content_type='text/plain')
         if len(value) > MAX_META_VALUE_LENGTH:
             return HTTPBadRequest(
-                body='Metadata value longer than %d: %s%s' % (
-                    MAX_META_VALUE_LENGTH, prefix, key),
+                body=wsgi_to_bytes('Metadata value longer than %d: %s%s' % (
+                    MAX_META_VALUE_LENGTH, prefix, key)),
                 request=req, content_type='text/plain')
         if meta_count > MAX_META_COUNT:
             return HTTPBadRequest(
@@ -207,7 +208,7 @@ def check_object_creation(req, object_name):
 
     if 'Content-Type' not in req.headers:
         return HTTPBadRequest(request=req, content_type='text/plain',
-                              body='No content type')
+                              body=b'No content type')
 
     try:
         req = check_delete_headers(req)
@@ -215,7 +216,7 @@ def check_object_creation(req, object_name):
         return HTTPBadRequest(request=req, body=e.body,
                               content_type='text/plain')
 
-    if not check_utf8(req.headers['Content-Type']):
+    if not check_utf8(wsgi_to_str(req.headers['Content-Type'])):
         return HTTPBadRequest(request=req, body='Invalid Content-Type',
                               content_type='text/plain')
     return check_metadata(req, 'object')
@@ -229,7 +230,8 @@ def check_dir(root, drive):
 
     :param root:  base path where the dir is
     :param drive: drive name to be checked
-    :returns: full path to the device, or None if drive fails to validate
+    :returns: full path to the device
+    :raises ValueError: if drive fails to validate
     """
     return check_drive(root, drive, False)
 
@@ -243,7 +245,8 @@ def check_mount(root, drive):
 
     :param root:  base path where the devices are mounted
     :param drive: drive name to be checked
-    :returns: full path to the device, or None if drive fails to validate
+    :returns: full path to the device
+    :raises ValueError: if drive fails to validate
     """
     return check_drive(root, drive, True)
 
@@ -256,18 +259,19 @@ def check_drive(root, drive, mount_check):
     :param drive: drive name to be checked
     :param mount_check: additionally require path is mounted
 
-    :returns: full path to the device, or None if drive fails to validate
+    :returns: full path to the device
+    :raises ValueError: if drive fails to validate
     """
     if not (urllib.parse.quote_plus(drive) == drive):
-        return None
+        raise ValueError('%s is not a valid drive name' % drive)
     path = os.path.join(root, drive)
     if mount_check:
-        if utils.ismount(path):
-            return path
+        if not utils.ismount(path):
+            raise ValueError('%s is not mounted' % path)
     else:
-        if isdir(path):
-            return path
-    return None
+        if not isdir(path):
+            raise ValueError('%s is not a directory' % path)
+    return path
 
 
 def check_float(string):
@@ -359,16 +363,30 @@ def check_utf8(string):
         return False
     try:
         if isinstance(string, six.text_type):
-            string.encode('utf-8')
+            encoded = string.encode('utf-8')
+            decoded = string
         else:
+            encoded = string
             decoded = string.decode('UTF-8')
-            if decoded.encode('UTF-8') != string:
+            if decoded.encode('UTF-8') != encoded:
                 return False
-            # A UTF-8 string with surrogates in it is invalid.
-            if any(0xD800 <= ord(codepoint) <= 0xDFFF
-                   for codepoint in decoded):
-                return False
-        return '\x00' not in string
+        # A UTF-8 string with surrogates in it is invalid.
+        #
+        # Note: this check is only useful on Python 2. On Python 3, a
+        # bytestring with a UTF-8-encoded surrogate codepoint is (correctly)
+        # treated as invalid, so the decode() call above will fail.
+        #
+        # Note 2: this check requires us to use a wide build of Python 2. On
+        # narrow builds of Python 2, potato = u"\U0001F954" will have length
+        # 2, potato[0] == u"\ud83e" (surrogate), and potato[1] == u"\udda0"
+        # (also a surrogate), so even if it is correctly UTF-8 encoded as
+        # b'\xf0\x9f\xa6\xa0', it will not pass this check. Fortunately,
+        # most Linux distributions build Python 2 wide, and Python 3.3+
+        # removed the wide/narrow distinction entirely.
+        if any(0xD800 <= ord(codepoint) <= 0xDFFF
+               for codepoint in decoded):
+            return False
+        return b'\x00' not in encoded
     # If string is unicode, decode() will raise UnicodeEncodeError
     # So, we should catch both UnicodeDecodeError & UnicodeEncodeError
     except UnicodeError:
@@ -392,7 +410,7 @@ def check_name_format(req, name, target_type):
             body='%s name cannot be empty' % target_type)
     if isinstance(name, six.text_type):
         name = name.encode('utf-8')
-    if '/' in name:
+    if b'/' in name:
         raise HTTPPreconditionFailed(
             request=req,
             body='%s name cannot contain slashes' % target_type)

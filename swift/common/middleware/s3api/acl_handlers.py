@@ -49,11 +49,9 @@ Example::
   the end of method.
 
 """
-import sys
-
 from swift.common.middleware.s3api.subresource import ACL, Owner, encode_acl
 from swift.common.middleware.s3api.s3response import MissingSecurityHeader, \
-    MalformedACLError, UnexpectedContent
+    MalformedACLError, UnexpectedContent, AccessDenied
 from swift.common.middleware.s3api.etree import fromstring, XMLSyntaxError, \
     DocumentInvalid
 from swift.common.middleware.s3api.utils import MULTIUPLOAD_SUFFIX, \
@@ -168,9 +166,8 @@ class BaseAclHandler(object):
             except(XMLSyntaxError, DocumentInvalid):
                 raise MalformedACLError()
             except Exception as e:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
                 self.logger.error(e)
-                raise exc_type, exc_value, exc_traceback
+                raise
         else:
             if body:
                 # Specifying grant with both header and xml is not allowed.
@@ -209,10 +206,13 @@ class BucketAclHandler(BaseAclHandler):
         req_acl = ACL.from_headers(self.req.headers,
                                    Owner(self.user_id, self.user_id))
 
+        if not self.req.environ.get('swift_owner'):
+            raise AccessDenied()
+
         # To avoid overwriting the existing bucket's ACL, we send PUT
         # request first before setting the ACL to make sure that the target
         # container does not exist.
-        self.req.get_acl_response(app, 'PUT')
+        self.req.get_acl_response(app, 'PUT', self.container)
 
         # update metadata
         self.req.bucket_acl = req_acl

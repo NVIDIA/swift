@@ -24,7 +24,7 @@ Application Bindings
     * `swift_client <https://github.com/mrkamel/swift_client>`_ -
       Small but powerful Ruby client to interact with OpenStack Swift
     * `nightcrawler_swift <https://github.com/tulios/nightcrawler_swift>`_ -
-      This Ruby gem teleports your assets to a OpenStack Swift bucket/container
+      This Ruby gem teleports your assets to an OpenStack Swift bucket/container
     * `swift storage <https://rubygems.org/gems/swift-storage>`_ -
       Simple OpenStack Swift storage client.
 
@@ -75,8 +75,8 @@ Command Line Access
 External Integration
 --------------------
 
-* `swift-s3-sync <https://github.com/swiftstack/swift-s3-sync>`_ -
-  Swift-S3 synchronization tool
+* `1space <https://github.com/swiftstack/1space>`_ -
+  Multi-cloud synchronization tool - supports Swift and S3 APIs
 * `swift-metadata-sync <https://github.com/swiftstack/swift-metadata-sync>`_ -
   Propagate OpenStack Swift object metadata into Elasticsearch
 

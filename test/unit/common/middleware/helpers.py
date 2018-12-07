@@ -29,6 +29,8 @@ from test.unit import FakeLogger, FakeRing
 
 class LeakTrackingIter(object):
     def __init__(self, inner_iter, mark_closed, path):
+        if isinstance(inner_iter, bytes):
+            inner_iter = (inner_iter, )
         self.inner_iter = inner_iter
         self.mark_closed = mark_closed
         self.path = path
@@ -119,7 +121,7 @@ class FakeSwift(object):
 
         # simulate object PUT
         if method == 'PUT' and obj:
-            put_body = ''.join(iter(env['wsgi.input'].read, ''))
+            put_body = b''.join(iter(env['wsgi.input'].read, b''))
             if 'swift.callback.update_footers' in env:
                 footers = HeaderKeyDict()
                 env['swift.callback.update_footers'](footers)
@@ -200,7 +202,7 @@ class FakeSwift(object):
     def call_count(self):
         return len(self._calls)
 
-    def register(self, method, path, response_class, headers, body=''):
+    def register(self, method, path, response_class, headers, body=b''):
         self._responses[(method, path)] = (response_class, headers, body)
 
     def register_responses(self, method, path, responses):
@@ -208,7 +210,7 @@ class FakeSwift(object):
 
 
 class FakeAppThatExcepts(object):
-    MESSAGE = "We take exception to that!"
+    MESSAGE = b"We take exception to that!"
 
     def __init__(self, exception_class=Exception):
         self.exception_class = exception_class

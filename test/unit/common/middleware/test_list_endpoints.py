@@ -42,8 +42,8 @@ def start_response(*args):
                 StoragePolicy(1, 'one', True)])
 class TestListEndpoints(unittest.TestCase):
     def setUp(self):
-        utils.HASH_PATH_SUFFIX = 'endcap'
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_SUFFIX = b'endcap'
+        utils.HASH_PATH_PREFIX = b''
         self.testdir = mkdtemp()
 
         accountgz = os.path.join(self.testdir, 'account.ring.gz')
@@ -260,7 +260,8 @@ class TestListEndpoints(unittest.TestCase):
                     self.list_endpoints)
             self.assertEqual(resp.status_int, 200)
             self.assertEqual(resp.content_type, 'application/json')
-            self.assertEqual(json.loads(resp.body), expected[pol.idx])
+            self.assertEqual(json.loads(resp.body),
+                             expected[pol.idx])
 
         # Here, 'o1/' is the object name.
         resp = Request.blank('/endpoints/a/c/o1/').get_response(
@@ -326,7 +327,7 @@ class TestListEndpoints(unittest.TestCase):
             self.list_endpoints)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.status, '200 OK')
-        self.assertEqual(resp.body, 'FakeApp')
+        self.assertEqual(resp.body, b'FakeApp')
 
         # test policies with custom endpoint name
         for pol in POLICIES:
@@ -341,7 +342,8 @@ class TestListEndpoints(unittest.TestCase):
                     .get_response(custom_path_le)
             self.assertEqual(resp.status_int, 200)
             self.assertEqual(resp.content_type, 'application/json')
-            self.assertEqual(json.loads(resp.body), expected[pol.idx])
+            self.assertEqual(json.loads(resp.body),
+                             expected[pol.idx])
 
             # test custom path without trailing slash
             custom_path_le = list_endpoints.filter_factory({
@@ -354,14 +356,15 @@ class TestListEndpoints(unittest.TestCase):
                     .get_response(custom_path_le)
             self.assertEqual(resp.status_int, 200)
             self.assertEqual(resp.content_type, 'application/json')
-            self.assertEqual(json.loads(resp.body), expected[pol.idx])
+            self.assertEqual(json.loads(resp.body),
+                             expected[pol.idx])
 
     def test_v1_response(self):
         req = Request.blank('/endpoints/v1/a/c/o1')
         resp = req.get_response(self.list_endpoints)
         expected = ["http://10.1.1.1:6200/sdb1/1/a/c/o1",
                     "http://10.1.2.2:6200/sdd1/1/a/c/o1"]
-        self.assertEqual(resp.body, json.dumps(expected))
+        self.assertEqual(json.loads(resp.body), expected)
 
     def test_v2_obj_response(self):
         req = Request.blank('/endpoints/v2/a/c/o1')
@@ -371,7 +374,7 @@ class TestListEndpoints(unittest.TestCase):
                           "http://10.1.2.2:6200/sdd1/1/a/c/o1"],
             'headers': {'X-Backend-Storage-Policy-Index': "0"},
         }
-        self.assertEqual(resp.body, json.dumps(expected))
+        self.assertEqual(json.loads(resp.body), expected)
         for policy in POLICIES:
             patch_path = 'swift.common.middleware.list_endpoints' \
                 '.get_container_info'
@@ -387,7 +390,7 @@ class TestListEndpoints(unittest.TestCase):
                     'X-Backend-Storage-Policy-Index': str(int(policy))},
                 'endpoints': [path % node for node in nodes],
             }
-            self.assertEqual(resp.body, json.dumps(expected))
+            self.assertEqual(json.loads(resp.body), expected)
 
     def test_v2_non_obj_response(self):
         # account
@@ -400,7 +403,7 @@ class TestListEndpoints(unittest.TestCase):
             'headers': {},
         }
         # container
-        self.assertEqual(resp.body, json.dumps(expected))
+        self.assertEqual(json.loads(resp.body), expected)
         req = Request.blank('/endpoints/v2/a/c')
         resp = req.get_response(self.list_endpoints)
         expected = {
@@ -409,7 +412,7 @@ class TestListEndpoints(unittest.TestCase):
                           "http://10.1.2.1:6200/sdc1/0/a/c"],
             'headers': {},
         }
-        self.assertEqual(resp.body, json.dumps(expected))
+        self.assertEqual(json.loads(resp.body), expected)
 
     def test_version_account_response(self):
         req = Request.blank('/endpoints/a')
@@ -417,10 +420,10 @@ class TestListEndpoints(unittest.TestCase):
         expected = ["http://10.1.2.1:6200/sdc1/0/a",
                     "http://10.1.1.1:6200/sda1/0/a",
                     "http://10.1.1.1:6200/sdb1/0/a"]
-        self.assertEqual(resp.body, json.dumps(expected))
+        self.assertEqual(json.loads(resp.body), expected)
         req = Request.blank('/endpoints/v1.0/a')
         resp = req.get_response(self.list_endpoints)
-        self.assertEqual(resp.body, json.dumps(expected))
+        self.assertEqual(json.loads(resp.body), expected)
 
         req = Request.blank('/endpoints/v2/a')
         resp = req.get_response(self.list_endpoints)
@@ -430,7 +433,7 @@ class TestListEndpoints(unittest.TestCase):
                           "http://10.1.1.1:6200/sdb1/0/a"],
             'headers': {},
         }
-        self.assertEqual(resp.body, json.dumps(expected))
+        self.assertEqual(json.loads(resp.body), expected)
 
 
 if __name__ == '__main__':

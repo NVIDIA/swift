@@ -97,13 +97,31 @@ class DiskFileWriter(object):
 
     :param fs: internal file system object to use
     :param name: standard object name
-    :param fp: `StringIO` in-memory representation object
     """
-    def __init__(self, fs, name, fp):
+    def __init__(self, fs, name):
         self._filesystem = fs
         self._name = name
-        self._fp = fp
+        self._fp = None
         self._upload_size = 0
+        self._chunks_etag = hashlib.md5()
+
+    def open(self):
+        """
+        Prepare to accept writes.
+
+        Create a new ``StringIO`` object for a started-but-not-yet-finished
+        PUT.
+        """
+        self._fp = moves.cStringIO()
+        return self
+
+    def close(self):
+        """
+        Clean up resources following an ``open()``.
+
+        Note: If ``put()`` has not been called, the data written will be lost.
+        """
+        self._fp = None
 
     def write(self, chunk):
         """
@@ -113,7 +131,15 @@ class DiskFileWriter(object):
         """
         self._fp.write(chunk)
         self._upload_size += len(chunk)
-        return self._upload_size
+        self._chunks_etag.update(chunk)
+
+    def chunks_finished(self):
+        """
+        Expose internal stats about written chunks.
+
+        :returns: a tuple, (upload_size, etag)
+        """
+        return self._upload_size, self._chunks_etag.hexdigest()
 
     def put(self, metadata):
         """
@@ -413,6 +439,9 @@ class DiskFile(object):
         self._fp = None
         return dr
 
+    def writer(self, size=None):
+        return DiskFileWriter(self._filesystem, self._name)
+
     @contextmanager
     def create(self, size=None):
         """
@@ -423,11 +452,11 @@ class DiskFile(object):
                      disk
         :raises DiskFileNoSpace: if a size is specified and allocation fails
         """
-        fp = moves.cStringIO()
+        writer = self.writer(size)
         try:
-            yield DiskFileWriter(self._filesystem, self._name, fp)
+            yield writer.open()
         finally:
-            del fp
+            writer.close()
 
     def write_metadata(self, metadata):
         """

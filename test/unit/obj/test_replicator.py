@@ -133,15 +133,15 @@ def _mock_process(ret):
 
 
 class MockHungProcess(object):
-    def __init__(self, waits_needed=1, *args, **kwargs):
+    def __init__(self, polls_needed=0, *args, **kwargs):
         class MockStdout(object):
             def read(self):
                 pass
         self.stdout = MockStdout()
         self._state = 'running'
         self._calls = []
-        self._waits = 0
-        self._waits_needed = waits_needed
+        self._polls = 0
+        self._polls_needed = polls_needed
 
     def wait(self, timeout=None):
         self._calls.append(('wait', self._state))
@@ -149,12 +149,22 @@ class MockHungProcess(object):
             # Sleep so we trip the rsync timeout
             sleep(1)
             raise BaseException('You need to mock out some timeouts')
-        elif self._state == 'killed':
-            self._waits += 1
-            if self._waits >= self._waits_needed:
-                return
-            else:
-                raise subprocess.TimeoutExpired('some cmd', timeout)
+        if not self._polls_needed:
+            self._state = 'os-reaped'
+            return 137
+        if timeout is not None:
+            raise subprocess.TimeoutExpired('some cmd', timeout)
+        raise BaseException("You're waiting indefinitely on something "
+                            "we've established is hung")
+
+    def poll(self):
+        self._calls.append(('poll', self._state))
+        self._polls += 1
+        if self._polls >= self._polls_needed:
+            self._state = 'os-reaped'
+            return 137
+        else:
+            return None
 
     def terminate(self):
         self._calls.append(('terminate', self._state))
@@ -214,8 +224,8 @@ class TestObjectReplicator(unittest.TestCase):
 
     def setUp(self):
         skip_if_no_xattrs()
-        utils.HASH_PATH_SUFFIX = 'endcap'
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_SUFFIX = b'endcap'
+        utils.HASH_PATH_PREFIX = b''
         # recon cache path
         self.recon_cache = tempfile.mkdtemp()
         rmtree(self.recon_cache, ignore_errors=1)
@@ -1798,10 +1808,10 @@ class TestObjectReplicator(unittest.TestCase):
         self.replicator.sync_method.assert_called_once_with(
             'node', 'job', 'suffixes')
 
-    @mock.patch('swift.obj.replicator.tpool_reraise')
+    @mock.patch('swift.obj.replicator.tpool.execute')
     @mock.patch('swift.obj.replicator.http_connect', autospec=True)
     @mock.patch('swift.obj.replicator._do_listdir')
-    def test_update(self, mock_do_listdir, mock_http, mock_tpool_reraise):
+    def test_update(self, mock_do_listdir, mock_http, mock_tpool_execute):
 
         def set_default(self):
             self.replicator.suffix_count = 0
@@ -1813,7 +1823,7 @@ class TestObjectReplicator(unittest.TestCase):
 
         self.headers = {'Content-Length': '0',
                         'user-agent': 'object-replicator %s' % os.getpid()}
-        mock_tpool_reraise.return_value = (0, {})
+        mock_tpool_execute.return_value = (0, {})
 
         all_jobs = self.replicator.collect_jobs()
         jobs = [job for job in all_jobs if not job['delete']]
@@ -1868,7 +1878,7 @@ class TestObjectReplicator(unittest.TestCase):
             mock_http.reset_mock()
             self.logger.clear()
         mock_do_listdir.assert_has_calls(expected_listdir_calls)
-        mock_tpool_reraise.assert_has_calls(expected_tpool_calls)
+        mock_tpool_execute.assert_has_calls(expected_tpool_calls)
         mock_do_listdir.side_effect = None
         mock_do_listdir.return_value = False
         # Check incorrect http_connect with status 400 != HTTP_OK
@@ -1920,7 +1930,7 @@ class TestObjectReplicator(unittest.TestCase):
             self.logger.clear()
 
         # Check successful http_connect and sync for local node
-        mock_tpool_reraise.return_value = (1, {'a83': 'ba47fd314242ec8c'
+        mock_tpool_execute.return_value = (1, {'a83': 'ba47fd314242ec8c'
                                                       '7efb91f5d57336e4'})
         resp.read.return_value = pickle.dumps({'a83': 'c130a2c17ed45102a'
                                                       'ada0f4eee69494ff'})
@@ -2102,7 +2112,7 @@ class TestObjectReplicator(unittest.TestCase):
         mock_procs = []
 
         def new_mock(*a, **kw):
-            proc = MockHungProcess(waits_needed=2)
+            proc = MockHungProcess(polls_needed=2)
             mock_procs.append(proc)
             return proc
 
@@ -2116,7 +2126,8 @@ class TestObjectReplicator(unittest.TestCase):
                 ('wait', 'running'),
                 ('kill', 'running'),
                 ('wait', 'killed'),
-                ('wait', 'killed'),
+                ('poll', 'killed'),
+                ('poll', 'killed'),
             ])
         self.assertEqual(len(mock_procs), 2)
 

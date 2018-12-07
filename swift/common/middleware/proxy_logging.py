@@ -71,14 +71,12 @@ if this is a middleware subrequest or not. A log processor calculating
 bandwidth usage will want to only sum up logs with no swift.source.
 """
 
-import sys
 import time
 
-import six
-from six.moves.urllib.parse import quote, unquote
+from six.moves.urllib.parse import quote
 from swift.common.swob import Request
 from swift.common.utils import (get_logger, get_remote_client,
-                                get_valid_utf8_str, config_true_value,
+                                config_true_value,
                                 InputProxy, list_from_csv, get_policy_index)
 
 from swift.common.storage_policy import POLICIES
@@ -152,10 +150,6 @@ class ProxyLoggingMiddleware(object):
         :param resp_headers: dict of the response headers
         """
         resp_headers = resp_headers or {}
-        req_path = get_valid_utf8_str(req.path)
-        the_request = quote(unquote(req_path), QUOTE_SAFE)
-        if req.query_string:
-            the_request = the_request + '?' + req.query_string
         logged_headers = None
         if self.log_hdrs:
             if self.log_hdrs_only:
@@ -180,7 +174,7 @@ class ProxyLoggingMiddleware(object):
                 req.remote_addr,
                 end_gmtime_str,
                 method,
-                the_request,
+                req.path_qs,
                 req.environ.get('SERVER_PROTOCOL'),
                 status_int,
                 req.referer,
@@ -337,13 +331,12 @@ class ProxyLoggingMiddleware(object):
         try:
             iterable = self.app(env, my_start_response)
         except Exception:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
             req = Request(env)
             status_int = status_int_for_logging(start_status=500)
             self.log_request(
                 req, status_int, input_proxy.bytes_received, 0, start_time,
                 time.time())
-            six.reraise(exc_type, exc_value, exc_traceback)
+            raise
         else:
             return iter_response(iterable)
 

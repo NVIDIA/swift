@@ -87,6 +87,9 @@ def _label_for_policy(policy):
     return '(default)'
 
 
+VALID_SORTING_METHODS = ('shuffle', 'timing', 'affinity')
+
+
 class ProxyOverrideOptions(object):
     """
     Encapsulates proxy server options that may be overridden e.g. for
@@ -100,6 +103,11 @@ class ProxyOverrideOptions(object):
             return override_conf.get(key, base_conf.get(key, default))
 
         self.sorting_method = get('sorting_method', 'shuffle').lower()
+        if self.sorting_method not in VALID_SORTING_METHODS:
+            raise ValueError(
+                'Invalid sorting_method value; must be one of %s, not %r' % (
+                    ', '.join(VALID_SORTING_METHODS), self.sorting_method))
+
         self.read_affinity = get('read_affinity', '')
         try:
             self.read_affinity_sort_key = affinity_key_function(
@@ -333,23 +341,25 @@ class Application(object):
                 raise ValueError(
                     "No policy found for override config, index: %s" % index)
             override = self._make_policy_override(policy, conf, override_conf)
-            overrides[policy] = override
+            overrides[index] = override
         return overrides
 
     def get_policy_options(self, policy):
         """
         Return policy specific options.
 
-        :param policy: an instance of :class:`BaseStoragePolicy`
+        :param policy: an instance of :class:`BaseStoragePolicy` or ``None``
         :return: an instance of :class:`ProxyOverrideOptions`
         """
-        return self._override_options[policy]
+        return self._override_options[policy and policy.idx]
 
     def check_config(self):
         """
         Check the configuration for possible errors
         """
-        for policy, options in self._override_options.items():
+        for policy_idx, options in self._override_options.items():
+            policy = (None if policy_idx is None
+                      else POLICIES.get_by_index(policy_idx))
             if options.read_affinity and options.sorting_method != 'affinity':
                 self.logger.warning(
                     _("sorting_method is set to '%(method)s', not 'affinity'; "
@@ -625,8 +635,10 @@ class Application(object):
         :param msg: error message
         """
         self._incr_node_errors(node)
+        if isinstance(msg, bytes):
+            msg = msg.decode('utf-8')
         self.logger.error(_('%(msg)s %(ip)s:%(port)s/%(device)s'),
-                          {'msg': msg.decode('utf-8'), 'ip': node['ip'],
+                          {'msg': msg, 'ip': node['ip'],
                           'port': node['port'], 'device': node['device']})
 
     def iter_nodes(self, ring, partition, node_iter=None, policy=None):
@@ -649,11 +661,13 @@ class Application(object):
                 kwargs['exc_info'] = sys.exc_info()
         else:
             log = self.logger.exception
+        if isinstance(additional_info, bytes):
+            additional_info = additional_info.decode('utf-8')
         log(_('ERROR with %(type)s server %(ip)s:%(port)s/%(device)s'
               ' re: %(info)s'),
             {'type': typ, 'ip': node['ip'],
              'port': node['port'], 'device': node['device'],
-             'info': additional_info.decode('utf-8')},
+             'info': additional_info},
             **kwargs)
 
     def modify_wsgi_pipeline(self, pipe):

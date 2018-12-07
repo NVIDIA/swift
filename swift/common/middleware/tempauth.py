@@ -174,6 +174,7 @@ To generate a curl command line from the above::
 
 from __future__ import print_function
 
+import json
 from time import time
 from traceback import format_exc
 from uuid import uuid4
@@ -181,7 +182,7 @@ import base64
 
 from eventlet import Timeout
 import six
-from swift.common.swob import Response, Request
+from swift.common.swob import Response, Request, wsgi_to_str
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, HTTPNotFound, \
     HTTPUnauthorized
 
@@ -190,7 +191,7 @@ from swift.common.middleware.acl import (
     clean_acl, parse_acl, referrer_allowed, acls_from_account_info)
 from swift.common.utils import cache_from_env, get_logger, \
     split_path, config_true_value, register_swift_info
-from swift.common.utils import config_read_reseller_options
+from swift.common.utils import config_read_reseller_options, quote
 from swift.proxy.controllers.base import get_account_info
 
 
@@ -229,7 +230,7 @@ class TempAuth(object):
         self.storage_url_scheme = conf.get('storage_url_scheme', 'default')
         self.users = {}
         for conf_key in conf:
-            if conf_key.startswith('user_') or conf_key.startswith('user64_'):
+            if conf_key.startswith(('user_', 'user64_')):
                 account, username = conf_key.split('_', 1)[1].split('_')
                 if conf_key.startswith('user64_'):
                     # Because trailing equal signs would screw up config file
@@ -238,6 +239,9 @@ class TempAuth(object):
                     account = base64.b64decode(account)
                     username += '=' * (len(username) % 4)
                     username = base64.b64decode(username)
+                    if not six.PY2:
+                        account = account.decode('utf8')
+                        username = username.decode('utf8')
                 values = conf[conf_key].split()
                 if not values:
                     raise ValueError('%s has no key set' % conf_key)
@@ -245,7 +249,8 @@ class TempAuth(object):
                 if values and ('://' in values[-1] or '$HOST' in values[-1]):
                     url = values.pop()
                 else:
-                    url = '$HOST/v1/%s%s' % (self.reseller_prefix, account)
+                    url = '$HOST/v1/%s%s' % (
+                        self.reseller_prefix, quote(account))
                 self.users[account + ':' + username] = {
                     'key': key, 'url': url, 'groups': values}
 
@@ -273,7 +278,7 @@ class TempAuth(object):
             return self.app(env, start_response)
         if env.get('PATH_INFO', '').startswith(self.auth_prefix):
             return self.handle(env, start_response)
-        s3 = env.get('s3api.auth_details')
+        s3 = env.get('s3api.auth_details') or env.get('swift3.auth_details')
         token = env.get('HTTP_X_AUTH_TOKEN', env.get('HTTP_X_STORAGE_TOKEN'))
         service_token = env.get('HTTP_X_SERVICE_TOKEN')
         if s3 or (token and token.startswith(self.reseller_prefix)):
@@ -287,10 +292,8 @@ class TempAuth(object):
                 group_list = groups.split(',', 2)
                 if len(group_list) > 1:
                     user = group_list[1]
-                elif groups:
-                    user = group_list[0]
                 else:
-                    user = ''
+                    user = group_list[0]
                 trans_id = env.get('swift.trans_id')
                 self.logger.debug('User: %s uses token %s (trans_id %s)' %
                                   (user, 's3' if s3 else token, trans_id))
@@ -438,10 +441,11 @@ class TempAuth(object):
             expires, groups = cached_auth_data
             if expires < time():
                 groups = None
-            else:
+            elif six.PY2:
                 groups = groups.encode('utf8')
 
-        s3_auth_details = env.get('s3api.auth_details')
+        s3_auth_details = env.get('s3api.auth_details') or\
+            env.get('swift3.auth_details')
         if s3_auth_details:
             if 'check_signature' not in s3_auth_details:
                 self.logger.warning(
@@ -497,7 +501,7 @@ class TempAuth(object):
         or None if there are no errors.
         """
         acl_header = 'x-account-access-control'
-        acl_data = req.headers.get(acl_header)
+        acl_data = wsgi_to_str(req.headers.get(acl_header))
         result = parse_acl(version=2, data=acl_data)
         if result is None:
             return 'Syntax error in input (%r)' % acl_data
@@ -508,16 +512,17 @@ class TempAuth(object):
             # on ACLs, TempAuth is not such an auth system.  At this point,
             # it thinks it is authoritative.
             if key not in tempauth_acl_keys:
-                return "Key '%s' not recognized" % key
+                return "Key %s not recognized" % json.dumps(key)
 
         for key in tempauth_acl_keys:
             if key not in result:
                 continue
             if not isinstance(result[key], list):
-                return "Value for key '%s' must be a list" % key
+                return "Value for key %s must be a list" % json.dumps(key)
             for grantee in result[key]:
                 if not isinstance(grantee, six.string_types):
-                    return "Elements of '%s' list must be strings" % key
+                    return "Elements of %s list must be strings" % json.dumps(
+                        key)
 
         # Everything looks fine, no errors found
         internal_hdr = get_sys_meta_prefix('account') + 'core-access-control'
@@ -564,7 +569,7 @@ class TempAuth(object):
                               % account_user)
             return None
 
-        if account in user_groups and \
+        if wsgi_to_str(account) in user_groups and \
                 (req.method not in ('DELETE', 'PUT') or container):
             # The user is admin for the account and is not trying to do an
             # account DELETE or PUT
@@ -740,7 +745,7 @@ class TempAuth(object):
                     return HTTPUnauthorized(request=req,
                                             headers={'Www-Authenticate': auth})
                 account2, user = user.split(':', 1)
-                if account != account2:
+                if wsgi_to_str(account) != account2:
                     self.logger.increment('token_denied')
                     auth = 'Swift realm="%s"' % account
                     return HTTPUnauthorized(request=req,
@@ -796,7 +801,7 @@ class TempAuth(object):
             cached_auth_data = memcache_client.get(memcache_token_key)
             if cached_auth_data:
                 expires, old_groups = cached_auth_data
-                old_groups = [group.encode('utf8')
+                old_groups = [group.encode('utf8') if six.PY2 else group
                               for group in old_groups.split(',')]
                 new_groups = self._get_user_groups(account, account_user,
                                                    account_id)

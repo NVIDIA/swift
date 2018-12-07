@@ -29,12 +29,11 @@ from eventlet.green import subprocess
 
 import swift.common.db
 from swift.common.constraints import check_drive
-from swift.common.direct_client import quote
 from swift.common.utils import get_logger, whataremyips, storage_directory, \
     renamer, mkdirs, lock_parent_directory, config_true_value, \
     unlink_older_than, dump_recon_cache, rsync_module_interpolation, \
     json, parse_override_options, round_robin_iter, Everything, get_db_files, \
-    parse_db_filename
+    parse_db_filename, quote, RateLimitedIterator
 from swift.common import ring
 from swift.common.ring.utils import is_local_device
 from swift.common.http import HTTP_NOT_FOUND, HTTP_INSUFFICIENT_STORAGE, \
@@ -198,6 +197,15 @@ class Replicator(Daemon):
         self.max_diffs = int(conf.get('max_diffs') or 100)
         self.interval = int(conf.get('interval') or
                             conf.get('run_pause') or 30)
+        if 'run_pause' in conf and 'interval' not in conf:
+            self.logger.warning('Option %(type)s-replicator/run_pause '
+                                'is deprecated and will be removed in a '
+                                'future version. Update your configuration'
+                                ' to use option %(type)s-replicator/'
+                                'interval.'
+                                % {'type': self.server_type})
+        self.databases_per_second = int(
+            conf.get('databases_per_second', 50))
         self.node_timeout = float(conf.get('node_timeout', 10))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.rsync_compress = config_true_value(
@@ -468,7 +476,7 @@ class Replicator(Daemon):
         elif response.status == HTTP_INSUFFICIENT_STORAGE:
             raise DriveNotMounted()
         elif 200 <= response.status < 300:
-            rinfo = json.loads(response.data)
+            rinfo = json.loads(response.data.decode('ascii'))
             local_sync = broker.get_sync(rinfo['id'], incoming=False)
             if rinfo.get('metadata', ''):
                 broker.update_metadata(json.loads(rinfo['metadata']))
@@ -727,6 +735,11 @@ class Replicator(Daemon):
     def report_up_to_date(self, full_info):
         return True
 
+    def roundrobin_datadirs(self, dirs):
+        return RateLimitedIterator(
+            roundrobin_datadirs(dirs),
+            elements_per_second=self.databases_per_second)
+
     def run_once(self, *args, **kwargs):
         """Run a replication pass once."""
         override_options = parse_override_options(once=True, **kwargs)
@@ -754,14 +767,15 @@ class Replicator(Daemon):
                                         node['replication_ip'],
                                         node['replication_port']):
                 found_local = True
-                if not check_drive(self.root, node['device'],
-                                   self.mount_check):
+                try:
+                    dev_path = check_drive(self.root, node['device'],
+                                           self.mount_check)
+                except ValueError as err:
                     self._add_failure_stats(
                         [(failure_dev['replication_ip'],
                           failure_dev['device'])
                          for failure_dev in self.ring.devs if failure_dev])
-                    self.logger.warning(
-                        _('Skipping %(device)s as it is not mounted') % node)
+                    self.logger.warning('Skipping: %s', err)
                     continue
                 if node['device'] not in devices_to_replicate:
                     self.logger.debug(
@@ -769,7 +783,7 @@ class Replicator(Daemon):
                         node['device'])
                     continue
                 unlink_older_than(
-                    os.path.join(self.root, node['device'], 'tmp'),
+                    os.path.join(dev_path, 'tmp'),
                     time.time() - self.reclaim_age)
                 datadir = os.path.join(self.root, node['device'], self.datadir)
                 if os.path.isdir(datadir):
@@ -782,7 +796,7 @@ class Replicator(Daemon):
                               "file, not replicating",
                               ", ".join(ips), self.port)
         self.logger.info(_('Beginning replication run'))
-        for part, object_file, node_id in roundrobin_datadirs(dirs):
+        for part, object_file, node_id in self.roundrobin_datadirs(dirs):
             self.cpool.spawn_n(
                 self._replicate_object, part, object_file, node_id)
         self.cpool.waitall()
@@ -828,9 +842,11 @@ class ReplicatorRpc(object):
             return HTTPBadRequest(body='Invalid object type')
         op = args.pop(0)
         drive, partition, hsh = replicate_args
-        if not check_drive(self.root, drive, self.mount_check):
+        try:
+            dev_path = check_drive(self.root, drive, self.mount_check)
+        except ValueError:
             return Response(status='507 %s is not mounted' % drive)
-        db_file = os.path.join(self.root, drive,
+        db_file = os.path.join(dev_path,
                                storage_directory(self.datadir, partition, hsh),
                                hsh + '.db')
         if op == 'rsync_then_merge':
@@ -908,6 +924,13 @@ class ReplicatorRpc(object):
                     quarantine_db(broker.db_file, broker.db_type)
                     return HTTPNotFound()
                 raise
+        # TODO(mattoliverau) At this point in the RPC, we have the callers
+        # replication info and ours, so it would be cool to be able to make
+        # an educated guess here on the size of the incoming replication (maybe
+        # average object table row size * difference in ROWIDs or something)
+        # and the fallocate_reserve setting so we could return a 507.
+        # This would make db fallocate_reserve more or less on par with the
+        # object's.
         if remote_info['metadata']:
             with self.debug_timing('update_metadata'):
                 broker.update_metadata(remote_info['metadata'])

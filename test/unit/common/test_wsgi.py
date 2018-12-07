@@ -70,7 +70,6 @@ class TestWSGI(unittest.TestCase):
     """Tests for swift.common.wsgi"""
 
     def setUp(self):
-        utils.HASH_PATH_PREFIX = 'startcap'
         if six.PY2:
             self._orig_parsetype = mimetools.Message.parsetype
 
@@ -404,6 +403,39 @@ class TestWSGI(unittest.TestCase):
                 'keyfile': '',
             }
             self.assertEqual(wsgi.ssl.wrap_socket_called, [expected_kwargs])
+
+            # test keep_idle value
+            keepIdle_value = 700
+            conf['keep_idle'] = keepIdle_value
+            sock = wsgi.get_socket(conf)
+            # assert
+            if hasattr(socket, 'TCP_KEEPIDLE'):
+                expected_socket_opts[socket.IPPROTO_TCP][
+                    socket.TCP_KEEPIDLE] = keepIdle_value
+            self.assertEqual(sock.opts, expected_socket_opts)
+
+            # test keep_idle for str -> int conversion
+            keepIdle_value = '800'
+            conf['keep_idle'] = keepIdle_value
+            sock = wsgi.get_socket(conf)
+            # assert
+            if hasattr(socket, 'TCP_KEEPIDLE'):
+                expected_socket_opts[socket.IPPROTO_TCP][
+                    socket.TCP_KEEPIDLE] = int(keepIdle_value)
+            self.assertEqual(sock.opts, expected_socket_opts)
+
+            # test keep_idle for negative value
+            conf['keep_idle'] = -600
+            self.assertRaises(wsgi.ConfigFileError, wsgi.get_socket, conf)
+
+            # test keep_idle for upperbound value
+            conf['keep_idle'] = 2 ** 15
+            self.assertRaises(wsgi.ConfigFileError, wsgi.get_socket, conf)
+
+            # test keep_idle for Type mismatch
+            conf['keep_idle'] = 'foobar'
+            self.assertRaises(wsgi.ConfigFileError, wsgi.get_socket, conf)
+
         finally:
             wsgi.listen = old_listen
             wsgi.ssl = old_ssl
@@ -1043,14 +1075,14 @@ class TestSwiftHttpProtocol(unittest.TestCase):
         delattr(proto_obj.server.app, 'logger')
 
         proto_obj.log_message('a%sc', 'b')
-        self.assertEqual([mock.call.error('ERROR WSGI: a%sc', 'b')],
+        self.assertEqual([mock.call.info('ERROR WSGI: a%sc', 'b')],
                          proto_obj.server.log.mock_calls)
 
         proto_obj.server.log.reset_mock()
         proto_obj.server.app.logger = None
 
         proto_obj.log_message('a%sc', 'b')
-        self.assertEqual([mock.call.error('ERROR WSGI: a%sc', 'b')],
+        self.assertEqual([mock.call.info('ERROR WSGI: a%sc', 'b')],
                          proto_obj.server.log.mock_calls)
 
     def test_swift_http_protocol_parse_request_no_proxy(self):
@@ -1093,20 +1125,33 @@ class TestProxyProtocol(unittest.TestCase):
 
         def dinky_app(env, start_response):
             start_response("200 OK", [])
-            body = "got addr: %s %s\r\n" % (
-                env.get("REMOTE_ADDR", "<missing>"),
-                env.get("REMOTE_PORT", "<missing>"))
+            body = '\r\n'.join([
+                'got addr: %s %s' % (
+                    env.get("REMOTE_ADDR", "<missing>"),
+                    env.get("REMOTE_PORT", "<missing>")),
+                'on addr: %s %s' % (
+                    env.get("SERVER_ADDR", "<missing>"),
+                    env.get("SERVER_PORT", "<missing>")),
+                'https is %s (scheme %s)' % (
+                    env.get("HTTPS", "<missing>"),
+                    env.get("wsgi.url_scheme", "<missing>")),
+            ]) + '\r\n'
             return [body.encode("utf-8")]
 
+        addr = ('127.0.0.1', 8359)
         fake_tcp_socket = mock.Mock(
             setsockopt=lambda *a: None,
             makefile=lambda mode, bufsize: rfile if 'r' in mode else wfile,
+            getsockname=lambda *a: addr
         )
-        fake_listen_socket = mock.Mock(accept=mock.MagicMock(
-            side_effect=[[fake_tcp_socket, ('127.0.0.1', 8359)],
-                         # KeyboardInterrupt breaks the WSGI server out of
-                         # its infinite accept-process-close loop.
-                         KeyboardInterrupt]))
+        fake_listen_socket = mock.Mock(
+            accept=mock.MagicMock(
+                side_effect=[[fake_tcp_socket, addr],
+                             # KeyboardInterrupt breaks the WSGI server out of
+                             # its infinite accept-process-close loop.
+                             KeyboardInterrupt]),
+            getsockname=lambda *a: addr)
+        del fake_listen_socket.do_handshake
 
         # If we let the WSGI server close rfile/wfile then we can't access
         # their contents any more.
@@ -1122,6 +1167,22 @@ class TestProxyProtocol(unittest.TestCase):
 
     def test_request_with_proxy(self):
         bytes_out = self._run_bytes_through_protocol((
+            b"PROXY TCP4 192.168.0.1 192.168.0.11 56423 4433\r\n"
+            b"GET /someurl HTTP/1.0\r\n"
+            b"User-Agent: something or other\r\n"
+            b"\r\n"
+        ), wsgi.SwiftHttpProxiedProtocol)
+
+        lines = [l for l in bytes_out.split(b"\r\n") if l]
+        self.assertEqual(lines[0], b"HTTP/1.1 200 OK")  # sanity check
+        self.assertEqual(lines[-3:], [
+            b"got addr: 192.168.0.1 56423",
+            b"on addr: 192.168.0.11 4433",
+            b"https is <missing> (scheme http)",
+        ])
+
+    def test_request_with_proxy_https(self):
+        bytes_out = self._run_bytes_through_protocol((
             b"PROXY TCP4 192.168.0.1 192.168.0.11 56423 443\r\n"
             b"GET /someurl HTTP/1.0\r\n"
             b"User-Agent: something or other\r\n"
@@ -1130,7 +1191,11 @@ class TestProxyProtocol(unittest.TestCase):
 
         lines = [l for l in bytes_out.split(b"\r\n") if l]
         self.assertEqual(lines[0], b"HTTP/1.1 200 OK")  # sanity check
-        self.assertEqual(lines[-1], b"got addr: 192.168.0.1 56423")
+        self.assertEqual(lines[-3:], [
+            b"got addr: 192.168.0.1 56423",
+            b"on addr: 192.168.0.11 443",
+            b"https is on (scheme https)",
+        ])
 
     def test_multiple_requests_with_proxy(self):
         bytes_out = self._run_bytes_through_protocol((
@@ -1150,6 +1215,10 @@ class TestProxyProtocol(unittest.TestCase):
         # the address in the PROXY line is applied to every request
         addr_lines = [l for l in lines if l.startswith(b"got addr")]
         self.assertEqual(addr_lines, [b"got addr: 192.168.0.1 56423"] * 2)
+        addr_lines = [l for l in lines if l.startswith(b"on addr")]
+        self.assertEqual(addr_lines, [b"on addr: 192.168.0.11 443"] * 2)
+        addr_lines = [l for l in lines if l.startswith(b"https is")]
+        self.assertEqual(addr_lines, [b"https is on (scheme https)"] * 2)
 
     def test_missing_proxy_line(self):
         bytes_out = self._run_bytes_through_protocol((
@@ -1187,6 +1256,45 @@ class TestProxyProtocol(unittest.TestCase):
             ), wsgi.SwiftHttpProxiedProtocol)
             lines = [l for l in bytes_out.split(b"\r\n") if l]
             self.assertIn(b"200 OK", lines[0])
+
+    def test_address_and_environ(self):
+        # Make an object we can exercise... note the base class's __init__()
+        # does a bunch of work, so we just new up an object like eventlet.wsgi
+        # does.
+        dummy_env = {'OTHER_ENV_KEY': 'OTHER_ENV_VALUE'}
+        mock_protocol = mock.Mock(get_environ=lambda s: dummy_env)
+        patcher = mock.patch(
+            'swift.common.wsgi.SwiftHttpProtocol', mock_protocol
+        )
+        self.mock_super = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        proto_class = wsgi.SwiftHttpProxiedProtocol
+        try:
+            proxy_obj = types.InstanceType(proto_class)
+        except AttributeError:
+            proxy_obj = proto_class.__new__(proto_class)
+
+        # Install some convenience mocks
+        proxy_obj.server = Namespace(app=Namespace(logger=mock.Mock()),
+                                     url_length_limit=777,
+                                     log=mock.Mock())
+        proxy_obj.send_error = mock.Mock()
+
+        proxy_obj.rfile = BytesIO(
+            b'PROXY TCP4 111.111.111.111 222.222.222.222 111 222'
+        )
+
+        assert proxy_obj.handle()
+
+        self.assertEqual(proxy_obj.client_address, ('111.111.111.111', '111'))
+        self.assertEqual(proxy_obj.proxy_address, ('222.222.222.222', '222'))
+        expected_env = {
+            'SERVER_PORT': '222',
+            'SERVER_ADDR': '222.222.222.222',
+            'OTHER_ENV_KEY': 'OTHER_ENV_VALUE'
+        }
+        self.assertEqual(proxy_obj.get_environ(), expected_env)
 
 
 class TestServersPerPortStrategy(unittest.TestCase):
@@ -1709,7 +1817,6 @@ class TestPipelineWrapper(unittest.TestCase):
 
 
 @patch_policies
-@mock.patch('swift.common.utils.HASH_PATH_SUFFIX', new='endcap')
 class TestPipelineModification(unittest.TestCase):
     def pipeline_modules(self, app):
         # This is rather brittle; it'll break if a middleware stores its app

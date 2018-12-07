@@ -1,6 +1,7 @@
 [DEFAULT]
 # bind_ip = 0.0.0.0
 bind_port = 8080
+# keep_idle = 600
 # bind_timeout = 30
 # backlog = 4096
 # swift_dir = /etc/swift
@@ -69,11 +70,18 @@ bind_port = 8080
 # log_statsd_sample_rate_factor = 1.0
 # log_statsd_metric_prefix =
 #
+# List of origin hosts that are allowed for CORS requests in addition to what
+# the container has set.
 # Use a comma separated list of full URL (http://foo.bar:1234,https://foo.bar)
 # cors_allow_origin =
+
+# If True (default) then CORS requests are only allowed if their Origin header
+# matches an allowed origin. Otherwise, any Origin is allowed.
 # strict_cors_mode = True
 #
-# Comma separated list of headers to expose through Access-Control-Expose-Headers
+# Comma separated list of headers to expose through Access-Control-Expose-Headers,
+# in addition to the defaults and any headers set in container metadata (see
+# CORS documentation).
 # cors_expose_headers =
 #
 # client_timeout = 60
@@ -351,8 +359,9 @@ use = egg:swift#tempauth
 # Here are example entries, required for running the tests:
 user_admin_admin = admin .admin .reseller_admin
 user_test_tester = testing .admin
-user_test2_tester2 = testing2 .admin
+user_test_tester2 = testing2 .admin
 user_test_tester3 = testing3
+user_test2_tester2 = testing2 .admin
 user_test5_tester5 = testing5 service
 
 # To enable Keystone authentication you need to have the auth token
@@ -475,7 +484,7 @@ use = egg:swift#s3api
 # Set a region name of your Swift cluster.  Note that the s3api doesn't choose
 # a region of the newly created bucket.  This value is used for the
 # GET Bucket location API and v4 signatures calculation.
-# location = US
+# location = us-east-1
 #
 # Set whether to enforce DNS-compliant bucket names. Note that S3 enforces
 # these conventions in all regions except the US Standard region.
@@ -678,6 +687,14 @@ use = egg:swift#ratelimit
 # container_listing_ratelimit_0 = 100
 # container_listing_ratelimit_10 = 50
 # container_listing_ratelimit_50 = 20
+
+[filter:read_only]
+use = egg:swift#read_only
+# read_only set to true means turn global read only on
+# read_only = false
+# allow_deletes set to true means to allow deletes
+# allow_deletes = false
+# Note: Put after ratelimit in the pipeline.
 
 [filter:domain_remap]
 use = egg:swift#domain_remap
@@ -1039,6 +1056,19 @@ use = egg:swift#keymaster
 # likely to result in data loss.
 encryption_root_secret = changeme
 
+# Multiple root secrets may be configured using options named
+# 'encryption_root_secret_<secret_id>' where 'secret_id' is a unique
+# identifier. This enables the root secret to be changed from time to time.
+# Only one root secret is used for object PUTs or POSTs at any moment in time.
+# This is specified by the 'active_root_secret_id' option. If
+# 'active_root_secret_id' is not specified then the root secret specified by
+# 'encryption_root_secret' is considered to be the default. Once a root secret
+# has been used as the default root secret it must remain in the config file in
+# order that any objects that were encrypted with it may be subsequently
+# decrypted. The secret_id used to identify the key cannot change.
+# encryption_root_secret_myid = changeme
+# active_root_secret_id = myid
+
 # Sets the path from which the keymaster config options should be read. This
 # allows multiple processes which need to be encryption-aware (for example,
 # proxy-server and container-sync) to share the same config file, ensuring
@@ -1063,6 +1093,25 @@ use = egg:swift#kms_keymaster
 # that the encryption keys used are the same. The format expected is similar
 # to other config files, with a single [kms_keymaster] section. See the
 # keymaster.conf-sample file for details on the kms_keymaster configuration
+# options.
+# keymaster_config_path =
+
+# kmip_keymaster middleware may be used to fetch an encryption root secret from
+# a KMIP service. It should replace, in the same position, any other keymaster
+# middleware in the proxy-server pipeline, so that the middleware order is as
+# shown in this example:
+# <other middleware> kmip_keymaster encryption proxy-logging proxy-server
+[filter:kmip_keymaster]
+use = egg:swift#kmip_keymaster
+
+# Sets the path from which the keymaster config options should be read. This
+# allows multiple processes which need to be encryption-aware (for example,
+# proxy-server and container-sync) to share the same config file, ensuring
+# that the encryption keys used are the same. As an added benefit the
+# keymaster configuration file can have different permissions than the
+# `proxy-server.conf` file. The format expected is similar
+# to other config files, with a single [kmip_keymaster] section. See the
+# keymaster.conf-sample file for details on the kmip_keymaster configuration
 # options.
 # keymaster_config_path =
 

@@ -381,26 +381,33 @@ def _load_domain_remap_staticweb(proxy_conf_file, swift_conf_file, **kwargs):
     """
     _debug('Setting configuration for domain_remap')
 
+    # add a domain_remap storage_domain to the test configuration
+    storage_domain = 'example.net'
+    global config
+    config['storage_domain'] = storage_domain
+
     # The global conf dict cannot be used to modify the pipeline.
     # The pipeline loader requires the pipeline to be set in the local_conf.
     # If pipeline is set in the global conf dict (which in turn populates the
     # DEFAULTS options) then it prevents pipeline being loaded into the local
     # conf during wsgi load_app.
     # Therefore we must modify the [pipeline:main] section.
-
     conf = ConfigParser()
     conf.read(proxy_conf_file)
     try:
         section = 'pipeline:main'
         old_pipeline = conf.get(section, 'pipeline')
         pipeline = old_pipeline.replace(
-            "tempauth",
-            "domain_remap tempauth staticweb")
+            " tempauth ",
+            " domain_remap tempauth staticweb ")
         if pipeline == old_pipeline:
             raise InProcessException(
                 "Failed to insert domain_remap and staticweb into pipeline: %s"
                 % old_pipeline)
         conf.set(section, 'pipeline', pipeline)
+        # set storage_domain in domain_remap middleware to match test config
+        section = 'filter:domain_remap'
+        conf.set(section, 'storage_domain', storage_domain)
     except NoSectionError as err:
         msg = 'Error problem with proxy conf file %s: %s' % \
               (proxy_conf_file, err)
@@ -581,6 +588,10 @@ def in_process_setup(the_object_server=object_server):
         'password': 'testing',
         's3_access_key': 'test:tester',
         's3_secret_key': 'testing',
+        # Secondary user of the primary test account (needs admin access
+        # to the account) for s3api
+        's3_access_key2': 'test:tester2',
+        's3_secret_key2': 'testing2',
         # User on a second account (needs admin access to the account)
         'account2': 'test2',
         'username2': 'tester2',
@@ -588,8 +599,8 @@ def in_process_setup(the_object_server=object_server):
         # User on same account as first, but without admin access
         'username3': 'tester3',
         'password3': 'testing3',
-        's3_access_key2': 'test:tester3',
-        's3_secret_key2': 'testing3',
+        's3_access_key3': 'test:tester3',
+        's3_secret_key3': 'testing3',
         # Service user and prefix (emulates glance, cinder, etc. user)
         'account5': 'test5',
         'username5': 'tester5',
@@ -918,39 +929,46 @@ def setup_package():
                     + swift_test_user[_]
 
     global skip
-    skip = not all([swift_test_auth, swift_test_user[0], swift_test_key[0]])
-    if skip:
-        print('SKIPPING FUNCTIONAL TESTS DUE TO NO CONFIG', file=sys.stderr)
+    if not skip:
+        skip = not all([swift_test_auth, swift_test_user[0],
+                        swift_test_key[0]])
+        if skip:
+            print('SKIPPING FUNCTIONAL TESTS DUE TO NO CONFIG',
+                  file=sys.stderr)
 
     global skip2
-    skip2 = not all([not skip, swift_test_user[1], swift_test_key[1]])
-    if not skip and skip2:
-        print('SKIPPING SECOND ACCOUNT FUNCTIONAL TESTS '
-              'DUE TO NO CONFIG FOR THEM', file=sys.stderr)
+    if not skip2:
+        skip2 = not all([not skip, swift_test_user[1], swift_test_key[1]])
+        if not skip and skip2:
+            print('SKIPPING SECOND ACCOUNT FUNCTIONAL TESTS '
+                  'DUE TO NO CONFIG FOR THEM', file=sys.stderr)
 
     global skip3
-    skip3 = not all([not skip, swift_test_user[2], swift_test_key[2]])
-    if not skip and skip3:
-        print('SKIPPING THIRD ACCOUNT FUNCTIONAL TESTS'
-              'DUE TO NO CONFIG FOR THEM', file=sys.stderr)
+    if not skip3:
+        skip3 = not all([not skip, swift_test_user[2], swift_test_key[2]])
+        if not skip and skip3:
+            print('SKIPPING THIRD ACCOUNT FUNCTIONAL TESTS '
+                  'DUE TO NO CONFIG FOR THEM', file=sys.stderr)
 
     global skip_if_not_v3
-    skip_if_not_v3 = (swift_test_auth_version != '3'
-                      or not all([not skip,
-                                  swift_test_user[3],
-                                  swift_test_key[3]]))
-    if not skip and skip_if_not_v3:
-        print('SKIPPING FUNCTIONAL TESTS SPECIFIC TO AUTH VERSION 3',
-              file=sys.stderr)
+    if not skip_if_not_v3:
+        skip_if_not_v3 = (swift_test_auth_version != '3'
+                          or not all([not skip,
+                                      swift_test_user[3],
+                                      swift_test_key[3]]))
+        if not skip and skip_if_not_v3:
+            print('SKIPPING FUNCTIONAL TESTS SPECIFIC TO AUTH VERSION 3',
+                  file=sys.stderr)
 
     global skip_service_tokens
-    skip_service_tokens = not all([not skip, swift_test_user[4],
-                                   swift_test_key[4], swift_test_tenant[4],
-                                   swift_test_service_prefix])
-    if not skip and skip_service_tokens:
-        print(
-            'SKIPPING FUNCTIONAL TESTS SPECIFIC TO SERVICE TOKENS',
-            file=sys.stderr)
+    if not skip_service_tokens:
+        skip_service_tokens = not all([not skip, swift_test_user[4],
+                                       swift_test_key[4], swift_test_tenant[4],
+                                       swift_test_service_prefix])
+        if not skip and skip_service_tokens:
+            print(
+                'SKIPPING FUNCTIONAL TESTS SPECIFIC TO SERVICE TOKENS',
+                file=sys.stderr)
 
     if policy_specified:
         policies = FunctionalStoragePolicyCollection.from_info()
@@ -969,13 +987,13 @@ def setup_package():
                             % policy_specified)
 
     global skip_if_no_reseller_admin
-    skip_if_no_reseller_admin = not all([not skip, swift_test_user[5],
-                                         swift_test_key[5],
-                                         swift_test_tenant[5]])
-    if not skip and skip_if_no_reseller_admin:
-        print(
-            'SKIPPING FUNCTIONAL TESTS DUE TO NO CONFIG FOR RESELLER ADMIN',
-            file=sys.stderr)
+    if not skip_if_no_reseller_admin:
+        skip_if_no_reseller_admin = not all([not skip, swift_test_user[5],
+                                             swift_test_key[5],
+                                             swift_test_tenant[5]])
+        if not skip and skip_if_no_reseller_admin:
+            print('SKIPPING FUNCTIONAL TESTS DUE TO NO CONFIG FOR '
+                  'RESELLER ADMIN', file=sys.stderr)
 
     get_cluster_info()
 

@@ -79,7 +79,7 @@ def update_headers(response, headers):
     if hasattr(headers, 'items'):
         headers = headers.items()
     for name, value in headers:
-        if name == 'etag':
+        if name.lower() == 'etag':
             response.headers[name] = value.replace('"', '')
         elif name.lower() not in (
                 'date', 'content-length', 'content-type',
@@ -199,7 +199,7 @@ def headers_to_object_info(headers, status_int=HTTP_OK):
     """
     headers, meta, sysmeta = _prep_headers_to_info(headers, 'object')
     transient_sysmeta = {}
-    for key, val in six.iteritems(headers):
+    for key, val in headers.items():
         if is_object_transient_sysmeta(key):
             key = strip_object_transient_sysmeta_prefix(key.lower())
             transient_sysmeta[key] = val
@@ -590,7 +590,8 @@ def _get_info_from_memcache(app, env, account, container=None):
     memcache = getattr(app, 'memcache', None) or env.get('swift.cache')
     if memcache:
         info = memcache.get(cache_key)
-        if info:
+        if info and six.PY2:
+            # Get back to native strings
             for key in info:
                 if isinstance(info[key], six.text_type):
                     info[key] = info[key].encode("utf-8")
@@ -598,6 +599,7 @@ def _get_info_from_memcache(app, env, account, container=None):
                     for subkey, value in info[key].items():
                         if isinstance(value, six.text_type):
                             info[key][subkey] = value.encode("utf-8")
+        if info:
             env.setdefault('swift.infocache', {})[cache_key] = info
         return info
     return None
@@ -963,7 +965,7 @@ class ResumingGetter(object):
 
             def iter_bytes_from_response_part(part_file):
                 nchunks = 0
-                buf = ''
+                buf = b''
                 while True:
                     try:
                         with ChunkReadTimeout(node_timeout):
@@ -973,14 +975,14 @@ class ResumingGetter(object):
                     except ChunkReadTimeout:
                         exc_type, exc_value, exc_traceback = exc_info()
                         if self.newest or self.server_type != 'Object':
-                            six.reraise(exc_type, exc_value, exc_traceback)
+                            raise
                         try:
                             self.fast_forward(self.bytes_used_from_backend)
                         except (HTTPException, ValueError):
                             six.reraise(exc_type, exc_value, exc_traceback)
                         except RangeAlreadyComplete:
                             break
-                        buf = ''
+                        buf = b''
                         new_source, new_node = self._get_source_and_node()
                         if new_source:
                             self.app.exception_occurred(
@@ -1017,7 +1019,7 @@ class ResumingGetter(object):
                             else:
                                 self.skip_bytes -= len(buf)
                                 self.bytes_used_from_backend += len(buf)
-                                buf = ''
+                                buf = b''
 
                         if not chunk:
                             if buf:
@@ -1025,7 +1027,7 @@ class ResumingGetter(object):
                                         self.app.client_timeout):
                                     self.bytes_used_from_backend += len(buf)
                                     yield buf
-                                buf = ''
+                                buf = b''
                             break
 
                         if client_chunk_size is not None:
@@ -1041,7 +1043,7 @@ class ResumingGetter(object):
                             with ChunkWriteTimeout(self.app.client_timeout):
                                 self.bytes_used_from_backend += len(buf)
                                 yield buf
-                            buf = ''
+                            buf = b''
 
                         # This is for fairness; if the network is outpacing
                         # the CPU, we'll always be able to read and write
@@ -1091,20 +1093,18 @@ class ResumingGetter(object):
                 self.app.client_timeout)
             self.app.logger.increment('client_timeouts')
         except GeneratorExit:
-            exc_type, exc_value, exc_traceback = exc_info()
             warn = True
-            try:
-                req_range = Range(self.backend_headers['Range'])
-            except ValueError:
-                req_range = None
-            if req_range and len(req_range.ranges) == 1:
-                begin, end = req_range.ranges[0]
-                if end is not None and begin is not None:
-                    if end - begin + 1 == self.bytes_used_from_backend:
-                        warn = False
+            req_range = self.backend_headers['Range']
+            if req_range:
+                req_range = Range(req_range)
+                if len(req_range.ranges) == 1:
+                    begin, end = req_range.ranges[0]
+                    if end is not None and begin is not None:
+                        if end - begin + 1 == self.bytes_used_from_backend:
+                            warn = False
             if not req.environ.get('swift.non_client_disconnect') and warn:
                 self.app.logger.warning(_('Client disconnected on read'))
-            six.reraise(exc_type, exc_value, exc_traceback)
+            raise
         except Exception:
             self.app.logger.exception(_('Trying to send to client'))
             raise

@@ -17,6 +17,7 @@ import unittest2
 import os
 
 import test.functional as tf
+from swift.common.utils import config_true_value
 from swift.common.middleware.s3api.etree import fromstring, tostring, Element, \
     SubElement
 from test.functional.s3api import S3ApiBase
@@ -78,7 +79,7 @@ class TestS3ApiBucket(S3ApiBase):
         self.assertEqual(status, 200)
 
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue(headers['content-type'] is not None)
+        self.assertIsNotNone(headers['content-type'])
         self.assertEqual(headers['content-length'], str(len(body)))
         # TODO; requires consideration
         # self.assertEqual(headers['transfer-encoding'], 'chunked')
@@ -110,24 +111,24 @@ class TestS3ApiBucket(S3ApiBase):
         resp_objects = elem.findall('./Contents')
         self.assertEqual(len(list(resp_objects)), 2)
         for o in resp_objects:
-            self.assertTrue(o.find('Key').text in req_objects)
-            self.assertTrue(o.find('LastModified').text is not None)
+            self.assertIn(o.find('Key').text, req_objects)
+            self.assertIsNotNone(o.find('LastModified').text)
             self.assertRegexpMatches(
                 o.find('LastModified').text,
                 r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
-            self.assertTrue(o.find('ETag').text is not None)
-            self.assertTrue(o.find('Size').text is not None)
-            self.assertTrue(o.find('StorageClass').text is not None)
-            self.assertTrue(o.find('Owner/ID').text, self.conn.user_id)
-            self.assertTrue(o.find('Owner/DisplayName').text,
-                            self.conn.user_id)
+            self.assertIsNotNone(o.find('ETag').text)
+            self.assertIsNotNone(o.find('Size').text)
+            self.assertIsNotNone(o.find('StorageClass').text)
+            self.assertEqual(o.find('Owner/ID').text, self.conn.user_id)
+            self.assertEqual(o.find('Owner/DisplayName').text,
+                             self.conn.user_id)
 
         # HEAD Bucket
         status, headers, body = self.conn.make_request('HEAD', bucket)
         self.assertEqual(status, 200)
 
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue(headers['content-type'] is not None)
+        self.assertIsNotNone(headers['content-type'])
         self.assertEqual(headers['content-length'], str(len(body)))
         # TODO; requires consideration
         # self.assertEqual(headers['transfer-encoding'], 'chunked')
@@ -151,11 +152,46 @@ class TestS3ApiBucket(S3ApiBase):
 
         self.conn.make_request('PUT', 'bucket')
         status, headers, body = self.conn.make_request('PUT', 'bucket')
-        self.assertEqual(get_error_code(body), 'BucketAlreadyExists')
+        self.assertEqual(status, 409)
+        self.assertEqual(get_error_code(body), 'BucketAlreadyOwnedByYou')
+
+    def test_put_bucket_error_key2(self):
+        if config_true_value(tf.cluster_info['s3api'].get('s3_acl')):
+            if 's3_access_key2' not in tf.config or \
+                    's3_secret_key2' not in tf.config:
+                raise tf.SkipTest(
+                    'Cannot test for BucketAlreadyExists with second user; '
+                    'need s3_access_key2 and s3_secret_key2 configured')
+
+            self.conn.make_request('PUT', 'bucket')
+
+            # Other users of the same account get the same 409 error
+            conn2 = Connection(tf.config['s3_access_key2'],
+                               tf.config['s3_secret_key2'],
+                               tf.config['s3_access_key2'])
+            status, headers, body = conn2.make_request('PUT', 'bucket')
+            self.assertEqual(status, 409)
+            self.assertEqual(get_error_code(body), 'BucketAlreadyExists')
+
+    def test_put_bucket_error_key3(self):
+        if 's3_access_key3' not in tf.config or \
+                's3_secret_key3' not in tf.config:
+            raise tf.SkipTest('Cannot test for AccessDenied; need '
+                              's3_access_key3 and s3_secret_key3 configured')
+
+        self.conn.make_request('PUT', 'bucket')
+        # If the user can't create buckets, they shouldn't even know
+        # whether the bucket exists.
+        conn3 = Connection(tf.config['s3_access_key3'],
+                           tf.config['s3_secret_key3'],
+                           tf.config['s3_access_key3'])
+        status, headers, body = conn3.make_request('PUT', 'bucket')
+        self.assertEqual(status, 403)
+        self.assertEqual(get_error_code(body), 'AccessDenied')
 
     def test_put_bucket_with_LocationConstraint(self):
         bucket = 'bucket'
-        xml = self._gen_location_xml('US')
+        xml = self._gen_location_xml(self.conn.conn.auth_region_name)
         status, headers, body = \
             self.conn.make_request('PUT', bucket, body=xml)
         self.assertEqual(status, 200)
@@ -198,16 +234,16 @@ class TestS3ApiBucket(S3ApiBase):
         self.assertEqual(len(list(resp_objects)), len(expect_objects))
         for i, o in enumerate(resp_objects):
             self.assertEqual(o.find('Key').text, expect_objects[i])
-            self.assertTrue(o.find('LastModified').text is not None)
+            self.assertIsNotNone(o.find('LastModified').text)
             self.assertRegexpMatches(
                 o.find('LastModified').text,
                 r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
-            self.assertTrue(o.find('ETag').text is not None)
-            self.assertTrue(o.find('Size').text is not None)
+            self.assertIsNotNone(o.find('ETag').text)
+            self.assertIsNotNone(o.find('Size').text)
             self.assertEqual(o.find('StorageClass').text, 'STANDARD')
-            self.assertTrue(o.find('Owner/ID').text, self.conn.user_id)
-            self.assertTrue(o.find('Owner/DisplayName').text,
-                            self.conn.user_id)
+            self.assertEqual(o.find('Owner/ID').text, self.conn.user_id)
+            self.assertEqual(o.find('Owner/DisplayName').text,
+                             self.conn.user_id)
         resp_prefixes = elem.findall('CommonPrefixes')
         self.assertEqual(len(resp_prefixes), len(expect_prefixes))
         for i, p in enumerate(resp_prefixes):
@@ -244,16 +280,16 @@ class TestS3ApiBucket(S3ApiBase):
         self.assertEqual(len(list(resp_objects)), len(expect_objects))
         for i, o in enumerate(resp_objects):
             self.assertEqual(o.find('Key').text, expect_objects[i])
-            self.assertTrue(o.find('LastModified').text is not None)
+            self.assertIsNotNone(o.find('LastModified').text)
             self.assertRegexpMatches(
                 o.find('LastModified').text,
                 r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
-            self.assertTrue(o.find('ETag').text is not None)
-            self.assertTrue(o.find('Size').text is not None)
+            self.assertIsNotNone(o.find('ETag').text)
+            self.assertIsNotNone(o.find('Size').text)
             self.assertEqual(o.find('StorageClass').text, 'STANDARD')
-            self.assertTrue(o.find('Owner/ID').text, self.conn.user_id)
-            self.assertTrue(o.find('Owner/DisplayName').text,
-                            self.conn.user_id)
+            self.assertEqual(o.find('Owner/ID').text, self.conn.user_id)
+            self.assertEqual(o.find('Owner/DisplayName').text,
+                             self.conn.user_id)
 
     def test_get_bucket_with_max_keys(self):
         bucket = 'bucket'
@@ -273,16 +309,16 @@ class TestS3ApiBucket(S3ApiBase):
         self.assertEqual(len(list(resp_objects)), len(expect_objects))
         for i, o in enumerate(resp_objects):
             self.assertEqual(o.find('Key').text, expect_objects[i])
-            self.assertTrue(o.find('LastModified').text is not None)
+            self.assertIsNotNone(o.find('LastModified').text)
             self.assertRegexpMatches(
                 o.find('LastModified').text,
                 r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
-            self.assertTrue(o.find('ETag').text is not None)
-            self.assertTrue(o.find('Size').text is not None)
+            self.assertIsNotNone(o.find('ETag').text)
+            self.assertIsNotNone(o.find('Size').text)
             self.assertEqual(o.find('StorageClass').text, 'STANDARD')
-            self.assertTrue(o.find('Owner/ID').text, self.conn.user_id)
-            self.assertTrue(o.find('Owner/DisplayName').text,
-                            self.conn.user_id)
+            self.assertEqual(o.find('Owner/ID').text, self.conn.user_id)
+            self.assertEqual(o.find('Owner/DisplayName').text,
+                             self.conn.user_id)
 
     def test_get_bucket_with_prefix(self):
         bucket = 'bucket'
@@ -302,16 +338,16 @@ class TestS3ApiBucket(S3ApiBase):
         self.assertEqual(len(list(resp_objects)), len(expect_objects))
         for i, o in enumerate(resp_objects):
             self.assertEqual(o.find('Key').text, expect_objects[i])
-            self.assertTrue(o.find('LastModified').text is not None)
+            self.assertIsNotNone(o.find('LastModified').text)
             self.assertRegexpMatches(
                 o.find('LastModified').text,
                 r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
-            self.assertTrue(o.find('ETag').text is not None)
-            self.assertTrue(o.find('Size').text is not None)
+            self.assertIsNotNone(o.find('ETag').text)
+            self.assertIsNotNone(o.find('Size').text)
             self.assertEqual(o.find('StorageClass').text, 'STANDARD')
-            self.assertTrue(o.find('Owner/ID').text, self.conn.user_id)
-            self.assertTrue(o.find('Owner/DisplayName').text,
-                            self.conn.user_id)
+            self.assertEqual(o.find('Owner/ID').text, self.conn.user_id)
+            self.assertEqual(o.find('Owner/DisplayName').text,
+                             self.conn.user_id)
 
     def test_get_bucket_v2_with_start_after(self):
         bucket = 'bucket'
@@ -370,63 +406,60 @@ class TestS3ApiBucket(S3ApiBase):
             self.assertTrue(o.find('Owner/DisplayName').text,
                             self.conn.user_id)
 
-    def test_get_bucket_v2_with_continuation_token(self):
+    def test_get_bucket_v2_with_continuation_token_and_delimiter(self):
         bucket = 'bucket'
-        put_objects = ('object', 'object2', 'subdir/object', 'subdir2/object',
-                       'dir/subdir/object')
+        put_objects = ('object', u'object2-\u062a', 'subdir/object',
+                       u'subdir2-\u062a/object', 'dir/subdir/object',
+                       'x', 'y', 'z')
         self._prepare_test_get_bucket(bucket, put_objects)
 
-        query = 'list-type=2&max-keys=3'
-        expect_objects = ('dir/subdir/object', 'object', 'object2')
-        status, headers, body = \
-            self.conn.make_request('GET', bucket, query=query)
-        self.assertEqual(status, 200)
-        elem = fromstring(body, 'ListBucketResult')
-        self.assertEqual(elem.find('MaxKeys').text, '3')
-        self.assertEqual(elem.find('KeyCount').text, '3')
-        self.assertEqual(elem.find('IsTruncated').text, 'true')
-        next_cont_token_elem = elem.find('NextContinuationToken')
-        self.assertIsNotNone(next_cont_token_elem)
-        resp_objects = elem.findall('./Contents')
-        self.assertEqual(len(list(resp_objects)), len(expect_objects))
-        for i, o in enumerate(resp_objects):
-            self.assertEqual(o.find('Key').text, expect_objects[i])
-            self.assertTrue(o.find('LastModified').text is not None)
-            self.assertRegexpMatches(
-                o.find('LastModified').text,
-                r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
-            self.assertTrue(o.find('ETag').text is not None)
-            self.assertTrue(o.find('Size').text is not None)
-            self.assertEqual(o.find('StorageClass').text, 'STANDARD')
-            self.assertIsNone(o.find('Owner/ID'))
-            self.assertIsNone(o.find('Owner/DisplayName'))
+        expected = [{'objects': ['object', u'object2-\u062a'],
+                     'subdirs': ['dir/']},
+                    {'objects': ['x'],
+                     'subdirs': ['subdir/', u'subdir2-\u062a/']},
+                    {'objects': ['y', 'z'],
+                     'subdirs': []}]
 
-        query = 'list-type=2&max-keys=3&continuation-token=%s' % \
-            next_cont_token_elem.text
-        expect_objects = ('subdir/object', 'subdir2/object')
-        status, headers, body = \
-            self.conn.make_request('GET', bucket, query=query)
-        self.assertEqual(status, 200)
-        elem = fromstring(body, 'ListBucketResult')
-        self.assertEqual(elem.find('MaxKeys').text, '3')
-        self.assertEqual(elem.find('KeyCount').text, '2')
-        self.assertEqual(elem.find('IsTruncated').text, 'false')
-        self.assertIsNone(elem.find('NextContinuationToken'))
-        cont_token_elem = elem.find('ContinuationToken')
-        self.assertEqual(cont_token_elem.text, next_cont_token_elem.text)
-        resp_objects = elem.findall('./Contents')
-        self.assertEqual(len(list(resp_objects)), len(expect_objects))
-        for i, o in enumerate(resp_objects):
-            self.assertEqual(o.find('Key').text, expect_objects[i])
-            self.assertTrue(o.find('LastModified').text is not None)
-            self.assertRegexpMatches(
-                o.find('LastModified').text,
-                r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
-            self.assertTrue(o.find('ETag').text is not None)
-            self.assertTrue(o.find('Size').text is not None)
-            self.assertEqual(o.find('StorageClass').text, 'STANDARD')
-            self.assertIsNone(o.find('Owner/ID'))
-            self.assertIsNone(o.find('Owner/DisplayName'))
+        continuation_token = ''
+        query = 'list-type=2&max-keys=3&delimiter=/&continuation-token=%s'
+
+        for i in range(len(expected)):
+            status, headers, body = self.conn.make_request(
+                'GET', bucket, query=query % continuation_token)
+            self.assertEqual(status, 200)
+            elem = fromstring(body, 'ListBucketResult')
+            self.assertEqual(elem.find('MaxKeys').text, '3')
+            self.assertEqual(
+                elem.find('KeyCount').text,
+                str(len(expected[i]['objects']) + len(expected[i]['subdirs'])))
+            expect_truncated = 'true' if i < len(expected) - 1 else 'false'
+            self.assertEqual(elem.find('IsTruncated').text, expect_truncated)
+            next_cont_token_elem = elem.find('NextContinuationToken')
+            if expect_truncated == 'true':
+                self.assertIsNotNone(next_cont_token_elem)
+                continuation_token = next_cont_token_elem.text
+            resp_objects = elem.findall('./Contents')
+            self.assertEqual(
+                len(list(resp_objects)), len(expected[i]['objects']))
+            for j, o in enumerate(resp_objects):
+                self.assertEqual(o.find('Key').text,
+                                 expected[i]['objects'][j].encode('utf-8'))
+                self.assertTrue(o.find('LastModified').text is not None)
+                self.assertRegexpMatches(
+                    o.find('LastModified').text,
+                    r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
+                self.assertTrue(o.find('ETag').text is not None)
+                self.assertTrue(o.find('Size').text is not None)
+                self.assertEqual(o.find('StorageClass').text, 'STANDARD')
+                self.assertIsNone(o.find('Owner/ID'))
+                self.assertIsNone(o.find('Owner/DisplayName'))
+            resp_subdirs = elem.findall('./CommonPrefixes')
+            self.assertEqual(
+                len(list(resp_subdirs)), len(expected[i]['subdirs']))
+            for j, o in enumerate(resp_subdirs):
+                self.assertEqual(
+                    o.find('Prefix').text,
+                    expected[i]['subdirs'][j].encode('utf-8'))
 
     def test_head_bucket_error(self):
         self.conn.make_request('PUT', 'bucket')

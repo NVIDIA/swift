@@ -178,16 +178,16 @@ class TestAccount(Base):
         self.assert_body('Bad URL')
 
     def testInvalidPath(self):
-        was_url = self.env.account.conn.storage_url
+        was_path = self.env.account.conn.storage_path
         if (normalized_urls):
-            self.env.account.conn.storage_url = '/'
+            self.env.account.conn.storage_path = '/'
         else:
-            self.env.account.conn.storage_url = "/%s" % was_url
-        self.env.account.conn.make_request('GET')
+            self.env.account.conn.storage_path = "/%s" % was_path
         try:
+            self.env.account.conn.make_request('GET')
             self.assert_status(404)
         finally:
-            self.env.account.conn.storage_url = was_url
+            self.env.account.conn.storage_path = was_path
 
     def testPUTError(self):
         if load_constraint('allow_account_management'):
@@ -1569,6 +1569,8 @@ class TestFile(Base):
                               Utils.create_name())
 
     def testCopyAccount404s(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
         acct = self.env.conn.account_name
         acct2 = self.env.conn2.account_name
         source_filename = Utils.create_name()
@@ -1696,6 +1698,8 @@ class TestFile(Base):
                 self.assertEqual(metadata, file_item.metadata)
 
     def testCopyFromAccountHeader(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
         acct = self.env.conn.account_name
         src_cont = self.env.account.container(Utils.create_name())
         self.assertTrue(src_cont.create(hdrs={
@@ -1771,6 +1775,8 @@ class TestFile(Base):
             self.assert_status(404)
 
     def testCopyFromAccountHeader404s(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
         acct = self.env.conn2.account_name
         src_cont = self.env.account2.container(Utils.create_name())
         self.assertTrue(src_cont.create(hdrs={
@@ -1791,9 +1797,7 @@ class TestFile(Base):
                                                    (prefix,
                                                     Utils.create_name(),
                                                     source_filename)})
-            # looks like cached responses leak "not found"
-            # to un-authorized users, not going to fix it now, but...
-            self.assert_status([403, 404])
+            self.assert_status(403)
 
             # invalid source object
             file_item = self.env.container.file(Utils.create_name())
@@ -1815,6 +1819,50 @@ class TestFile(Base):
                                                     src_cont,
                                                     source_filename)})
             self.assert_status(404)
+
+    def testCopyFromAccountHeader403s(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
+        acct = self.env.conn2.account_name
+        src_cont = self.env.account2.container(Utils.create_name())
+        self.assertTrue(src_cont.create())  # Primary user has no access
+        source_filename = Utils.create_name()
+        file_item = src_cont.file(source_filename)
+        file_item.write_random()
+        dest_cont = self.env.account.container(Utils.create_name())
+        self.assertTrue(dest_cont.create())
+
+        for prefix in ('', '/'):
+            # invalid source container
+            file_item = dest_cont.file(Utils.create_name())
+            self.assertRaises(ResponseError, file_item.write,
+                              hdrs={'X-Copy-From-Account': acct,
+                                    'X-Copy-From': '%s%s/%s' %
+                                                   (prefix,
+                                                    Utils.create_name(),
+                                                    source_filename)})
+            self.assert_status(403)
+
+            # invalid source object
+            file_item = self.env.container.file(Utils.create_name())
+            self.assertRaises(ResponseError, file_item.write,
+                              hdrs={'X-Copy-From-Account': acct,
+                                    'X-Copy-From': '%s%s/%s' %
+                                                   (prefix,
+                                                    src_cont,
+                                                    Utils.create_name())})
+            self.assert_status(403)
+
+            # invalid destination container
+            dest_cont = self.env.account.container(Utils.create_name())
+            file_item = dest_cont.file(Utils.create_name())
+            self.assertRaises(ResponseError, file_item.write,
+                              hdrs={'X-Copy-From-Account': acct,
+                                    'X-Copy-From': '%s%s/%s' %
+                                                   (prefix,
+                                                    src_cont,
+                                                    source_filename)})
+            self.assert_status(403)
 
     def testNameLimit(self):
         limit = load_constraint('max_object_name_length')
@@ -1893,7 +1941,7 @@ class TestFile(Base):
                 self.assertTrue(file_item.write())
                 self.assert_status(201)
                 self.assertTrue(file_item.sync_metadata())
-                self.assert_status((201, 202))
+                self.assert_status(202)
             else:
                 self.assertRaises(ResponseError, file_item.write)
                 self.assert_status(400)
@@ -2326,7 +2374,7 @@ class TestFile(Base):
 
             file_item.metadata = metadata
             self.assertTrue(file_item.sync_metadata())
-            self.assert_status((201, 202))
+            self.assert_status(202)
 
             file_item = self.env.container.file(file_item.name)
             self.assertTrue(file_item.initialize())

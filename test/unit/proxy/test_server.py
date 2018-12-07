@@ -562,17 +562,47 @@ class TestController(unittest.TestCase):
 
 
 @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
-class TestProxyServer(unittest.TestCase):
+class TestProxyServerConfiguration(unittest.TestCase):
+    def _make_app(self, conf):
+        # helper function to instantiate a proxy server instance
+        return proxy_server.Application(conf, FakeMemcache(),
+                                        container_ring=FakeRing(),
+                                        account_ring=FakeRing())
 
-    def test_creation(self):
+    def test_node_timeout(self):
         # later config should be extended to assert more config options
-        app = proxy_server.Application({'node_timeout': '3.5',
-                                        'recoverable_node_timeout': '1.5'},
-                                       FakeMemcache(),
-                                       container_ring=FakeRing(),
-                                       account_ring=FakeRing())
+        app = self._make_app({'node_timeout': '3.5',
+                              'recoverable_node_timeout': '1.5'})
         self.assertEqual(app.node_timeout, 3.5)
         self.assertEqual(app.recoverable_node_timeout, 1.5)
+
+    def test_cors_options(self):
+        # check defaults
+        app = self._make_app({})
+        self.assertFalse(app.cors_allow_origin)
+        self.assertFalse(app.cors_expose_headers)
+        self.assertTrue(app.strict_cors_mode)
+
+        # check custom configs
+        app = self._make_app({
+            'cors_allow_origin': '',
+            'cors_expose_headers': '',
+            'strict_cors_mode': 'True'})
+        self.assertTrue(app.strict_cors_mode)
+
+        app = self._make_app({
+            'cors_allow_origin': ' http://X.com,http://Y.com ,,  http://Z.com',
+            'cors_expose_headers': ' custom1,,,  custom2,custom3,,',
+            'strict_cors_mode': 'False'})
+        self.assertEqual({'http://X.com', 'http://Y.com', 'http://Z.com'},
+                         set(app.cors_allow_origin))
+        self.assertEqual({'custom1', 'custom2', 'custom3'},
+                         set(app.cors_expose_headers))
+        self.assertFalse(app.strict_cors_mode)
+
+
+@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
+class TestProxyServer(unittest.TestCase):
 
     def test_get_object_ring(self):
         baseapp = proxy_server.Application({},
@@ -1193,7 +1223,7 @@ class TestProxyServerLoading(unittest.TestCase):
 
     def setUp(self):
         self._orig_hash_suffix = utils.HASH_PATH_SUFFIX
-        utils.HASH_PATH_SUFFIX = 'endcap'
+        utils.HASH_PATH_SUFFIX = b'endcap'
         self.tempdir = mkdtemp()
 
     def tearDown(self):
@@ -1708,6 +1738,35 @@ class TestProxyServerConfigLoading(unittest.TestCase):
                                      "sorting_method": "affinity"}}
         app = self._write_conf_and_load_app(conf_sections)
         self._check_policy_options(app, exp_options, {})
+
+    def test_per_policy_conf_invalid_sorting_method_value(self):
+        def do_test(conf_sections, scope):
+            with self.assertRaises(ValueError) as cm:
+                self._write_conf_and_load_app(conf_sections)
+            self.assertEqual(
+                'Invalid sorting_method value; must be one of shuffle, '
+                "timing, affinity, not 'broken' for %s" % scope,
+                cm.exception.message)
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = shuffle
+
+        [proxy-server:policy:0]
+        sorting_method = broken
+        """
+        do_test(conf_sections, 'policy 0 (nulo)')
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = broken
+
+        [proxy-server:policy:0]
+        sorting_method = shuffle
+        """
+        do_test(conf_sections, '(default)')
 
     def test_per_policy_conf_invalid_read_affinity_value(self):
         def do_test(conf_sections, label):
@@ -2584,9 +2643,12 @@ class TestReplicatedObjectController(
         def test_connect(ipaddr, port, device, partition, method, path,
                          headers=None, query_string=None):
             if path == '/a/c/o.jpg':
-                if 'expect' in headers or 'Expect' in headers:
-                    test_errors.append('Expect was in headers for object '
-                                       'server!')
+                if headers.get('Transfer-Encoding') != 'chunked':
+                    test_errors.append('"Transfer-Encoding: chunked" should '
+                                       'be in headers for object server!')
+                if 'Expect' not in headers:
+                    test_errors.append('Expect should be in headers for '
+                                       'object server!')
 
         with save_globals():
             controller = ReplicatedObjectController(
@@ -5277,6 +5339,14 @@ class TestReplicatedObjectController(
         self.assertNotIn('access-control-expose-headers', resp.headers)
         self.assertNotIn('access-control-allow-origin', resp.headers)
 
+        # test proxy server cors_allow_origin option
+        self.app.cors_allow_origin = ['http://foo.bar']
+        resp = self._get_CORS_response(
+            container_cors=container_cors, strict_mode=True)
+        self.assertEqual('http://foo.bar',
+                         resp.headers['access-control-allow-origin'])
+        self.assertEqual(expected_exposed, exposed)
+
     def test_CORS_valid_with_obj_headers(self):
         container_cors = {'allow_origin': 'http://foo.bar'}
 
@@ -5860,7 +5930,8 @@ class BaseTestECObjectController(BaseTestObjectController):
         prolis = _test_sockets[0]
         prosrv = _test_servers[0]
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        with mock.patch('swift.obj.server.md5', busted_md5_constructor):
+        with mock.patch('swift.obj.diskfile.md5',
+                        busted_md5_constructor):
             fd = sock.makefile()
             fd.write('PUT /v1/a/%s/pimento HTTP/1.1\r\n'
                      'Host: localhost\r\n'

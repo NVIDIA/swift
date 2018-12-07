@@ -154,8 +154,8 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         _create_test_rings(self.testdir)
         POLICIES[0].object_ring = ring.Ring(self.testdir, ring_name='object')
         POLICIES[1].object_ring = ring.Ring(self.testdir, ring_name='object-1')
-        utils.HASH_PATH_SUFFIX = 'endcap'
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_SUFFIX = b'endcap'
+        utils.HASH_PATH_PREFIX = b''
         self.devices = os.path.join(self.testdir, 'node')
         os.makedirs(self.devices)
         os.mkdir(os.path.join(self.devices, 'sda1'))
@@ -1175,21 +1175,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             'sda1', '2', self.policy)
         for path, hash_, ts in hash_gen:
             self.fail('found %s with %s in %s' % (hash_, ts, path))
-        # but the partition directory and hashes pkl still exist
-        self.assertTrue(os.access(part_path, os.F_OK))
-        hashes_path = os.path.join(self.objects_1, '2', diskfile.HASH_FILE)
-        self.assertTrue(os.access(hashes_path, os.F_OK))
-
-        # ... but on next pass
-        ssync_calls = []
-        with mocked_http_conn() as request_log:
-            with mock.patch('swift.obj.reconstructor.ssync_sender',
-                            self._make_fake_ssync(ssync_calls)):
-                self.reconstructor.reconstruct(override_partitions=[2])
-        # reconstruct won't generate any replicate or ssync_calls
-        self.assertFalse(request_log.requests)
-        self.assertFalse(ssync_calls)
-        # and the partition will get removed!
+        # even the partition directory is gone
         self.assertFalse(os.access(part_path, os.F_OK))
 
     def test_process_job_all_success(self):
@@ -2321,6 +2307,54 @@ class TestWorkerReconstructor(unittest.TestCase):
             }
         }, data)
 
+    def test_recon_aggregation_at_end_of_run_once(self):
+        reconstructor = object_reconstructor.ObjectReconstructor({
+            'reconstructor_workers': 2,
+            'recon_cache_path': self.recon_cache_path
+        }, logger=self.logger)
+        reconstructor.all_local_devices = set(['d0', 'd1', 'd2', 'd3'])
+        start = time.time() - 1000
+        for i in range(4):
+            with mock.patch('swift.obj.reconstructor.time.time',
+                            return_value=start + (300 * i)), \
+                    mock.patch('swift.obj.reconstructor.os.getpid',
+                               return_value='pid-%s' % i):
+                reconstructor.final_recon_dump(
+                    i, override_devices=['d%s' % i])
+        # sanity
+        with open(self.rcache) as f:
+            data = json.load(f)
+        self.assertEqual({
+            'object_reconstruction_per_disk': {
+                'd0': {
+                    'object_reconstruction_last': start,
+                    'object_reconstruction_time': 0.0,
+                    'pid': 'pid-0',
+                },
+                'd1': {
+                    'object_reconstruction_last': start + 300,
+                    'object_reconstruction_time': 1,
+                    'pid': 'pid-1',
+                },
+                'd2': {
+                    'object_reconstruction_last': start + 600,
+                    'object_reconstruction_time': 2,
+                    'pid': 'pid-2',
+                },
+                'd3': {
+                    'object_reconstruction_last': start + 900,
+                    'object_reconstruction_time': 3,
+                    'pid': 'pid-3',
+                },
+            }
+        }, data)
+
+        reconstructor.post_multiprocess_run()
+        with open(self.rcache) as f:
+            data = json.load(f)
+        self.assertEqual(start + 900, data['object_reconstruction_last'])
+        self.assertEqual(15, data['object_reconstruction_time'])
+
     def test_recon_aggregation_races_with_final_recon_dump(self):
         reconstructor = object_reconstructor.ObjectReconstructor({
             'reconstructor_workers': 2,
@@ -2349,7 +2383,7 @@ class TestWorkerReconstructor(unittest.TestCase):
         }, data)
 
         # simulate a second worker concurrently dumping to recon cache while
-        # parent is aggregatng existing results; mock dump_recon_cache as a
+        # parent is aggregating existing results; mock dump_recon_cache as a
         # convenient way to interrupt parent aggregate_recon_update and 'pass
         # control' to second worker
         updated_data = []  # state of recon cache just after second worker dump
@@ -3348,6 +3382,60 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
                 v, job[k], k)
             self.assertEqual(v, job[k], msg)
 
+    def test_rehash_remote(self):
+        part_path = os.path.join(self.devices, self.local_dev['device'],
+                                 diskfile.get_data_dir(self.policy), '1')
+        utils.mkdirs(part_path)
+        part_info = {
+            'local_dev': self.local_dev,
+            'policy': self.policy,
+            'partition': 1,
+            'part_path': part_path,
+        }
+        jobs = self.reconstructor.build_reconstruction_jobs(part_info)
+        self.assertEqual(1, len(jobs))
+        job = jobs[0]
+        node = job['sync_to'][0]
+        # process_job used to try and modify the instance base headers
+        self.reconstructor.headers['X-Backend-Storage-Policy-Index'] = \
+            int(POLICIES[1])
+        # ... which doesn't work out under concurrency with multiple policies
+        self.assertNotEqual(
+            self.reconstructor.headers['X-Backend-Storage-Policy-Index'],
+            int(job['policy']))
+        with mocked_http_conn(200, body=pickle.dumps({})) as request_log:
+            self.reconstructor.rehash_remote(node, job, [])
+        self.assertEqual([int(job['policy'])], [
+            r['headers']['X-Backend-Storage-Policy-Index']
+            for r in request_log.requests])
+
+    def test_get_suffixes_to_sync(self):
+        part_path = os.path.join(self.devices, self.local_dev['device'],
+                                 diskfile.get_data_dir(self.policy), '1')
+        utils.mkdirs(part_path)
+        part_info = {
+            'local_dev': self.local_dev,
+            'policy': self.policy,
+            'partition': 1,
+            'part_path': part_path,
+        }
+        jobs = self.reconstructor.build_reconstruction_jobs(part_info)
+        self.assertEqual(1, len(jobs))
+        job = jobs[0]
+        node = job['sync_to'][0]
+        # process_job used to try and modify the instance base headers
+        self.reconstructor.headers['X-Backend-Storage-Policy-Index'] = \
+            int(POLICIES[1])
+        # ... which doesn't work out under concurrency with multiple policies
+        self.assertNotEqual(
+            self.reconstructor.headers['X-Backend-Storage-Policy-Index'],
+            int(job['policy']))
+        with mocked_http_conn(200, body=pickle.dumps({})) as request_log:
+            self.reconstructor._get_suffixes_to_sync(job, node)
+        self.assertEqual([int(job['policy'])], [
+            r['headers']['X-Backend-Storage-Policy-Index']
+            for r in request_log.requests])
+
     def test_get_suffix_delta(self):
         # different
         local_suff = {'123': {None: 'abc', 0: 'def'}}
@@ -3973,15 +4061,9 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         ], [
             (r['ip'], r['path']) for r in request_log.requests
         ])
-        # hashpath is still there, but all files have been purged
-        files = os.listdir(df._datadir)
-        self.assertFalse(files)
+        # hashpath has been removed
+        self.assertFalse(os.path.exists(df._datadir))
 
-        # and more to the point, the next suffix recalc will clean it up
-        df_mgr = self.reconstructor._df_router[self.policy]
-        df_mgr.get_hashes(self.local_dev['device'], str(partition), [],
-                          self.policy)
-        self.assertFalse(os.access(df._datadir, os.F_OK))
         self.assertEqual(self.reconstructor.handoffs_remaining, 0)
 
     def test_process_job_revert_cleanup_tombstone(self):
@@ -4797,8 +4879,9 @@ class TestReconstructFragmentArchiveUTF8(TestReconstructFragmentArchive):
                                  ec_type=DEFAULT_TEST_EC_TYPE,
                                  ec_ndata=10, ec_nparity=4,
                                  ec_segment_size=4096,
-                                 ec_duplication_factor=2)],
-                fake_ring_args=[{'replicas': 28}])
+                                 ec_duplication_factor=2),
+                 StoragePolicy(1, name='other')],
+                fake_ring_args=[{'replicas': 28}, {'replicas': 3}])
 class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
     def setUp(self):
         super(TestObjectReconstructorECDuplicationFactor, self).setUp()

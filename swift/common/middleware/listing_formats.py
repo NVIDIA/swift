@@ -55,14 +55,27 @@ def get_listing_content_type(req):
         out_content_type = req.accept.best_match(
             ['text/plain', 'application/json', 'application/xml', 'text/xml'])
     except ValueError:
-        raise HTTPBadRequest(request=req, body='Invalid Accept header')
+        raise HTTPBadRequest(request=req, body=b'Invalid Accept header')
     if not out_content_type:
         raise HTTPNotAcceptable(request=req)
     return out_content_type
 
 
+def to_xml(document_element):
+    result = tostring(document_element, encoding='UTF-8').replace(
+        b"<?xml version='1.0' encoding='UTF-8'?>",
+        b'<?xml version="1.0" encoding="UTF-8"?>', 1)
+    if not result.startswith(b'<?xml '):
+        # py3 tostring doesn't (necessarily?) include the XML declaration;
+        # add it if it's missing.
+        result = b'<?xml version="1.0" encoding="UTF-8"?>\n' + result
+    return result
+
+
 def account_to_xml(listing, account_name):
-    doc = Element('account', name=account_name.decode('utf-8'))
+    if isinstance(account_name, bytes):
+        account_name = account_name.decode('utf-8')
+    doc = Element('account', name=account_name)
     doc.text = '\n'
     for record in listing:
         if 'subdir' in record:
@@ -74,13 +87,13 @@ def account_to_xml(listing, account_name):
                 SubElement(sub, field).text = six.text_type(
                     record.pop(field))
         sub.tail = '\n'
-    return tostring(doc, encoding='UTF-8').replace(
-        "<?xml version='1.0' encoding='UTF-8'?>",
-        '<?xml version="1.0" encoding="UTF-8"?>', 1)
+    return to_xml(doc)
 
 
 def container_to_xml(listing, base_name):
-    doc = Element('container', name=base_name.decode('utf-8'))
+    if isinstance(base_name, bytes):
+        base_name = base_name.decode('utf-8')
+    doc = Element('container', name=base_name)
     for record in listing:
         if 'subdir' in record:
             name = record.pop('subdir')
@@ -92,10 +105,7 @@ def container_to_xml(listing, base_name):
                           'last_modified'):
                 SubElement(sub, field).text = six.text_type(
                     record.pop(field))
-
-    return tostring(doc, encoding='UTF-8').replace(
-        "<?xml version='1.0' encoding='UTF-8'?>",
-        '<?xml version="1.0" encoding="UTF-8"?>', 1)
+    return to_xml(doc)
 
 
 def listing_to_text(listing):

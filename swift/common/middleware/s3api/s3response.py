@@ -14,14 +14,15 @@
 # limitations under the License.
 
 import re
-from UserDict import DictMixin
+from collections import MutableMapping
 from functools import partial
 
 from swift.common import swob
 from swift.common.utils import config_true_value
 from swift.common.request_helpers import is_sys_meta
 
-from swift.common.middleware.s3api.utils import snake_to_camel, sysmeta_prefix
+from swift.common.middleware.s3api.utils import snake_to_camel, \
+    sysmeta_prefix, sysmeta_header
 from swift.common.middleware.s3api.etree import Element, SubElement, tostring
 
 
@@ -79,10 +80,6 @@ class S3Response(S3ResponseBase, swob.Response):
     def __init__(self, *args, **kwargs):
         swob.Response.__init__(self, *args, **kwargs)
 
-        if self.etag:
-            # add double quotes to the etag header
-            self.etag = self.etag
-
         sw_sysmeta_headers = swob.HeaderKeyDict()
         sw_headers = swob.HeaderKeyDict()
         headers = HeaderKeyDict()
@@ -97,7 +94,7 @@ class S3Response(S3ResponseBase, swob.Response):
             s3api_sysmeta_prefix = sysmeta_prefix(_server_type).lower()
             return sysmeta_key.lower().startswith(s3api_sysmeta_prefix)
 
-        for key, val in self.headers.iteritems():
+        for key, val in self.headers.items():
             if is_sys_meta('object', key) or is_sys_meta('container', key):
                 _server_type = key.split('-')[1]
                 if is_swift3_sysmeta(key, _server_type):
@@ -116,7 +113,7 @@ class S3Response(S3ResponseBase, swob.Response):
                 sw_headers[key] = val
 
         # Handle swift headers
-        for key, val in sw_headers.iteritems():
+        for key, val in sw_headers.items():
             _key = key.lower()
 
             if _key.startswith('x-object-meta-'):
@@ -134,7 +131,26 @@ class S3Response(S3ResponseBase, swob.Response):
                 # for delete slo
                 self.is_slo = config_true_value(val)
 
+        # Check whether we stored the AWS-style etag on upload
+        override_etag = sw_sysmeta_headers.get(
+            sysmeta_header('object', 'etag'))
+        if override_etag is not None:
+            # Multipart uploads in AWS have ETags like
+            #   <MD5(part_etag1 || ... || part_etagN)>-<number of parts>
+            headers['etag'] = override_etag
+        elif self.is_slo and 'etag' in headers:
+            # Many AWS clients use the presence of a '-' to decide whether
+            # to attempt client-side download validation, so even if we
+            # didn't store the AWS-style header, tack on a '-N'. (Use 'N'
+            # because we don't actually know how many parts there are.)
+            headers['etag'] += '-N'
+
         self.headers = headers
+
+        if self.etag:
+            # add double quotes to the etag header
+            self.etag = self.etag
+
         # Used for pure swift header handling at the request layer
         self.sw_headers = sw_headers
         self.sysmeta_headers = sw_sysmeta_headers
@@ -219,7 +235,7 @@ class ErrorResponse(S3ResponseBase, swob.HTTPException):
             tag = re.sub('\W', '', snake_to_camel(key))
             elem = SubElement(parent, tag)
 
-            if isinstance(value, (dict, DictMixin)):
+            if isinstance(value, (dict, MutableMapping)):
                 self._dict_to_etree(elem, value)
             else:
                 try:

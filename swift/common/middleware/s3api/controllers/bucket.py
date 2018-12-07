@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
 from base64 import standard_b64encode as b64encode
 from base64 import standard_b64decode as b64decode
+
+from six.moves.urllib.parse import quote
 
 from swift.common.http import HTTP_OK
 from swift.common.utils import json, public, config_true_value
@@ -66,7 +67,7 @@ class BucketController(Controller):
                 for seg in segments:
                     try:
                         req.get_response(self.app, 'DELETE', container,
-                                         seg['name'])
+                                         seg['name'].encode('utf8'))
                     except NoSuchKey:
                         pass
                     except InternalError:
@@ -111,17 +112,22 @@ class BucketController(Controller):
             'format': 'json',
             'limit': max_keys + 1,
         }
-        if 'marker' in req.params:
-            query.update({'marker': req.params['marker']})
         if 'prefix' in req.params:
             query.update({'prefix': req.params['prefix']})
         if 'delimiter' in req.params:
             query.update({'delimiter': req.params['delimiter']})
-
-        # GET Bucket (List Objects) Version 2 parameters
-        is_v2 = int(req.params.get('list-type', '1')) == 2
         fetch_owner = False
-        if is_v2:
+        if 'versions' in req.params:
+            listing_type = 'object-versions'
+            if 'key-marker' in req.params:
+                query.update({'marker': req.params['key-marker']})
+            elif 'version-id-marker' in req.params:
+                err_msg = ('A version-id marker cannot be specified without '
+                           'a key marker.')
+                raise InvalidArgument('version-id-marker',
+                                      req.params['version-id-marker'], err_msg)
+        elif int(req.params.get('list-type', '1')) == 2:
+            listing_type = 'version-2'
             if 'start-after' in req.params:
                 query.update({'marker': req.params['start-after']})
             # continuation-token overrides start-after
@@ -130,51 +136,71 @@ class BucketController(Controller):
                 query.update({'marker': decoded})
             if 'fetch-owner' in req.params:
                 fetch_owner = config_true_value(req.params['fetch-owner'])
+        else:
+            listing_type = 'version-1'
+            if 'marker' in req.params:
+                query.update({'marker': req.params['marker']})
 
         resp = req.get_response(self.app, query=query)
 
         objects = json.loads(resp.body)
-
-        elem = Element('ListBucketResult')
-        SubElement(elem, 'Name').text = req.container_name
-        SubElement(elem, 'Prefix').text = req.params.get('prefix')
 
         # in order to judge that truncated is valid, check whether
         # max_keys + 1 th element exists in swift.
         is_truncated = max_keys > 0 and len(objects) > max_keys
         objects = objects[:max_keys]
 
-        if not is_v2:
-            SubElement(elem, 'Marker').text = req.params.get('marker')
-            if is_truncated and 'delimiter' in req.params:
-                if 'name' in objects[-1]:
-                    SubElement(elem, 'NextMarker').text = \
-                        objects[-1]['name']
-                if 'subdir' in objects[-1]:
-                    SubElement(elem, 'NextMarker').text = \
-                        objects[-1]['subdir']
-        else:
+        if listing_type == 'object-versions':
+            elem = Element('ListVersionsResult')
+            SubElement(elem, 'Name').text = req.container_name
+            SubElement(elem, 'Prefix').text = req.params.get('prefix')
+            SubElement(elem, 'KeyMarker').text = req.params.get('key-marker')
+            SubElement(elem, 'VersionIdMarker').text = req.params.get(
+                'version-id-marker')
             if is_truncated:
                 if 'name' in objects[-1]:
-                    SubElement(elem, 'NextContinuationToken').text = \
-                        b64encode(objects[-1]['name'])
+                    SubElement(elem, 'NextKeyMarker').text = \
+                        objects[-1]['name']
                 if 'subdir' in objects[-1]:
-                    SubElement(elem, 'NextContinuationToken').text = \
-                        b64encode(objects[-1]['subdir'])
-            if 'continuation-token' in req.params:
-                SubElement(elem, 'ContinuationToken').text = \
-                    req.params['continuation-token']
-            if 'start-after' in req.params:
-                SubElement(elem, 'StartAfter').text = \
-                    req.params['start-after']
-            SubElement(elem, 'KeyCount').text = str(len(objects))
+                    SubElement(elem, 'NextKeyMarker').text = \
+                        objects[-1]['subdir']
+                SubElement(elem, 'NextVersionIdMarker').text = 'null'
+        else:
+            elem = Element('ListBucketResult')
+            SubElement(elem, 'Name').text = req.container_name
+            SubElement(elem, 'Prefix').text = req.params.get('prefix')
+            if listing_type == 'version-1':
+                SubElement(elem, 'Marker').text = req.params.get('marker')
+                if is_truncated and 'delimiter' in req.params:
+                    if 'name' in objects[-1]:
+                        name = objects[-1]['name']
+                    else:
+                        name = objects[-1]['subdir']
+                    if encoding_type == 'url':
+                        name = quote(name)
+                    SubElement(elem, 'NextMarker').text = name
+            elif listing_type == 'version-2':
+                if is_truncated:
+                    if 'name' in objects[-1]:
+                        SubElement(elem, 'NextContinuationToken').text = \
+                            b64encode(objects[-1]['name'].encode('utf8'))
+                    if 'subdir' in objects[-1]:
+                        SubElement(elem, 'NextContinuationToken').text = \
+                            b64encode(objects[-1]['subdir'].encode('utf8'))
+                if 'continuation-token' in req.params:
+                    SubElement(elem, 'ContinuationToken').text = \
+                        req.params['continuation-token']
+                if 'start-after' in req.params:
+                    SubElement(elem, 'StartAfter').text = \
+                        req.params['start-after']
+                SubElement(elem, 'KeyCount').text = str(len(objects))
 
         SubElement(elem, 'MaxKeys').text = str(tag_max_keys)
 
         if 'delimiter' in req.params:
             SubElement(elem, 'Delimiter').text = req.params['delimiter']
 
-        if encoding_type is not None:
+        if encoding_type == 'url':
             SubElement(elem, 'EncodingType').text = encoding_type
 
         SubElement(elem, 'IsTruncated').text = \
@@ -182,13 +208,34 @@ class BucketController(Controller):
 
         for o in objects:
             if 'subdir' not in o:
-                contents = SubElement(elem, 'Contents')
-                SubElement(contents, 'Key').text = o['name']
+                name = o['name']
+                if encoding_type == 'url':
+                    name = quote(name.encode('utf-8'))
+
+                if listing_type == 'object-versions':
+                    contents = SubElement(elem, 'Version')
+                    SubElement(contents, 'Key').text = name
+                    SubElement(contents, 'VersionId').text = 'null'
+                    SubElement(contents, 'IsLatest').text = 'true'
+                else:
+                    contents = SubElement(elem, 'Contents')
+                    SubElement(contents, 'Key').text = name
                 SubElement(contents, 'LastModified').text = \
                     o['last_modified'][:-3] + 'Z'
-                SubElement(contents, 'ETag').text = '"%s"' % o['hash']
+                if 's3_etag' in o:
+                    # New-enough MUs are already in the right format
+                    etag = o['s3_etag']
+                elif 'slo_etag' in o:
+                    # SLOs may be in something *close* to the MU format
+                    etag = '"%s-N"' % o['slo_etag'].strip('"')
+                else:
+                    # Normal objects just use the MD5
+                    etag = '"%s"' % o['hash']
+                    # This also catches sufficiently-old SLOs, but we have
+                    # no way to identify those from container listings
+                SubElement(contents, 'ETag').text = etag
                 SubElement(contents, 'Size').text = str(o['bytes'])
-                if fetch_owner or not is_v2:
+                if fetch_owner or listing_type != 'version-2':
                     owner = SubElement(contents, 'Owner')
                     SubElement(owner, 'ID').text = req.user_id
                     SubElement(owner, 'DisplayName').text = req.user_id
@@ -197,9 +244,12 @@ class BucketController(Controller):
         for o in objects:
             if 'subdir' in o:
                 common_prefixes = SubElement(elem, 'CommonPrefixes')
-                SubElement(common_prefixes, 'Prefix').text = o['subdir']
+                name = o['subdir']
+                if encoding_type == 'url':
+                    name = quote(name.encode('utf-8'))
+                SubElement(common_prefixes, 'Prefix').text = name
 
-        body = tostring(elem, encoding_type=encoding_type)
+        body = tostring(elem)
 
         return HTTPOk(body=body, content_type='application/xml')
 
@@ -218,9 +268,8 @@ class BucketController(Controller):
             except (XMLSyntaxError, DocumentInvalid):
                 raise MalformedXML()
             except Exception as e:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
                 self.logger.error(e)
-                raise exc_type, exc_value, exc_traceback
+                raise
 
             if location != self.conf.location:
                 # s3api cannot support multiple regions currently.

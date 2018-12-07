@@ -34,6 +34,7 @@ import logging
 import platform
 import os
 import mock
+import posix
 import pwd
 import random
 import re
@@ -1605,8 +1606,16 @@ class TestUtils(unittest.TestCase):
         syslog_handler_catcher.LOG_LOCAL0 = orig_sysloghandler.LOG_LOCAL0
         syslog_handler_catcher.LOG_LOCAL3 = orig_sysloghandler.LOG_LOCAL3
 
+        # Some versions of python perform host resolution while initializing
+        # the handler. See https://bugs.python.org/issue30378
+        orig_getaddrinfo = socket.getaddrinfo
+
+        def fake_getaddrinfo(host, *args):
+            return orig_getaddrinfo('localhost', *args)
+
         with mock.patch.object(utils, 'ThreadSafeSysLogHandler',
-                               syslog_handler_catcher):
+                               syslog_handler_catcher), \
+                mock.patch.object(socket, 'getaddrinfo', fake_getaddrinfo):
             utils.get_logger({
                 'log_facility': 'LOG_LOCAL3',
             }, 'server', log_route='server')
@@ -1626,13 +1635,10 @@ class TestUtils(unittest.TestCase):
                 'log_facility': 'LOG_LOCAL3',
                 'log_address': '/foo/bar',
             }, 'server', log_route='server')
-            self.assertEqual([
+            self.assertEqual(
                 ((), {'address': '/foo/bar',
                       'facility': orig_sysloghandler.LOG_LOCAL3}),
-                # Second call is because /foo/bar didn't exist (and wasn't a
-                # UNIX domain socket).
-                ((), {'facility': orig_sysloghandler.LOG_LOCAL3})],
-                syslog_handler_args)
+                syslog_handler_args[0])
 
             # Using UDP with default port
             syslog_handler_args = []
@@ -2586,6 +2592,30 @@ log_name = %(yarr)s'''
             self.assertIsNone(utils.remove_file(file_name))
             self.assertFalse(os.path.exists(file_name))
 
+    def test_remove_directory(self):
+        with temptree([]) as t:
+            dir_name = os.path.join(t, 'subdir')
+
+            os.mkdir(dir_name)
+            self.assertTrue(os.path.isdir(dir_name))
+            self.assertIsNone(utils.remove_directory(dir_name))
+            self.assertFalse(os.path.exists(dir_name))
+
+            # assert no raise only if it does not exist, or is not empty
+            self.assertEqual(os.path.exists(dir_name), False)
+            self.assertIsNone(utils.remove_directory(dir_name))
+
+            _m_rmdir = mock.Mock(
+                side_effect=OSError(errno.ENOTEMPTY,
+                                    os.strerror(errno.ENOTEMPTY)))
+            with mock.patch('swift.common.utils.os.rmdir', _m_rmdir):
+                self.assertIsNone(utils.remove_directory(dir_name))
+
+            _m_rmdir = mock.Mock(
+                side_effect=OSError(errno.EPERM, os.strerror(errno.EPERM)))
+            with mock.patch('swift.common.utils.os.rmdir', _m_rmdir):
+                self.assertRaises(OSError, utils.remove_directory, dir_name)
+
     def test_human_readable(self):
         self.assertEqual(utils.human_readable(0), '0')
         self.assertEqual(utils.human_readable(1), '1')
@@ -2922,246 +2952,6 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertRaises(ValueError, utils.rsync_module_interpolation,
                           '{replication_ip}::object_{deivce}', fake_device)
 
-    def test_fallocate_reserve(self):
-
-        class StatVFS(object):
-            f_frsize = 1024
-            f_bavail = 1
-            f_blocks = 100
-
-        def fstatvfs(fd):
-            return StatVFS()
-
-        orig_FALLOCATE_RESERVE = utils.FALLOCATE_RESERVE
-        orig_fstatvfs = utils.os.fstatvfs
-        try:
-            fallocate = utils.FallocateWrapper(noop=True)
-            utils.os.fstatvfs = fstatvfs
-
-            # Make sure setting noop, which disables fallocate, also stops the
-            # fallocate_reserve check.
-            # Set the fallocate_reserve to 99% and request an object that is
-            # about 50% the size. With fallocate_reserve off this will succeed.
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('99%')
-            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(500)), 0)
-
-            # Setting noop to False after the constructor allows us to use
-            # a noop fallocate syscall and still test fallocate_reserve.
-            fallocate.noop = False
-
-            # Want 1023 reserved, have 1024 * 1 free, so succeeds
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('1023')
-            StatVFS.f_frsize = 1024
-            StatVFS.f_bavail = 1
-            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(0)), 0)
-            # Want 1023 reserved, have 512 * 2 free, so succeeds
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('1023')
-            StatVFS.f_frsize = 512
-            StatVFS.f_bavail = 2
-            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(0)), 0)
-            # Want 1024 reserved, have 1024 * 1 free, so fails
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('1024')
-            StatVFS.f_frsize = 1024
-            StatVFS.f_bavail = 1
-
-            with self.assertRaises(OSError) as catcher:
-                fallocate(0, 1, 0, ctypes.c_uint64(0))
-            self.assertEqual(
-                str(catcher.exception),
-                '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 1024'
-                % errno.ENOSPC)
-            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
-
-            # Want 1024 reserved, have 512 * 2 free, so fails
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('1024')
-            StatVFS.f_frsize = 512
-            StatVFS.f_bavail = 2
-            with self.assertRaises(OSError) as catcher:
-                fallocate(0, 1, 0, ctypes.c_uint64(0))
-            self.assertEqual(
-                str(catcher.exception),
-                '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 1024'
-                % errno.ENOSPC)
-            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
-
-            # Want 2048 reserved, have 1024 * 1 free, so fails
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('2048')
-            StatVFS.f_frsize = 1024
-            StatVFS.f_bavail = 1
-            with self.assertRaises(OSError) as catcher:
-                fallocate(0, 1, 0, ctypes.c_uint64(0))
-            self.assertEqual(
-                str(catcher.exception),
-                '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 2048'
-                % errno.ENOSPC)
-            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
-
-            # Want 2048 reserved, have 512 * 2 free, so fails
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('2048')
-            StatVFS.f_frsize = 512
-            StatVFS.f_bavail = 2
-            with self.assertRaises(OSError) as catcher:
-                fallocate(0, 1, 0, ctypes.c_uint64(0))
-            self.assertEqual(
-                str(catcher.exception),
-                '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 2048'
-                % errno.ENOSPC)
-            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
-
-            # Want 1023 reserved, have 1024 * 1 free, but file size is 1, so
-            # fails
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('1023')
-            StatVFS.f_frsize = 1024
-            StatVFS.f_bavail = 1
-            with self.assertRaises(OSError) as catcher:
-                fallocate(0, 1, 0, ctypes.c_uint64(1))
-            self.assertEqual(
-                str(catcher.exception),
-                '[Errno %d] FALLOCATE_RESERVE fail 1023 <= 1023'
-                % errno.ENOSPC)
-            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
-
-            # Want 1022 reserved, have 1024 * 1 free, and file size is 1, so
-            # succeeds
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('1022')
-            StatVFS.f_frsize = 1024
-            StatVFS.f_bavail = 1
-            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(1)), 0)
-
-            # Want 1% reserved, have 100 bytes * 2/100 free, and file size is
-            # 99, so succeeds
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('1%')
-            StatVFS.f_frsize = 100
-            StatVFS.f_bavail = 2
-            StatVFS.f_blocks = 100
-            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(99)), 0)
-
-            # Want 2% reserved, have 50 bytes * 2/50 free, and file size is 49,
-            # so succeeds
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('2%')
-            StatVFS.f_frsize = 50
-            StatVFS.f_bavail = 2
-            StatVFS.f_blocks = 50
-            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(49)), 0)
-
-            # Want 100% reserved, have  100 * 100/100 free, and file size is 0,
-            # so fails.
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('100%')
-            StatVFS.f_frsize = 100
-            StatVFS.f_bavail = 100
-            StatVFS.f_blocks = 100
-            with self.assertRaises(OSError) as catcher:
-                fallocate(0, 1, 0, ctypes.c_uint64(0))
-            self.assertEqual(
-                str(catcher.exception),
-                '[Errno %d] FALLOCATE_RESERVE fail 100 <= 100'
-                % errno.ENOSPC)
-            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
-
-            # Want 1% reserved, have 100 * 2/100 free, and file size is 101,
-            # so fails.
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('1%')
-            StatVFS.f_frsize = 100
-            StatVFS.f_bavail = 2
-            StatVFS.f_blocks = 100
-            with self.assertRaises(OSError) as catcher:
-                fallocate(0, 1, 0, ctypes.c_uint64(101))
-            self.assertEqual(
-                str(catcher.exception),
-                '[Errno %d] FALLOCATE_RESERVE fail 0.99 <= 1'
-                % errno.ENOSPC)
-            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
-
-            # is 100, so fails
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('98%')
-            StatVFS.f_frsize = 100
-            StatVFS.f_bavail = 99
-            StatVFS.f_blocks = 100
-            with self.assertRaises(OSError) as catcher:
-                fallocate(0, 1, 0, ctypes.c_uint64(100))
-            self.assertEqual(
-                str(catcher.exception),
-                '[Errno %d] FALLOCATE_RESERVE fail 98 <= 98'
-                % errno.ENOSPC)
-            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
-
-            # Want 2% reserved, have 1000 bytes * 21/1000 free, and file size
-            # is 999, so succeeds.
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('2%')
-            StatVFS.f_frsize = 1000
-            StatVFS.f_bavail = 21
-            StatVFS.f_blocks = 1000
-            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(999)), 0)
-
-            # Want 2% resereved, have 1000 bytes * 21/1000 free, and file size
-            # is 1000, so fails.
-            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
-                utils.config_fallocate_value('2%')
-            StatVFS.f_frsize = 1000
-            StatVFS.f_bavail = 21
-            StatVFS.f_blocks = 1000
-            with self.assertRaises(OSError) as catcher:
-                fallocate(0, 1, 0, ctypes.c_uint64(1000))
-            self.assertEqual(
-                str(catcher.exception),
-                '[Errno %d] FALLOCATE_RESERVE fail 2 <= 2'
-                % errno.ENOSPC)
-            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
-
-        finally:
-            utils.FALLOCATE_RESERVE = orig_FALLOCATE_RESERVE
-            utils.os.fstatvfs = orig_fstatvfs
-
-    def test_fallocate_func(self):
-
-        class FallocateWrapper(object):
-
-            def __init__(self):
-                self.last_call = None
-
-            def __call__(self, *args):
-                self.last_call = list(args)
-                self.last_call[-1] = self.last_call[-1].value
-                return 0
-
-        with patch.object(utils, '_sys_fallocate', FallocateWrapper()):
-            utils._sys_fallocate = FallocateWrapper()
-            # Ensure fallocate calls _sys_fallocate even with 0 bytes
-            utils._sys_fallocate.last_call = None
-            utils.fallocate(1234, 0)
-            self.assertEqual(utils._sys_fallocate.last_call,
-                             [1234, 1, 0, 0])
-            # Ensure fallocate calls _sys_fallocate even with negative bytes
-            utils._sys_fallocate.last_call = None
-            utils.fallocate(1234, -5678)
-            self.assertEqual(utils._sys_fallocate.last_call,
-                             [1234, 1, 0, 0])
-            # Ensure fallocate calls _sys_fallocate properly with positive
-            # bytes
-            utils._sys_fallocate.last_call = None
-            utils.fallocate(1234, 1)
-            self.assertEqual(utils._sys_fallocate.last_call,
-                             [1234, 1, 0, 1])
-            utils._sys_fallocate.last_call = None
-            utils.fallocate(1234, 10 * 1024 * 1024 * 1024)
-            self.assertEqual(utils._sys_fallocate.last_call,
-                             [1234, 1, 0, 10 * 1024 * 1024 * 1024])
-
     def test_generate_trans_id(self):
         fake_time = 1366428370.5163341
         with patch.object(utils.time, 'time', return_value=fake_time):
@@ -3236,18 +3026,6 @@ cluster_dfw1 = http://dfw1.host/v1/
         fallocate_value, is_percent = utils.config_fallocate_value('10.000%')
         self.assertEqual(fallocate_value, 10.000)
         self.assertTrue(is_percent)
-
-    def test_tpool_reraise(self):
-        with patch.object(utils.tpool, 'execute', lambda f: f()):
-            self.assertTrue(
-                utils.tpool_reraise(MagicMock(return_value='test1')), 'test1')
-            self.assertRaises(
-                Exception,
-                utils.tpool_reraise, MagicMock(side_effect=Exception('test2')))
-            self.assertRaises(
-                BaseException,
-                utils.tpool_reraise,
-                MagicMock(side_effect=BaseException('test3')))
 
     def test_lock_file(self):
         flags = os.O_CREAT | os.O_RDWR
@@ -3408,8 +3186,15 @@ cluster_dfw1 = http://dfw1.host/v1/
         tmpdir = mkdtemp()
         try:
             link = os.path.join(tmpdir, "tmp")
-            os.symlink(tempfile.gettempdir(), link)
+            rdir = os.path.join(tmpdir, "realtmp")
+            os.mkdir(rdir)
+            os.symlink(rdir, link)
             self.assertFalse(utils.ismount(link))
+
+            # Can add a stubfile to make it pass
+            with open(os.path.join(link, ".ismount"), "w"):
+                pass
+            self.assertTrue(utils.ismount(link))
         finally:
             shutil.rmtree(tmpdir)
 
@@ -3635,6 +3420,16 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertEqual(
             utils.get_hmac('GET', '/path', 1, 'abc'),
             'b17f6ff8da0e251737aa9e3ee69a881e3e092e2f')
+
+    def test_get_hmac_ip_range(self):
+        self.assertEqual(
+            utils.get_hmac('GET', '/path', 1, 'abc', ip_range='127.0.0.1'),
+            'b30dde4d2b8562b8496466c3b46b2b9ac5054461')
+
+    def test_get_hmac_ip_range_non_binary_type(self):
+        self.assertEqual(
+            utils.get_hmac(u'GET', u'/path', 1, u'abc', ip_range=u'127.0.0.1'),
+            'b30dde4d2b8562b8496466c3b46b2b9ac5054461')
 
     def test_parse_override_options(self):
         # When override_<thing> is passed in, it takes precedence.
@@ -4325,25 +4120,25 @@ cluster_dfw1 = http://dfw1.host/v1/
     def test_get_redirect_data(self):
         ts_now = utils.Timestamp.now()
         headers = {'X-Backend-Redirect-Timestamp': ts_now.internal}
-        response = FakeResponse(200, headers, '')
+        response = FakeResponse(200, headers, b'')
         self.assertIsNone(utils.get_redirect_data(response))
 
         headers = {'Location': '/a/c/o',
                    'X-Backend-Redirect-Timestamp': ts_now.internal}
-        response = FakeResponse(200, headers, '')
+        response = FakeResponse(200, headers, b'')
         path, ts = utils.get_redirect_data(response)
         self.assertEqual('a/c', path)
         self.assertEqual(ts_now, ts)
 
         headers = {'Location': '/a/c',
                    'X-Backend-Redirect-Timestamp': ts_now.internal}
-        response = FakeResponse(200, headers, '')
+        response = FakeResponse(200, headers, b'')
         path, ts = utils.get_redirect_data(response)
         self.assertEqual('a/c', path)
         self.assertEqual(ts_now, ts)
 
         def do_test(headers):
-            response = FakeResponse(200, headers, '')
+            response = FakeResponse(200, headers, b'')
             with self.assertRaises(ValueError) as cm:
                 utils.get_redirect_data(response)
             return cm.exception
@@ -4366,6 +4161,29 @@ cluster_dfw1 = http://dfw1.host/v1/
         exc = do_test({'Location': '/a/c',
                        'X-Backend-Redirect-Timestamp': '-1'})
         self.assertIn('Invalid timestamp', str(exc))
+
+    @mock.patch('pkg_resources.load_entry_point')
+    def test_load_pkg_resource(self, mock_driver):
+        tests = {
+            ('swift.diskfile', 'egg:swift#replication.fs'):
+                ('swift', 'swift.diskfile', 'replication.fs'),
+            ('swift.diskfile', 'egg:swift#erasure_coding.fs'):
+                ('swift', 'swift.diskfile', 'erasure_coding.fs'),
+            ('swift.section', 'egg:swift#thing.other'):
+                ('swift', 'swift.section', 'thing.other'),
+            ('swift.section', 'swift#thing.other'):
+                ('swift', 'swift.section', 'thing.other'),
+            ('swift.section', 'thing.other'):
+                ('swift', 'swift.section', 'thing.other'),
+        }
+        for args, expected in tests.items():
+            utils.load_pkg_resource(*args)
+            mock_driver.assert_called_with(*expected)
+
+        with self.assertRaises(TypeError) as cm:
+            args = ('swift.diskfile', 'nog:swift#replication.fs')
+            utils.load_pkg_resource(*args)
+        self.assertEqual("Unhandled URI scheme: 'nog'", str(cm.exception))
 
 
 class ResellerConfReader(unittest.TestCase):
@@ -4935,6 +4753,38 @@ class TestFileLikeIter(unittest.TestCase):
         iter_file.close()
         self.assertTrue(iter_file.closed)
 
+    def test_get_hub(self):
+        # This test mock the eventlet.green.select module without poll
+        # as in eventlet > 0.20
+        # https://github.com/eventlet/eventlet/commit/614a20462
+        # We add __original_module_select to sys.modules to mock usage
+        # of eventlet.patcher.original
+
+        class SelectWithPoll(object):
+            def poll():
+                pass
+
+        class SelectWithoutPoll(object):
+            pass
+
+        # Platform with poll() that call get_hub before eventlet patching
+        with mock.patch.dict('sys.modules',
+                             {'select': SelectWithPoll,
+                              '__original_module_select': SelectWithPoll}):
+            self.assertEqual(utils.get_hub(), 'poll')
+
+        # Platform with poll() that call get_hub after eventlet patching
+        with mock.patch.dict('sys.modules',
+                             {'select': SelectWithoutPoll,
+                              '__original_module_select': SelectWithPoll}):
+            self.assertEqual(utils.get_hub(), 'poll')
+
+        # Platform without poll() -- before or after patching doesn't matter
+        with mock.patch.dict('sys.modules',
+                             {'select': SelectWithoutPoll,
+                              '__original_module_select': SelectWithoutPoll}):
+            self.assertEqual(utils.get_hub(), 'selects')
+
 
 class TestStatsdLogging(unittest.TestCase):
     def setUp(self):
@@ -5255,7 +5105,7 @@ class TestStatsdLogging(unittest.TestCase):
 
 class UnsafeXrange(object):
     """
-    Like xrange(limit), but with extra context switching to screw things up.
+    Like range(limit), but with extra context switching to screw things up.
     """
     def __init__(self, upper_bound):
         self.current = 0
@@ -6466,7 +6316,7 @@ class FakeResponse(object):
     def __init__(self, status, headers, body):
         self.status = status
         self.headers = HeaderKeyDict(headers)
-        self.body = StringIO(body)
+        self.body = BytesIO(body)
 
     def getheader(self, header_name):
         return str(self.headers.get(header_name, ''))
@@ -6489,52 +6339,52 @@ class TestDocumentItersToHTTPResponseBody(unittest.TestCase):
         self.assertEqual(body, '')
 
     def test_single_part(self):
-        body = "time flies like an arrow; fruit flies like a banana"
-        doc_iters = [{'part_iter': iter(StringIO(body).read, '')}]
+        body = b"time flies like an arrow; fruit flies like a banana"
+        doc_iters = [{'part_iter': iter(BytesIO(body).read, b'')}]
 
-        resp_body = ''.join(
+        resp_body = b''.join(
             utils.document_iters_to_http_response_body(
-                iter(doc_iters), 'dontcare',
+                iter(doc_iters), b'dontcare',
                 multipart=False, logger=FakeLogger()))
         self.assertEqual(resp_body, body)
 
     def test_multiple_parts(self):
-        part1 = "two peanuts were walking down a railroad track"
-        part2 = "and one was a salted. ... peanut."
+        part1 = b"two peanuts were walking down a railroad track"
+        part2 = b"and one was a salted. ... peanut."
 
         doc_iters = [{
             'start_byte': 88,
             'end_byte': 133,
             'content_type': 'application/peanut',
             'entity_length': 1024,
-            'part_iter': iter(StringIO(part1).read, ''),
+            'part_iter': iter(BytesIO(part1).read, b''),
         }, {
             'start_byte': 500,
             'end_byte': 532,
             'content_type': 'application/salted',
             'entity_length': 1024,
-            'part_iter': iter(StringIO(part2).read, ''),
+            'part_iter': iter(BytesIO(part2).read, b''),
         }]
 
-        resp_body = ''.join(
+        resp_body = b''.join(
             utils.document_iters_to_http_response_body(
-                iter(doc_iters), 'boundaryboundary',
+                iter(doc_iters), b'boundaryboundary',
                 multipart=True, logger=FakeLogger()))
         self.assertEqual(resp_body, (
-            "--boundaryboundary\r\n" +
+            b"--boundaryboundary\r\n" +
             # This is a little too strict; we don't actually care that the
             # headers are in this order, but the test is much more legible
             # this way.
-            "Content-Type: application/peanut\r\n" +
-            "Content-Range: bytes 88-133/1024\r\n" +
-            "\r\n" +
-            part1 + "\r\n" +
-            "--boundaryboundary\r\n"
-            "Content-Type: application/salted\r\n" +
-            "Content-Range: bytes 500-532/1024\r\n" +
-            "\r\n" +
-            part2 + "\r\n" +
-            "--boundaryboundary--"))
+            b"Content-Type: application/peanut\r\n" +
+            b"Content-Range: bytes 88-133/1024\r\n" +
+            b"\r\n" +
+            part1 + b"\r\n" +
+            b"--boundaryboundary\r\n"
+            b"Content-Type: application/salted\r\n" +
+            b"Content-Range: bytes 500-532/1024\r\n" +
+            b"\r\n" +
+            part2 + b"\r\n" +
+            b"--boundaryboundary--"))
 
     def test_closed_part_iterator(self):
         print('test')
@@ -6685,6 +6535,51 @@ class TestHashForFileFunction(unittest.TestCase):
         if failures:
             self.fail('Some data did not compute expected hash:\n' +
                       '\n'.join(failures))
+
+
+class TestFsHasFreeSpace(unittest.TestCase):
+    def test_bytes(self):
+        fake_result = posix.statvfs_result([
+            4096,     # f_bsize
+            4096,     # f_frsize
+            2854907,  # f_blocks
+            1984802,  # f_bfree   (free blocks for root)
+            1728089,  # f_bavail  (free blocks for non-root)
+            1280000,  # f_files
+            1266040,  # f_ffree,
+            1266040,  # f_favail,
+            4096,     # f_flag
+            255,      # f_namemax
+        ])
+        with mock.patch('os.statvfs', return_value=fake_result):
+            self.assertTrue(utils.fs_has_free_space("/", 0, False))
+            self.assertTrue(utils.fs_has_free_space("/", 1, False))
+            # free space left = f_bavail * f_bsize = 7078252544
+            self.assertTrue(utils.fs_has_free_space("/", 7078252544, False))
+            self.assertFalse(utils.fs_has_free_space("/", 7078252545, False))
+            self.assertFalse(utils.fs_has_free_space("/", 2 ** 64, False))
+
+    def test_percent(self):
+        fake_result = posix.statvfs_result([
+            4096,     # f_bsize
+            4096,     # f_frsize
+            2854907,  # f_blocks
+            1984802,  # f_bfree   (free blocks for root)
+            1728089,  # f_bavail  (free blocks for non-root)
+            1280000,  # f_files
+            1266040,  # f_ffree,
+            1266040,  # f_favail,
+            4096,     # f_flag
+            255,      # f_namemax
+        ])
+        with mock.patch('os.statvfs', return_value=fake_result):
+            self.assertTrue(utils.fs_has_free_space("/", 0, True))
+            self.assertTrue(utils.fs_has_free_space("/", 1, True))
+            # percentage of free space for the faked statvfs is 60%
+            self.assertTrue(utils.fs_has_free_space("/", 60, True))
+            self.assertFalse(utils.fs_has_free_space("/", 61, True))
+            self.assertFalse(utils.fs_has_free_space("/", 100, True))
+            self.assertFalse(utils.fs_has_free_space("/", 110, True))
 
 
 class TestSetSwiftDir(unittest.TestCase):
@@ -7749,5 +7644,406 @@ class TestShardRange(unittest.TestCase):
                          actual)
 
 
-if __name__ == '__main__':
-    unittest.main()
+@patch('ctypes.get_errno')
+@patch.object(utils, '_sys_posix_fallocate')
+@patch.object(utils, '_sys_fallocate')
+@patch.object(utils, 'FALLOCATE_RESERVE', 0)
+class TestFallocate(unittest.TestCase):
+    def test_fallocate(self, sys_fallocate_mock,
+                       sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = 0
+
+        utils.fallocate(1234, 5000 * 2 ** 20)
+
+        # We can't use sys_fallocate_mock.assert_called_once_with because no
+        # two ctypes.c_uint64 objects are equal even if their values are
+        # equal. Yes, ctypes.c_uint64(123) != ctypes.c_uint64(123).
+        calls = sys_fallocate_mock.mock_calls
+        self.assertEqual(len(calls), 1)
+        args = calls[0][1]
+        self.assertEqual(len(args), 4)
+        self.assertEqual(args[0], 1234)
+        self.assertEqual(args[1], utils.FALLOC_FL_KEEP_SIZE)
+        self.assertEqual(args[2].value, 0)
+        self.assertEqual(args[3].value, 5000 * 2 ** 20)
+
+        sys_posix_fallocate_mock.assert_not_called()
+
+    def test_fallocate_offset(self, sys_fallocate_mock,
+                              sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = 0
+
+        utils.fallocate(1234, 5000 * 2 ** 20, offset=3 * 2 ** 30)
+        calls = sys_fallocate_mock.mock_calls
+        self.assertEqual(len(calls), 1)
+        args = calls[0][1]
+        self.assertEqual(len(args), 4)
+        self.assertEqual(args[0], 1234)
+        self.assertEqual(args[1], utils.FALLOC_FL_KEEP_SIZE)
+        self.assertEqual(args[2].value, 3 * 2 ** 30)
+        self.assertEqual(args[3].value, 5000 * 2 ** 20)
+
+        sys_posix_fallocate_mock.assert_not_called()
+
+    def test_fallocate_fatal_error(self, sys_fallocate_mock,
+                                   sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = -1
+        get_errno_mock.return_value = errno.EIO
+
+        with self.assertRaises(OSError) as cm:
+            utils.fallocate(1234, 5000 * 2 ** 20)
+        self.assertEqual(cm.exception.errno, errno.EIO)
+
+    def test_fallocate_silent_errors(self, sys_fallocate_mock,
+                                     sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = -1
+
+        for silent_error in (0, errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL):
+            get_errno_mock.return_value = silent_error
+            try:
+                utils.fallocate(1234, 5678)
+            except OSError:
+                self.fail("fallocate() raised an error on %d", silent_error)
+
+    def test_posix_fallocate_fallback(self, sys_fallocate_mock,
+                                      sys_posix_fallocate_mock,
+                                      get_errno_mock):
+        sys_fallocate_mock.available = False
+        sys_fallocate_mock.side_effect = NotImplementedError
+
+        sys_posix_fallocate_mock.available = True
+        sys_posix_fallocate_mock.return_value = 0
+
+        utils.fallocate(1234, 567890)
+        sys_fallocate_mock.assert_not_called()
+
+        calls = sys_posix_fallocate_mock.mock_calls
+        self.assertEqual(len(calls), 1)
+        args = calls[0][1]
+        self.assertEqual(len(args), 3)
+        self.assertEqual(args[0], 1234)
+        self.assertEqual(args[1].value, 0)
+        self.assertEqual(args[2].value, 567890)
+
+    def test_posix_fallocate_offset(self, sys_fallocate_mock,
+                                    sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = False
+        sys_fallocate_mock.side_effect = NotImplementedError
+
+        sys_posix_fallocate_mock.available = True
+        sys_posix_fallocate_mock.return_value = 0
+
+        utils.fallocate(1234, 5000 * 2 ** 20, offset=3 * 2 ** 30)
+        calls = sys_posix_fallocate_mock.mock_calls
+        self.assertEqual(len(calls), 1)
+        args = calls[0][1]
+        self.assertEqual(len(args), 3)
+        self.assertEqual(args[0], 1234)
+        self.assertEqual(args[1].value, 3 * 2 ** 30)
+        self.assertEqual(args[2].value, 5000 * 2 ** 20)
+
+        sys_fallocate_mock.assert_not_called()
+
+    def test_no_fallocates_available(self, sys_fallocate_mock,
+                                     sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = False
+        sys_posix_fallocate_mock.available = False
+
+        with mock.patch("logging.warning") as warning_mock, \
+                mock.patch.object(utils, "_fallocate_warned_about_missing",
+                                  False):
+            utils.fallocate(321, 654)
+            utils.fallocate(321, 654)
+
+        sys_fallocate_mock.assert_not_called()
+        sys_posix_fallocate_mock.assert_not_called()
+        get_errno_mock.assert_not_called()
+
+        self.assertEqual(len(warning_mock.mock_calls), 1)
+
+    def test_arg_bounds(self, sys_fallocate_mock,
+                        sys_posix_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = 0
+        with self.assertRaises(ValueError):
+            utils.fallocate(0, 1 << 64, 0)
+        with self.assertRaises(ValueError):
+            utils.fallocate(0, 0, -1)
+        with self.assertRaises(ValueError):
+            utils.fallocate(0, 0, 1 << 64)
+        self.assertEqual([], sys_fallocate_mock.mock_calls)
+        # sanity check
+        utils.fallocate(0, 0, 0)
+        self.assertEqual(
+            [mock.call(0, utils.FALLOC_FL_KEEP_SIZE, mock.ANY, mock.ANY)],
+            sys_fallocate_mock.mock_calls)
+        # Go confirm the ctypes values separately; apparently == doesn't
+        # work the way you'd expect with ctypes :-/
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][2].value, 0)
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][3].value, 0)
+
+
+@patch.object(os, 'fstatvfs')
+@patch.object(utils, '_sys_fallocate', available=True, return_value=0)
+@patch.object(utils, 'FALLOCATE_RESERVE', 0)
+@patch.object(utils, 'FALLOCATE_IS_PERCENT', False)
+@patch.object(utils, '_fallocate_enabled', True)
+class TestFallocateReserve(unittest.TestCase):
+    def _statvfs_result(self, f_frsize, f_bavail):
+        # Only 3 values are relevant to us, so use zeros for the rest
+        f_blocks = 100
+        return posix.statvfs_result((0, f_frsize, f_blocks, 0, f_bavail,
+                                     0, 0, 0, 0, 0))
+
+    def test_disabled(self, sys_fallocate_mock, fstatvfs_mock):
+        utils.disable_fallocate()
+        utils.fallocate(123, 456)
+
+        sys_fallocate_mock.assert_not_called()
+        fstatvfs_mock.assert_not_called()
+
+    def test_zero_reserve(self, sys_fallocate_mock, fstatvfs_mock):
+        utils.fallocate(123, 456)
+
+        fstatvfs_mock.assert_not_called()
+        self.assertEqual(len(sys_fallocate_mock.mock_calls), 1)
+
+    def test_enough_space(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 1024 bytes in reserve plus 1023 allocated, and have 2 blocks
+        # of size 1024 free, so succeed
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1024')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 2)
+        utils.fallocate(88, 1023)
+
+    def test_not_enough_space(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 1024 bytes in reserve plus 1024 allocated, and have 2 blocks
+        # of size 1024 free, so fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1024')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 2)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 1024)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 1024'
+            % errno.ENOSPC)
+        sys_fallocate_mock.assert_not_called()
+
+    def test_not_enough_space_large(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 1024 bytes in reserve plus 1GB allocated, and have 2 blocks
+        # of size 1024 free, so fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1024')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 2)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 1 << 30)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail %g <= 1024'
+            % (errno.ENOSPC, ((2 * 1024) - (1 << 30))))
+        sys_fallocate_mock.assert_not_called()
+
+    def test_enough_space_small_blocks(self, sys_fallocate_mock,
+                                       fstatvfs_mock):
+        # Want 1024 bytes in reserve plus 1023 allocated, and have 4 blocks
+        # of size 512 free, so succeed
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1024')
+
+        fstatvfs_mock.return_value = self._statvfs_result(512, 4)
+        utils.fallocate(88, 1023)
+
+    def test_not_enough_space_small_blocks(self, sys_fallocate_mock,
+                                           fstatvfs_mock):
+        # Want 1024 bytes in reserve plus 1024 allocated, and have 4 blocks
+        # of size 512 free, so fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1024')
+
+        fstatvfs_mock.return_value = self._statvfs_result(512, 4)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 1024)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 1024'
+            % errno.ENOSPC)
+        sys_fallocate_mock.assert_not_called()
+
+    def test_free_space_under_reserve(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 2048 bytes in reserve but have only 3 blocks of size 512, so
+        # allocating even 0 bytes fails
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('2048')
+
+        fstatvfs_mock.return_value = self._statvfs_result(512, 3)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 0)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail 1536 <= 2048'
+            % errno.ENOSPC)
+        sys_fallocate_mock.assert_not_called()
+
+    def test_all_reserved(self, sys_fallocate_mock, fstatvfs_mock):
+        # Filesystem is empty, but our reserve is bigger than the
+        # filesystem, so any allocation will fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('9999999999999')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 100)
+        self.assertRaises(OSError, utils.fallocate, 88, 0)
+        sys_fallocate_mock.assert_not_called()
+
+    def test_enough_space_pct(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 1% reserved, filesystem has 3/100 blocks of size 1024 free
+        # and file size is 2047, so succeed
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1%')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 3)
+        utils.fallocate(88, 2047)
+
+    def test_not_enough_space_pct(self, sys_fallocate_mock, fstatvfs_mock):
+        # Want 1% reserved, filesystem has 3/100 blocks of size 1024 free
+        # and file size is 2048, so fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('1%')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 3)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 2048)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail 1 <= 1'
+            % errno.ENOSPC)
+        sys_fallocate_mock.assert_not_called()
+
+    def test_all_space_reserved_pct(self, sys_fallocate_mock, fstatvfs_mock):
+        # Filesystem is empty, but our reserve is the whole filesystem, so
+        # any allocation will fail
+        utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+            utils.config_fallocate_value('100%')
+
+        fstatvfs_mock.return_value = self._statvfs_result(1024, 100)
+        with self.assertRaises(OSError) as catcher:
+            utils.fallocate(88, 0)
+        self.assertEqual(
+            str(catcher.exception),
+            '[Errno %d] FALLOCATE_RESERVE fail 100 <= 100'
+            % errno.ENOSPC)
+        sys_fallocate_mock.assert_not_called()
+
+
+@patch('ctypes.get_errno')
+@patch.object(utils, '_sys_fallocate')
+class TestPunchHole(unittest.TestCase):
+    def test_punch_hole(self, sys_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = 0
+
+        utils.punch_hole(123, 456, 789)
+
+        calls = sys_fallocate_mock.mock_calls
+        self.assertEqual(len(calls), 1)
+        args = calls[0][1]
+        self.assertEqual(len(args), 4)
+        self.assertEqual(args[0], 123)
+        self.assertEqual(
+            args[1], utils.FALLOC_FL_PUNCH_HOLE | utils.FALLOC_FL_KEEP_SIZE)
+        self.assertEqual(args[2].value, 456)
+        self.assertEqual(args[3].value, 789)
+
+    def test_error(self, sys_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = -1
+        get_errno_mock.return_value = errno.EISDIR
+
+        with self.assertRaises(OSError) as cm:
+            utils.punch_hole(123, 456, 789)
+        self.assertEqual(cm.exception.errno, errno.EISDIR)
+
+    def test_arg_bounds(self, sys_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = True
+        sys_fallocate_mock.return_value = 0
+
+        with self.assertRaises(ValueError):
+            utils.punch_hole(0, 1, -1)
+        with self.assertRaises(ValueError):
+            utils.punch_hole(0, -1, 1)
+        with self.assertRaises(ValueError):
+            utils.punch_hole(0, 1, 0)
+        with self.assertRaises(ValueError):
+            utils.punch_hole(0, 1, 1 << 64)
+        self.assertEqual([], sys_fallocate_mock.mock_calls)
+
+        # sanity check
+        utils.punch_hole(0, 0, 1)
+        self.assertEqual(
+            [mock.call(
+                0, utils.FALLOC_FL_PUNCH_HOLE | utils.FALLOC_FL_KEEP_SIZE,
+                mock.ANY, mock.ANY)],
+            sys_fallocate_mock.mock_calls)
+        # Go confirm the ctypes values separately; apparently == doesn't
+        # work the way you'd expect with ctypes :-/
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][2].value, 0)
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][3].value, 1)
+
+    def test_no_fallocate(self, sys_fallocate_mock, get_errno_mock):
+        sys_fallocate_mock.available = False
+
+        with self.assertRaises(OSError) as cm:
+            utils.punch_hole(123, 456, 789)
+        self.assertEqual(cm.exception.errno, errno.ENOTSUP)
+
+
+class TestPunchHoleReally(unittest.TestCase):
+    def setUp(self):
+        if not utils._sys_fallocate.available:
+            raise unittest.SkipTest("utils._sys_fallocate not available")
+
+    def test_punch_a_hole(self):
+        with TemporaryFile() as tf:
+            tf.write(b"x" * 64 + b"y" * 64 + b"z" * 64)
+            tf.flush()
+
+            # knock out the first half of the "y"s
+            utils.punch_hole(tf.fileno(), 64, 32)
+
+            tf.seek(0)
+            contents = tf.read(4096)
+            self.assertEqual(
+                contents,
+                b"x" * 64 + b"\0" * 32 + b"y" * 32 + b"z" * 64)
+
+
+class Test_LibcWrapper(unittest.TestCase):
+    def test_available_function(self):
+        # This should pretty much always exist
+        getpid_wrapper = utils._LibcWrapper('getpid')
+        self.assertTrue(getpid_wrapper.available)
+        self.assertEqual(getpid_wrapper(), os.getpid())
+
+    def test_unavailable_function(self):
+        # This won't exist
+        no_func_wrapper = utils._LibcWrapper('diffractively_protectorship')
+        self.assertFalse(no_func_wrapper.available)
+        self.assertRaises(NotImplementedError, no_func_wrapper)
+
+    def test_argument_plumbing(self):
+        lseek_wrapper = utils._LibcWrapper('lseek')
+        with TemporaryFile() as tf:
+            tf.write(b"abcdefgh")
+            tf.flush()
+            lseek_wrapper(tf.fileno(),
+                          ctypes.c_uint64(3),
+                          # 0 is SEEK_SET
+                          0)
+            self.assertEqual(tf.read(100), b"defgh")

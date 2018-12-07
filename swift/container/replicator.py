@@ -66,7 +66,7 @@ class ContainerReplicator(db_replicator.Replicator):
     def _handle_sync_response(self, node, response, info, broker, http,
                               different_region=False):
         if is_success(response.status):
-            remote_info = json.loads(response.data)
+            remote_info = json.loads(response.data.decode('ascii'))
             if incorrect_policy_index(info, remote_info):
                 status_changed_at = Timestamp.now()
                 broker.set_storage_policy_index(
@@ -78,8 +78,9 @@ class ContainerReplicator(db_replicator.Replicator):
                 broker.merge_timestamps(*(remote_info[key] for key in
                                           sync_timestamps))
 
-            # Grab remote's shard ranges, too
-            self._fetch_and_merge_shard_ranges(http, broker)
+            if 'shard_max_row' in remote_info:
+                # Grab remote's shard ranges, too
+                self._fetch_and_merge_shard_ranges(http, broker)
 
         return super(ContainerReplicator, self)._handle_sync_response(
             node, response, info, broker, http, different_region)
@@ -101,8 +102,16 @@ class ContainerReplicator(db_replicator.Replicator):
 
     def _choose_replication_mode(self, node, rinfo, info, local_sync, broker,
                                  http, different_region):
-        # Always replicate shard ranges
-        shard_range_success = self._sync_shard_ranges(broker, http, info['id'])
+        if 'shard_max_row' in rinfo:
+            # Always replicate shard ranges to new-enough swift
+            shard_range_success = self._sync_shard_ranges(
+                broker, http, info['id'])
+        else:
+            shard_range_success = False
+            self.logger.warning(
+                '%s is unable to replicate shard ranges to peer %s; '
+                'peer may need upgrading', broker.db_file,
+                '%(ip)s:%(port)s/%(device)s' % node)
         if broker.sharding_initiated():
             self.logger.warning(
                 '%s is able to shard -- refusing to replicate objects to peer '
@@ -120,7 +129,8 @@ class ContainerReplicator(db_replicator.Replicator):
     def _fetch_and_merge_shard_ranges(self, http, broker):
         response = http.replicate('get_shard_ranges')
         if is_success(response.status):
-            broker.merge_shard_ranges(json.loads(response.data))
+            broker.merge_shard_ranges(json.loads(
+                response.data.decode('ascii')))
 
     def find_local_handoff_for_part(self, part):
         """

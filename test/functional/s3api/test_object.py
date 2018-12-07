@@ -139,6 +139,12 @@ class TestS3ApiObject(S3ApiBase):
         self.assertEqual(status, 204)
         self.assertCommonResponseHeaders(headers)
 
+        # DELETE Non-Existent Object
+        status, headers, body = \
+            self.conn.make_request('DELETE', self.bucket, 'does-not-exist')
+        self.assertEqual(status, 204)
+        self.assertCommonResponseHeaders(headers)
+
     def test_put_object_error(self):
         auth_error_conn = Connection(aws_secret_key='invalid')
         status, headers, body = \
@@ -236,11 +242,6 @@ class TestS3ApiObject(S3ApiBase):
         status, headers, body = \
             auth_error_conn.make_request('DELETE', self.bucket, obj)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
-        self.assertEqual(headers['content-type'], 'application/xml')
-
-        status, headers, body = \
-            self.conn.make_request('DELETE', self.bucket, 'invalid')
-        self.assertEqual(get_error_code(body), 'NoSuchKey')
         self.assertEqual(headers['content-type'], 'application/xml')
 
         status, headers, body = \
@@ -485,6 +486,35 @@ class TestS3ApiObject(S3ApiBase):
         status, headers, body = \
             self.conn.make_request('HEAD', dst_bucket, dst_obj)
         self.assertEqual(headers['x-amz-meta-test'], 'dst')
+
+        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
+                   'X-Amz-Metadata-Directive': 'COPY',
+                   'X-Amz-Meta-Test': 'dst'}
+        status, headers, body = \
+            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
+        self.assertEqual(status, 200)
+        self.assertCommonResponseHeaders(headers)
+        status, headers, body = \
+            self.conn.make_request('HEAD', dst_bucket, dst_obj)
+        self.assertEqual(headers['x-amz-meta-test'], 'src')
+
+        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
+                   'X-Amz-Meta-Test2': 'dst',
+                   'X-Amz-Metadata-Directive': 'REPLACE'}
+        status, headers, body = \
+            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
+        self.assertEqual(status, 200)
+        self.assertCommonResponseHeaders(headers)
+        status, headers, body = \
+            self.conn.make_request('HEAD', dst_bucket, dst_obj)
+        self.assertNotIn('x-amz-meta-test', headers)
+        self.assertEqual(headers['x-amz-meta-test2'], 'dst')
+
+        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
+                   'X-Amz-Metadata-Directive': 'BAD'}
+        status, headers, body = \
+            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
+        self.assertEqual(status, 400)
 
     def test_put_object_copy_source_if_modified_since(self):
         obj = 'object'

@@ -24,7 +24,7 @@ from swift.common.middleware.crypto.crypto_utils import CryptoWSGIContext, \
 from swift.common.request_helpers import get_object_transient_sysmeta, \
     strip_user_meta_prefix, is_user_meta, update_etag_is_at_header
 from swift.common.swob import Request, Match, HTTPException, \
-    HTTPUnprocessableEntity
+    HTTPUnprocessableEntity, wsgi_to_bytes, bytes_to_wsgi
 from swift.common.utils import get_logger, config_true_value, \
     MD5_OF_EMPTY_STRING
 
@@ -46,7 +46,8 @@ def encrypt_header_val(crypto, value, key):
 
     crypto_meta = crypto.create_crypto_meta()
     crypto_ctxt = crypto.create_encryption_ctxt(key, crypto_meta['iv'])
-    enc_val = base64.b64encode(crypto_ctxt.update(value))
+    enc_val = bytes_to_wsgi(base64.b64encode(
+        crypto_ctxt.update(wsgi_to_bytes(value))))
     return enc_val, crypto_meta
 
 
@@ -58,6 +59,8 @@ def _hmac_etag(key, etag):
     :param etag: The etag to hash.
     :returns: a Base64-encoded representation of the HMAC
     """
+    if not isinstance(etag, bytes):
+        etag = wsgi_to_bytes(etag)
     result = hmac.new(key, etag, digestmod=hashlib.sha256).digest()
     return base64.b64encode(result).decode()
 
@@ -146,12 +149,16 @@ class EncInputWrapper(object):
             #   * override in the footer, otherwise
             #   * override in the header, and finally
             #   * MD5 of the plaintext received
-            # This may be None if no override was set and no data was read
+            # This may be None if no override was set and no data was read. An
+            # override value of '' will be passed on.
             container_listing_etag = footers.get(
                 'X-Object-Sysmeta-Container-Update-Override-Etag',
-                container_listing_etag_header) or plaintext_etag
+                container_listing_etag_header)
 
-            if (container_listing_etag is not None and
+            if container_listing_etag is None:
+                container_listing_etag = plaintext_etag
+
+            if (container_listing_etag and
                     (container_listing_etag != MD5_OF_EMPTY_STRING or
                      plaintext_etag)):
                 # Encrypt the container-listing etag using the container key
@@ -287,6 +294,9 @@ class EncrypterObjContext(CryptoWSGIContext):
         plaintext etag to generate the value of
         X-Object-Sysmeta-Crypto-Etag-Mac when the object was PUT. The object
         server can therefore use these HMACs to evaluate conditional requests.
+        HMACs of the etags are appended for the current root secrets and
+        historic root secrets because it is not known which of them may have
+        been used to generate the on-disk etag HMAC.
 
         The existing etag values are left in the list of values to match in
         case the object was not encrypted when it was PUT. It is unlikely that
@@ -299,14 +309,16 @@ class EncrypterObjContext(CryptoWSGIContext):
         masked = False
         old_etags = req.headers.get(header_name)
         if old_etags:
-            keys = self.get_keys(req.environ)
+            all_keys = self.get_multiple_keys(req.environ)
             new_etags = []
             for etag in Match(old_etags).tags:
                 if etag == '*':
                     new_etags.append(etag)
                     continue
-                masked_etag = _hmac_etag(keys['object'], etag)
-                new_etags.extend(('"%s"' % etag, '"%s"' % masked_etag))
+                new_etags.append('"%s"' % etag)
+                for keys in all_keys:
+                    masked_etag = _hmac_etag(keys['object'], etag)
+                    new_etags.append('"%s"' % masked_etag)
                 masked = True
 
             req.headers[header_name] = ', '.join(new_etags)

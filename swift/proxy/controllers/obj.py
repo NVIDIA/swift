@@ -461,7 +461,7 @@ class BaseObjectController(Controller):
             if final_phase:
                 body = response.read()
             else:
-                body = ''
+                body = b''
             bodies.append(body)
             if response.status == HTTP_INSUFFICIENT_STORAGE:
                 putter.failed = True
@@ -497,7 +497,7 @@ class BaseObjectController(Controller):
             while len(statuses) < num_nodes:
                 statuses.append(HTTP_SERVICE_UNAVAILABLE)
                 reasons.append('')
-                bodies.append('')
+                bodies.append(b'')
 
         return statuses, reasons, bodies, etags
 
@@ -650,9 +650,12 @@ class BaseObjectController(Controller):
         pile = GreenPile(len(nodes))
 
         for nheaders in outgoing_headers:
-            # RFC2616:8.2.3 disallows 100-continue without a body
-            if (req.content_length > 0) or req.is_chunked:
-                nheaders['Expect'] = '100-continue'
+            # RFC2616:8.2.3 disallows 100-continue without a body,
+            # so switch to chunked request
+            if nheaders.get('Content-Length') == '0':
+                nheaders['Transfer-Encoding'] = 'chunked'
+                del nheaders['Content-Length']
+            nheaders['Expect'] = '100-continue'
             pile.spawn(self._connect_put_node, node_iter, partition,
                        req, nheaders, self.app.logger.thread_locals)
 
@@ -808,7 +811,7 @@ class BaseObjectController(Controller):
                     self.app.client_chunk_size)
             except (ValueError, IOError) as e:
                 raise ChunkReadError(str(e))
-        data_source = iter(reader, '')
+        data_source = iter(reader, b'')
 
         # check if object is set to be automatically deleted (i.e. expired)
         req, delete_at_container, delete_at_part, \
@@ -894,12 +897,13 @@ class ReplicatedObjectController(BaseObjectController):
                 logger=self.app.logger,
                 need_multiphase=False)
         else:
+            te = ',' + headers.get('Transfer-Encoding', '')
             putter = Putter.connect(
                 node, part, req.swift_entity_path, headers,
                 conn_timeout=self.app.conn_timeout,
                 node_timeout=self.app.node_timeout,
                 logger=self.app.logger,
-                chunked=req.is_chunked)
+                chunked=te.endswith(',chunked'))
         return putter
 
     def _transfer_data(self, req, data_source, putters, nodes):
@@ -1067,7 +1071,7 @@ class ECAppIter(object):
         self.range_specs = range_specs
         self.fa_length = fa_length
         self.obj_length = obj_length if obj_length is not None else 0
-        self.boundary = ''
+        self.boundary = b''
         self.logger = logger
 
         self.mime_boundary = None
@@ -1414,7 +1418,7 @@ class ECAppIter(object):
         def put_fragments_in_queue(frag_iter, queue):
             try:
                 for fragment in frag_iter:
-                    if fragment.startswith(' '):
+                    if fragment.startswith(b' '):
                         raise Exception('Leading whitespace on fragment.')
                     queue.put(fragment)
             except GreenletExit:
@@ -1683,7 +1687,7 @@ class Putter(object):
         if self.state == DATA_SENT:
             raise ValueError("called end_of_object_data twice")
 
-        self.queue.put('')
+        self.queue.put(b'')
         self.state = DATA_SENT
 
     def _send_file(self, write_timeout, exception_handler):
@@ -1698,7 +1702,7 @@ class Putter(object):
             chunk = self.queue.get()
             if not self.failed:
                 if self.chunked:
-                    to_send = "%x\r\n%s\r\n" % (len(chunk), chunk)
+                    to_send = b"%x\r\n%s\r\n" % (len(chunk), chunk)
                 else:
                     to_send = chunk
                 try:
@@ -1787,7 +1791,7 @@ class MIMEPutter(Putter):
         # We're sending the object plus other stuff in the same request
         # body, all wrapped up in multipart MIME, so we'd better start
         # off the MIME document before sending any object data.
-        self.queue.put("--%s\r\nX-Document: object body\r\n\r\n" %
+        self.queue.put(b"--%s\r\nX-Document: object body\r\n\r\n" %
                        (self.mime_boundary,))
 
     def end_of_object_data(self, footer_metadata=None):
@@ -1805,25 +1809,25 @@ class MIMEPutter(Putter):
         elif self.state == NO_DATA_SENT and self.mime_boundary:
             self._start_object_data()
 
-        footer_body = json.dumps(footer_metadata)
-        footer_md5 = md5(footer_body).hexdigest()
+        footer_body = json.dumps(footer_metadata).encode('ascii')
+        footer_md5 = md5(footer_body).hexdigest().encode('ascii')
 
-        tail_boundary = ("--%s" % (self.mime_boundary,))
+        tail_boundary = (b"--%s" % (self.mime_boundary,))
         if not self.multiphase:
             # this will be the last part sent
-            tail_boundary = tail_boundary + "--"
+            tail_boundary = tail_boundary + b"--"
 
         message_parts = [
-            ("\r\n--%s\r\n" % self.mime_boundary),
-            "X-Document: object metadata\r\n",
-            "Content-MD5: %s\r\n" % footer_md5,
-            "\r\n",
-            footer_body, "\r\n",
-            tail_boundary, "\r\n",
+            (b"\r\n--%s\r\n" % self.mime_boundary),
+            b"X-Document: object metadata\r\n",
+            b"Content-MD5: %s\r\n" % footer_md5,
+            b"\r\n",
+            footer_body, b"\r\n",
+            tail_boundary, b"\r\n",
         ]
-        self.queue.put("".join(message_parts))
+        self.queue.put(b"".join(message_parts))
 
-        self.queue.put('')
+        self.queue.put(b'')
         self.state = DATA_SENT
 
     def send_commit_confirmation(self):
@@ -1840,17 +1844,17 @@ class MIMEPutter(Putter):
         self.state = DATA_ACKED
 
         if self.mime_boundary:
-            body = "put_commit_confirmation"
-            tail_boundary = ("--%s--" % (self.mime_boundary,))
+            body = b"put_commit_confirmation"
+            tail_boundary = (b"--%s--" % (self.mime_boundary,))
             message_parts = [
-                "X-Document: put commit\r\n",
-                "\r\n",
-                body, "\r\n",
+                b"X-Document: put commit\r\n",
+                b"\r\n",
+                body, b"\r\n",
                 tail_boundary,
             ]
-            self.queue.put("".join(message_parts))
+            self.queue.put(b"".join(message_parts))
 
-        self.queue.put('')
+        self.queue.put(b'')
         self.state = COMMIT_SENT
 
     @classmethod
@@ -1870,7 +1874,7 @@ class MIMEPutter(Putter):
         :raises MultiphasePUTNotSupported: if need_multiphase is set but
                  backend node can't handle multiphase PUT
         """
-        mime_boundary = "%.64x" % random.randint(0, 16 ** 64)
+        mime_boundary = b"%.64x" % random.randint(0, 16 ** 64)
         headers = HeaderKeyDict(headers)
         # when using a multipart mime request to backend the actual
         # content-length is not equal to the object content size, so move the
@@ -1940,7 +1944,7 @@ def chunk_transformer(policy):
                     pieces.append(piece)
                     to_take -= len(piece)
                     total_buf_len -= len(piece)
-                chunks_to_encode.append(''.join(pieces))
+                chunks_to_encode.append(b''.join(pieces))
 
             frags_by_byte_order = []
             for chunk_to_encode in chunks_to_encode:
@@ -1958,7 +1962,7 @@ def chunk_transformer(policy):
             #  (frag_B1 + frag_B2 + ...),  # destined for node B
             #  (frag_C1 + frag_C2 + ...),  # destined for node C
             #  ...]
-            obj_data = [''.join(frags)
+            obj_data = [b''.join(frags)
                         for frags in zip(*frags_by_byte_order)]
             chunk = yield obj_data
         else:
@@ -1967,12 +1971,12 @@ def chunk_transformer(policy):
 
     # Now we've gotten an empty chunk, which indicates end-of-input.
     # Take any leftover bytes and encode them.
-    last_bytes = ''.join(buf)
+    last_bytes = b''.join(buf)
     if last_bytes:
         last_frags = policy.pyeclib_driver.encode(last_bytes)
         yield last_frags
     else:
-        yield [''] * policy.ec_n_unique_fragments
+        yield [b''] * policy.ec_n_unique_fragments
 
 
 def trailing_metadata(policy, client_obj_hasher,
@@ -2538,7 +2542,7 @@ class ECObjectController(BaseObjectController):
         # (i.e. 1:[0] at first)
 
         # Grouping all missing fragment indexes for each frag_index
-        available_indexes = putter_to_frag_index.values()
+        available_indexes = list(putter_to_frag_index.values())
         lack_list = collections.defaultdict(list)
         for frag_index in range(policy.ec_n_unique_fragments):
             # Set the missing index to lack_list
@@ -2639,19 +2643,13 @@ class ECObjectController(BaseObjectController):
                     self.app.logger.increment('client_disconnects')
                     raise HTTPClientDisconnect(request=req)
 
+                send_chunk(b'')  # flush out any buffered data
+
                 computed_etag = (etag_hasher.hexdigest()
                                  if etag_hasher else None)
-                received_etag = req.headers.get(
-                    'etag', '').strip('"')
-                if (computed_etag and received_etag and
-                   computed_etag != received_etag):
-                    raise HTTPUnprocessableEntity(request=req)
-
-                send_chunk('')  # flush out any buffered data
-
                 footers = self._get_footers(req)
-                received_etag = footers.get(
-                    'etag', '').strip('"')
+                received_etag = footers.get('etag', req.headers.get(
+                    'etag', '')).strip('"')
                 if (computed_etag and received_etag and
                    computed_etag != received_etag):
                     raise HTTPUnprocessableEntity(request=req)
@@ -2790,7 +2788,7 @@ class ECObjectController(BaseObjectController):
             # TODO: PyECLib <= 1.2.0 looks to return the segment info
             # different from the input for aligned data efficiency but
             # Swift never does. So calculate the fragment length Swift
-            # will actually send to object sever by making two different
+            # will actually send to object server by making two different
             # get_segment_info calls (until PyECLib fixed).
             # policy.fragment_size makes the call using segment size,
             # and the next call is to get info for the last segment

@@ -22,6 +22,10 @@
       tools/test-setup.sh.
     vars:
       tox_envlist: py27
+      tox_environment:
+        NOSE_COVER_HTML: 1
+        NOSE_COVER_HTML_DIR: '{toxinidir}/cover'
+    post-run: tools/playbooks/common/cover-post.yaml
 
 - job:
     name: swift-tox-py27-centos-7
@@ -40,6 +44,28 @@
     vars:
       tox_envlist: py35
       bindep_profile: test py35
+      tox_environment:
+        NOSE_COVER_HTML: 1
+        NOSE_COVER_HTML_DIR: '{toxinidir}/cover'
+    post-run: tools/playbooks/common/cover-post.yaml
+
+- job:
+    name: swift-tox-py36
+    parent: swift-tox-base
+    nodeset: ubuntu-bionic
+    description: |
+      Run unit-tests for swift under cPython version 3.6.
+
+      Uses tox with the ``py36`` environment.
+      It sets TMPDIR to an XFS mount point created via
+      tools/test-setup.sh.
+    vars:
+      tox_envlist: py36
+      bindep_profile: test py36
+      tox_environment:
+        NOSE_COVER_HTML: 1
+        NOSE_COVER_HTML_DIR: '{toxinidir}/cover'
+    post-run: tools/playbooks/common/cover-post.yaml
 
 - job:
     name: swift-tox-func
@@ -118,33 +144,235 @@
       tox_envlist: func-s3api
 
 - job:
+    name: swift-dsvm-functional
+    parent: devstack-minimal
+    description: |
+      Setup a Swift/Keystone environment and run Swift's func tests.
+    required-projects:
+      - git.openstack.org/openstack/requirements
+      - git.openstack.org/openstack/swift
+      - git.openstack.org/openstack/keystone
+    timeout: 2700
+    vars:
+      tox_constraints_file: '{{ ansible_user_dir }}/src/git.openstack.org/openstack/requirements/upper-constraints.txt'
+      # This tox env get run twice; once for Keystone and once for tempauth
+      tox_envlist: func
+      devstack_localrc:
+        SWIFT_HASH: changeme
+        # We don't need multiple replicas to run purely functional tests.
+        # In fact, devstack special cases some things when there's only
+        # one replica.
+        SWIFT_REPLICAS: 1
+        # One replica => no need for replicators, etc.
+        SWIFT_START_ALL_SERVICES: False
+        # Keystone v3 is currently the default, but may as well be explicit
+        ENABLE_IDENTITY_V2: False
+        IDENTITY_API_VERSION: 3
+      devstack_services:
+        keystone: true
+        swift: true
+      zuul_work_dir: src/git.openstack.org/openstack/swift
+    pre-run: tools/playbooks/dsvm/pre.yaml
+    run: tools/playbooks/dsvm/run.yaml
+    post-run: tools/playbooks/dsvm/post.yaml
+
+- job:
+    name: swift-dsvm-functional-ipv6
+    parent: swift-dsvm-functional
+    vars:
+      devstack_localrc:
+        SERVICE_IP_VERSION: 6
+        HOST_IPV6: '[::1]'
+        SERVICE_HOST: '[::1]'
+
+- job:
+    name: swift-tox-func-s3api-ceph-s3tests-tempauth
+    parent: unittests
+    voting: false
+    nodeset: centos-7
+    description: |
+      Setup a SAIO dev environment and run ceph-s3tests
+    pre-run:
+      - tools/playbooks/common/install_dependencies.yaml
+      - tools/playbooks/saio_single_node_setup/setup_saio.yaml
+      - tools/playbooks/saio_single_node_setup/make_rings.yaml
+    run: tools/playbooks/ceph-s3tests/run.yaml
+    post-run:
+      - tools/playbooks/probetests/post.yaml
+      - tools/playbooks/ceph-s3tests/post.yaml
+
+- job:
     name: swift-probetests-centos-7
     parent: unittests
     nodeset: centos-7
-    voting: false
     description: |
       Setup a SAIO dev environment and run Swift's probe tests
     timeout: 3600
     pre-run:
-      - playbooks/saio_single_node_setup/install_dependencies.yaml
-      - playbooks/saio_single_node_setup/setup_saio.yaml
-      - playbooks/saio_single_node_setup/make_rings.yaml
-    run: playbooks/probetests/run.yaml
-    post-run: playbooks/probetests/post.yaml
+      - tools/playbooks/common/install_dependencies.yaml
+      - tools/playbooks/saio_single_node_setup/setup_saio.yaml
+      - tools/playbooks/saio_single_node_setup/make_rings.yaml
+    run: tools/playbooks/probetests/run.yaml
+    post-run: tools/playbooks/probetests/post.yaml
+
+- nodeset:
+    name: swift-five-nodes
+    nodes:
+      - name: test-runner1
+        label: centos-7
+      - name: proxy1
+        label: centos-7
+      - name: account1
+        label: centos-7
+      - name: container1
+        label: centos-7
+      - name: object1
+        label: centos-7
+    groups:
+      - name: test-runner
+        nodes:
+          - test-runner1
+      - name: swift-cluster
+        nodes:
+          - proxy1
+          - account1
+          - container1
+          - object1
+      - name: proxy
+        nodes:
+          - proxy1
+      - name: account
+        nodes:
+          - account1
+      - name: container
+        nodes:
+          - container1
+      - name: object
+        nodes:
+          - object1
+      - name: storage
+        nodes:
+          - account1
+          - container1
+          - object1
+
+- job:
+    name: swift-multinode-rolling-upgrade
+    parent: multinode
+    nodeset: swift-five-nodes
+    description: |
+      Build a 4 node swift cluster and run functional tests
+    timeout: 3600
+    pre-run:
+      - tools/playbooks/multinode_setup/pre.yaml
+      - tools/playbooks/common/install_dependencies.yaml
+      - tools/playbooks/multinode_setup/configure_loopback.yaml
+      - tools/playbooks/multinode_setup/common_config.yaml
+      - tools/playbooks/multinode_setup/make_rings.yaml
+    run: tools/playbooks/multinode_setup/run.yaml
+    post-run: tools/playbooks/probetests/post.yaml
+
+- job:
+    name: swift-multinode-rolling-upgrade-queens
+    parent: swift-multinode-rolling-upgrade
+    vars:
+      previous_swift_version: origin/stable/queens
+
+- job:
+    name: swift-tox-lower-constraints
+    parent: openstack-tox-lower-constraints
+    vars:
+      tox_environment:
+        TMPDIR: '{{ ansible_env.HOME }}/xfstmp'
 
 - project:
+    templates:
+      - publish-openstack-docs-pti
+      - periodic-stable-jobs
+      - check-requirements
+      - release-notes-jobs-python3
     check:
       jobs:
-        - swift-tox-py27
-        - swift-tox-py35
-        - swift-tox-func
-        - swift-tox-func-encryption
-        - swift-tox-func-domain-remap-staticweb
-        - swift-tox-func-ec
-        - swift-tox-func-s3api
-        - swift-probetests-centos-7
+        - swift-tox-py27:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/(functional|probe)/.*$
+        - swift-tox-py35:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/(functional|probe)/.*$
+        - swift-tox-py36:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/(functional|probe)/.*$
+            voting: false
+        - swift-tox-func:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-tox-func-encryption:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-tox-func-domain-remap-staticweb:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-tox-func-ec:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-tox-func-s3api:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-tox-func-s3api-ceph-s3tests-tempauth:
+            irrelevant-files:
+              - ^(api-ref|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-probetests-centos-7:
+            irrelevant-files:
+              - ^(api-ref|releasenotes)/.*$
+              # Keep doc/saio -- we use those sample configs in the saio playbooks
+              - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
+              - ^test/(unit|functional)/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-dsvm-functional:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-dsvm-functional-ipv6:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-tox-lower-constraints:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/(functional|probe)/.*$
+        - openstack-tox-pep8:
+            irrelevant-files:
+              - ^(api-ref|etc|examples|releasenotes)/.*$
+              # Keep doc/manpages -- we want to syntax check them
+              - ^doc/(requirements.txt|(saio|s3api|source)/.*)$
+        - swift-multinode-rolling-upgrade:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
     gate:
       jobs:
+        # For gate jobs, err towards running more jobs (so, generally avoid
+        # using irrelevant-files). Exceptions should mainly be made for
+        # long-running jobs, like probetests or (once they move to
+        # in-tree definitions) dsvm jobs.
         - swift-tox-py27
         - swift-tox-py35
         - swift-tox-func
@@ -152,9 +380,40 @@
         - swift-tox-func-domain-remap-staticweb
         - swift-tox-func-ec
         - swift-tox-func-s3api
+        - swift-probetests-centos-7:
+            irrelevant-files:
+              - ^(api-ref|releasenotes)/.*$
+              # Keep doc/saio -- we use those sample configs in the saio playbooks
+              - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
+              - ^test/(unit|functional)/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-dsvm-functional:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-dsvm-functional-ipv6:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-tox-lower-constraints:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/(functional|probe)/.*$
+        - openstack-tox-pep8:
+            irrelevant-files:
+              - ^(api-ref|etc|examples|releasenotes)/.*$
+              # Keep doc/manpages -- we want to syntax check them
+              - ^doc/(requirements.txt|(saio|s3api|source)/.*)$
     experimental:
       jobs:
         - swift-tox-py27-centos-7
         - swift-tox-func-centos-7
         - swift-tox-func-encryption-centos-7
         - swift-tox-func-ec-centos-7
+        - swift-multinode-rolling-upgrade-queens
+
+    post:
+      jobs:
+        - publish-openstack-python-branch-tarball
