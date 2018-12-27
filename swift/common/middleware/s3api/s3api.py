@@ -43,7 +43,7 @@ Proxy-Server Setting
 ^^^^^^^^^^^^^^^^^^^^
 
 Set s3api before your auth in your pipeline in ``proxy-server.conf`` file.
-To enable all compatiblity currently supported, you should make sure that
+To enable all compatibility currently supported, you should make sure that
 bulk, slo, and your auth middleware are also included in your proxy
 pipeline setting.
 
@@ -195,6 +195,8 @@ class S3ApiMiddleware(object):
             conf.get('max_parts_listing', 1000))
         self.conf.max_multi_delete_objects = config_positive_int_value(
             conf.get('max_multi_delete_objects', 1000))
+        self.conf.multi_delete_concurrency = config_positive_int_value(
+            conf.get('multi_delete_concurrency', 2))
         self.conf.s3_acl = config_true_value(
             conf.get('s3_acl', False))
         self.conf.storage_domain = conf.get('storage_domain', '')
