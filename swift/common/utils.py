@@ -40,7 +40,6 @@ import uuid
 import functools
 import platform
 import email.parser
-from distutils.version import LooseVersion
 from hashlib import md5, sha1
 from random import random, shuffle
 from contextlib import contextmanager, closing
@@ -1918,6 +1917,37 @@ class LogAdapter(logging.LoggerAdapter, object):
         logging.LoggerAdapter.__init__(self, logger, {})
         self.server = server
         self.warn = self.warning
+
+    # There are a few properties needed for py35; see
+    # - https://bugs.python.org/issue31457
+    # - https://github.com/python/cpython/commit/1bbd482
+    # - https://github.com/python/cpython/commit/0b6a118
+    # - https://github.com/python/cpython/commit/ce9e625
+    def _log(self, level, msg, args, exc_info=None, extra=None,
+             stack_info=False):
+        """
+        Low-level log implementation, proxied to allow nested logger adapters.
+        """
+        return self.logger._log(
+            level,
+            msg,
+            args,
+            exc_info=exc_info,
+            extra=extra,
+            stack_info=stack_info,
+        )
+
+    @property
+    def manager(self):
+        return self.logger.manager
+
+    @manager.setter
+    def manager(self, value):
+        self.logger.manager = value
+
+    @property
+    def name(self):
+        return self.logger.name
 
     @property
     def txn_id(self):
@@ -5204,22 +5234,6 @@ def o_tmpfile_in_path_supported(dirpath):
 
 def o_tmpfile_in_tmpdir_supported():
     return o_tmpfile_in_path_supported(gettempdir())
-
-
-def o_tmpfile_supported():
-    """
-    Returns True if O_TMPFILE flag is supported.
-
-    O_TMPFILE was introduced in Linux 3.11 but it also requires support from
-    underlying filesystem being used. Some common filesystems and linux
-    versions in which those filesystems added support for O_TMPFILE:
-    xfs (3.15)
-    ext4 (3.11)
-    btrfs (3.16)
-    """
-    return all([linkat.available,
-                platform.system() == 'Linux',
-                LooseVersion(platform.release()) >= LooseVersion('3.16')])
 
 
 def safe_json_loads(value):

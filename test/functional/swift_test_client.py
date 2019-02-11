@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import hashlib
+import io
 import json
 import os
 import random
@@ -30,6 +31,7 @@ from six.moves import urllib
 from swiftclient import get_auth
 
 from swift.common import constraints
+from swift.common.http import is_success
 from swift.common.utils import config_true_value
 
 from test import safe_repr
@@ -46,12 +48,13 @@ class RequestError(Exception):
 
 
 class ResponseError(Exception):
-    def __init__(self, response, method=None, path=None):
+    def __init__(self, response, method=None, path=None, details=None):
         self.status = response.status
         self.reason = response.reason
         self.method = method
         self.path = path
         self.headers = response.getheaders()
+        self.details = details
 
         for name, value in self.headers:
             if name.lower() == 'x-trans-id':
@@ -66,8 +69,11 @@ class ResponseError(Exception):
         return repr(self)
 
     def __repr__(self):
-        return '%d: %r (%r %r) txid=%s' % (
+        msg = '%d: %r (%r %r) txid=%s' % (
             self.status, self.reason, self.method, self.path, self.txid)
+        if self.details:
+            msg += '\n%s' % self.details
+        return msg
 
 
 def listing_empty(method):
@@ -216,7 +222,7 @@ class Connection(object):
                                    cfg={'absolute_path': True})
         if status // 100 == 4:
             return {}
-        if not 200 <= status <= 299:
+        if not is_success(status):
             raise ResponseError(self.response, 'GET', '/info')
         return json.loads(self.response.read())
 
@@ -297,6 +303,16 @@ class Connection(object):
             self.connection.request(method, path, data, headers)
             return self.connection.getresponse()
 
+        try:
+            self.response = self.request_with_retry(try_request)
+        except RequestError as e:
+            details = "{method} {path} headers: {headers} data: {data}".format(
+                method=method, path=path, headers=headers, data=data)
+            raise RequestError('Unable to complete request: %s.\n%s' % (
+                details, str(e)))
+        return self.response.status
+
+    def request_with_retry(self, try_request):
         self.response = None
         try_count = 0
         fail_messages = []
@@ -305,6 +321,9 @@ class Connection(object):
 
             try:
                 self.response = try_request()
+            except socket.timeout as e:
+                fail_messages.append(safe_repr(e))
+                continue
             except http_client.HTTPException as e:
                 fail_messages.append(safe_repr(e))
                 continue
@@ -318,17 +337,13 @@ class Connection(object):
                 if try_count != 5:
                     time.sleep(5)
                 continue
-
             break
 
         if self.response:
-            return self.response.status
+            return self.response
 
-        request = "{method} {path} headers: {headers} data: {data}".format(
-            method=method, path=path, headers=headers, data=data)
-        raise RequestError('Unable to complete http request: %s. '
-                           'Attempts: %s, Failures: %s' %
-                           (request, len(fail_messages), fail_messages))
+        raise RequestError('Attempts: %s, Failures: %s' % (
+            len(fail_messages), fail_messages))
 
     def put_start(self, path, hdrs=None, parms=None, cfg=None, chunked=False):
         if hdrs is None:
@@ -436,7 +451,7 @@ class Account(Base):
                        for k, v in metadata.items())
 
         self.conn.make_request('POST', self.path, hdrs=headers, cfg=cfg)
-        if not 200 <= self.conn.response.status <= 299:
+        if not is_success(self.conn.response.status):
             raise ResponseError(self.conn.response, 'POST',
                                 self.conn.make_path(self.path))
         return True
@@ -554,7 +569,7 @@ class Container(Base):
             cfg = {}
 
         self.conn.make_request('POST', self.path, hdrs=hdrs, cfg=cfg)
-        if 200 <= self.conn.response.status <= 299:
+        if is_success(self.conn.response.status):
             return True
         if tolerate_missing and self.conn.response.status == 404:
             return True
@@ -850,7 +865,7 @@ class File(Base):
                                         parms=parms)
         if status == 404:
             return False
-        elif (status < 200) or (status > 299):
+        elif not is_success(status):
             raise ResponseError(self.conn.response, 'HEAD',
                                 self.conn.make_path(self.path))
 
@@ -903,7 +918,7 @@ class File(Base):
         status = self.conn.make_request('GET', self.path, hdrs=hdrs,
                                         cfg=cfg, parms=parms)
 
-        if (status < 200) or (status > 299):
+        if not is_success(status):
             raise ResponseError(self.conn.response, 'GET',
                                 self.conn.make_path(self.path))
 
@@ -930,7 +945,7 @@ class File(Base):
     def read_md5(self):
         status = self.conn.make_request('GET', self.path)
 
-        if (status < 200) or (status > 299):
+        if not is_success(status):
             raise ResponseError(self.conn.response, 'GET',
                                 self.conn.make_path(self.path))
 
@@ -1000,7 +1015,7 @@ class File(Base):
         else:
             raise RuntimeError
 
-    def write(self, data='', hdrs=None, parms=None, callback=None, cfg=None,
+    def write(self, data=b'', hdrs=None, parms=None, callback=None, cfg=None,
               return_resp=False):
         if hdrs is None:
             hdrs = {}
@@ -1019,32 +1034,34 @@ class File(Base):
                 pass
             self.size = int(os.fstat(data.fileno())[6])
         else:
-            data = six.StringIO(data)
-            self.size = data.len
+            data = io.BytesIO(data)
+            self.size = data.seek(0, os.SEEK_END)
+            data.seek(0)
 
         headers = self.make_headers(cfg=cfg)
         headers.update(hdrs)
 
-        self.conn.put_start(self.path, hdrs=headers, parms=parms, cfg=cfg)
+        def try_request():
+            # rewind to be ready for another attempt
+            data.seek(0)
+            self.conn.put_start(self.path, hdrs=headers, parms=parms, cfg=cfg)
 
-        transferred = 0
-        buff = data.read(block_size)
-        buff_len = len(buff)
-        try:
-            while buff_len > 0:
+            transferred = 0
+            for buff in iter(lambda: data.read(block_size), b''):
                 self.conn.put_data(buff)
-                transferred += buff_len
+                transferred += len(buff)
                 if callable(callback):
                     callback(transferred, self.size)
-                buff = data.read(block_size)
-                buff_len = len(buff)
 
             self.conn.put_end()
-        except socket.timeout as err:
-            raise err
+            return self.conn.response
 
-        if (self.conn.response.status < 200) or \
-           (self.conn.response.status > 299):
+        try:
+            self.response = self.conn.request_with_retry(try_request)
+        except RequestError as e:
+            raise ResponseError(self.conn.response, 'PUT',
+                                self.conn.make_path(self.path), details=str(e))
+        if not is_success(self.response.status):
             raise ResponseError(self.conn.response, 'PUT',
                                 self.conn.make_path(self.path))
 

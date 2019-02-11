@@ -19,8 +19,6 @@ from __future__ import print_function
 import os
 import copy
 import logging
-from six.moves import range
-from six import BytesIO
 import sys
 from contextlib import contextmanager, closing
 from collections import defaultdict, Iterable
@@ -39,21 +37,21 @@ import random
 import errno
 import xattr
 
-
+from swift.common import storage_policy, swob, utils
+from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
+                                         VALID_EC_TYPES)
 from swift.common.utils import Timestamp, NOTICE
 from test import get_config
-from swift.common import utils
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.ring import Ring, RingData, RingBuilder
 from swift.obj import server
 from hashlib import md5
 import logging.handlers
 
+from six.moves import range
+from six import BytesIO
 from six.moves.http_client import HTTPException
-from swift.common import storage_policy
-from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
-                                         VALID_EC_TYPES)
-from swift.common import swob
+
 import functools
 import six.moves.cPickle as pickle
 from gzip import GzipFile
@@ -276,6 +274,7 @@ class FakeRing(Ring):
         return [dict(node, index=i) for i, node in enumerate(list(self._devs))]
 
     def get_more_nodes(self, part):
+        index_counter = itertools.count()
         for x in range(self.replicas, (self.replicas + self.max_more_nodes)):
             yield {'ip': '10.0.0.%s' % x,
                    'replication_ip': '10.0.0.%s' % x,
@@ -284,7 +283,8 @@ class FakeRing(Ring):
                    'device': 'sda',
                    'zone': x % 3,
                    'region': x % 2,
-                   'id': x}
+                   'id': x,
+                   'handoff_index': next(index_counter)}
 
 
 def write_fake_ring(path, *devs):
@@ -293,7 +293,7 @@ def write_fake_ring(path, *devs):
     """
     dev1 = {'id': 0, 'zone': 0, 'device': 'sda1', 'ip': '127.0.0.1',
             'port': 6200}
-    dev2 = {'id': 0, 'zone': 0, 'device': 'sdb1', 'ip': '127.0.0.1',
+    dev2 = {'id': 1, 'zone': 0, 'device': 'sdb1', 'ip': '127.0.0.1',
             'port': 6200}
 
     dev1_updates, dev2_updates = devs or ({}, {})
@@ -348,6 +348,9 @@ class FabricatedRing(Ring):
         self._part_shift = 32 - part_power
         self._reload()
 
+    def has_changed(self):
+        return False
+
     def _reload(self, *args, **kwargs):
         self._rtime = time.time() * 2
         if hasattr(self, '_replica2part2dev_id'):
@@ -372,6 +375,7 @@ class FabricatedRing(Ring):
         for p in range(2 ** self.part_power):
             for r in range(self.replicas):
                 self._replica2part2dev_id[r][p] = next(dev_ids)
+        self._update_bookkeeping()
 
 
 class FakeMemcache(object):
@@ -637,6 +641,9 @@ class FakeLogger(logging.Logger, object):
     def handleError(self, record):
         pass
 
+    def isEnabledFor(self, level):
+        return True
+
 
 class DebugSwiftLogFormatter(utils.SwiftLogFormatter):
 
@@ -867,7 +874,10 @@ def fake_http_connect(*code_iter, **kwargs):
 
     class FakeConn(object):
 
-        def __init__(self, status, etag=None, body='', timestamp='1',
+        SLOW_READS = 4
+        SLOW_WRITES = 4
+
+        def __init__(self, status, etag=None, body=b'', timestamp='1',
                      headers=None, expect_headers=None, connection_id=None,
                      give_send=None, give_expect=None):
             if not isinstance(status, FakeStatus):
@@ -892,6 +902,12 @@ def fake_http_connect(*code_iter, **kwargs):
                     self._next_sleep = kwargs['slow'].pop(0)
                 except IndexError:
                     self._next_sleep = None
+
+            # if we're going to be slow, we need a body to send slowly
+            am_slow, _junk = self.get_slow()
+            if am_slow and len(self.body) < self.SLOW_READS:
+                self.body += " " * (self.SLOW_READS - len(self.body))
+
             # be nice to trixy bits with node_iter's
             eventlet.sleep()
 
@@ -922,11 +938,12 @@ def fake_http_connect(*code_iter, **kwargs):
         def getheaders(self):
             etag = self.etag
             if not etag:
-                if isinstance(self.body, str):
+                if isinstance(self.body, bytes):
                     etag = '"' + md5(self.body).hexdigest() + '"'
                 else:
                     etag = '"68b329da9893e34099c7d8ad5cb9c940"'
 
+            am_slow, _junk = self.get_slow()
             headers = HeaderKeyDict({
                 'content-length': len(self.body),
                 'content-type': 'x-application/test',
@@ -949,9 +966,6 @@ def fake_http_connect(*code_iter, **kwargs):
                     headers['x-container-timestamp'] = '1'
             except StopIteration:
                 pass
-            am_slow, value = self.get_slow()
-            if am_slow:
-                headers['content-length'] = '4'
             headers.update(self.headers)
             return headers.items()
 
@@ -968,12 +982,16 @@ def fake_http_connect(*code_iter, **kwargs):
         def read(self, amt=None):
             am_slow, value = self.get_slow()
             if am_slow:
-                if self.sent < 4:
+                if self.sent < self.SLOW_READS:
+                    slowly_read_byte = self.body[self.sent]
                     self.sent += 1
                     eventlet.sleep(value)
-                    return ' '
-            rv = self.body[:amt]
-            self.body = self.body[amt:]
+                    return slowly_read_byte
+            if amt is None:
+                rv = self.body[self.sent:]
+            else:
+                rv = self.body[self.sent:self.sent + amt]
+            self.sent += len(rv)
             return rv
 
         def send(self, data=None):
@@ -981,7 +999,7 @@ def fake_http_connect(*code_iter, **kwargs):
                 self.give_send(self, data)
             am_slow, value = self.get_slow()
             if am_slow:
-                if self.received < 4:
+                if self.received < self.SLOW_WRITES:
                     self.received += 1
                     eventlet.sleep(value)
 
@@ -1043,10 +1061,10 @@ def fake_http_connect(*code_iter, **kwargs):
         expect_headers = next(expect_headers_iter)
         timestamp = next(timestamps_iter)
 
-        if status <= 0:
+        if isinstance(status, int) and status <= 0:
             raise HTTPException()
         if body_iter is None:
-            body = static_body or ''
+            body = static_body or b''
         else:
             body = next(body_iter)
         return FakeConn(status, etag, body=body, timestamp=timestamp,
@@ -1129,18 +1147,9 @@ def requires_o_tmpfile_support_in_tmp(func):
     return wrapper
 
 
-def requires_o_tmpfile_support(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        if not utils.o_tmpfile_supported():
-            raise SkipTest('Requires O_TMPFILE support')
-        return func(*args, **kwargs)
-    return wrapper
-
-
 class StubResponse(object):
 
-    def __init__(self, status, body='', headers=None, frag_index=None):
+    def __init__(self, status, body=b'', headers=None, frag_index=None):
         self.status = status
         self.body = body
         self.readable = BytesIO(body)
@@ -1187,7 +1196,7 @@ def encode_frag_archive_bodies(policy, body):
         fragment_payloads.append(fragments)
 
     # join up the fragment payloads per node
-    ec_archive_bodies = [''.join(frags)
+    ec_archive_bodies = [b''.join(frags)
                          for frags in zip(*fragment_payloads)]
     return ec_archive_bodies
 
@@ -1195,7 +1204,7 @@ def encode_frag_archive_bodies(policy, body):
 def make_ec_object_stub(test_body, policy, timestamp):
     segment_size = policy.ec_segment_size
     test_body = test_body or (
-        'test' * segment_size)[:-random.randint(1, 1000)]
+        b'test' * segment_size)[:-random.randint(1, 1000)]
     timestamp = timestamp or utils.Timestamp.now()
     etag = md5(test_body).hexdigest()
     ec_archive_bodies = encode_frag_archive_bodies(policy, test_body)

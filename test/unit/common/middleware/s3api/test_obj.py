@@ -30,27 +30,6 @@ from swift.common.middleware.s3api.subresource import ACL, User, encode_acl, \
     Owner, Grant
 from swift.common.middleware.s3api.etree import fromstring
 from swift.common.middleware.s3api.utils import mktime, S3Timestamp
-from test.unit.common.middleware.s3api.helpers import FakeSwift
-
-
-def _wrap_fake_auth_middleware(org_func):
-    def fake_fake_auth_middleware(self, env):
-        org_func(env)
-
-        if 'swift.authorize_override' in env:
-            return
-
-        if 'HTTP_AUTHORIZATION' not in env:
-            return
-
-        _, authorization = env['HTTP_AUTHORIZATION'].split(' ')
-        tenant_user, sign = authorization.rsplit(':', 1)
-        tenant, user = tenant_user.rsplit(':', 1)
-
-        env['HTTP_X_TENANT_NAME'] = tenant
-        env['HTTP_X_USER_NAME'] = user
-
-    return fake_fake_auth_middleware
 
 
 class TestS3ApiObj(S3ApiTestCase):
@@ -320,15 +299,20 @@ class TestS3ApiObj(S3ApiTestCase):
     @s3acl(s3acl_only=True)
     def test_object_GET_with_s3acl_and_keystone(self):
         # for passing keystone authentication root
-        fake_auth = self.swift._fake_auth_middleware
-        with patch.object(FakeSwift, '_fake_auth_middleware',
-                          _wrap_fake_auth_middleware(fake_auth)):
+        orig_auth = self.swift._fake_auth_middleware
+        calls = []
 
+        def wrapped_auth(env):
+            calls.append((env['REQUEST_METHOD'], 's3api.auth_details' in env))
+            orig_auth(env)
+
+        with patch.object(self.swift, '_fake_auth_middleware', wrapped_auth):
             self._test_object_GETorHEAD('GET')
-            _, _, headers = self.swift.calls_with_headers[-1]
-            self.assertNotIn('Authorization', headers)
-            _, _, headers = self.swift.calls_with_headers[0]
-            self.assertNotIn('Authorization', headers)
+        self.assertEqual(calls, [
+            ('TEST', True),
+            ('HEAD', False),
+            ('GET', False),
+        ])
 
     @s3acl
     def test_object_GET_Range(self):
@@ -572,17 +556,23 @@ class TestS3ApiObj(S3ApiTestCase):
         def do_test(src_path=None):
             date_header = self.get_date_header()
             timestamp = mktime(date_header)
-            last_modified = S3Timestamp(timestamp).s3xmlformat
+            allowed_last_modified = [S3Timestamp(timestamp).s3xmlformat]
             status, headers, body = self._test_object_PUT_copy(
                 swob.HTTPOk, put_header={'Date': date_header},
                 timestamp=timestamp, src_path=src_path)
+            # may have gotten unlucky and had the clock roll over
+            date_header = self.get_date_header()
+            timestamp = mktime(date_header)
+            allowed_last_modified.append(S3Timestamp(timestamp).s3xmlformat)
+
             self.assertEqual(status.split()[0], '200')
             self.assertEqual(headers['Content-Type'], 'application/xml')
 
             self.assertTrue(headers.get('etag') is None)
             self.assertTrue(headers.get('x-amz-meta-something') is None)
             elem = fromstring(body, 'CopyObjectResult')
-            self.assertEqual(elem.find('LastModified').text, last_modified)
+            self.assertIn(elem.find('LastModified').text,
+                          allowed_last_modified)
             self.assertEqual(elem.find('ETag').text, '"%s"' % self.etag)
 
             _, _, headers = self.swift.calls_with_headers[-1]
@@ -601,7 +591,7 @@ class TestS3ApiObj(S3ApiTestCase):
     def test_object_PUT_copy_metadata_replace(self):
         date_header = self.get_date_header()
         timestamp = mktime(date_header)
-        last_modified = S3Timestamp(timestamp).s3xmlformat
+        allowed_last_modified = [S3Timestamp(timestamp).s3xmlformat]
         status, headers, body = \
             self._test_object_PUT_copy(
                 swob.HTTPOk,
@@ -617,12 +607,15 @@ class TestS3ApiObj(S3ApiTestCase):
                  'content-type': 'so',
                  'expires': 'yeah',
                  'x-robots-tag': 'bye'})
+        date_header = self.get_date_header()
+        timestamp = mktime(date_header)
+        allowed_last_modified.append(S3Timestamp(timestamp).s3xmlformat)
 
         self.assertEqual(status.split()[0], '200')
         self.assertEqual(headers['Content-Type'], 'application/xml')
         self.assertIsNone(headers.get('etag'))
         elem = fromstring(body, 'CopyObjectResult')
-        self.assertEqual(elem.find('LastModified').text, last_modified)
+        self.assertIn(elem.find('LastModified').text, allowed_last_modified)
         self.assertEqual(elem.find('ETag').text, '"%s"' % self.etag)
 
         _, _, headers = self.swift.calls_with_headers[-1]
@@ -653,7 +646,7 @@ class TestS3ApiObj(S3ApiTestCase):
     def test_object_PUT_copy_metadata_copy(self):
         date_header = self.get_date_header()
         timestamp = mktime(date_header)
-        last_modified = S3Timestamp(timestamp).s3xmlformat
+        allowed_last_modified = [S3Timestamp(timestamp).s3xmlformat]
         status, headers, body = \
             self._test_object_PUT_copy(
                 swob.HTTPOk,
@@ -669,12 +662,16 @@ class TestS3ApiObj(S3ApiTestCase):
                  'content-type': 'so',
                  'expires': 'yeah',
                  'x-robots-tag': 'bye'})
+        date_header = self.get_date_header()
+        timestamp = mktime(date_header)
+        allowed_last_modified.append(S3Timestamp(timestamp).s3xmlformat)
+
         self.assertEqual(status.split()[0], '200')
         self.assertEqual(headers['Content-Type'], 'application/xml')
         self.assertIsNone(headers.get('etag'))
 
         elem = fromstring(body, 'CopyObjectResult')
-        self.assertEqual(elem.find('LastModified').text, last_modified)
+        self.assertIn(elem.find('LastModified').text, allowed_last_modified)
         self.assertEqual(elem.find('ETag').text, '"%s"' % self.etag)
 
         _, _, headers = self.swift.calls_with_headers[-1]
@@ -726,16 +723,20 @@ class TestS3ApiObj(S3ApiTestCase):
     def test_object_PUT_copy_self_metadata_replace(self):
         date_header = self.get_date_header()
         timestamp = mktime(date_header)
-        last_modified = S3Timestamp(timestamp).s3xmlformat
+        allowed_last_modified = [S3Timestamp(timestamp).s3xmlformat]
         header = {'x-amz-metadata-directive': 'REPLACE',
                   'Date': date_header}
         status, headers, body = self._test_object_PUT_copy_self(
             swob.HTTPOk, header, timestamp=timestamp)
+        date_header = self.get_date_header()
+        timestamp = mktime(date_header)
+        allowed_last_modified.append(S3Timestamp(timestamp).s3xmlformat)
+
         self.assertEqual(status.split()[0], '200')
         self.assertEqual(headers['Content-Type'], 'application/xml')
         self.assertTrue(headers.get('etag') is None)
         elem = fromstring(body, 'CopyObjectResult')
-        self.assertEqual(elem.find('LastModified').text, last_modified)
+        self.assertIn(elem.find('LastModified').text, allowed_last_modified)
         self.assertEqual(elem.find('ETag').text, '"%s"' % self.etag)
 
         _, _, headers = self.swift.calls_with_headers[-1]

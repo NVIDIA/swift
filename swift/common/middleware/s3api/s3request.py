@@ -491,15 +491,6 @@ class S3Request(swob.Request):
         self.user_id = None
         self.slo_enabled = slo_enabled
 
-        # NOTE(andrey-mp): substitute authorization header for next modules
-        # in pipeline (s3token). it uses this and X-Auth-Token in specific
-        # format.
-        # (kota_): yeah, the reason we need this is s3token only supports
-        # v2 like header consists of AWS access:signature. Since the commit
-        # b626a3ca86e467fc7564eac236b9ee2efd49bdcc, the s3token is in swift3
-        # repo so probably we need to change s3token to support v4 format.
-        self.headers['Authorization'] = 'AWS %s:%s' % (
-            self.access_key, self.signature)
         # Avoids that swift.swob.Response replaces Location header value
         # by full URL when absolute path given. See swift.swob for more detail.
         self.environ['swift.leave_relative_location'] = True
@@ -758,7 +749,10 @@ class S3Request(swob.Request):
 
         # https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.html
         # describes some of what would be required to support this
-        if 'aws-chunked' in self.headers.get('content-encoding', ''):
+        if any(['aws-chunked' in self.headers.get('content-encoding', ''),
+                'STREAMING-AWS4-HMAC-SHA256-PAYLOAD' == self.headers.get(
+                    'x-amz-content-sha256', ''),
+                'x-amz-decoded-content-length' in self.headers]):
             raise S3NotImplemented('Transfering payloads in multiple chunks '
                                    'using aws-chunked is not supported.')
 
@@ -1460,7 +1454,6 @@ class S3AclRequest(S3Request):
 
         # Need to skip S3 authorization on subsequent requests to prevent
         # overwriting the account in PATH_INFO
-        del self.headers['Authorization']
         del self.environ['s3api.auth_details']
 
     def to_swift_req(self, method, container, obj, query=None,

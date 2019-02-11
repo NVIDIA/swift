@@ -31,6 +31,7 @@ are also not considered part of the backend API.
 """
 
 import six.moves.cPickle as pickle
+import binascii
 import copy
 import errno
 import fcntl
@@ -64,7 +65,7 @@ from swift.common.utils import mkdirs, Timestamp, \
     fsync_dir, drop_buffer_cache, lock_path, write_pickle, \
     config_true_value, listdir, split_path, remove_file, \
     get_md5_socket, F_SETPIPE_SZ, decode_timestamps, encode_timestamps, \
-    MD5_OF_EMPTY_STRING, link_fd_to_path, o_tmpfile_supported, \
+    MD5_OF_EMPTY_STRING, link_fd_to_path, \
     O_TMPFILE, makedirs_count, replace_partition_in_path, remove_directory
 from swift.common.splice import splice, tee
 from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
@@ -704,7 +705,7 @@ class BaseDiskFileManager(object):
                 with open('/proc/sys/fs/pipe-max-size') as f:
                     max_pipe_size = int(f.read())
                 self.pipe_size = min(max_pipe_size, self.disk_chunk_size)
-        self.use_linkat = o_tmpfile_supported()
+        self.use_linkat = True
 
     @classmethod
     def check_policy(cls, policy):
@@ -748,11 +749,12 @@ class BaseDiskFileManager(object):
             rv = '%s%s' % (rv, ext)
         return rv
 
-    def parse_on_disk_filename(self, filename):
+    def parse_on_disk_filename(self, filename, policy):
         """
         Parse an on disk file name.
 
         :param filename: the file name including extension
+        :param policy: storage policy used to store the file
         :returns: a dict, with keys for timestamp, ext and ctype_timestamp:
 
             * timestamp is a :class:`~swift.common.utils.Timestamp`
@@ -859,7 +861,8 @@ class BaseDiskFileManager(object):
         return self._split_list(
             file_info_list, lambda x: x['timestamp'] >= timestamp)
 
-    def get_ondisk_files(self, files, datadir, verify=True, **kwargs):
+    def get_ondisk_files(self, files, datadir, verify=True, policy=None,
+                         **kwargs):
         """
         Given a simple list of files names, determine the files that constitute
         a valid fileset i.e. a set of files that defines the state of an
@@ -880,6 +883,8 @@ class BaseDiskFileManager(object):
         :param datadir: directory name files are from.
         :param verify: if True verify that the ondisk file contract has not
                        been violated, otherwise do not verify.
+        :param policy: storage policy used to store the files. Used to
+                       validate fragment indexes for EC policies.
         :returns: a dict that will contain keys:
                     ts_file   -> path to a .ts file or None
                     data_file -> path to a .data file or None
@@ -913,7 +918,7 @@ class BaseDiskFileManager(object):
         for afile in files:
             # Categorize files by extension
             try:
-                file_info = self.parse_on_disk_filename(afile)
+                file_info = self.parse_on_disk_filename(afile, policy)
                 file_info['filename'] = afile
                 exts[file_info['ext']].append(file_info)
             except DiskFileError as e:
@@ -1068,12 +1073,28 @@ class BaseDiskFileManager(object):
         """
         raise NotImplementedError
 
-    def _hash_suffix_dir(self, path):
+    def _hash_suffix_dir(self, path, policy):
         """
 
         :param path: full path to directory
+        :param policy: storage policy used
         """
-        hashes = defaultdict(md5)
+        if six.PY2:
+            hashes = defaultdict(md5)
+        else:
+            class shim(object):
+                def __init__(self):
+                    self.md5 = md5()
+
+                def update(self, s):
+                    if isinstance(s, str):
+                        self.md5.update(s.encode('utf-8'))
+                    else:
+                        self.md5.update(s)
+
+                def hexdigest(self):
+                    return self.md5.hexdigest()
+            hashes = defaultdict(shim)
         try:
             path_contents = sorted(os.listdir(path))
         except OSError as err:
@@ -1083,7 +1104,8 @@ class BaseDiskFileManager(object):
         for hsh in path_contents:
             hsh_path = join(path, hsh)
             try:
-                ondisk_info = self.cleanup_ondisk_files(hsh_path)
+                ondisk_info = self.cleanup_ondisk_files(
+                    hsh_path, policy=policy)
             except OSError as err:
                 if err.errno == errno.ENOTDIR:
                     partition_path = dirname(path)
@@ -1137,11 +1159,12 @@ class BaseDiskFileManager(object):
             raise PathNotDir()
         return hashes
 
-    def _hash_suffix(self, path):
+    def _hash_suffix(self, path, policy=None):
         """
         Performs reclamation and returns an md5 of all (remaining) files.
 
         :param path: full path to directory
+        :param policy: storage policy used to store the files
         :raises PathNotDir: if given path is not a valid directory
         :raises OSError: for non-ENOTDIR errors
         """
@@ -1213,11 +1236,12 @@ class BaseDiskFileManager(object):
             modified = True
             self.logger.debug('Run listdir on %s', partition_path)
         hashes.update((suffix, None) for suffix in recalculate)
-        for suffix, hash_ in hashes.items():
+        for suffix, hash_ in list(hashes.items()):
             if not hash_:
                 suffix_dir = join(partition_path, suffix)
                 try:
-                    hashes[suffix] = self._hash_suffix(suffix_dir)
+                    hashes[suffix] = self._hash_suffix(
+                        suffix_dir, policy=policy)
                     hashed += 1
                 except PathNotDir:
                     del hashes[suffix]
@@ -1648,7 +1672,6 @@ class BaseDiskFileWriter(object):
         return self.manager.logger
 
     def _get_tempfile(self):
-        fallback_to_mkstemp = False
         tmppath = None
         if self.manager.use_linkat:
             self._dirs_created = makedirs_count(self._datadir)
@@ -1660,10 +1683,10 @@ class BaseDiskFileWriter(object):
                            Falling back to using mkstemp()' \
                            % (self._datadir, os.strerror(err.errno))
                     self.logger.warning(msg)
-                    fallback_to_mkstemp = True
+                    self.manager.use_linkat = False
                 else:
                     raise
-        if not self.manager.use_linkat or fallback_to_mkstemp:
+        if not self.manager.use_linkat:
             tmpdir = join(self._diskfile._device_path,
                           get_tmp_dir(self._diskfile.policy))
             if not exists(tmpdir):
@@ -2073,7 +2096,7 @@ class BaseDiskFileReader(object):
             # returning the correct value.
             if self._bytes_read > 0:
                 bin_checksum = os.read(md5_sockfd, 16)
-                hex_checksum = ''.join("%02x" % ord(c) for c in bin_checksum)
+                hex_checksum = binascii.hexlify(bin_checksum).decode('ascii')
             else:
                 hex_checksum = MD5_OF_EMPTY_STRING
             self._md5_of_sent_bytes = hex_checksum
@@ -2220,8 +2243,7 @@ class BaseDiskFile(object):
     def __init__(self, mgr, device_path, partition,
                  account=None, container=None, obj=None, _datadir=None,
                  policy=None, use_splice=False, pipe_size=None,
-                 open_expired=False, next_part_power=None,
-                 **kwargs):
+                 open_expired=False, next_part_power=None, **kwargs):
         self._manager = mgr
         self._device_path = device_path
         self._logger = mgr.logger
@@ -2388,7 +2410,7 @@ class BaseDiskFile(object):
             files = []
 
         # gather info about the valid files to use to open the DiskFile
-        file_info = self._get_ondisk_files(files)
+        file_info = self._get_ondisk_files(files, self.policy)
 
         self._data_file = file_info.get('data_file')
         if not self._data_file:
@@ -2443,11 +2465,12 @@ class BaseDiskFile(object):
         self._logger.increment('quarantines')
         return DiskFileQuarantined(msg)
 
-    def _get_ondisk_files(self, files):
+    def _get_ondisk_files(self, files, policy=None):
         """
         Determine the on-disk files to use.
 
         :param files: a list of files in the object's dir
+        :param policy: storage policy used to store the files
         :returns: dict of files to use having keys 'data_file', 'ts_file',
                  'meta_file'
         """
@@ -2842,8 +2865,9 @@ class DiskFile(BaseDiskFile):
     reader_cls = DiskFileReader
     writer_cls = DiskFileWriter
 
-    def _get_ondisk_files(self, files):
-        self._ondisk_info = self.manager.get_ondisk_files(files, self._datadir)
+    def _get_ondisk_files(self, files, policy=None):
+        self._ondisk_info = self.manager.get_ondisk_files(
+            files, self._datadir, policy=policy)
         return self._ondisk_info
 
 
@@ -2893,16 +2917,17 @@ class DiskFileManager(BaseDiskFileManager):
             hashes[None].update(
                 file_info['timestamp'].internal + file_info['ext'])
 
-    def _hash_suffix(self, path):
+    def _hash_suffix(self, path, policy=None):
         """
         Performs reclamation and returns an md5 of all (remaining) files.
 
         :param path: full path to directory
+        :param policy: storage policy used to store the files
         :raises PathNotDir: if given path is not a valid directory
         :raises OSError: for non-ENOTDIR errors
         :returns: md5 of files in suffix
         """
-        hashes = self._hash_suffix_dir(path)
+        hashes = self._hash_suffix_dir(path, policy)
         return hashes[None].hexdigest()
 
 
@@ -3073,7 +3098,8 @@ class ECDiskFileWriter(BaseDiskFileWriter):
             # sure that the fragment index is included in object sysmeta.
             fi = metadata.setdefault('X-Object-Sysmeta-Ec-Frag-Index',
                                      self._diskfile._frag_index)
-            fi = self.manager.validate_fragment_index(fi)
+            fi = self.manager.validate_fragment_index(
+                fi, self._diskfile.policy)
             self._diskfile._frag_index = fi
             # defer cleanup until commit() writes makes diskfile durable
             cleanup = False
@@ -3090,7 +3116,8 @@ class ECDiskFile(BaseDiskFile):
         frag_index = kwargs.get('frag_index')
         self._frag_index = None
         if frag_index is not None:
-            self._frag_index = self.manager.validate_fragment_index(frag_index)
+            self._frag_index = self.manager.validate_fragment_index(
+                frag_index, self.policy)
         self._frag_prefs = self._validate_frag_prefs(kwargs.get('frag_prefs'))
         self._durable_frag_set = None
 
@@ -3159,17 +3186,18 @@ class ECDiskFile(BaseDiskFile):
             return dict([(ts, [info['frag_index'] for info in frag_set])
                          for ts, frag_set in frag_sets.items()])
 
-    def _get_ondisk_files(self, files):
+    def _get_ondisk_files(self, files, policy=None):
         """
         The only difference between this method and the replication policy
         DiskFile method is passing in the frag_index and frag_prefs kwargs to
         our manager's get_ondisk_files method.
 
         :param files: list of file names
+        :param policy: storage policy used to store the files
         """
         self._ondisk_info = self.manager.get_ondisk_files(
             files, self._datadir, frag_index=self._frag_index,
-            frag_prefs=self._frag_prefs)
+            frag_prefs=self._frag_prefs, policy=policy)
         return self._ondisk_info
 
     def purge(self, timestamp, frag_index):
@@ -3210,12 +3238,13 @@ class ECDiskFileManager(BaseDiskFileManager):
     diskfile_cls = ECDiskFile
     policy = EC_POLICY
 
-    def validate_fragment_index(self, frag_index):
+    def validate_fragment_index(self, frag_index, policy=None):
         """
         Return int representation of frag_index, or raise a DiskFileError if
         frag_index is not a whole number.
 
         :param frag_index: a fragment archive index
+        :param policy: storage policy used to validate the index against
         """
         try:
             frag_index = int(str(frag_index))
@@ -3225,6 +3254,11 @@ class ECDiskFileManager(BaseDiskFileManager):
         if frag_index < 0:
             raise DiskFileError(
                 'Fragment index must not be negative: %s' % frag_index)
+        if policy and frag_index >= policy.ec_ndata + policy.ec_nparity:
+            msg = 'Fragment index must be less than %d for a %d+%d policy: %s'
+            raise DiskFileError(msg % (
+                policy.ec_ndata + policy.ec_nparity,
+                policy.ec_ndata, policy.ec_nparity, frag_index))
         return frag_index
 
     def make_on_disk_filename(self, timestamp, ext=None, frag_index=None,
@@ -3257,7 +3291,7 @@ class ECDiskFileManager(BaseDiskFileManager):
         return super(ECDiskFileManager, self).make_on_disk_filename(
             timestamp, ext, ctype_timestamp, *a, **kw)
 
-    def parse_on_disk_filename(self, filename):
+    def parse_on_disk_filename(self, filename, policy):
         """
         Returns timestamp(s) and other info extracted from a policy specific
         file name. For EC policy the data file name includes a fragment index
@@ -3296,7 +3330,7 @@ class ECDiskFileManager(BaseDiskFileManager):
             except IndexError:
                 # expect validate_fragment_index raise DiskFileError
                 pass
-            frag_index = self.validate_fragment_index(frag_index)
+            frag_index = self.validate_fragment_index(frag_index, policy)
             try:
                 durable = parts[2] == 'd'
             except IndexError:
@@ -3308,7 +3342,8 @@ class ECDiskFileManager(BaseDiskFileManager):
                 'ctype_timestamp': None,
                 'durable': durable
             }
-        rv = super(ECDiskFileManager, self).parse_on_disk_filename(filename)
+        rv = super(ECDiskFileManager, self).parse_on_disk_filename(
+            filename, policy)
         rv['frag_index'] = None
         return rv
 
@@ -3529,11 +3564,12 @@ class ECDiskFileManager(BaseDiskFileManager):
             file_info = ondisk_info['durable_frag_set'][0]
             hashes[None].update(file_info['timestamp'].internal + '.durable')
 
-    def _hash_suffix(self, path):
+    def _hash_suffix(self, path, policy=None):
         """
         Performs reclamation and returns an md5 of all (remaining) files.
 
         :param path: full path to directory
+        :param policy: storage policy used to store the files
         :raises PathNotDir: if given path is not a valid directory
         :raises OSError: for non-ENOTDIR errors
         :returns: dict of md5 hex digests
@@ -3542,5 +3578,5 @@ class ECDiskFileManager(BaseDiskFileManager):
         # here we flatten out the hashers hexdigest into a dictionary instead
         # of just returning the one hexdigest for the whole suffix
 
-        hash_per_fi = self._hash_suffix_dir(path)
+        hash_per_fi = self._hash_suffix_dir(path, policy)
         return dict((fi, md5.hexdigest()) for fi, md5 in hash_per_fi.items())

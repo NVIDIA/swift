@@ -95,14 +95,14 @@ def _make_backend_fragments_header(fragments):
     return None
 
 
-class EventletPlungerString(str):
+class EventletPlungerString(bytes):
     """
     Eventlet won't send headers until it's accumulated at least
-    eventlet.wsgi.MINIMUM_CHUNK_SIZE bytes or the app iter is exhausted. If we
-    want to send the response body behind Eventlet's back, perhaps with some
-    zero-copy wizardry, then we have to unclog the plumbing in eventlet.wsgi
-    to force the headers out, so we use an EventletPlungerString to empty out
-    all of Eventlet's buffers.
+    eventlet.wsgi.MINIMUM_CHUNK_SIZE bytes or the app iter is exhausted.
+    If we want to send the response body behind Eventlet's back, perhaps
+    with some zero-copy wizardry, then we have to unclog the plumbing in
+    eventlet.wsgi to force the headers out, so we use an
+    EventletPlungerString to empty out all of Eventlet's buffers.
     """
     def __len__(self):
         return wsgi.MINIMUM_CHUNK_SIZE + 1
@@ -377,7 +377,10 @@ class ObjectController(BaseStorageServer):
                 contpath = None
 
         if contpartition:
-            updates = zip(conthosts, contdevices)
+            # In py3, zip() continues to work for our purposes... But when
+            # we want to log an error, consumed items are not longer present
+            # in the zip, making the logs useless for operators. So, list().
+            updates = list(zip(conthosts, contdevices))
         else:
             updates = []
 
@@ -756,9 +759,8 @@ class ObjectController(BaseStorageServer):
                 except ValueError as e:
                     raise HTTPBadRequest(body=str(e), request=request,
                                          content_type='text/plain')
-        # SSYNC will include Frag-Index header for subrequests to primary
-        # nodes; handoff nodes should 409 subrequests to over-write an
-        # existing data fragment until they offloaded the existing fragment
+        # SSYNC will include Frag-Index header for subrequests, in which case
+        # get_diskfile will ignore non-matching on-disk data files
         frag_index = request.headers.get('X-Backend-Ssync-Frag-Index')
         next_part_power = request.headers.get('X-Backend-Next-Part-Power')
         try:

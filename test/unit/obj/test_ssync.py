@@ -36,7 +36,7 @@ from swift.obj.replicator import ObjectReplicator
 from test import listen_zero
 from test.unit.obj.common import BaseTest
 from test.unit import patch_policies, debug_logger, \
-    encode_frag_archive_bodies, skip_if_no_xattrs
+    encode_frag_archive_bodies, skip_if_no_xattrs, quiet_eventlet_exceptions
 
 
 class TestBaseSsync(BaseTest):
@@ -312,6 +312,7 @@ class TestBaseSsyncEC(TestBaseSsync):
         self.policy = POLICIES.default
         self.logger = debug_logger('test-ssync-sender')
         self.daemon = ObjectReconstructor(self.daemon_conf, self.logger)
+        self.rx_node['backend_index'] = 0
 
     def _get_object_data(self, path, frag_index=None, **kwargs):
         # return a frag archive for given object name and frag index.
@@ -378,7 +379,6 @@ class TestSsyncEC(TestBaseSsyncEC):
                'policy': policy,
                'frag_index': frag_index}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -485,7 +485,6 @@ class TestSsyncEC(TestBaseSsyncEC):
                'policy': policy,
                'frag_index': frag_index}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -583,7 +582,6 @@ class TestSsyncEC(TestBaseSsyncEC):
                'frag_index': frag_index,
                'sync_diskfile_builder': fake_reconstruct_fa}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -667,10 +665,11 @@ class TestSsyncEC(TestBaseSsyncEC):
 
     def test_send_invalid_frag_index(self):
         policy = POLICIES.default
-        job = {'frag_index': 'Not a number',
+        job = {'frag_index': 'No one cares',
                'device': self.device,
                'partition': self.partition,
                'policy': policy}
+        self.rx_node['backend_index'] = 'Not a number'
         sender = ssync_sender.Sender(
             self.daemon, self.rx_node, job, ['abc'])
         success, _ = sender()
@@ -713,7 +712,6 @@ class TestSsyncEC(TestBaseSsyncEC):
                'policy': policy,
                'frag_index': frag_index}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -808,7 +806,7 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
                     os.path.basename(os.path.dirname(df._datadir)))
 
         self.job_node = dict(self.rx_node)
-        self.job_node['index'] = self.rx_node_index
+        self.job_node['id'] = 0
 
         self.frag_length = int(
             self.tx_objs['o1'][0].get_metadata()['Content-Length'])
@@ -957,7 +955,9 @@ class TestSsyncECReconstructorSyncJob(TestBaseSsyncEC):
             [FakeResponse(i, self.obj_data)
              for i in range(self.policy.ec_ndata + self.policy.ec_nparity)]]
 
-        self._test_reconstructor_sync_job(frag_responses)
+        with quiet_eventlet_exceptions():
+            self._test_reconstructor_sync_job(frag_responses)
+
         msgs = []
         for obj_name in ('o1', 'o2'):
             try:
@@ -1080,7 +1080,6 @@ class TestSsyncReplication(TestBaseSsync):
 
     def test_sync(self):
         policy = POLICIES.default
-        rx_node_index = 0
 
         # create sender side diskfiles...
         tx_objs = {}
@@ -1134,7 +1133,6 @@ class TestSsyncReplication(TestBaseSsync):
                'partition': self.partition,
                'policy': policy}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1202,7 +1200,6 @@ class TestSsyncReplication(TestBaseSsync):
 
     def test_meta_file_sync(self):
         policy = POLICIES.default
-        rx_node_index = 0
 
         # create diskfiles...
         tx_objs = {}
@@ -1307,7 +1304,6 @@ class TestSsyncReplication(TestBaseSsync):
                'partition': self.partition,
                'policy': policy}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1350,7 +1346,6 @@ class TestSsyncReplication(TestBaseSsync):
     def test_expired_object(self):
         # verify that expired objects sync
         policy = POLICIES.default
-        rx_node_index = 0
         tx_df_mgr = self.daemon._df_router[policy]
         t1 = next(self.ts_iter)
         obj_name = 'o1'
@@ -1368,7 +1363,6 @@ class TestSsyncReplication(TestBaseSsync):
                'partition': self.partition,
                'policy': policy}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1385,7 +1379,6 @@ class TestSsyncReplication(TestBaseSsync):
     def _check_no_longer_expired_object(self, obj_name, df, policy):
         # verify that objects with x-delete-at metadata that are not expired
         # can be sync'd
-        rx_node_index = 0
 
         def do_ssync():
             # create ssync sender instance...
@@ -1394,7 +1387,6 @@ class TestSsyncReplication(TestBaseSsync):
                    'partition': self.partition,
                    'policy': policy}
             node = dict(self.rx_node)
-            node.update({'index': rx_node_index})
             sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
             # wrap connection from tx to rx to capture ssync messages...
             sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1478,7 +1470,6 @@ class TestSsyncReplication(TestBaseSsync):
         # verify that the sender does sync a data file to a legacy receiver,
         # but does not PUT meta file content to a legacy receiver
         policy = POLICIES.default
-        rx_node_index = 0
 
         # create diskfiles...
         tx_df_mgr = self.daemon._df_router[policy]
@@ -1502,7 +1493,6 @@ class TestSsyncReplication(TestBaseSsync):
                'partition': self.partition,
                'policy': policy}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1561,7 +1551,6 @@ class TestSsyncReplication(TestBaseSsync):
 
     def test_content_type_sync(self):
         policy = POLICIES.default
-        rx_node_index = 0
 
         # create diskfiles...
         tx_objs = {}
@@ -1673,7 +1662,6 @@ class TestSsyncReplication(TestBaseSsync):
                'partition': self.partition,
                'policy': policy}
         node = dict(self.rx_node)
-        node.update({'index': rx_node_index})
         sender = ssync_sender.Sender(self.daemon, node, job, suffixes)
         # wrap connection from tx to rx to capture ssync messages...
         sender.connect, trace = self.make_connect_wrapper(sender)
@@ -1718,6 +1706,7 @@ class TestSsyncReplication(TestBaseSsync):
         rx_hashes = rx_df_mgr.get_hashes(
             self.device, self.partition, suffixes, policy)
         self.assertEqual(tx_hashes, rx_hashes)
+
 
 if __name__ == '__main__':
     unittest.main()
