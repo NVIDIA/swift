@@ -118,6 +118,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             'min_segment_size': 5242880,
             'multi_delete_concurrency': 2,
             's3_acl': False,
+            'use_async_delete': False,
             'cors_preflight_allow_origin': [],
             'ratelimit_as_client_error': False,
         })
@@ -142,6 +143,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             'min_segment_size': 1000000,
             'multi_delete_concurrency': 1,
             's3_acl': True,
+            'use_async_delete': False,
             'cors_preflight_allow_origin': 'foo.example.com,bar.example.com',
             'ratelimit_as_client_error': True,
         }
