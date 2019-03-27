@@ -16,11 +16,14 @@
 import copy
 import json
 
+from swift.cli.container_deleter import make_delete_jobs
 from swift.common.constraints import MAX_OBJECT_NAME_LENGTH
 from swift.common.http import HTTP_NO_CONTENT
 from swift.common.swob import str_to_wsgi
-from swift.common.utils import public, StreamingPile
+from swift.common.utils import public, StreamingPile, Timestamp, \
+    config_true_value
 from swift.common.registry import get_swift_info
+from swift.common.wsgi import make_pre_authed_request
 
 from swift.common.middleware.s3api.controllers.base import Controller, \
     bucket_operation
@@ -28,7 +31,8 @@ from swift.common.middleware.s3api.etree import Element, SubElement, \
     fromstring, tostring, XMLSyntaxError, DocumentInvalid
 from swift.common.middleware.s3api.s3response import HTTPOk, \
     S3NotImplemented, NoSuchKey, ErrorResponse, MalformedXML, \
-    UserKeyMustBeSpecified, AccessDenied, MissingRequestBodyError
+    UserKeyMustBeSpecified, AccessDenied, MissingRequestBodyError, \
+    ServiceUnavailable
 
 
 class MultiObjectDeleteController(Controller):
@@ -164,6 +168,84 @@ class MultiObjectDeleteController(Controller):
 
             return key, None
 
+        if self.conf.use_async_delete:
+            container_info = req.get_container_info(self.app)
+            versions_enabled = config_true_value(container_info.get(
+                'sysmeta', {}).get('versions-enabled'))
+            if versions_enabled or any(
+                    version is not None for _key, version in delete_list):
+                raise S3NotImplemented()
+            # Fire off first delete inline to check that we're authed to delete
+            _, err = do_delete(req, *delete_list[0])
+            if err:
+                # We've already ruled out multipart uploads and S3-style acls;
+                # assume that whatever this failure was would apply to all of
+                # the objects.
+                for key, _version in delete_list:
+                    error = SubElement(elem, 'Error')
+                    SubElement(error, 'Key').text = key
+                    SubElement(error, 'Code').text = err['code']
+                    SubElement(error, 'Message').text = err['message']
+                return HTTPOk(body=tostring(elem))
+            # Note that even on success, we *also* async-delete this first key.
+            # This ensures the container listing gets updated immediately.
+
+            ts = Timestamp.now()
+            dest_container_body = []
+            dest_storage_policy = container_info['storage_policy']
+            for key, _version in delete_list:
+                # NB: no ROWIDs
+                dest_container_body.append({
+                    "name": key, "deleted": 1, "created_at": ts.internal,
+                    "storage_policy_index": dest_storage_policy,
+                    "etag": "noetag",
+                    "content_type": "application/deleted", "size": 0})
+                if not self.quiet:
+                    deleted = SubElement(elem, 'Deleted')
+                    SubElement(deleted, 'Key').text = key
+
+            # make UPDATE request to bulk-insert expirer jobs
+            exp_jobs = make_delete_jobs(
+                req.account,
+                req.container_name,
+                [key for key, version in delete_list if version is None],
+                ts)
+            # TODO: extend with jobs for specific versions
+            enqueue_req = make_pre_authed_request(
+                req.environ,
+                method='UPDATE',
+                path="/v1/.expiring_objects/%d" % int(ts),
+                body=json.dumps(exp_jobs),
+                headers={'Content-Type': 'application/json',
+                         'X-Backend-Storage-Policy-Index': '0',
+                         'X-Backend-Allow-Private-Methods': 'True'},
+            )
+            resp = enqueue_req.get_response(self.app)
+            if not resp.is_success:
+                self.logger.error(
+                    'Failed to enqueue expiration entries: %s\n%s',
+                    resp.status, resp.body)
+                return ServiceUnavailable()
+            # consume the response (should be short)
+            resp.body
+
+            # make UPDATE request to the container so we can
+            # update the listing *now*
+            resp = req.get_response(
+                self.app, method='UPDATE',
+                body=json.dumps(dest_container_body),
+                headers={
+                    'Content-Type': 'application/json',
+                    'X-Backend-Storage-Policy-Index': str(dest_storage_policy),
+                    'X-Backend-Allow-Private-Methods': 'True'})
+            if not resp.is_success:
+                return resp
+            # consume the response (should be short)
+            resp.body
+
+            return HTTPOk(body=tostring(elem))
+
+        # else, do inline deletes
         with StreamingPile(self.conf.multi_delete_concurrency) as pile:
             for key, err in pile.asyncstarmap(do_delete, (
                     (req, key, version) for key, version in delete_list)):
