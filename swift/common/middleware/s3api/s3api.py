@@ -277,10 +277,21 @@ class S3ApiMiddleware(object):
             wsgi_conf.get('min_segment_size', 5242880))
         self.conf.allowable_clock_skew = config_positive_int_value(
             wsgi_conf.get('allowable_clock_skew', 15 * 60))
+        self.conf.use_async_delete = config_true_value(
+            wsgi_conf.get('use_async_delete', False))
 
         self.logger = get_logger(
             wsgi_conf, log_route=wsgi_conf.get('log_name', 's3api'))
         self.check_pipeline(wsgi_conf)
+
+        if self.conf.use_async_delete and (self.conf.s3_acl or
+                                           self.conf.allow_multipart_uploads):
+            self.conf.use_async_delete = False
+            self.logger.warning(
+                'use_async_delete is not compatible with s3_acl or '
+                'allow_multipart_uploads; it has been disabled')
+            # Alternatively, have the proxy refuse to start.
+            # We default the async to false; operator opted into it...
 
     def __call__(self, env, start_response):
         try:
