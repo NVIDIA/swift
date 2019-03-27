@@ -1212,6 +1212,9 @@ class S3Request(swob.Request):
                 'DELETE': [
                     HTTP_NO_CONTENT,
                 ],
+                'UPDATE': [  # used for bulk deletes
+                    HTTP_ACCEPTED,
+                ],
             }
         else:
             # Swift object access.
@@ -1285,6 +1288,8 @@ class S3Request(swob.Request):
                 'DELETE': {
                     HTTP_NOT_FOUND: (NoSuchBucket, container),
                     HTTP_CONFLICT: BucketNotEmpty,
+                },
+                'UPDATE': {
                 },
             }
         else:
