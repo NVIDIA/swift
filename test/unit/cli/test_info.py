@@ -19,6 +19,7 @@ import mock
 from shutil import rmtree
 from tempfile import mkdtemp
 
+import six
 from six.moves import cStringIO as StringIO
 from test.unit import patch_policies, write_fake_ring, skip_if_no_xattrs
 
@@ -267,6 +268,87 @@ Shard Ranges (3):
                   POLICIES[0].name
         self.assertEqual(sorted(out.getvalue().strip().split('\n')),
                          sorted(exp_out.strip().split('\n')))
+
+    def test_print_db_info_metadata_with_shard_ranges_bis(self):
+
+        shard_ranges = [utils.ShardRange(
+            name='.sharded_a/shard_range_%s' % i,
+            timestamp=utils.Timestamp(i), lower=u'%d\u30a2' % i,
+            upper=u'%d\u30e4' % i, object_count=i, bytes_used=i,
+            meta_timestamp=utils.Timestamp(i)) for i in range(1, 4)]
+        shard_ranges[0].state = utils.ShardRange.CLEAVED
+        shard_ranges[1].state = utils.ShardRange.CREATED
+
+        info = dict(
+            account='acct',
+            container='cont',
+            storage_policy_index=0,
+            created_at='0000000100.10000',
+            put_timestamp='0000000106.30000',
+            delete_timestamp='0000000107.90000',
+            status_changed_at='0000000108.30000',
+            object_count='20',
+            bytes_used='42',
+            reported_put_timestamp='0000010106.30000',
+            reported_delete_timestamp='0000010107.90000',
+            reported_object_count='20',
+            reported_bytes_used='42',
+            db_state=SHARDED,
+            is_root=True,
+            shard_ranges=shard_ranges)
+        info['hash'] = 'abaddeadbeefcafe'
+        info['id'] = 'abadf100d0ddba11'
+        out = StringIO()
+        with mock.patch('sys.stdout', out):
+            print_db_info_metadata('container', info, {})
+        if six.PY2:
+            s_a = '\\xe3\\x82\\xa2'
+            s_ya = '\\xe3\\x83\\xa4'
+        else:
+            s_a = '\u30a2'
+            s_ya = '\u30e4'
+        exp_out = '''Path: /acct/cont
+  Account: acct
+  Container: cont
+  Container Hash: d49d0ecbb53be1fcc49624f2f7c7ccae
+Metadata:
+  Created at: 1970-01-01T00:01:40.100000 (0000000100.10000)
+  Put Timestamp: 1970-01-01T00:01:46.300000 (0000000106.30000)
+  Delete Timestamp: 1970-01-01T00:01:47.900000 (0000000107.90000)
+  Status Timestamp: 1970-01-01T00:01:48.300000 (0000000108.30000)
+  Object Count: 20
+  Bytes Used: 42
+  Storage Policy: %s (0)
+  Reported Put Timestamp: 1970-01-01T02:48:26.300000 (0000010106.30000)
+  Reported Delete Timestamp: 1970-01-01T02:48:27.900000 (0000010107.90000)
+  Reported Object Count: 20
+  Reported Bytes Used: 42
+  Chexor: abaddeadbeefcafe
+  UUID: abadf100d0ddba11
+No system metadata found in db file
+No user metadata found in db file
+Sharding Metadata:
+  Type: root
+  State: sharded
+Shard Ranges (3):
+  Name: .sharded_a/shard_range_1
+    lower: '1%s', upper: '1%s'
+    Object Count: 1, Bytes Used: 1, State: cleaved (30)
+    Created at: 1970-01-01T00:00:01.000000 (0000000001.00000)
+    Meta Timestamp: 1970-01-01T00:00:01.000000 (0000000001.00000)
+  Name: .sharded_a/shard_range_2
+    lower: '2%s', upper: '2%s'
+    Object Count: 2, Bytes Used: 2, State: created (20)
+    Created at: 1970-01-01T00:00:02.000000 (0000000002.00000)
+    Meta Timestamp: 1970-01-01T00:00:02.000000 (0000000002.00000)
+  Name: .sharded_a/shard_range_3
+    lower: '3%s', upper: '3%s'
+    Object Count: 3, Bytes Used: 3, State: found (10)
+    Created at: 1970-01-01T00:00:03.000000 (0000000003.00000)
+    Meta Timestamp: 1970-01-01T00:00:03.000000 (0000000003.00000)''' %\
+                  (POLICIES[0].name, s_a, s_ya, s_a, s_ya, s_a, s_ya)
+        self.assertEqual(out.getvalue().strip().split('\n'),
+                         exp_out.strip().split('\n'))
 
     def test_print_ring_locations_invalid_args(self):
         self.assertRaises(ValueError, print_ring_locations,
@@ -1403,6 +1485,69 @@ Other Metadata:
             utils.Timestamp(106.3).internal)
 
         self.assertEqual(out.getvalue().strip(), exp_out)
+
+    def test_print_obj_crypto_metadata(self):
+        cryto_body_meta = '%7B%22body_key%22%3A+%7B%22iv%22%3A+%22HmpwLDjlo' \
+            '6JxFvOOCVyT6Q%3D%3D%22%2C+%22key%22%3A+%22dEox1dyZJPCs4mtmiQDg' \
+            'u%2Fv1RTointi%2FUhm2y%2BgB3F8%3D%22%7D%2C+%22cipher%22%3A+%22A' \
+            'ES_CTR_256%22%2C+%22iv%22%3A+%22l3W0NZekjt4PFkAJXubVYQ%3D%3D%2' \
+            '2%2C+%22key_id%22%3A+%7B%22path%22%3A+%22%2FAUTH_test%2Ftest%2' \
+            'Ftest%22%2C+%22secret_id%22%3A+%222018%22%2C+%22v%22%3A+%221%2' \
+            '2%7D%7D'
+
+        crypto_meta_meta = '%7B%22cipher%22%3A+%22AES_CTR_256%22%2C+%22key_' \
+            'id%22%3A+%7B%22path%22%3A+%22%2FAUTH_test%2Ftest%2Ftest%22%2C+' \
+            '%22secret_id%22%3A+%222018%22%2C+%22v%22%3A+%221%22%7D%7D'
+
+        stub_metadata = {
+            'name': '/AUTH_test/test/test',
+            'Content-Type': 'application/sekret',
+            'X-Timestamp': '1549899598.237075',
+            'X-Object-Sysmeta-Crypto-Body-Meta': cryto_body_meta,
+            'X-Object-Transient-Sysmeta-Crypto-Meta': crypto_meta_meta,
+        }
+        out = StringIO()
+        with mock.patch('sys.stdout', out):
+            print_obj_metadata(stub_metadata)
+        exp_out = '''Path: /AUTH_test/test/test
+  Account: AUTH_test
+  Container: test
+  Object: test
+  Object hash: dc3a7d53522b9392b0d19571a752fdfb
+Content-Type: application/sekret
+Timestamp: 2019-02-11T15:39:58.237080 (1549899598.23708)
+System Metadata:
+  X-Object-Sysmeta-Crypto-Body-Meta: %s
+Transient System Metadata:
+  X-Object-Transient-Sysmeta-Crypto-Meta: %s
+User Metadata:
+  No metadata found
+Other Metadata:
+  No metadata found
+Data crypto details: {
+  "body_key": {
+    "iv": "HmpwLDjlo6JxFvOOCVyT6Q==",
+    "key": "dEox1dyZJPCs4mtmiQDgu/v1RTointi/Uhm2y+gB3F8="
+  },
+  "cipher": "AES_CTR_256",
+  "iv": "l3W0NZekjt4PFkAJXubVYQ==",
+  "key_id": {
+    "path": "/AUTH_test/test/test",
+    "secret_id": "2018",
+    "v": "1"
+  }
+}
+Metadata crypto details: {
+  "cipher": "AES_CTR_256",
+  "key_id": {
+    "path": "/AUTH_test/test/test",
+    "secret_id": "2018",
+    "v": "1"
+  }
+}''' % (cryto_body_meta, crypto_meta_meta)
+
+        self.maxDiff = None
+        self.assertMultiLineEqual(out.getvalue().strip(), exp_out)
 
 
 class TestPrintObjWeirdPath(TestPrintObjFullMeta):

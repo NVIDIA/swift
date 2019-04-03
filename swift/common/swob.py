@@ -309,6 +309,50 @@ def str_to_wsgi(native_str):
     return bytes_to_wsgi(native_str.encode('utf8', errors='surrogateescape'))
 
 
+def wsgi_quote(wsgi_str):
+    if six.PY2:
+        if not isinstance(wsgi_str, bytes):
+            raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+        return urllib.parse.quote(wsgi_str)
+
+    if not isinstance(wsgi_str, str) or any(ord(x) > 255 for x in wsgi_str):
+        raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+    return urllib.parse.quote(wsgi_str, encoding='latin-1')
+
+
+def wsgi_unquote(wsgi_str):
+    if six.PY2:
+        if not isinstance(wsgi_str, bytes):
+            raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+        return urllib.parse.unquote(wsgi_str)
+
+    if not isinstance(wsgi_str, str) or any(ord(x) > 255 for x in wsgi_str):
+        raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+    return urllib.parse.unquote(wsgi_str, encoding='latin-1')
+
+
+def wsgi_quote_plus(wsgi_str):
+    if six.PY2:
+        if not isinstance(wsgi_str, bytes):
+            raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+        return urllib.parse.quote_plus(wsgi_str)
+
+    if not isinstance(wsgi_str, str) or any(ord(x) > 255 for x in wsgi_str):
+        raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+    return urllib.parse.quote_plus(wsgi_str, encoding='latin-1')
+
+
+def wsgi_unquote_plus(wsgi_str):
+    if six.PY2:
+        if not isinstance(wsgi_str, bytes):
+            raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+        return urllib.parse.unquote_plus(wsgi_str)
+
+    if not isinstance(wsgi_str, str) or any(ord(x) > 255 for x in wsgi_str):
+        raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+    return urllib.parse.unquote_plus(wsgi_str, encoding='latin-1')
+
+
 def _resp_status_property():
     """
     Set and retrieve the value of Response.status
@@ -755,7 +799,7 @@ class Accept(object):
 def _req_environ_property(environ_field, is_wsgi_string_field=True):
     """
     Set and retrieve value of the environ_field entry in self.environ.
-    (Used by both request and response)
+    (Used by Request)
     """
     def getter(self):
         return self.environ.get(environ_field, None)
@@ -971,7 +1015,11 @@ class Request(object):
     @params.setter
     def params(self, param_pairs):
         self._params_cache = None
-        self.query_string = urllib.parse.urlencode(param_pairs)
+        if six.PY2:
+            self.query_string = urllib.parse.urlencode(param_pairs)
+        else:
+            self.query_string = urllib.parse.urlencode(param_pairs,
+                                                       encoding='latin-1')
 
     @property
     def timestamp(self):

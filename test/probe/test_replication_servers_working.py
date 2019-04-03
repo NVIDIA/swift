@@ -124,13 +124,13 @@ class TestReplicatorFunctions(ReplProbeTest):
                 test_node_dir_list.append(d)
         # Run all replicators
         try:
-            self.replicators.start()
-
             # Delete some files
             for directory in os.listdir(test_node):
                 shutil.rmtree(os.path.join(test_node, directory))
 
             self.assertFalse(os.listdir(test_node))
+
+            self.replicators.start()
 
             # We will keep trying these tests until they pass for up to 60s
             begin = time.time()
@@ -142,17 +142,18 @@ class TestReplicatorFunctions(ReplProbeTest):
                     for files in test_node_files_list:
                         self.assertIn(files, new_files_list[0])
 
-                    for dir in test_node_dir_list:
-                        self.assertIn(dir, new_dir_list[0])
+                    for directory in test_node_dir_list:
+                        self.assertIn(directory, new_dir_list[0])
                     break
                 except Exception:
                     if time.time() - begin > 60:
                         raise
                     time.sleep(1)
 
+            self.replicators.stop()
+
             # Delete directories and files in objects storage without
             # deleting file "hashes.pkl".
-            # Check, that files not replicated.
             for directory in os.listdir(os.path.join(test_node, data_dir)):
                 for input_dir in os.listdir(os.path.join(
                         test_node, data_dir, directory)):
@@ -161,23 +162,17 @@ class TestReplicatorFunctions(ReplProbeTest):
                         shutil.rmtree(os.path.join(
                             test_node, data_dir, directory, input_dir))
 
-            # We will keep trying these tests until they pass for up to 60s
-            begin = time.time()
-            while True:
-                try:
-                    for directory in os.listdir(os.path.join(
-                            test_node, data_dir)):
-                        for input_dir in os.listdir(os.path.join(
-                                test_node, data_dir, directory)):
-                            self.assertFalse(os.path.isdir(
-                                os.path.join(test_node, data_dir,
-                                             directory, input_dir)))
-                    break
-                except Exception:
-                    if time.time() - begin > 60:
-                        raise
-                    time.sleep(1)
+            self.replicators.once()
+            # Check, that files not replicated.
+            for directory in os.listdir(os.path.join(
+                    test_node, data_dir)):
+                for input_dir in os.listdir(os.path.join(
+                        test_node, data_dir, directory)):
+                    self.assertFalse(os.path.isdir(
+                        os.path.join(test_node, data_dir,
+                                     directory, input_dir)))
 
+            self.replicators.start()
             # Now, delete file "hashes.pkl".
             # Check, that all files were replicated.
             for directory in os.listdir(os.path.join(test_node, data_dir)):

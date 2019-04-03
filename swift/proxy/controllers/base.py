@@ -846,6 +846,10 @@ class ResumingGetter(object):
                     # we sent out exactly the first range's worth of bytes, so
                     # we're done with it
                     raise RangeAlreadyComplete()
+
+                if end < 0:
+                    raise HTTPRequestedRangeNotSatisfiable()
+
             else:
                 begin += num_bytes
                 if end is not None and begin == end + 1:
@@ -853,8 +857,8 @@ class ResumingGetter(object):
                     # we're done with it
                     raise RangeAlreadyComplete()
 
-            if end is not None and (begin > end or end < 0):
-                raise HTTPRequestedRangeNotSatisfiable()
+                if end is not None and begin > end:
+                    raise HTTPRequestedRangeNotSatisfiable()
 
             req_range.ranges = [(begin, end)] + req_range.ranges[1:]
             self.backend_headers['Range'] = str(req_range)

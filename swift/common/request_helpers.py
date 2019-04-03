@@ -26,7 +26,6 @@ import sys
 import time
 
 import six
-from six.moves.urllib.parse import unquote
 from swift.common.header_key_dict import HeaderKeyDict
 
 from swift import gettext_ as _
@@ -35,11 +34,11 @@ from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.http import is_success
 from swift.common.swob import HTTPBadRequest, \
     HTTPServiceUnavailable, Range, is_chunked, multi_range_iterator, \
-    HTTPPreconditionFailed, wsgi_to_bytes
+    HTTPPreconditionFailed, wsgi_to_bytes, wsgi_unquote, wsgi_to_str
 from swift.common.utils import split_path, validate_device_partition, \
     close_if_possible, maybe_multipart_byteranges_to_document_iters, \
     multipart_byteranges_to_document_iters, parse_content_type, \
-    parse_content_range, csv_append, list_from_csv, Spliterator
+    parse_content_range, csv_append, list_from_csv, Spliterator, quote
 
 from swift.common.wsgi import make_subrequest
 
@@ -55,7 +54,7 @@ def get_param(req, name, default=None):
     :param req: request object
     :param name: parameter name
     :param default: result to return if the parameter is not found
-    :returns: HTTP request parameter value
+    :returns: HTTP request parameter value, as a native string
               (in py2, as UTF-8 encoded str, not unicode object)
     :raises HTTPBadRequest: if param not valid UTF-8 byte sequence
     """
@@ -70,15 +69,8 @@ def get_param(req, name, default=None):
                     body='"%s" parameter not valid UTF-8' % name)
     else:
         if value:
-            try:
-                if isinstance(value, six.text_type):
-                    value = value.encode('latin1')
-            except UnicodeEncodeError:
-                # This happens, remarkably enough, when WSGI string is not
-                # a valid latin-1, and passed through parse_qsl().
-                raise HTTPBadRequest(
-                    request=req, content_type='text/plain',
-                    body='"%s" parameter not valid UTF-8' % name)
+            # req.params is a dict of WSGI strings, so encoding will succeed
+            value = value.encode('latin1')
             try:
                 # Ensure UTF8ness since we're at it
                 value = value.decode('utf8')
@@ -122,14 +114,13 @@ def split_and_validate_path(request, minsegs=1, maxsegs=None,
     Utility function to split and validate the request path.
 
     :returns: result of :meth:`~swift.common.utils.split_path` if
-              everything's okay
+              everything's okay, as native strings
     :raises HTTPBadRequest: if something's not okay
     """
     try:
-        segs = split_path(unquote(request.path),
-                          minsegs, maxsegs, rest_with_last)
+        segs = request.split_path(minsegs, maxsegs, rest_with_last)
         validate_device_partition(segs[0], segs[1])
-        return segs
+        return [wsgi_to_str(seg) for seg in segs]
     except ValueError as err:
         raise HTTPBadRequest(body=str(err), request=request,
                              content_type='text/plain')
@@ -315,7 +306,7 @@ def check_path_header(req, name, length, error_msg):
     :raise: HTTPPreconditionFailed if header value
             is not well formatted.
     """
-    hdr = unquote(req.headers.get(name))
+    hdr = wsgi_unquote(req.headers.get(name))
     if not hdr.startswith('/'):
         hdr = '/' + hdr
     try:
@@ -398,7 +389,7 @@ class SegmentedIterable(object):
                 # segment is a plain old object, not some flavor of large
                 # object; therefore, its etag is its MD5sum and hence we can
                 # check it.
-                path = seg_path + '?multipart-manifest=get'
+                path = quote(seg_path) + '?multipart-manifest=get'
                 seg_req = make_subrequest(
                     self.req.environ, path=path, method='GET',
                     headers={'x-auth-token': self.req.headers.get(

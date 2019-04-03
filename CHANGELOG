@@ -1,3 +1,61 @@
+swift (2.21.0, OpenStack Stein release)
+
+    * Change the behavior of the EC reconstructor to perform a
+      fragment rebuild to a handoff node when a primary peer responds
+      with 507 to the REPLICATE request. This changes EC to match the
+      existing behavior of replication when drives fail. After a
+      rebalance of EC rings (potentially removing unmounted/failed
+      devices), it's most IO efficient to run in handoffs_only mode to
+      avoid unnecessary rebuilds.
+
+    * O_TMPFILE support is now detected by attempting to use it
+      instead of looking at the kernel version. This allows older
+      kernels with backported patches to take advantage of the
+      O_TMPFILE functionality.
+
+    * Add slo_manifest_hook callback to allow other middlewares to
+      impose additional constraints on or make edits to SLO manifests
+      before being written. For example, a middleware could enforce
+      minimum segment size or insert data segments.
+
+    * Fixed an issue with multi-region EC policies that caused the EC
+      reconstructor to constantly attempt cross-region rebuild
+      traffic.
+
+    * Fixed an issue where S3 API v4 signatures would not be validated
+      against the body of the request, allowing a replay attack if
+      request headers were captured by a malicious third party.
+
+    * Display crypto data/metadata details in swift-object-info.
+
+    * formpost can now accept a content-encoding parameter.
+
+    * Fixed an issue where multipart uploads with the S3 API would
+      sometimes report an error despite all segments being upload
+      successfully.
+
+    * Multipart object segments are now actually deleted when the
+      multipart object is deleted via the S3 API.
+
+    * Swift now returns a 503 (instead of a 500) when an account
+      auto-create fails.
+
+    * Fixed a bug where encryption would store the incorrect key
+      metadata if the object name starts with a slash.
+
+    * Fixed an issue where an object server failure during a client
+      download could leave an open socket between the proxy and
+      client.
+
+    * Fixed an issue where deleted EC objects didn't have their
+      on-disk directories cleaned up. This would cause extra resource
+      usage on the object servers.
+
+    * Fixed issue where bulk requests using xml and expect
+      100-continue would return a malformed HTTP response.
+
+    * Various other minor bug fixes and improvements.
+
 swift (2.20.0)
 
     * S3 API compatibility updates
@@ -103,6 +161,20 @@ swift (2.20.0)
     * Allow direct_client users to overwrite the X-Timestamp header.
 
     * Various other minor bug fixes and improvements.
+
+2.19.1 (rocky stable backports)
+
+    * Prevent PyKMIP's kmip_protocol logger from logging at DEBUG.
+      Previously, some versions of PyKMIP would include all wire
+      data when the root logger was configured to log at DEBUG; this
+      could expose key material in logs. Only the kmip_keymaster was
+      affected.
+
+    * Fixed an issue where a failed drive could prevent the container sharder
+      from making progress.
+
+    * Fixed a bug in how Swift uses eventlet that was exposed under high
+      concurrency.
 
 swift (2.19.0, OpenStack Rocky)
 
@@ -267,6 +339,15 @@ swift (2.18.0)
 
     * Various other minor bug fixes and improvements.
 
+2.17.1 (queens stable backports)
+
+    * Fix SLO delete for accounts with non-ASCII names.
+
+    * Fixed an issue in COPY where concurrent requests may have copied the
+      wrong data.
+
+    * Fixed a bug in how Swift uses eventlet that was exposed under high
+      concurrency.
 
 swift (2.17.0, OpenStack Queens)
 
@@ -460,6 +541,25 @@ swift (2.16.0)
 
     * Various other minor bug fixes and improvements.
 
+2.15.2 (pike stable backports)
+
+    * Fixed a cache invalidation issue related to GET and PUT requests to
+      containers that would occasionally cause object PUTs to a container to
+      404 after the container had been successfully created.
+
+    * Removed a race condition where a POST to an SLO could modify the
+      X-Static-Large-Object metadata.
+
+    * Fixed rare socket leak on range requests to erasure-coded objects.
+
+    * Fix SLO delete for accounts with non-ASCII names.
+
+    * Fixed an issue in COPY where concurrent requests may have copied the
+      wrong data.
+
+    * Fixed time skew when using X-Delete-After.
+
+    * Send ETag header in 206 Partial Content responses to SLO reads.
 
 swift (2.15.1, OpenStack Pike)
 

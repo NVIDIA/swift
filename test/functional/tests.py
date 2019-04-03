@@ -63,8 +63,11 @@ class Utils(object):
                      u'\u1802\u0901\uF111\uD20F\uB30D\u940B\u850A\u5607'\
                      u'\u3705\u1803\u0902\uF112\uD210\uB30E\u940C\u850B'\
                      u'\u5608\u3706\u1804\u0903\u03A9\u2603'
-        return ''.join([random.choice(utf8_chars)
-                        for x in range(length)]).encode('utf-8')
+        ustr = u''.join([random.choice(utf8_chars)
+                         for x in range(length)])
+        if six.PY2:
+            return ustr.encode('utf-8')
+        return ustr
 
     create_name = create_ascii_name
 
@@ -101,6 +104,8 @@ class Base(unittest2.TestCase):
             tf.skip_if_no_xattrs()
 
     def assert_body(self, body):
+        if not isinstance(body, bytes):
+            body = body.encode('utf-8')
         response_body = self.env.conn.response.read()
         self.assertEqual(response_body, body,
                          'Body returned: %s' % (response_body))
@@ -123,11 +128,13 @@ class Base(unittest2.TestCase):
 
 
 class Base2(object):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         Utils.create_name = Utils.create_utf8_name
-        super(Base2, self).setUp()
+        super(Base2, cls).setUpClass()
 
-    def tearDown(self):
+    @classmethod
+    def tearDownClass(cls):
         Utils.create_name = Utils.create_ascii_name
 
 
@@ -165,7 +172,12 @@ class TestAccount(Base):
         self.assert_status([401, 412])
 
     def testInvalidUTF8Path(self):
-        invalid_utf8 = Utils.create_utf8_name()[::-1]
+        valid_utf8 = Utils.create_utf8_name()
+        if six.PY2:
+            invalid_utf8 = valid_utf8[::-1]
+        else:
+            invalid_utf8 = (valid_utf8.encode('utf8')[::-1]).decode(
+                'utf-8', 'surrogateescape')
         container = self.env.account.container(invalid_utf8)
         self.assertFalse(container.create(cfg={'no_path_quote': True}))
         self.assert_status(412)
@@ -338,12 +350,15 @@ class TestAccount(Base):
 
     def testLastContainerMarker(self):
         for format_type in [None, 'json', 'xml']:
-            containers = self.env.account.containers({'format': format_type})
+            containers = self.env.account.containers(parms={
+                'format': format_type})
             self.assertEqual(len(containers), len(self.env.containers))
             self.assert_status(200)
 
+            marker = (containers[-1] if format_type is None
+                      else containers[-1]['name'])
             containers = self.env.account.containers(
-                parms={'format': format_type, 'marker': containers[-1]})
+                parms={'format': format_type, 'marker': marker})
             self.assertEqual(len(containers), 0)
             if format_type is None:
                 self.assert_status(204)
@@ -373,7 +388,7 @@ class TestAccount(Base):
                 parms={'format': format_type})
             if isinstance(containers[0], dict):
                 containers = [x['name'] for x in containers]
-            self.assertEqual(sorted(containers, cmp=locale.strcoll),
+            self.assertEqual(sorted(containers, key=locale.strxfrm),
                              containers)
 
     def testQuotedWWWAuthenticateHeader(self):
@@ -685,7 +700,11 @@ class TestContainer(Base):
 
     def testUtf8Container(self):
         valid_utf8 = Utils.create_utf8_name()
-        invalid_utf8 = valid_utf8[::-1]
+        if six.PY2:
+            invalid_utf8 = valid_utf8[::-1]
+        else:
+            invalid_utf8 = (valid_utf8.encode('utf8')[::-1]).decode(
+                'utf-8', 'surrogateescape')
         container = self.env.account.container(valid_utf8)
         self.assertTrue(container.create(cfg={'no_path_quote': True}))
         self.assertIn(container.name, self.env.account.containers())
@@ -707,15 +726,13 @@ class TestContainer(Base):
         self.assert_status(202)
 
     def testSlashInName(self):
-        if Utils.create_name == Utils.create_utf8_name:
-            cont_name = list(six.text_type(Utils.create_name(), 'utf-8'))
+        if six.PY2:
+            cont_name = list(Utils.create_name().decode('utf-8'))
         else:
             cont_name = list(Utils.create_name())
-
         cont_name[random.randint(2, len(cont_name) - 2)] = '/'
         cont_name = ''.join(cont_name)
-
-        if Utils.create_name == Utils.create_utf8_name:
+        if six.PY2:
             cont_name = cont_name.encode('utf-8')
 
         cont = self.env.account.container(cont_name)
@@ -754,12 +771,13 @@ class TestContainer(Base):
 
     def testLastFileMarker(self):
         for format_type in [None, 'json', 'xml']:
-            files = self.env.container.files({'format': format_type})
+            files = self.env.container.files(parms={'format': format_type})
             self.assertEqual(len(files), len(self.env.files))
             self.assert_status(200)
 
+            marker = files[-1] if format_type is None else files[-1]['name']
             files = self.env.container.files(
-                parms={'format': format_type, 'marker': files[-1]})
+                parms={'format': format_type, 'marker': marker})
             self.assertEqual(len(files), 0)
 
             if format_type is None:
@@ -830,7 +848,7 @@ class TestContainer(Base):
             files = self.env.container.files(parms={'format': format_type})
             if isinstance(files[0], dict):
                 files = [x['name'] for x in files]
-            self.assertEqual(sorted(files, cmp=locale.strcoll), files)
+            self.assertEqual(sorted(files, key=locale.strxfrm), files)
 
     def testContainerInfo(self):
         info = self.env.container.info()
@@ -854,11 +872,12 @@ class TestContainer(Base):
         cont = self.env.account.container(Utils.create_name())
         self.assertRaises(ResponseError, cont.files)
         self.assertTrue(cont.create())
-        cont.files()
+        self.assertEqual(cont.files(), [])
 
         cont = self.env.account.container(Utils.create_name())
         self.assertRaises(ResponseError, cont.files)
         self.assertTrue(cont.create())
+        # NB: no GET! Make sure the PUT cleared the cached 404
         file_item = cont.file(Utils.create_name())
         file_item.write_random()
 
@@ -889,7 +908,7 @@ class TestContainer(Base):
         # PUT object doesn't change container last modified timestamp
         obj = container.file(Utils.create_name())
         self.assertTrue(
-            obj.write("aaaaa", hdrs={'Content-Type': 'text/plain'}))
+            obj.write(b"aaaaa", hdrs={'Content-Type': 'text/plain'}))
         info = container.info()
         t3 = info['last_modified']
         self.assertEqual(t2, t3)
@@ -1156,7 +1175,7 @@ class TestContainerPaths(Base):
     def testStructure(self):
         def assert_listing(path, file_list):
             files = self.env.container.files(parms={'path': path})
-            self.assertEqual(sorted(file_list, cmp=locale.strcoll), files)
+            self.assertEqual(sorted(file_list, key=locale.strxfrm), files)
         if not normalized_urls:
             assert_listing('/', ['/dir1/', '/dir2/', '/file1', '/file A'])
             assert_listing('/dir1',
@@ -1238,7 +1257,7 @@ class TestFile(Base):
     env = TestFileEnv
 
     def testGetResponseHeaders(self):
-        obj_data = 'test_body'
+        obj_data = b'test_body'
 
         def do_test(put_hdrs, get_hdrs, expected_hdrs, unexpected_hdrs):
             filename = Utils.create_name()
@@ -1868,7 +1887,7 @@ class TestFile(Base):
         limit = load_constraint('max_object_name_length')
         long_name = '/'.join('a' * 128 for x in range(limit // 64 + 1))
 
-        for l in (1, 10, limit / 2, limit - 1, limit, limit + 1, limit * 2):
+        for l in (1, 10, limit // 2, limit - 1, limit, limit + 1, limit * 2):
             file_item = self.env.container.file(long_name[:l])
 
             if l <= limit:
@@ -1921,7 +1940,7 @@ class TestFile(Base):
         for i in (number_limit - 10, number_limit - 1, number_limit,
                   number_limit + 1, number_limit + 10, number_limit + 100):
 
-            j = size_limit / (i * 2)
+            j = size_limit // (i * 2)
 
             metadata = {}
             while len(metadata.keys()) < i:
@@ -1961,7 +1980,7 @@ class TestFile(Base):
 
         for i in file_types.keys():
             file_item = container.file(Utils.create_name() + '.' + i)
-            file_item.write('', cfg={'no_content_type': True})
+            file_item.write(b'', cfg={'no_content_type': True})
 
         file_types_read = {}
         for i in container.files(parms={'format': 'json'}):
@@ -1976,7 +1995,7 @@ class TestFile(Base):
         # that's a common EC segment size. The 1.33 multiple is to ensure we
         # aren't aligned on segment boundaries
         file_length = int(1048576 * 1.33)
-        range_size = file_length / 10
+        range_size = file_length // 10
         file_item = self.env.container.file(Utils.create_name())
         data = file_item.write_random(file_length)
 
@@ -2035,8 +2054,8 @@ class TestFile(Base):
 
     def testMultiRangeGets(self):
         file_length = 10000
-        range_size = file_length / 10
-        subrange_size = range_size / 10
+        range_size = file_length // 10
+        subrange_size = range_size // 10
         file_item = self.env.container.file(Utils.create_name())
         data = file_item.write_random(
             file_length, hdrs={"Content-Type":
@@ -2230,7 +2249,7 @@ class TestFile(Base):
 
     def testNoContentLengthForPut(self):
         file_item = self.env.container.file(Utils.create_name())
-        self.assertRaises(ResponseError, file_item.write, 'testing',
+        self.assertRaises(ResponseError, file_item.write, b'testing',
                           cfg={'no_content_length': True})
         self.assert_status(411)
 
@@ -2515,14 +2534,14 @@ class TestFile(Base):
     def testZeroByteFile(self):
         file_item = self.env.container.file(Utils.create_name())
 
-        self.assertTrue(file_item.write(''))
+        self.assertTrue(file_item.write(b''))
         self.assertIn(file_item.name, self.env.container.files())
-        self.assertEqual(file_item.read(), '')
+        self.assertEqual(file_item.read(), b'')
 
     def testEtagResponse(self):
         file_item = self.env.container.file(Utils.create_name())
 
-        data = six.StringIO(file_item.write_random(512))
+        data = six.BytesIO(file_item.write_random(512))
         etag = File.compute_md5sum(data)
 
         headers = dict(self.env.conn.response.getheaders())
@@ -2533,8 +2552,8 @@ class TestFile(Base):
 
     def testChunkedPut(self):
         if (tf.web_front_end == 'apache2'):
-            raise SkipTest("Chunked PUT can only be tested with apache2 web"
-                           " front end")
+            raise SkipTest("Chunked PUT cannot be tested with apache2 web "
+                           "front end")
 
         def chunks(s, length=3):
             i, j = 0, length
