@@ -18,7 +18,7 @@ import json
 
 from six.moves.urllib.parse import unquote
 
-from swift.common.utils import public, csv_append, Timestamp, \
+from swift.common.utils import public, private, csv_append, Timestamp, \
     config_true_value, ShardRange
 from swift.common.constraints import check_metadata, CONTAINER_LISTING_LIMIT
 from swift.common.http import HTTP_ACCEPTED, is_success
@@ -270,9 +270,9 @@ class ContainerController(Controller):
                 str(config_true_value(req.headers['X-Container-Sharding']))
         length_limit = self.get_name_length_limit()
         if len(self.container_name) > length_limit:
-            resp = HTTPBadRequest(request=req)
-            resp.body = 'Container name length of %d longer than %d' % \
-                        (len(self.container_name), length_limit)
+            body = 'Container name length of %d longer than %d' % (
+                len(self.container_name), length_limit)
+            resp = HTTPBadRequest(request=req, body=body)
             return resp
         account_partition, accounts, container_count = \
             self.account_info(self.account_name, req)
@@ -289,9 +289,9 @@ class ContainerController(Controller):
                 self.container_info(self.account_name, self.container_name,
                                     req)
             if not is_success(container_info.get('status')):
-                resp = HTTPForbidden(request=req)
-                resp.body = 'Reached container limit of %s' % \
-                    self.app.max_containers_per_account
+                body = 'Reached container limit of %s' % (
+                    self.app.max_containers_per_account, )
+                resp = HTTPForbidden(request=req, body=body)
                 return resp
         container_partition, containers = self.app.container_ring.get_nodes(
             self.account_name, self.container_name)
@@ -355,6 +355,27 @@ class ContainerController(Controller):
         if resp.status_int == HTTP_ACCEPTED:
             return HTTPNotFound(request=req)
         return resp
+
+    @private
+    def UPDATE(self, req):
+        """HTTP UPDATE request handler.
+
+        Method to perform bulk operations on container DBs,
+        similar to a merge_items REPLICATE request.
+
+        Not client facing; internal clients or middlewares must include
+        ``X-Backend-Allow-Method: UPDATE`` header to access.
+        """
+        container_partition, containers = self.app.container_ring.get_nodes(
+            self.account_name, self.container_name)
+        # Since this isn't client facing, expect callers to supply an index
+        policy_index = req.headers['X-Backend-Storage-Policy-Index']
+        headers = self._backend_requests(
+            req, len(containers), account_partition=None, accounts=[],
+            policy_index=policy_index)
+        return self.make_requests(
+            req, self.app.container_ring, container_partition, 'UPDATE',
+            req.swift_entity_path, headers, body=req.body)
 
     def _backend_requests(self, req, n_outgoing, account_partition, accounts,
                           policy_index=None):

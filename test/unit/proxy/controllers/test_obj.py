@@ -99,7 +99,7 @@ class PatchedObjControllerApp(proxy_server.Application):
 
         def _fake_get_container_info(env, app, swift_source=None):
             _vrs, account, container, _junk = utils.split_path(
-                env['PATH_INFO'], 3, 4)
+                swob.wsgi_to_str(env['PATH_INFO']), 3, 4)
 
             # Seed the cache with our container info so that the real
             # get_container_info finds it.
@@ -3764,6 +3764,32 @@ class TestECFunctions(unittest.TestCase):
 
         do_test(1)
         do_test(2)
+
+    def test_client_range_to_segment_range(self):
+        actual = obj.client_range_to_segment_range(100, 700, 512)
+        self.assertEqual(actual, (0, 1023))
+        self.assertEqual([type(x) for x in actual], [int, int])
+
+        actual = obj.client_range_to_segment_range(100, 700, 256)
+        self.assertEqual(actual, (0, 767))
+        self.assertEqual([type(x) for x in actual], [int, int])
+
+        actual = obj.client_range_to_segment_range(300, None, 256)
+        self.assertEqual(actual, (256, None))
+        self.assertEqual([type(x) for x in actual], [int, type(None)])
+
+    def test_segment_range_to_fragment_range(self):
+        actual = obj.segment_range_to_fragment_range(0, 1023, 512, 300)
+        self.assertEqual(actual, (0, 599))
+        self.assertEqual([type(x) for x in actual], [int, int])
+
+        actual = obj.segment_range_to_fragment_range(0, 767, 256, 100)
+        self.assertEqual(actual, (0, 299))
+        self.assertEqual([type(x) for x in actual], [int, int])
+
+        actual = obj.segment_range_to_fragment_range(256, None, 256, 100)
+        self.assertEqual(actual, (100, None))
+        self.assertEqual([type(x) for x in actual], [int, type(None)])
 
 
 @patch_policies([ECStoragePolicy(0, name='ec', is_default=True,

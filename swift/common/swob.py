@@ -38,7 +38,7 @@ needs to change.
 from collections import defaultdict, MutableMapping
 import time
 from functools import partial
-from datetime import datetime, timedelta, tzinfo
+from datetime import datetime
 from email.utils import parsedate
 import re
 import random
@@ -51,7 +51,7 @@ from six import StringIO
 from six.moves import urllib
 
 from swift.common.header_key_dict import HeaderKeyDict
-from swift.common.utils import reiterate, split_path, Timestamp, pairs, \
+from swift.common.utils import UTC, reiterate, split_path, Timestamp, pairs, \
     close_if_possible, closing_if_possible
 from swift.common.exceptions import InvalidTimestamp
 
@@ -116,21 +116,6 @@ RESPONSE_REASONS = {
 MAX_RANGE_OVERLAPS = 2
 MAX_NONASCENDING_RANGES = 8
 MAX_RANGES = 50
-
-
-class _UTC(tzinfo):
-    """
-    A tzinfo class for datetime objects that returns a 0 timedelta (UTC time)
-    """
-    def dst(self, dt):
-        return timedelta(0)
-    utcoffset = dst
-
-    def tzname(self, dt):
-        return 'UTC'
-
-
-UTC = _UTC()
 
 
 class WsgiBytesIO(BytesIO):
@@ -309,15 +294,15 @@ def str_to_wsgi(native_str):
     return bytes_to_wsgi(native_str.encode('utf8', errors='surrogateescape'))
 
 
-def wsgi_quote(wsgi_str):
+def wsgi_quote(wsgi_str, safe='/'):
     if six.PY2:
         if not isinstance(wsgi_str, bytes):
             raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
-        return urllib.parse.quote(wsgi_str)
+        return urllib.parse.quote(wsgi_str, safe=safe)
 
     if not isinstance(wsgi_str, str) or any(ord(x) > 255 for x in wsgi_str):
         raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
-    return urllib.parse.quote(wsgi_str, encoding='latin-1')
+    return urllib.parse.quote(wsgi_str, safe=safe, encoding='latin-1')
 
 
 def wsgi_unquote(wsgi_str):
@@ -478,6 +463,10 @@ def _resp_app_iter_property():
 
     def setter(self, value):
         if isinstance(value, (list, tuple)):
+            for i, item in enumerate(value):
+                if not isinstance(item, bytes):
+                    raise TypeError('WSGI responses must be bytes; '
+                                    'got %s for item %d' % (type(item), i))
             self.content_length = sum(map(len, value))
         elif value is not None:
             self.content_length = None
@@ -932,9 +921,10 @@ class Request(object):
         """
         headers = headers or {}
         environ = environ or {}
-        if six.PY2 and isinstance(path, six.text_type):
-            path = path.encode('utf-8')
-        elif not six.PY2:
+        if six.PY2:
+            if isinstance(path, six.text_type):
+                path = path.encode('utf-8')
+        else:
             if isinstance(path, six.binary_type):
                 path = path.decode('latin1')
             else:
@@ -952,16 +942,11 @@ class Request(object):
                            'https': 443}.get(parsed_path.scheme, 80)
         if parsed_path.scheme and parsed_path.scheme not in ['http', 'https']:
             raise TypeError('Invalid scheme: %s' % parsed_path.scheme)
-        if six.PY2:
-            path_info = urllib.parse.unquote(parsed_path.path)
-        else:
-            path_info = urllib.parse.unquote(parsed_path.path,
-                                             encoding='latin-1')
         env = {
             'REQUEST_METHOD': 'GET',
             'SCRIPT_NAME': '',
             'QUERY_STRING': parsed_path.query,
-            'PATH_INFO': path_info,
+            'PATH_INFO': wsgi_unquote(parsed_path.path),
             'SERVER_NAME': server_name,
             'SERVER_PORT': str(server_port),
             'HTTP_HOST': '%s:%d' % (server_name, server_port),
@@ -1048,13 +1033,8 @@ class Request(object):
     @property
     def path(self):
         "Provides the full path of the request, excluding the QUERY_STRING"
-        if six.PY2:
-            return urllib.parse.quote(self.environ.get('SCRIPT_NAME', '') +
-                                      self.environ['PATH_INFO'])
-        else:
-            return urllib.parse.quote(self.environ.get('SCRIPT_NAME', '') +
-                                      self.environ['PATH_INFO'],
-                                      encoding='latin-1')
+        return wsgi_quote(self.environ.get('SCRIPT_NAME', '') +
+                          self.environ['PATH_INFO'])
 
     @property
     def swift_entity_path(self):
@@ -1492,7 +1472,7 @@ class Response(object):
                 realm = 'unknown'
         except (AttributeError, ValueError):
             realm = 'unknown'
-        return 'Swift realm="%s"' % urllib.parse.quote(realm)
+        return 'Swift realm="%s"' % wsgi_quote(realm)
 
     @property
     def is_success(self):

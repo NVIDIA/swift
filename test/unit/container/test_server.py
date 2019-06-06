@@ -24,7 +24,6 @@ from contextlib import contextmanager
 from shutil import rmtree
 from tempfile import mkdtemp
 from test.unit import make_timestamp_iter, mock_timestamp_now
-from time import gmtime
 from xml.dom import minidom
 import time
 import random
@@ -355,10 +354,8 @@ class TestContainerController(unittest.TestCase):
         req.content_length = 0
         resp = server_handler.OPTIONS(req)
         self.assertEqual(200, resp.status_int)
-        for verb in 'OPTIONS GET POST PUT DELETE HEAD REPLICATE'.split():
-            self.assertTrue(
-                verb in resp.headers['Allow'].split(', '))
-        self.assertEqual(len(resp.headers['Allow'].split(', ')), 7)
+        self.assertEqual(sorted(resp.headers['Allow'].split(', ')), sorted(
+            'OPTIONS GET POST PUT DELETE HEAD REPLICATE UPDATE'.split()))
         self.assertEqual(resp.headers['Server'],
                          (self.controller.server_type + '/' + swift_version))
 
@@ -1477,6 +1474,115 @@ class TestContainerController(unittest.TestCase):
         self.assertEqual(resp.status_int, 507)
         self.assertEqual(mock_statvfs.mock_calls,
                          [mock.call(os.path.join(self.testdir, 'sda1'))])
+
+    def test_UPDATE(self):
+        ts_iter = make_timestamp_iter()
+        req = Request.blank(
+            '/sda1/p/a/c',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': next(ts_iter).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 201)
+
+        ts_iter = make_timestamp_iter()
+        req = Request.blank(
+            '/sda1/p/a/c',
+            environ={'REQUEST_METHOD': 'UPDATE'},
+            headers={'X-Timestamp': next(ts_iter).internal},
+            body='[invalid json')
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 400)
+
+        ts_iter = make_timestamp_iter()
+        req = Request.blank(
+            '/sda1/p/a/c',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'X-Timestamp': next(ts_iter).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 204)
+
+        obj_ts = next(ts_iter)
+        req = Request.blank(
+            '/sda1/p/a/c',
+            environ={'REQUEST_METHOD': 'UPDATE'},
+            headers={'X-Timestamp': next(ts_iter).internal},
+            body=json.dumps([
+                {'name': 'some obj', 'deleted': 0,
+                 'created_at': obj_ts.internal,
+                 'etag': 'whatever', 'size': 1234,
+                 'storage_policy_index': POLICIES.default.idx,
+                 'content_type': 'foo/bar'},
+                {'name': 'some tombstone', 'deleted': 1,
+                 'created_at': next(ts_iter).internal,
+                 'etag': 'noetag', 'size': 0,
+                 'storage_policy_index': POLICIES.default.idx,
+                 'content_type': 'application/deleted'},
+                {'name': 'wrong policy', 'deleted': 0,
+                 'created_at': next(ts_iter).internal,
+                 'etag': 'whatever', 'size': 6789,
+                 'storage_policy_index': 1,
+                 'content_type': 'foo/bar'},
+            ]))
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 202)
+
+        req = Request.blank(
+            '/sda1/p/a/c?format=json',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'X-Timestamp': next(ts_iter).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(json.loads(resp.body), [
+            {'name': 'some obj', 'hash': 'whatever', 'bytes': 1234,
+             'content_type': 'foo/bar', 'last_modified': obj_ts.isoformat},
+        ])
+
+    def test_UPDATE_autocreate(self):
+        ts_iter = make_timestamp_iter()
+        req = Request.blank(
+            '/sda1/p/.a/c',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'X-Timestamp': next(ts_iter).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 404)
+
+        obj_ts = next(ts_iter)
+        req = Request.blank(
+            '/sda1/p/.a/c',
+            environ={'REQUEST_METHOD': 'UPDATE'},
+            headers={
+                'X-Timestamp': next(ts_iter).internal,
+                'X-Backend-Storage-Policy-Index': str(POLICIES.default.idx)},
+            body=json.dumps([
+                {'name': 'some obj', 'deleted': 0,
+                 'created_at': obj_ts.internal,
+                 'etag': 'whatever', 'size': 1234,
+                 'storage_policy_index': POLICIES.default.idx,
+                 'content_type': 'foo/bar'},
+                {'name': 'some tombstone', 'deleted': 1,
+                 'created_at': next(ts_iter).internal,
+                 'etag': 'noetag', 'size': 0,
+                 'storage_policy_index': POLICIES.default.idx,
+                 'content_type': 'application/deleted'},
+                {'name': 'wrong policy', 'deleted': 0,
+                 'created_at': next(ts_iter).internal,
+                 'etag': 'whatever', 'size': 6789,
+                 'storage_policy_index': 1,
+                 'content_type': 'foo/bar'},
+            ]))
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 202, resp.body)
+
+        req = Request.blank(
+            '/sda1/p/.a/c?format=json',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'X-Timestamp': next(ts_iter).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(json.loads(resp.body), [
+            {'name': 'some obj', 'hash': 'whatever', 'bytes': 1234,
+             'content_type': 'foo/bar', 'last_modified': obj_ts.isoformat},
+        ])
 
     def test_DELETE(self):
         ts_iter = make_timestamp_iter()
@@ -4564,16 +4670,14 @@ class TestContainerController(unittest.TestCase):
         req = Request.blank(
             '/sda1/p/a/c',
             environ={'REQUEST_METHOD': 'HEAD', 'REMOTE_ADDR': '1.2.3.4'})
-        with mock.patch('time.gmtime',
-                        mock.MagicMock(side_effect=[gmtime(10001.0)])), \
-                mock.patch('time.time',
-                           mock.MagicMock(side_effect=[
-                               10000.0, 10001.0, 10002.0])), \
+        with mock.patch('time.time',
+                        mock.MagicMock(side_effect=[10000.0, 10001.0, 10002.0,
+                                                    10002.0])), \
                 mock.patch('os.getpid', mock.MagicMock(return_value=1234)):
             req.get_response(self.controller)
         info_lines = self.controller.logger.get_lines_for_level('info')
         self.assertEqual(info_lines, [
-            '1.2.3.4 - - [01/Jan/1970:02:46:41 +0000] "HEAD /sda1/p/a/c" '
+            '1.2.3.4 - - [01/Jan/1970:02:46:42 +0000] "HEAD /sda1/p/a/c" '
             '404 - "-" "-" "-" 2.0000 "-" 1234 0',
         ])
 
@@ -4594,7 +4698,7 @@ class TestNonLegacyDefaultStoragePolicy(TestContainerController):
     def _update_object_put_headers(self, req):
         """
         Add policy index headers for containers created with default policy
-        - which in this TestCase is 1.
+        - which in this TestCase is 2.
         """
         req.headers['X-Backend-Storage-Policy-Index'] = \
             str(POLICIES.default.idx)

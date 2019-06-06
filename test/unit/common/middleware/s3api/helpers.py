@@ -114,6 +114,9 @@ class FakeSwift(object):
         if method == 'PUT' and obj:
             input = env['wsgi.input'].read()
             etag = md5(input).hexdigest()
+            if env.get('HTTP_ETAG', etag) != etag:
+                raise Exception('Client sent a bad ETag! Got %r, but '
+                                'md5(body) = %r' % (env['HTTP_ETAG'], etag))
             headers.setdefault('Etag', etag)
             headers.setdefault('Content-Length', len(input))
 
@@ -162,12 +165,16 @@ class FakeSwift(object):
                     # keep old sysmeta for s3acl
                     headers.update({key: value})
 
+        if body is not None and not isinstance(body, (bytes, list)):
+            body = body.encode('utf8')
         self._responses[(method, path)] = (response_class, headers, body)
 
     def register_unconditionally(self, method, path, response_class, headers,
                                  body):
         # register() keeps old sysmeta around, but
         # register_unconditionally() keeps nothing.
+        if body is not None and not isinstance(body, bytes):
+            body = body.encode('utf8')
         self._responses[(method, path)] = (response_class, headers, body)
 
     def clear_calls(self):

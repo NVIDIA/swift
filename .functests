@@ -3,11 +3,11 @@
 # How-To debug functional tests:
 # SWIFT_TEST_IN_PROCESS=1 tox -e func -- --pdb test.functional.tests.TestFile.testCopy
 
-SRC_DIR=$(python -c "import os; print os.path.dirname(os.path.realpath('$0'))")
+SRC_DIR=$(python -c "import os; print(os.path.dirname(os.path.realpath('$0')))")
 
 cd ${SRC_DIR} > /dev/null
 export TESTS_DIR=${SRC_DIR}/test/functional
-ARGS="--serial ${@:-"--pretty"}"
+ARGS="--concurrency 1 ${@:-"--pretty"}"
 ostestr $ARGS
 rvalue=$?
 cd -  > /dev/null

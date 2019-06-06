@@ -18,6 +18,7 @@ from base64 import standard_b64decode as b64decode
 
 from six.moves.urllib.parse import quote
 
+from swift.common import swob
 from swift.common.http import HTTP_OK
 from swift.common.utils import json, public, config_true_value
 
@@ -66,8 +67,9 @@ class BucketController(Controller):
                 segments = json.loads(resp.body)
                 for seg in segments:
                     try:
-                        req.get_response(self.app, 'DELETE', container,
-                                         seg['name'].encode('utf8'))
+                        req.get_response(
+                            self.app, 'DELETE', container,
+                            swob.bytes_to_wsgi(seg['name'].encode('utf8')))
                     except NoSuchKey:
                         pass
                     except InternalError:
@@ -177,16 +179,16 @@ class BucketController(Controller):
                     else:
                         name = objects[-1]['subdir']
                     if encoding_type == 'url':
-                        name = quote(name)
+                        name = quote(name.encode('utf-8'))
                     SubElement(elem, 'NextMarker').text = name
             elif listing_type == 'version-2':
                 if is_truncated:
                     if 'name' in objects[-1]:
                         SubElement(elem, 'NextContinuationToken').text = \
-                            b64encode(objects[-1]['name'].encode('utf8'))
+                            b64encode(objects[-1]['name'].encode('utf-8'))
                     if 'subdir' in objects[-1]:
                         SubElement(elem, 'NextContinuationToken').text = \
-                            b64encode(objects[-1]['subdir'].encode('utf8'))
+                            b64encode(objects[-1]['subdir'].encode('utf-8'))
                 if 'continuation-token' in req.params:
                     SubElement(elem, 'ContinuationToken').text = \
                         req.params['continuation-token']

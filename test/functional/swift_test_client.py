@@ -32,6 +32,7 @@ from swiftclient import get_auth
 
 from swift.common import constraints
 from swift.common.http import is_success
+from swift.common.swob import str_to_wsgi, wsgi_to_str
 from swift.common.utils import config_true_value
 
 from test import safe_repr
@@ -111,18 +112,100 @@ def listing_items(method):
             items = []
 
 
+def putrequest(self, method, url, skip_host=False, skip_accept_encoding=False):
+    '''Send a request to the server.
+
+    This is mostly a regurgitation of CPython's HTTPConnection.putrequest,
+    but fixed up so we can still send arbitrary bytes in the request line
+    on py3. See also: https://bugs.python.org/issue36274
+
+    To use, swap out a HTTP(S)Connection's putrequest with something like::
+
+       conn.putrequest = putrequest.__get__(conn)
+
+    :param method: specifies an HTTP request method, e.g. 'GET'.
+    :param url: specifies the object being requested, e.g. '/index.html'.
+    :param skip_host: if True does not add automatically a 'Host:' header
+    :param skip_accept_encoding: if True does not add automatically an
+       'Accept-Encoding:' header
+    '''
+    # (Mostly) inline the HTTPConnection implementation; just fix it
+    # so we can send non-ascii request lines. For comparison, see
+    # https://github.com/python/cpython/blob/v2.7.16/Lib/httplib.py#L888-L1003
+    # and https://github.com/python/cpython/blob/v3.7.2/
+    # Lib/http/client.py#L1061-L1183
+    if self._HTTPConnection__response \
+            and self._HTTPConnection__response.isclosed():
+        self._HTTPConnection__response = None
+
+    if self._HTTPConnection__state == http_client._CS_IDLE:
+        self._HTTPConnection__state = http_client._CS_REQ_STARTED
+    else:
+        raise http_client.CannotSendRequest(self._HTTPConnection__state)
+
+    self._method = method
+    if not url:
+        url = '/'
+    self._path = url
+    request = '%s %s %s' % (method, url, self._http_vsn_str)
+    if not isinstance(request, bytes):
+        # This choice of encoding is the whole reason we copy/paste from
+        # cpython. When making backend requests, it should never be
+        # necessary; however, we have some functional tests that want
+        # to send non-ascii bytes.
+        # TODO: when https://bugs.python.org/issue36274 is resolved, make
+        # sure we fix up our API to match whatever upstream chooses to do
+        self._output(request.encode('latin1'))
+    else:
+        self._output(request)
+
+    if self._http_vsn == 11:
+        if not skip_host:
+            netloc = ''
+            if url.startswith('http'):
+                nil, netloc, nil, nil, nil = urllib.parse.urlsplit(url)
+
+            if netloc:
+                try:
+                    netloc_enc = netloc.encode("ascii")
+                except UnicodeEncodeError:
+                    netloc_enc = netloc.encode("idna")
+                self.putheader('Host', netloc_enc)
+            else:
+                if self._tunnel_host:
+                    host = self._tunnel_host
+                    port = self._tunnel_port
+                else:
+                    host = self.host
+                    port = self.port
+
+                try:
+                    host_enc = host.encode("ascii")
+                except UnicodeEncodeError:
+                    host_enc = host.encode("idna")
+
+                if host.find(':') >= 0:
+                    host_enc = b'[' + host_enc + b']'
+
+                if port == self.default_port:
+                    self.putheader('Host', host_enc)
+                else:
+                    host_enc = host_enc.decode("ascii")
+                    self.putheader('Host', "%s:%s" % (host_enc, port))
+
+        if not skip_accept_encoding:
+            self.putheader('Accept-Encoding', 'identity')
+
+
 class Connection(object):
     def __init__(self, config):
-        for key in 'auth_host auth_port auth_ssl username password'.split():
+        for key in 'auth_uri username password'.split():
             if key not in config:
                 raise SkipTest(
                     "Missing required configuration parameter: %s" % key)
 
-        self.auth_host = config['auth_host']
-        self.auth_port = int(config['auth_port'])
-        self.auth_ssl = config['auth_ssl'] in ('on', 'true', 'yes', '1')
+        self.auth_url = config['auth_uri']
         self.insecure = config_true_value(config.get('insecure', 'false'))
-        self.auth_prefix = config.get('auth_prefix', '/')
         self.auth_version = str(config.get('auth_version', '1'))
 
         self.account = config.get('account')
@@ -132,6 +215,7 @@ class Connection(object):
         self.storage_netloc = None
         self.storage_path = None
         self.conn_class = None
+        self.connection = None  # until you call .http_connect()
 
     @property
     def storage_url(self):
@@ -170,18 +254,10 @@ class Connection(object):
         return Account(self, self.account)
 
     def authenticate(self):
-        if self.auth_version == "1":
-            auth_path = '%sv1.0' % (self.auth_prefix)
-            if self.account:
-                auth_user = '%s:%s' % (self.account, self.username)
-            else:
-                auth_user = self.username
+        if self.auth_version == "1" and self.account:
+            auth_user = '%s:%s' % (self.account, self.username)
         else:
             auth_user = self.username
-            auth_path = self.auth_prefix
-        auth_scheme = 'https://' if self.auth_ssl else 'http://'
-        auth_netloc = "%s:%d" % (self.auth_host, self.auth_port)
-        auth_url = auth_scheme + auth_netloc + auth_path
 
         if self.insecure:
             try:
@@ -197,7 +273,7 @@ class Connection(object):
                         auth_version=self.auth_version, os_options={},
                         insecure=self.insecure)
         (storage_url, storage_token) = get_auth(
-            auth_url, auth_user, self.password, **authargs)
+            self.auth_url, auth_user, self.password, **authargs)
 
         if not (storage_url and storage_token):
             raise AuthenticationFailed()
@@ -235,6 +311,7 @@ class Connection(object):
                 context=ssl._create_unverified_context())
         else:
             self.connection = self.conn_class(self.storage_netloc)
+        self.connection.putrequest = putrequest.__get__(self.connection)
 
     def make_path(self, path=None, cfg=None):
         if path is None:
@@ -248,7 +325,7 @@ class Connection(object):
         if path:
             quote = urllib.parse.quote
             if cfg.get('no_quote') or cfg.get('no_path_quote'):
-                quote = lambda x: x
+                quote = str_to_wsgi
             return '%s/%s' % (self.storage_path,
                               '/'.join([quote(i) for i in path]))
         else:
@@ -266,7 +343,8 @@ class Connection(object):
             headers['X-Auth-Token'] = cfg.get('use_token')
 
         if isinstance(hdrs, dict):
-            headers.update(hdrs)
+            headers.update((str_to_wsgi(h), str_to_wsgi(v))
+                           for h, v in hdrs.items())
         return headers
 
     def make_request(self, method, path=None, data=b'', hdrs=None, parms=None,
@@ -413,7 +491,10 @@ class Base(object):
                 'x-container-bytes-used',
             )
 
-        headers = dict(self.conn.response.getheaders())
+        # NB: on py2, headers are always lower; on py3, they match the bytes
+        # on the wire
+        headers = dict((wsgi_to_str(h).lower(), wsgi_to_str(v))
+                       for h, v in self.conn.response.getheaders())
         ret = {}
 
         for return_key, header in required_fields:
@@ -880,17 +961,19 @@ class File(Base):
             raise ResponseError(self.conn.response, 'HEAD',
                                 self.conn.make_path(self.path))
 
-        for hdr in self.conn.response.getheaders():
-            if hdr[0].lower() == 'content-type':
-                self.content_type = hdr[1]
-            if hdr[0].lower().startswith('x-object-meta-'):
-                self.metadata[hdr[0][14:]] = hdr[1]
-            if hdr[0].lower() == 'etag':
-                self.etag = hdr[1]
-            if hdr[0].lower() == 'content-length':
-                self.size = int(hdr[1])
-            if hdr[0].lower() == 'last-modified':
-                self.last_modified = hdr[1]
+        for hdr, val in self.conn.response.getheaders():
+            hdr = wsgi_to_str(hdr).lower()
+            val = wsgi_to_str(val)
+            if hdr == 'content-type':
+                self.content_type = val
+            if hdr.startswith('x-object-meta-'):
+                self.metadata[hdr[14:]] = val
+            if hdr == 'etag':
+                self.etag = val
+            if hdr == 'content-length':
+                self.size = int(val)
+            if hdr == 'last-modified':
+                self.last_modified = val
 
         return True
 
@@ -933,11 +1016,11 @@ class File(Base):
             raise ResponseError(self.conn.response, 'GET',
                                 self.conn.make_path(self.path))
 
-        for hdr in self.conn.response.getheaders():
-            if hdr[0].lower() == 'content-type':
-                self.content_type = hdr[1]
-            if hdr[0].lower() == 'content-range':
-                self.content_range = hdr[1]
+        for hdr, val in self.conn.response.getheaders():
+            if hdr.lower() == 'content-type':
+                self.content_type = wsgi_to_str(val)
+            if hdr.lower() == 'content-range':
+                self.content_range = val
 
         if hasattr(buffer, 'write'):
             scratch = self.conn.response.read(8192)

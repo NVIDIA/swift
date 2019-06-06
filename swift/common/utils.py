@@ -75,9 +75,8 @@ from six.moves import cPickle as pickle
 from six.moves.configparser import (ConfigParser, NoSectionError,
                                     NoOptionError, RawConfigParser)
 from six.moves import range, http_client
-from six.moves.urllib.parse import ParseResult
 from six.moves.urllib.parse import quote as _quote
-from six.moves.urllib.parse import urlparse as stdlib_urlparse
+from six.moves.urllib.parse import urlparse
 
 from swift import gettext_ as _
 import swift.common.exceptions
@@ -187,6 +186,13 @@ O_TMPFILE = getattr(os, 'O_TMPFILE', 0o20000000 | os.O_DIRECTORY)
 IPV6_RE = re.compile("^\[(?P<address>.*)\](:(?P<port>[0-9]+))?$")
 
 MD5_OF_EMPTY_STRING = 'd41d8cd98f00b204e9800998ecf8427e'
+
+LOG_LINE_DEFAULT_FORMAT = '{remote_addr} - - [{time.d}/{time.b}/{time.Y}' \
+                          ':{time.H}:{time.M}:{time.S} +0000] ' \
+                          '"{method} {path}" {status} {content_length} ' \
+                          '"{referer}" "{txn_id}" "{user_agent}" ' \
+                          '{trans_time:.4f} "{additional_info}" {pid} ' \
+                          '{policy_index}'
 
 
 class InvalidHashPathConfigError(ValueError):
@@ -604,7 +610,117 @@ def get_policy_index(req_headers, res_headers):
     return str(policy_index) if policy_index is not None else None
 
 
-def get_log_line(req, res, trans_time, additional_info):
+class _UTC(datetime.tzinfo):
+    """
+    A tzinfo class for datetime objects that returns a 0 timedelta (UTC time)
+    """
+    def dst(self, dt):
+        return datetime.timedelta(0)
+    utcoffset = dst
+
+    def tzname(self, dt):
+        return 'UTC'
+
+
+UTC = _UTC()
+
+
+class LogStringFormatter(string.Formatter):
+    def __init__(self, default='', quote=False):
+        super(LogStringFormatter, self).__init__()
+        self.default = default
+        self.quote = quote
+
+    def format_field(self, value, spec):
+        if not value:
+            return self.default
+        else:
+            log = super(LogStringFormatter, self).format_field(value, spec)
+            if self.quote:
+                return quote(log, ':/{}')
+            else:
+                return log
+
+
+class StrAnonymizer(str):
+    """
+    Class that permits to get a string anonymized or simply quoted.
+    """
+
+    def __new__(cls, data, method, salt):
+        method = method.lower()
+        if method not in hashlib.algorithms_guaranteed:
+            raise ValueError('Unsupported hashing method: %r' % method)
+        s = str.__new__(cls, data or '')
+        s.method = method
+        s.salt = salt
+        return s
+
+    @property
+    def anonymized(self):
+        if not self:
+            return self
+        else:
+            h = getattr(hashlib, self.method)()
+            if self.salt:
+                h.update(six.b(self.salt))
+            h.update(six.b(self))
+            return '{%s%s}%s' % ('S' if self.salt else '', self.method.upper(),
+                                 h.hexdigest())
+
+
+class StrFormatTime(object):
+    """
+    Class that permits to get formats or parts of a time.
+    """
+
+    def __init__(self, ts):
+        self.time = ts
+        self.time_struct = time.gmtime(ts)
+
+    def __str__(self):
+        return "%.9f" % self.time
+
+    def __getattr__(self, attr):
+        if attr not in ['a', 'A', 'b', 'B', 'c', 'd', 'H',
+                        'I', 'j', 'm', 'M', 'p', 'S', 'U',
+                        'w', 'W', 'x', 'X', 'y', 'Y', 'Z']:
+            raise ValueError(("The attribute %s is not a correct directive "
+                              "for time.strftime formater.") % attr)
+        return datetime.datetime(*self.time_struct[:-2],
+                                 tzinfo=UTC).strftime('%' + attr)
+
+    @property
+    def asctime(self):
+        return time.asctime(self.time_struct)
+
+    @property
+    def datetime(self):
+        return time.strftime('%d/%b/%Y/%H/%M/%S', self.time_struct)
+
+    @property
+    def iso8601(self):
+        return time.strftime('%Y-%m-%dT%H:%M:%S', self.time_struct)
+
+    @property
+    def ms(self):
+        return self.__str__().split('.')[1][:3]
+
+    @property
+    def us(self):
+        return self.__str__().split('.')[1][:6]
+
+    @property
+    def ns(self):
+        return self.__str__().split('.')[1]
+
+    @property
+    def s(self):
+        return self.__str__().split('.')[0]
+
+
+def get_log_line(req, res, trans_time, additional_info, fmt,
+                 anonymization_method, anonymization_salt):
     """
     Make a line for logging that matches the documented log line format
     for backend servers.
@@ -618,14 +734,39 @@ def get_log_line(req, res, trans_time, additional_info):
     """
 
     policy_index = get_policy_index(req.headers, res.headers)
-    return '%s - - [%s] "%s %s" %s %s "%s" "%s" "%s" %.4f "%s" %d %s' % (
-        req.remote_addr,
-        time.strftime('%d/%b/%Y:%H:%M:%S +0000', time.gmtime()),
-        req.method, req.path, res.status.split()[0],
-        res.content_length or '-', req.referer or '-',
-        req.headers.get('x-trans-id', '-'),
-        req.user_agent or '-', trans_time, additional_info or '-',
-        os.getpid(), policy_index or '-')
+    if req.path.startswith('/'):
+        disk, partition, account, container, obj = split_path(req.path, 0, 5,
+                                                              True)
+    else:
+        disk, partition, account, container, obj = (None, ) * 5
+    replacements = {
+        'remote_addr': StrAnonymizer(req.remote_addr, anonymization_method,
+                                     anonymization_salt),
+        'time': StrFormatTime(time.time()),
+        'method': req.method,
+        'path': StrAnonymizer(req.path, anonymization_method,
+                              anonymization_salt),
+        'disk': disk,
+        'partition': partition,
+        'account': StrAnonymizer(account, anonymization_method,
+                                 anonymization_salt),
+        'container': StrAnonymizer(container, anonymization_method,
+                                   anonymization_salt),
+        'object': StrAnonymizer(obj, anonymization_method,
+                                anonymization_salt),
+        'status': res.status.split()[0],
+        'content_length': res.content_length,
+        'referer': StrAnonymizer(req.referer, anonymization_method,
+                                 anonymization_salt),
+        'txn_id': req.headers.get('x-trans-id'),
+        'user_agent': StrAnonymizer(req.user_agent, anonymization_method,
+                                    anonymization_salt),
+        'trans_time': trans_time,
+        'additional_info': additional_info,
+        'pid': os.getpid(),
+        'policy_index': policy_index,
+    }
+    return LogStringFormatter(default='-').format(fmt, **replacements)
 
 
 def get_trans_id_time(trans_id):
@@ -895,8 +1036,7 @@ def fallocate(fd, size, offset=0):
         st = os.fstatvfs(fd)
         free = st.f_frsize * st.f_bavail - size
         if FALLOCATE_IS_PERCENT:
-            free = \
-                (float(free) / float(st.f_frsize * st.f_blocks)) * 100
+            free = (float(free) / float(st.f_frsize * st.f_blocks)) * 100
         if float(free) <= float(FALLOCATE_RESERVE):
             raise OSError(
                 errno.ENOSPC,
@@ -2265,7 +2405,7 @@ def get_hub():
 
     Note about epoll:
 
-    Review: https://review.openstack.org/#/c/18806/
+    Review: https://review.opendev.org/#/c/18806/
 
     There was a problem where once out of every 30 quadrillion
     connections, a coroutine wouldn't wake up when the client
@@ -3244,38 +3384,6 @@ class StreamingPile(GreenAsyncPile):
         self.pool.__exit__(type, value, traceback)
 
 
-class ModifiedParseResult(ParseResult):
-    """Parse results class for urlparse."""
-
-    @property
-    def hostname(self):
-        netloc = self.netloc.split('@', 1)[-1]
-        if netloc.startswith('['):
-            return netloc[1:].split(']')[0]
-        elif ':' in netloc:
-            return netloc.rsplit(':')[0]
-        return netloc
-
-    @property
-    def port(self):
-        netloc = self.netloc.split('@', 1)[-1]
-        if netloc.startswith('['):
-            netloc = netloc.rsplit(']')[1]
-        if ':' in netloc:
-            return int(netloc.rsplit(':')[1])
-        return None
-
-
-def urlparse(url):
-    """
-    urlparse augmentation.
-    This is necessary because urlparse can't handle RFC 2732 URLs.
-
-    :param url: URL to parse.
-    """
-    return ModifiedParseResult(*stdlib_urlparse(url))
-
-
 def validate_sync_to(value, allowed_sync_hosts, realms_conf):
     """
     Validates an X-Container-Sync-To header value, returning the
@@ -3629,6 +3737,17 @@ def public(func):
     :param func: function to make public
     """
     func.publicly_accessible = True
+    return func
+
+
+def private(func):
+    """
+    Decorator to declare which methods are privately accessible as HTTP
+    requests with an ``X-Backend-Allow-Private-Methods: True`` override
+
+    :param func: function to make private
+    """
+    func.privately_accessible = True
     return func
 
 
@@ -4342,6 +4461,10 @@ def mime_to_document_iters(input_file, boundary, read_chunk_size=4096):
         (e.g. "divider", not "--divider")
     :param read_chunk_size: size of strings read via input_file.read()
     """
+    if six.PY3 and isinstance(boundary, str):
+        # Since the boundary is in client-supplied headers, it can contain
+        # garbage that trips us and we don't like client-induced 500.
+        boundary = boundary.encode('latin-1', errors='replace')
     doc_files = iter_multipart_mime_documents(input_file, boundary,
                                               read_chunk_size)
     for i, doc_file in enumerate(doc_files):

@@ -189,7 +189,7 @@ class TestContainerSync(unittest.TestCase):
                 mock.patch('swift.container.sync.sleep', fake_sleep), \
                 mock.patch(gen_func) as fake_generator, \
                 mock.patch('swift.container.sync.ContainerBroker',
-                           lambda p: FakeContainerBroker(p, info={
+                           lambda p, logger: FakeContainerBroker(p, info={
                                'account': 'a', 'container': 'c',
                                'storage_policy_index': 0})):
             fake_generator.side_effect = [iter(['container.db']),
@@ -235,7 +235,7 @@ class TestContainerSync(unittest.TestCase):
                 mock.patch('swift.container.sync.time', fake_time), \
                 mock.patch(gen_func) as fake_generator, \
                 mock.patch('swift.container.sync.ContainerBroker',
-                           lambda p: FakeContainerBroker(p, info={
+                           lambda p, logger: FakeContainerBroker(p, info={
                                'account': 'a', 'container': 'c',
                                'storage_policy_index': 0})):
             fake_generator.side_effect = [iter(['container.db']),
@@ -337,7 +337,7 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(['10.0.0.0'], cs._myips)
         orig_ContainerBroker = sync.ContainerBroker
         try:
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0})
             cs._myips = ['127.0.0.1']   # No match
@@ -370,7 +370,7 @@ class TestContainerSync(unittest.TestCase):
             cs = sync.ContainerSync({}, container_ring=cring)
         orig_ContainerBroker = sync.ContainerBroker
         try:
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0}, deleted=False)
             cs._myips = ['10.0.0.0']    # Match
@@ -380,7 +380,7 @@ class TestContainerSync(unittest.TestCase):
             cs.container_sync('isa.db')
             self.assertEqual(cs.container_failures, 1)
 
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0}, deleted=True)
             # This complete match will not cause any more container failures
@@ -396,7 +396,7 @@ class TestContainerSync(unittest.TestCase):
             cs = sync.ContainerSync({}, container_ring=cring)
         orig_ContainerBroker = sync.ContainerBroker
         try:
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -409,7 +409,7 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(cs.container_failures, 0)
             self.assertEqual(cs.container_skips, 1)
 
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -423,7 +423,7 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(cs.container_failures, 0)
             self.assertEqual(cs.container_skips, 2)
 
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -437,7 +437,7 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(cs.container_failures, 0)
             self.assertEqual(cs.container_skips, 3)
 
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -453,7 +453,7 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(cs.container_failures, 1)
             self.assertEqual(cs.container_skips, 3)
 
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -478,7 +478,7 @@ class TestContainerSync(unittest.TestCase):
         orig_ContainerBroker = sync.ContainerBroker
         orig_time = sync.time
         try:
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -534,7 +534,7 @@ class TestContainerSync(unittest.TestCase):
                       'x-container-sync-key': ('key', 1)},
             items_since=[{'ROWID': 1, 'name': 'o'}])
         with mock.patch('swift.container.sync.ContainerBroker',
-                        lambda p: fcb), \
+                        lambda p, logger: fcb), \
                 mock.patch('swift.container.sync.hash_path', fake_hash_path):
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
@@ -561,7 +561,7 @@ class TestContainerSync(unittest.TestCase):
                                             ('key', 1)},
                                   items_since=[{'ROWID': 1, 'name': 'o'}])
         with mock.patch('swift.container.sync.ContainerBroker',
-                        lambda p: fcb), \
+                        lambda p, logger: fcb), \
                 mock.patch('swift.container.sync.hash_path', fake_hash_path):
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
@@ -582,7 +582,8 @@ class TestContainerSync(unittest.TestCase):
             metadata={'x-container-sync-to': ('http://127.0.0.1/a/c', 1),
                       'x-container-sync-key': ('key', 1)},
             items_since=[{'ROWID': 1, 'name': 'o'}])
-        with mock.patch('swift.container.sync.ContainerBroker', lambda p: fcb):
+        with mock.patch('swift.container.sync.ContainerBroker',
+                        lambda p, logger: fcb):
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
             cs.allowed_sync_hosts = ['127.0.0.1']
@@ -607,7 +608,7 @@ class TestContainerSync(unittest.TestCase):
             items_since=[{'ROWID': 1, 'name': 'o', 'created_at': '1.2',
                           'deleted': True}])
         with mock.patch('swift.container.sync.ContainerBroker',
-                        lambda p: fcb), \
+                        lambda p, logger: fcb), \
                 mock.patch('swift.container.sync.delete_object',
                            fake_delete_object):
             cs._myips = ['10.0.0.0']    # Match
@@ -631,7 +632,7 @@ class TestContainerSync(unittest.TestCase):
             items_since=[{'ROWID': 1, 'name': 'o', 'created_at': '1.2',
                           'deleted': True}])
         with mock.patch('swift.container.sync.ContainerBroker',
-                        lambda p: fcb), \
+                        lambda p, logger: fcb), \
                 mock.patch('swift.container.sync.delete_object',
                            lambda *x, **y: None):
             cs._myips = ['10.0.0.0']    # Match
@@ -671,7 +672,7 @@ class TestContainerSync(unittest.TestCase):
                 metadata={'x-container-sync-to': ('http://127.0.0.1/a/c', 1),
                           'x-container-sync-key': ('key', 1)},
                 items_since=[{'ROWID': 1, 'name': 'o'}])
-            sync.ContainerBroker = lambda p: fcb
+            sync.ContainerBroker = lambda p, logger: fcb
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
             cs.allowed_sync_hosts = ['127.0.0.1']
@@ -701,7 +702,7 @@ class TestContainerSync(unittest.TestCase):
                 metadata={'x-container-sync-to': ('http://127.0.0.1/a/c', 1),
                           'x-container-sync-key': ('key', 1)},
                 items_since=[{'ROWID': 1, 'name': 'o'}])
-            sync.ContainerBroker = lambda p: fcb
+            sync.ContainerBroker = lambda p, logger: fcb
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
             cs.allowed_sync_hosts = ['127.0.0.1']
@@ -723,7 +724,7 @@ class TestContainerSync(unittest.TestCase):
                           'x-container-sync-key': ('key', 1)},
                 items_since=[{'ROWID': 1, 'name': 'o', 'created_at': '1.2',
                               'deleted': True}])
-            sync.ContainerBroker = lambda p: fcb
+            sync.ContainerBroker = lambda p, logger: fcb
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
             cs.allowed_sync_hosts = ['127.0.0.1']
@@ -779,7 +780,7 @@ class TestContainerSync(unittest.TestCase):
                 mock.patch('swift.container.sync.hash_path',
                            fake_hash_path), \
                 mock.patch('swift.container.sync.ContainerBroker',
-                           lambda p: fcb):
+                           lambda p, logger: fcb):
             cring = FakeRing()
             cs = sync.ContainerSync({}, container_ring=cring,
                                     logger=self.logger)

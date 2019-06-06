@@ -419,6 +419,7 @@ The following configuration sections are available:
 * `[object-reconstructor]`_
 * `[object-updater]`_
 * `[object-auditor]`_
+* `[object-expirer]`_
 
 .. _object-server-default-options:
 
@@ -1001,6 +1002,69 @@ ionice_priority             None                I/O scheduling priority of serve
                                                 ionice_class.
                                                 Ignored if IOPRIO_CLASS_IDLE is set.
 =========================== =================== ==========================================
+
+****************
+[object-expirer]
+****************
+
+============================= =============================== ==========================================
+Option                        Default                         Description
+----------------------------- ------------------------------- ------------------------------------------
+log_name                      object-expirer                  Label used when logging
+log_facility                  LOG_LOCAL0                      Syslog log facility
+log_level                     INFO                            Logging level
+log_address                   /dev/log                        Logging directory
+interval                      300                             Time in seconds to wait between
+                                                              expirer passes
+report_interval               300                             Frequency of status logs in seconds.
+auto_create_account_prefix    .                               Prefix used when automatically
+                                                              creating accounts.
+concurrency                   1                               Level of concurrency to use to do the work,
+                                                              this value must be set to at least 1
+expiring_objects_account_name expiring_objects                name for legacy expirer task queue
+dequeue_from_legacy           False                           This service will look for jobs on the legacy expirer task queue.
+processes                     0                               How many parts to divide the legacy work into,
+                                                              one part per process that will be doing the work.
+                                                              When set 0 means that a single legacy
+                                                              process will be doing all the work.
+                                                              This can only be used in conjunction with
+                                                              `dequeue_from_legacy`.
+process                       0                               Which of the parts a particular legacy process will
+                                                              work on. It is "zero based", if you want to use 3
+                                                              processes, you should run processes with process
+                                                              set to 0, 1, and 2.
+                                                              This can only be used in conjunction with
+                                                              `dequeue_from_legacy`.
+reclaim_age                   604800                          How long an un-processable expired object
+                                                              marker will be retried before it is abandoned.
+                                                              It is not coupled with the tombstone reclaim age
+                                                              in the consistency engine.
+request_tries                 3                               The number of times the expirer's internal client
+                                                              will attempt any given request in the event
+                                                              of failure
+recon_cache_path              /var/cache/swift                Path to recon cache
+nice_priority                 None                            Scheduling priority of server processes.
+                                                              Niceness values range from -20 (most
+                                                              favorable to the process) to 19 (least
+                                                              favorable to the process). The default
+                                                              does not modify priority.
+ionice_class                  None                            I/O scheduling class of server processes.
+                                                              I/O niceness class values are IOPRIO_CLASS_RT
+                                                              (realtime), IOPRIO_CLASS_BE (best-effort),
+                                                              and IOPRIO_CLASS_IDLE (idle).
+                                                              The default does not modify class and
+                                                              priority. Linux supports io scheduling
+                                                              priorities and classes since 2.6.13 with
+                                                              the CFQ io scheduler.
+                                                              Work only with ionice_priority.
+ionice_priority               None                            I/O scheduling priority of server
+                                                              processes. I/O niceness priority is
+                                                              a number which goes from 0 to 7.
+                                                              The higher the value, the lower the I/O
+                                                              priority of the process. Work only with
+                                                              ionice_class.
+                                                              Ignored if IOPRIO_CLASS_IDLE is set.
+============================= =============================== ==========================================
 
 ------------------------------
 Container Server Configuration
@@ -2252,7 +2316,7 @@ For distros with more recent kernels (for example Ubuntu 12.04 Precise),
 we recommend using the default settings (including the default inode size
 of 256 bytes) when creating the file system::
 
-    mkfs.xfs /dev/sda1
+    mkfs.xfs -L D1 /dev/sda1
 
 In the last couple of years, XFS has made great improvements in how inodes
 are allocated and used.  Using the default inode size no longer has an
@@ -2262,7 +2326,7 @@ For distros with older kernels (for example Ubuntu 10.04 Lucid),
 some settings can dramatically impact performance. We recommend the
 following when creating the file system::
 
-    mkfs.xfs -i size=1024 /dev/sda1
+    mkfs.xfs -i size=1024 -L D1 /dev/sda1
 
 Setting the inode size is important, as XFS stores xattr data in the inode.
 If the metadata is too large to fit in the inode, a new extent is created,
@@ -2272,15 +2336,15 @@ headroom.
 
 The following example mount options are recommended when using XFS::
 
-    mount -t xfs -o noatime,nodiratime,nobarrier,logbufs=8 /dev/sda1 /srv/node/sda
+    mount -t xfs -o noatime,nodiratime,nobarrier,logbufs=8 -L D1 /srv/node/d1
 
 We do not recommend running Swift on RAID, but if you are using
 RAID it is also important to make sure that the proper sunit and swidth
 settings get set so that XFS can make most efficient use of the RAID array.
 
 For a standard Swift install, all data drives are mounted directly under
-``/srv/node`` (as can be seen in the above example of mounting ``/dev/sda1`` as
-``/srv/node/sda``). If you choose to mount the drives in another directory,
+``/srv/node`` (as can be seen in the above example of mounting label ``D1``
+as ``/srv/node/d1``). If you choose to mount the drives in another directory,
 be sure to set the `devices` config option in all of the server configs to
 point to the correct directory.
 
@@ -2322,7 +2386,7 @@ The following settings should be in `/etc/sysctl.conf`::
     # double amount of allowed conntrack
     net.ipv4.netfilter.ip_conntrack_max = 262144
 
-To load the updated sysctl settings, run ``sudo sysctl -p``
+To load the updated sysctl settings, run ``sudo sysctl -p``.
 
 A note about changing the TIME_WAIT values.  By default the OS will hold
 a port open for 60 seconds to ensure that any remaining packets can be

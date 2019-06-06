@@ -42,7 +42,7 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, \
     HTTPCreated, HTTPForbidden, HTTPInternalServerError, \
     HTTPMethodNotAllowed, HTTPNoContent, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPConflict, Request, \
-    HTTPInsufficientStorage, HTTPException
+    HTTPInsufficientStorage, HTTPException, wsgi_to_str
 from swift.common.request_helpers import is_sys_or_user_meta
 
 
@@ -299,7 +299,7 @@ class AccountController(BaseStorageServer):
         start_time = time.time()
         req = Request(env)
         self.logger.txn_id = req.headers.get('x-trans-id', None)
-        if not check_utf8(req.path_info):
+        if not check_utf8(wsgi_to_str(req.path_info)):
             res = HTTPPreconditionFailed(body='Invalid UTF8 or contains NULL')
         else:
             try:
@@ -321,7 +321,9 @@ class AccountController(BaseStorageServer):
             if res.headers.get('x-container-timestamp') is not None:
                 additional_info += 'x-container-timestamp: %s' % \
                     res.headers['x-container-timestamp']
-            log_msg = get_log_line(req, res, trans_time, additional_info)
+            log_msg = get_log_line(req, res, trans_time, additional_info,
+                                   self.log_format, self.anonymization_method,
+                                   self.anonymization_salt)
             if req.method.upper() == 'REPLICATE':
                 self.logger.debug(log_msg)
             else:
