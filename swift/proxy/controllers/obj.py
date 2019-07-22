@@ -2003,6 +2003,10 @@ class ECGetResponseBucket(object):
     def set_durable(self):
         self._durable = True
 
+    @property
+    def durable(self):
+        return self._durable
+
     def add_response(self, getter, parts_iter):
         if not self.gets:
             self.status = getter.last_status
@@ -2436,6 +2440,16 @@ class ECObjectController(BaseObjectController):
             bodies = []
             headers = []
             for getter, _parts_iter in bad_bucket.get_responses():
+                if best_bucket and best_bucket.durable:
+                    headers = HeaderKeyDict(getter.last_headers)
+                    t_data_file = headers.get('X-Backend-Data-Timestamp')
+                    t_obj = headers.get('X-Backend-Timestamp',
+                                        headers.get('X-Timestamp'))
+                    bad_ts = Timestamp(t_data_file or t_obj or '0')
+                    if bad_ts <= Timestamp(best_bucket.timestamp_str):
+                        # We have reason to believe there's still good data
+                        # out there, it's just currently unavailable
+                        continue
                 statuses.extend(getter.statuses)
                 reasons.extend(getter.reasons)
                 bodies.extend(getter.bodies)

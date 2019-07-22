@@ -2136,7 +2136,7 @@ class ECObjectControllerMixin(CommonObjectControllerMixin):
             {'obj': obj1, 'frag': 13},
         ]
 
-        # ... and the rests are 404s which is limited by request_count
+        # ... and the rest are 404s which is limited by request_count
         # (2 * replicas in default) rather than max_extra_requests limitation
         # because the retries will be in ResumingGetter if the responses
         # are 404s
@@ -2147,7 +2147,7 @@ class ECObjectControllerMixin(CommonObjectControllerMixin):
         with capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
 
-        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(resp.status_int, 503)
 
         # expect a request to all nodes
         self.assertEqual(2 * self.replicas(), len(log))
@@ -2693,7 +2693,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         with capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
 
-        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(resp.status_int, 503)
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -2964,7 +2964,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         with capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
 
-        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(resp.status_int, 503)
         # all 28 nodes tried with an optimistic get, none are durable and none
         # report having a durable timestamp
         self.assertEqual(28, len(log))
@@ -3229,9 +3229,9 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         with capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
         # read body to provoke any EC decode errors
-        self.assertFalse(resp.body)
+        self.assertTrue(resp.body)
 
-        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(resp.status_int, 503)
         self.assertEqual(len(log), self.replicas() * 2)
         collected_etags = set()
         for conn in log:
@@ -3240,7 +3240,10 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual({obj1['etag'], obj2['etag'], None}, collected_etags)
         log_lines = self.app.logger.get_lines_for_level('error')
         self.assertEqual(log_lines,
-                         ['Problem with fragment response: ETag mismatch'] * 7)
+                         ['Problem with fragment response: ETag mismatch'] * 7
+                         + ['Object returning 503 for []'])
+        # Note the empty list above -- that log line comes out of
+        # best_response but we've already thrown out the "good" responses :-/
 
     def test_GET_mixed_success_with_range(self):
         fragment_size = self.policy.fragment_size
@@ -3926,7 +3929,7 @@ class TestECDuplicationObjController(
             {'obj': obj1, 'frag': 8},
             {'obj': obj2, 'frag': 8},
         ]
-        # ... and the rests are 404s which is limited by request_count
+        # ... and the rest are 404s which is limited by request_count
         # (2 * replicas in default) rather than max_extra_requests limitation
         # because the retries will be in ResumingGetter if the responses
         # are 404s
@@ -3937,7 +3940,7 @@ class TestECDuplicationObjController(
         with capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
 
-        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(resp.status_int, 503)
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -4170,7 +4173,7 @@ class TestECDuplicationObjController(
         with capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
 
-        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(resp.status_int, 503)
         # all 28 nodes tried with an optimistic get, none are durable and none
         # report having a durable timestamp
         self.assertEqual(self.replicas() * 2, len(log))
@@ -4267,9 +4270,9 @@ class TestECDuplicationObjController(
         with capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
         # read body to provoke any EC decode errors
-        self.assertFalse(resp.body)
+        self.assertTrue(resp.body)
 
-        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(resp.status_int, 503)
         self.assertEqual(len(log), self.replicas() * 2)
         collected_etags = set()
         for conn in log:
@@ -4278,7 +4281,8 @@ class TestECDuplicationObjController(
         self.assertEqual({obj1['etag'], obj2['etag'], None}, collected_etags)
         log_lines = self.app.logger.get_lines_for_level('error')
         self.assertEqual(log_lines,
-                         ['Problem with fragment response: ETag mismatch'] * 7)
+                         ['Problem with fragment response: ETag mismatch'] * 7
+                         + ['Object returning 503 for []'])
 
     def _test_determine_chunk_destinations_prioritize(
             self, missing_two, missing_one):
