@@ -22,6 +22,7 @@ from uuid import uuid4
 import time
 from xml.dom import minidom
 
+import six
 from six.moves import range
 
 from test.functional import check_response, retry, requires_acls, \
@@ -77,7 +78,7 @@ class TestObject(unittest2.TestCase):
             return check_response(conn)
         resp = retry(put, name, use_account=use_account)
         resp.read()
-        self.assertEqual(resp.status, 201)
+        self.assertIn(resp.status, (201, 202))
 
         # With keystoneauth we need the accounts to have had the project
         # domain id persisted as sysmeta prior to testing ACLs. This may
@@ -107,8 +108,11 @@ class TestObject(unittest2.TestCase):
 
         # delete an object
         def delete(url, token, parsed, conn, container, obj):
-            path = '/'.join([parsed.path, container,
-                             obj['name'].encode('utf8')])
+            if six.PY2:
+                obj_name = obj['name'].encode('utf8')
+            else:
+                obj_name = obj['name']
+            path = '/'.join([parsed.path, container, obj_name])
             conn.request('DELETE', path, '', {'X-Auth-Token': token})
             return check_response(conn)
 
@@ -178,7 +182,7 @@ class TestObject(unittest2.TestCase):
         resp.read()
         self.assertEqual(resp.status, 201)
         resp = retry(get)
-        self.assertEqual('', resp.read())
+        self.assertEqual(b'', resp.read())
         self.assertEqual(resp.status, 200)
         self.assertEqual(metadata(resp), {})
         # empty post
@@ -186,7 +190,7 @@ class TestObject(unittest2.TestCase):
         resp.read()
         self.assertEqual(resp.status, 202)
         resp = retry(get)
-        self.assertEqual('', resp.read())
+        self.assertEqual(b'', resp.read())
         self.assertEqual(resp.status, 200)
         self.assertEqual(metadata(resp), {})
 
@@ -199,7 +203,7 @@ class TestObject(unittest2.TestCase):
         resp.read()
         self.assertEqual(resp.status, 201)
         resp = retry(get)
-        self.assertEqual('', resp.read())
+        self.assertEqual(b'', resp.read())
         self.assertEqual(resp.status, 200)
         self.assertEqual(metadata(resp), {
             'X-Object-Meta-Color': 'blUe',
@@ -211,7 +215,7 @@ class TestObject(unittest2.TestCase):
         resp.read()
         self.assertEqual(resp.status, 202)
         resp = retry(get)
-        self.assertEqual('', resp.read())
+        self.assertEqual(b'', resp.read())
         self.assertEqual(resp.status, 200)
         self.assertEqual(metadata(resp), {
             'X-Object-Meta-Color': 'oraNge'
@@ -227,7 +231,7 @@ class TestObject(unittest2.TestCase):
         resp.read()
         self.assertEqual(resp.status, 201)
         resp = retry(get)
-        self.assertEqual('', resp.read())
+        self.assertEqual(b'', resp.read())
         self.assertEqual(resp.status, 200)
         self.assertEqual(metadata(resp), {
             'X-Object-Meta-Color': 'Red',
@@ -243,7 +247,7 @@ class TestObject(unittest2.TestCase):
         resp.read()
         self.assertEqual(resp.status, 202)
         resp = retry(get)
-        self.assertEqual('', resp.read())
+        self.assertEqual(b'', resp.read())
         self.assertEqual(resp.status, 200)
         self.assertEqual(metadata(resp), {
             'X-Object-Meta-Food': 'Burger',
@@ -258,7 +262,7 @@ class TestObject(unittest2.TestCase):
         resp.read()
         self.assertEqual(resp.status, 201)
         resp = retry(get)
-        self.assertEqual('', resp.read())
+        self.assertEqual(b'', resp.read())
         self.assertEqual(resp.status, 200)
         self.assertEqual(metadata(resp), {
             'X-Object-Meta-Foo': 'B\xc3\xa2r',
@@ -271,7 +275,7 @@ class TestObject(unittest2.TestCase):
         resp.read()
         self.assertEqual(resp.status, 202)
         resp = retry(get)
-        self.assertEqual('', resp.read())
+        self.assertEqual(b'', resp.read())
         self.assertEqual(resp.status, 200)
         self.assertEqual(metadata(resp), {
             'X-Object-Meta-Foo': 'B\xc3\xa5z',
@@ -343,7 +347,7 @@ class TestObject(unittest2.TestCase):
                 'X-Timestamp should be a UNIX timestamp float value', body)
         else:
             self.assertEqual(resp.status, 201)
-            self.assertEqual(body, '')
+            self.assertEqual(body, b'')
             resp = retry(head)
             resp.read()
             self.assertGreater(float(resp.headers['x-timestamp']), ts_before)
@@ -376,7 +380,7 @@ class TestObject(unittest2.TestCase):
                 'X-Timestamp should be a UNIX timestamp float value', body)
         else:
             self.assertEqual(resp.status, 201)
-            self.assertEqual(body, '')
+            self.assertEqual(body, b'')
             resp = retry(head)
             resp.read()
             self.assertGreater(float(resp.headers['x-timestamp']), ts_before)
@@ -472,7 +476,7 @@ class TestObject(unittest2.TestCase):
         resp = retry(put)
         body = resp.read()
         self.assertEqual(resp.status, 400)
-        self.assertEqual(body, 'Non-integer X-Delete-After')
+        self.assertEqual(body, b'Non-integer X-Delete-After')
 
     def test_non_integer_x_delete_at(self):
         def put(url, token, parsed, conn):
@@ -485,7 +489,7 @@ class TestObject(unittest2.TestCase):
         resp = retry(put)
         body = resp.read()
         self.assertEqual(resp.status, 400)
-        self.assertEqual(body, 'Non-integer X-Delete-At')
+        self.assertEqual(body, b'Non-integer X-Delete-At')
 
     def test_x_delete_at_in_the_past(self):
         def put(url, token, parsed, conn):
@@ -498,7 +502,7 @@ class TestObject(unittest2.TestCase):
         resp = retry(put)
         body = resp.read()
         self.assertEqual(resp.status, 400)
-        self.assertEqual(body, 'X-Delete-At in past')
+        self.assertEqual(body, b'X-Delete-At in past')
 
     def test_copy_object(self):
         if tf.skip:
@@ -516,7 +520,7 @@ class TestObject(unittest2.TestCase):
         resp = retry(get_source)
         source_contents = resp.read()
         self.assertEqual(resp.status, 200)
-        self.assertEqual(source_contents, 'test')
+        self.assertEqual(source_contents, b'test')
 
         # copy source to dest with X-Copy-From
         def put(url, token, parsed, conn):
@@ -607,7 +611,7 @@ class TestObject(unittest2.TestCase):
         resp = retry(get_source)
         source_contents = resp.read()
         self.assertEqual(resp.status, 200)
-        self.assertEqual(source_contents, 'test')
+        self.assertEqual(source_contents, b'test')
 
         acct = tf.parsed[0].path.split('/', 2)[2]
 
@@ -966,14 +970,16 @@ class TestObject(unittest2.TestCase):
         # can list objects
         resp = retry(get_listing, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
-        self.assertIn(self.obj, listing)
+        self.assertIn(self.obj, listing.split('\n'))
 
         # can get object
         resp = retry(get, self.obj, use_account=3)
         body = resp.read()
         self.assertEqual(resp.status, 200)
-        self.assertEqual(body, 'test')
+        self.assertEqual(body, b'test')
 
         # can not put an object
         obj_name = str(uuid4())
@@ -989,9 +995,11 @@ class TestObject(unittest2.TestCase):
         # sanity with account1
         resp = retry(get_listing, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
-        self.assertNotIn(obj_name, listing)
-        self.assertIn(self.obj, listing)
+        self.assertNotIn(obj_name, listing.split('\n'))
+        self.assertIn(self.obj, listing.split('\n'))
 
     @requires_acls
     def test_read_write(self):
@@ -1047,14 +1055,16 @@ class TestObject(unittest2.TestCase):
         # can list objects
         resp = retry(get_listing, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
-        self.assertIn(self.obj, listing)
+        self.assertIn(self.obj, listing.split('\n'))
 
         # can get object
         resp = retry(get, self.obj, use_account=3)
         body = resp.read()
         self.assertEqual(resp.status, 200)
-        self.assertEqual(body, 'test')
+        self.assertEqual(body, b'test')
 
         # can put an object
         obj_name = str(uuid4())
@@ -1070,9 +1080,11 @@ class TestObject(unittest2.TestCase):
         # sanity with account1
         resp = retry(get_listing, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
-        self.assertIn(obj_name, listing)
-        self.assertNotIn(self.obj, listing)
+        self.assertIn(obj_name, listing.split('\n'))
+        self.assertNotIn(self.obj, listing.split('\n'))
 
     @requires_acls
     def test_admin(self):
@@ -1128,14 +1140,16 @@ class TestObject(unittest2.TestCase):
         # can list objects
         resp = retry(get_listing, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
-        self.assertIn(self.obj, listing)
+        self.assertIn(self.obj, listing.split('\n'))
 
         # can get object
         resp = retry(get, self.obj, use_account=3)
         body = resp.read()
         self.assertEqual(resp.status, 200)
-        self.assertEqual(body, 'test')
+        self.assertEqual(body, b'test')
 
         # can put an object
         obj_name = str(uuid4())
@@ -1151,17 +1165,19 @@ class TestObject(unittest2.TestCase):
         # sanity with account1
         resp = retry(get_listing, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
-        self.assertIn(obj_name, listing)
+        self.assertIn(obj_name, listing.split('\n'))
         self.assertNotIn(self.obj, listing)
 
     def test_manifest(self):
         if tf.skip:
             raise SkipTest
         # Data for the object segments
-        segments1 = ['one', 'two', 'three', 'four', 'five']
-        segments2 = ['six', 'seven', 'eight']
-        segments3 = ['nine', 'ten', 'eleven']
+        segments1 = [b'one', b'two', b'three', b'four', b'five']
+        segments2 = [b'six', b'seven', b'eight']
+        segments3 = [b'nine', b'ten', b'eleven']
 
         # Upload the first set of segments
         def put(url, token, parsed, conn, objnum):
@@ -1192,7 +1208,7 @@ class TestObject(unittest2.TestCase):
                 parsed.path, self.container), '', {'X-Auth-Token': token})
             return check_response(conn)
         resp = retry(get)
-        self.assertEqual(resp.read(), ''.join(segments1))
+        self.assertEqual(resp.read(), b''.join(segments1))
         self.assertEqual(resp.status, 200)
         self.assertEqual(resp.getheader('content-type'), 'text/jibberish')
 
@@ -1203,7 +1219,7 @@ class TestObject(unittest2.TestCase):
                     'X-Auth-Token': token, 'Range': 'bytes=3-'})
             return check_response(conn)
         resp = retry(get)
-        self.assertEqual(resp.read(), ''.join(segments1[1:]))
+        self.assertEqual(resp.read(), b''.join(segments1[1:]))
         self.assertEqual(resp.status, 206)
 
         # Get with a range in the middle of the second segment
@@ -1213,7 +1229,7 @@ class TestObject(unittest2.TestCase):
                     'X-Auth-Token': token, 'Range': 'bytes=5-'})
             return check_response(conn)
         resp = retry(get)
-        self.assertEqual(resp.read(), ''.join(segments1)[5:])
+        self.assertEqual(resp.read(), b''.join(segments1)[5:])
         self.assertEqual(resp.status, 206)
 
         # Get with a full start and stop range
@@ -1223,7 +1239,7 @@ class TestObject(unittest2.TestCase):
                     'X-Auth-Token': token, 'Range': 'bytes=5-10'})
             return check_response(conn)
         resp = retry(get)
-        self.assertEqual(resp.read(), ''.join(segments1)[5:11])
+        self.assertEqual(resp.read(), b''.join(segments1)[5:11])
         self.assertEqual(resp.status, 206)
 
         # Upload the second set of segments
@@ -1243,7 +1259,7 @@ class TestObject(unittest2.TestCase):
                 parsed.path, self.container), '', {'X-Auth-Token': token})
             return check_response(conn)
         resp = retry(get)
-        self.assertEqual(resp.read(), ''.join(segments1))
+        self.assertEqual(resp.read(), b''.join(segments1))
         self.assertEqual(resp.status, 200)
 
         # Update the manifest
@@ -1264,7 +1280,7 @@ class TestObject(unittest2.TestCase):
                 parsed.path, self.container), '', {'X-Auth-Token': token})
             return check_response(conn)
         resp = retry(get)
-        self.assertEqual(resp.read(), ''.join(segments2))
+        self.assertEqual(resp.read(), b''.join(segments2))
         self.assertEqual(resp.status, 200)
 
         if not tf.skip3:
@@ -1294,7 +1310,7 @@ class TestObject(unittest2.TestCase):
                     parsed.path, self.container), '', {'X-Auth-Token': token})
                 return check_response(conn)
             resp = retry(get, use_account=3)
-            self.assertEqual(resp.read(), ''.join(segments2))
+            self.assertEqual(resp.read(), b''.join(segments2))
             self.assertEqual(resp.status, 200)
 
         # Create another container for the third set of segments
@@ -1337,7 +1353,7 @@ class TestObject(unittest2.TestCase):
                 parsed.path, self.container), '', {'X-Auth-Token': token})
             return check_response(conn)
         resp = retry(get)
-        self.assertEqual(resp.read(), ''.join(segments3))
+        self.assertEqual(resp.read(), b''.join(segments3))
         self.assertEqual(resp.status, 200)
 
         if not tf.skip3:
@@ -1370,7 +1386,7 @@ class TestObject(unittest2.TestCase):
                     parsed.path, self.container), '', {'X-Auth-Token': token})
                 return check_response(conn)
             resp = retry(get, use_account=3)
-            self.assertEqual(resp.read(), ''.join(segments3))
+            self.assertEqual(resp.read(), b''.join(segments3))
             self.assertEqual(resp.status, 200)
 
         # Delete the manifest
@@ -1494,7 +1510,7 @@ class TestObject(unittest2.TestCase):
         if (tf.web_front_end == 'apache2'):
             self.assertEqual(resp.status, 404)
         else:
-            self.assertEqual(resp.read(), 'Invalid UTF8 or contains NULL')
+            self.assertEqual(resp.read(), b'Invalid UTF8 or contains NULL')
             self.assertEqual(resp.status, 412)
 
     def test_cors(self):
@@ -1659,6 +1675,8 @@ class TestObject(unittest2.TestCase):
         for c, o, body in validate_requests:
             resp = retry(get_obj, c, o)
             self.assertEqual(resp.status, 200)
+            if not six.PY2:
+                body = body.encode('utf8')
             self.assertEqual(body, resp.read())
 
     @requires_bulk

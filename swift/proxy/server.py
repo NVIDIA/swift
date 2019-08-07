@@ -29,6 +29,7 @@ from eventlet import Timeout
 
 from swift import __canonical_version__ as swift_version
 from swift.common import constraints
+from swift.common.http import is_server_error
 from swift.common.storage_policy import POLICIES
 from swift.common.ring import Ring
 from swift.common.utils import cache_from_env, get_logger, \
@@ -39,7 +40,8 @@ from swift.common.constraints import check_utf8, valid_api_version
 from swift.proxy.controllers import AccountController, ContainerController, \
     ObjectControllerRouter, InfoController
 from swift.proxy.controllers.base import get_container_info, NodeIter, \
-    DEFAULT_RECHECK_CONTAINER_EXISTENCE, DEFAULT_RECHECK_ACCOUNT_EXISTENCE
+    DEFAULT_RECHECK_CONTAINER_EXISTENCE, DEFAULT_RECHECK_ACCOUNT_EXISTENCE, \
+    DEFAULT_RECHECK_UPDATING_SHARD_RANGES
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, \
     HTTPMethodNotAllowed, HTTPNotFound, HTTPPreconditionFailed, \
     HTTPServerError, HTTPException, Request, HTTPServiceUnavailable, \
@@ -201,6 +203,9 @@ class Application(object):
         self.recheck_container_existence = \
             int(conf.get('recheck_container_existence',
                          DEFAULT_RECHECK_CONTAINER_EXISTENCE))
+        self.recheck_updating_shard_ranges = \
+            int(conf.get('recheck_updating_shard_ranges',
+                         DEFAULT_RECHECK_UPDATING_SHARD_RANGES))
         self.recheck_account_existence = \
             int(conf.get('recheck_account_existence',
                          DEFAULT_RECHECK_ACCOUNT_EXISTENCE))
@@ -403,6 +408,8 @@ class Application(object):
             raise APIVersionError('Invalid path')
         if obj and container and account:
             info = get_container_info(req.environ, self)
+            if is_server_error(info.get('status')):
+                raise HTTPServiceUnavailable(request=req)
             policy_index = req.headers.get('X-Backend-Storage-Policy-Index',
                                            info['storage_policy'])
             policy = POLICIES.get_by_index(policy_index)

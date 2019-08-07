@@ -425,7 +425,11 @@ class SymlinkObjectContext(WSGIContext):
         :param req: HTTP PUT object request
         :returns: Response Iterator
         """
-        if req.content_length != 0:
+        if req.content_length is None:
+            has_body = (req.body_file.read(1) != b'')
+        else:
+            has_body = (req.content_length != 0)
+        if has_body:
             raise HTTPBadRequest(
                 body='Symlink requests require a zero byte body',
                 request=req,
@@ -450,7 +454,7 @@ class SymlinkObjectContext(WSGIContext):
         if TGT_ACCT_SYSMETA_SYMLINK_HDR in req.headers:
             etag_override.append(
                 'symlink_target_account=%s' %
-                req.headers[TGT_OBJ_SYSMETA_SYMLINK_HDR])
+                req.headers[TGT_ACCT_SYSMETA_SYMLINK_HDR])
         req.headers['X-Object-Sysmeta-Container-Update-Override-Etag'] = \
             '; '.join(etag_override)
 
@@ -551,7 +555,10 @@ class SymlinkMiddleware(object):
         req = Request(env)
         try:
             version, acc, cont, obj = req.split_path(3, 4, True)
+            is_cont_or_obj_req = True
         except ValueError:
+            is_cont_or_obj_req = False
+        if not is_cont_or_obj_req:
             return self.app(env, start_response)
 
         try:

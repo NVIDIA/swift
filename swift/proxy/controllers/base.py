@@ -45,7 +45,7 @@ from swift.common.wsgi import make_pre_authed_env, make_pre_authed_request
 from swift.common.utils import Timestamp, config_true_value, \
     public, split_path, list_from_csv, GreenthreadSafeIterator, \
     GreenAsyncPile, quorum_size, parse_content_type, \
-    document_iters_to_http_response_body, ShardRange
+    document_iters_to_http_response_body, ShardRange, find_shard_range
 from swift.common.bufferedhttp import http_connect
 from swift.common import constraints
 from swift.common.exceptions import ChunkReadTimeout, ChunkWriteTimeout, \
@@ -67,6 +67,7 @@ from swift.common.storage_policy import POLICIES
 
 DEFAULT_RECHECK_ACCOUNT_EXISTENCE = 60  # seconds
 DEFAULT_RECHECK_CONTAINER_EXISTENCE = 60  # seconds
+DEFAULT_RECHECK_UPDATING_SHARD_RANGES = 3600  # seconds
 
 
 def update_headers(response, headers):
@@ -123,7 +124,8 @@ def _prep_headers_to_info(headers, server_type):
     sysmeta = {}
     other = {}
     for key, val in dict(headers).items():
-        lkey = key.lower()
+        lkey = wsgi_to_str(key).lower()
+        val = wsgi_to_str(val) if isinstance(val, str) else val
         if is_user_meta(server_type, lkey):
             meta[strip_user_meta_prefix(server_type, lkey)] = val
         elif is_sys_meta(server_type, lkey):
@@ -366,7 +368,7 @@ def get_container_info(env, app, swift_source=None):
     if info:
         info = deepcopy(info)  # avoid mutating what's in swift.infocache
     else:
-        info = headers_to_container_info({}, 0)
+        info = headers_to_container_info({}, 503)
 
     # Old data format in memcache immediately after a Swift upgrade; clean
     # it up so consumers of get_container_info() aren't exposed to it.
@@ -431,7 +433,7 @@ def get_account_info(env, app, swift_source=None):
     if info:
         info = info.copy()  # avoid mutating what's in swift.infocache
     else:
-        info = headers_to_account_info({}, 0)
+        info = headers_to_account_info({}, 503)
 
     for field in ('container_count', 'bytes', 'total_object_count'):
         if info.get(field) is None:
@@ -442,7 +444,7 @@ def get_account_info(env, app, swift_source=None):
     return info
 
 
-def get_cache_key(account, container=None, obj=None):
+def get_cache_key(account, container=None, obj=None, shard=None):
     """
     Get the keys for both memcache and env['swift.infocache'] (cache_key)
     where info about accounts, containers, and objects is cached
@@ -450,10 +452,33 @@ def get_cache_key(account, container=None, obj=None):
     :param account: The name of the account
     :param container: The name of the container (or None if account)
     :param obj: The name of the object (or None if account or container)
-    :returns: a string cache_key
+    :param shard: Sharding state for the container query; typically 'updating'
+                  or 'listing' (Requires account and container; cannot use
+                  with obj)
+    :returns: a (native) string cache_key
     """
+    if six.PY2:
+        def to_native(s):
+            if s is None or isinstance(s, str):
+                return s
+            return s.encode('utf8')
+    else:
+        def to_native(s):
+            if s is None or isinstance(s, str):
+                return s
+            return s.decode('utf8', 'surrogateescape')
 
-    if obj:
+    account = to_native(account)
+    container = to_native(container)
+    obj = to_native(obj)
+
+    if shard:
+        if not (account and container):
+            raise ValueError('Shard cache key requires account and container')
+        if obj:
+            raise ValueError('Shard cache key cannot have obj')
+        cache_key = 'shard-%s/%s/%s' % (shard, account, container)
+    elif obj:
         if not (account and container):
             raise ValueError('Object cache key requires account and container')
         cache_key = 'object/%s/%s/%s' % (account, container, obj)
@@ -1218,6 +1243,10 @@ class ResumingGetter(object):
                 _('Trying to %(method)s %(path)s') %
                 {'method': self.req_method, 'path': self.req_path})
             return False
+
+        src_headers = dict(
+            (k.lower(), v) for k, v in
+            possible_source.getheaders())
         if self.is_good_source(possible_source):
             # 404 if we know we don't have a synced copy
             if not float(possible_source.getheader('X-PUT-Timestamp', 1)):
@@ -1227,9 +1256,6 @@ class ResumingGetter(object):
                 self.source_headers.append([])
                 close_swift_conn(possible_source)
             else:
-                src_headers = dict(
-                    (k.lower(), v) for k, v in
-                    possible_source.getheaders())
                 if self.used_source_etag and \
                     self.used_source_etag != src_headers.get(
                         'x-object-sysmeta-ec-etag',
@@ -1256,7 +1282,12 @@ class ResumingGetter(object):
                     if not self.newest:  # one good source is enough
                         return True
         else:
-
+            if 'handoff_index' in node and \
+                    possible_source.status == HTTP_NOT_FOUND and \
+                    not Timestamp(src_headers.get('x-backend-timestamp', 0)):
+                # throw out 404s from handoff nodes unless the data is really
+                # on disk and had been DELETEd
+                return False
             self.statuses.append(possible_source.status)
             self.reasons.append(possible_source.reason)
             self.bodies.append(possible_source.read())
@@ -2170,3 +2201,55 @@ class Controller(object):
                 "Failed to get shard ranges from %s: invalid data: %r",
                 req.path_qs, err)
             return None
+
+    def _get_update_shard(self, req, account, container, obj):
+        """
+        Find the appropriate shard range for an object update.
+
+        Note that this fetches and caches (in both the per-request infocache
+        and memcache, if available) all shard ranges for the given root
+        container so we won't have to contact the container DB for every write.
+
+        :param req: original Request instance.
+        :param account: account from which shard ranges should be fetched.
+        :param container: container from which shard ranges should be fetched.
+        :param obj: object getting updated.
+        :return: an instance of :class:`swift.common.utils.ShardRange`,
+            or None if the update should go back to the root
+        """
+        if not self.app.recheck_updating_shard_ranges:
+            # caching is disabled; fall back to old behavior
+            shard_ranges = self._get_shard_ranges(
+                req, account, container, states='updating', includes=obj)
+            if not shard_ranges:
+                return None
+            return shard_ranges[0]
+
+        cache_key = get_cache_key(account, container, shard='updating')
+        infocache = req.environ.setdefault('swift.infocache', {})
+        memcache = getattr(self.app, 'memcache', None) or req.environ.get(
+            'swift.cache')
+
+        cached_ranges = infocache.get(cache_key)
+        if cached_ranges is None and memcache:
+            cached_ranges = memcache.get(cache_key)
+
+        if cached_ranges:
+            shard_ranges = [
+                ShardRange.from_dict(shard_range)
+                for shard_range in cached_ranges]
+        else:
+            shard_ranges = self._get_shard_ranges(
+                req, account, container, states='updating')
+            if shard_ranges:
+                cached_ranges = [dict(sr) for sr in shard_ranges]
+                # went to disk; cache it
+                if memcache:
+                    memcache.set(cache_key, cached_ranges,
+                                 time=self.app.recheck_updating_shard_ranges)
+
+        if not shard_ranges:
+            return None
+
+        infocache[cache_key] = tuple(cached_ranges)
+        return find_shard_range(obj, shard_ranges)

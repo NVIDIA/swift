@@ -22,6 +22,8 @@ import mock
 import random
 import sqlite3
 
+from eventlet import sleep
+
 from swift.common import db_replicator
 from swift.common.swob import HTTPServerError
 from swift.container import replicator, backend, server, sync_store
@@ -922,6 +924,91 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         # our sync pointer
         self.assertEqual(broker.get_reconciler_sync(), 2)
 
+    def test_misplaced_rows_replicate_and_enqueue_from_shard(self):
+        # force all timestamps to fall in same hour
+        ts = (Timestamp(t) for t in
+              itertools.count(int(time.time()) // 3600 * 3600))
+        policy = random.choice(list(POLICIES))
+        broker = self._get_broker('.shards_a', 'some-other-c', node_index=0)
+        broker.initialize(next(ts).internal, policy.idx)
+        broker.set_sharding_sysmeta('Root', 'a/c')
+        remote_policy = random.choice([p for p in POLICIES if p is not
+                                       policy])
+        remote_broker = self._get_broker(
+            '.shards_a', 'some-other-c', node_index=1)
+        remote_broker.initialize(next(ts).internal, remote_policy.idx)
+
+        # add a misplaced row to *local* broker
+        obj_put_timestamp = next(ts).internal
+        broker.put_object(
+            'o', obj_put_timestamp, 0, 'content-type',
+            'etag', storage_policy_index=remote_policy.idx)
+        misplaced = broker.get_misplaced_since(-1, 10)
+        self.assertEqual(len(misplaced), 1)
+        # since this row is misplaced it doesn't show up in count
+        self.assertEqual(broker.get_info()['object_count'], 0)
+
+        # add another misplaced row to *local* broker with composite timestamp
+        ts_data = next(ts)
+        ts_ctype = next(ts)
+        ts_meta = next(ts)
+        broker.put_object(
+            'o2', ts_data.internal, 0, 'content-type',
+            'etag', storage_policy_index=remote_policy.idx,
+            ctype_timestamp=ts_ctype.internal, meta_timestamp=ts_meta.internal)
+        misplaced = broker.get_misplaced_since(-1, 10)
+        self.assertEqual(len(misplaced), 2)
+        # since this row is misplaced it doesn't show up in count
+        self.assertEqual(broker.get_info()['object_count'], 0)
+
+        # replicate
+        part, node = self._get_broker_part_node(broker)
+        daemon = self._run_once(node)
+        # push to remote, and third node was missing (also maybe reconciler)
+        self.assertTrue(2 < daemon.stats['rsync'] <= 3, daemon.stats['rsync'])
+
+        # grab the rsynced instance of remote_broker
+        remote_broker = self._get_broker(
+            '.shards_a', 'some-other-c', node_index=1)
+
+        # remote has misplaced rows too now
+        misplaced = remote_broker.get_misplaced_since(-1, 10)
+        self.assertEqual(len(misplaced), 2)
+
+        # and the correct policy_index and object_count
+        info = remote_broker.get_info()
+        expectations = {
+            'object_count': 0,
+            'storage_policy_index': policy.idx,
+        }
+        for key, value in expectations.items():
+            self.assertEqual(info[key], value)
+
+        # and we should have also enqueued these rows in a single reconciler,
+        # since we forced the object timestamps to be in the same hour.
+        reconciler = daemon.get_reconciler_broker(misplaced[0]['created_at'])
+        # but it may not be on the same node as us anymore though...
+        reconciler = self._get_broker(reconciler.account,
+                                      reconciler.container, node_index=0)
+        self.assertEqual(reconciler.get_info()['object_count'], 2)
+        objects = reconciler.list_objects_iter(
+            10, '', None, None, None, None, storage_policy_index=0)
+        self.assertEqual(len(objects), 2)
+        # NB: reconciler work is for the *root* container!
+        expected = ('%s:/a/c/o' % remote_policy.idx, obj_put_timestamp, 0,
+                    'application/x-put', obj_put_timestamp)
+        self.assertEqual(objects[0], expected)
+        # the second object's listing has ts_meta as its last modified time
+        # but its full composite timestamp is in the hash field.
+        expected = ('%s:/a/c/o2' % remote_policy.idx, ts_meta.internal, 0,
+                    'application/x-put',
+                    encode_timestamps(ts_data, ts_ctype, ts_meta))
+        self.assertEqual(objects[1], expected)
+
+        # having safely enqueued to the reconciler we can advance
+        # our sync pointer
+        self.assertEqual(broker.get_reconciler_sync(), 2)
+
     def test_multiple_out_sync_reconciler_enqueue_normalize(self):
         ts = (Timestamp(t).internal for t in
               itertools.count(int(time.time())))
@@ -1426,7 +1513,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertFalse(success)
         # broker only has its own shard range so expect objects to be sync'd
         self.assertEqual(
-            ['sync', 'get_shard_ranges', 'merge_shard_ranges', 'merge_items',
+            ['sync', 'merge_shard_ranges', 'merge_items',
              'merge_syncs'],
             [call[0][0] for call in replicate_hook.call_args_list])
         error_lines = daemon.logger.get_lines_for_level('error')
@@ -1434,6 +1521,46 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertFalse(error_lines[1:])
         self.assertEqual(1, daemon.stats['diff'])
         self.assertEqual(1, daemon.logger.get_increment_counts()['diffs'])
+
+    def test_sync_shard_ranges_timeout_in_fetch(self):
+        # verify that replication is not considered successful if
+        # merge_shard_ranges fails
+        put_time = Timestamp.now().internal
+        broker = self._get_broker('a', 'c', node_index=0)
+        broker.initialize(put_time, POLICIES.default.idx)
+        remote_broker = self._get_broker('a', 'c', node_index=1)
+        remote_broker.initialize(put_time, POLICIES.default.idx)
+        # get an own shard range into remote broker
+        remote_broker.enable_sharding(Timestamp.now())
+
+        replicate_calls = []
+
+        def replicate_hook(op, *args):
+            replicate_calls.append(op)
+            if op == 'get_shard_ranges':
+                sleep(0.1)
+
+        fake_repl_connection = attach_fake_replication_rpc(
+            self.rpc, replicate_hook=replicate_hook)
+        db_replicator.ReplConnection = fake_repl_connection
+        part, node = self._get_broker_part_node(remote_broker)
+        daemon = replicator.ContainerReplicator({'node_timeout': '0.001'})
+        daemon.logger = FakeLogger()
+        with mock.patch.object(daemon.ring, 'get_part_nodes',
+                               return_value=[node]), \
+                mock.patch.object(daemon, '_post_replicate_hook'):
+            success, _ = daemon._replicate_object(
+                part, broker.db_file, node['id'])
+        self.assertFalse(success)
+        # broker only has its own shard range so expect objects to be sync'd
+        self.assertEqual(['sync', 'get_shard_ranges'], replicate_calls)
+        error_lines = daemon.logger.get_lines_for_level('error')
+        self.assertIn('ERROR syncing /', error_lines[0])
+        self.assertFalse(error_lines[1:])
+        self.assertEqual(0, daemon.stats['diff'])
+        self.assertNotIn('diffs', daemon.logger.get_increment_counts())
+        self.assertEqual(1, daemon.stats['failure'])
+        self.assertEqual(1, daemon.logger.get_increment_counts()['failures'])
 
     def test_sync_shard_ranges_none_to_sync(self):
         # verify that merge_shard_ranges is not sent if there are no shard
@@ -1456,6 +1583,38 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         daemon = replicator.ContainerReplicator({})
         success = daemon._repl_to_node(node, broker, part, info)
         self.assertTrue(success)
+        # NB: remote has no shard ranges, so no call to get_shard_ranges
+        self.assertEqual(
+            ['sync', 'merge_items', 'merge_syncs'],
+            [call[0][0] for call in replicate_hook.call_args_list])
+
+    def test_sync_shard_ranges_trouble_receiving_so_none_to_sync(self):
+        # verify that merge_shard_ranges is not sent if local has no shard
+        # ranges to sync
+        put_time = Timestamp.now().internal
+        broker = self._get_broker('a', 'c', node_index=0)
+        broker.initialize(put_time, POLICIES.default.idx)
+        remote_broker = self._get_broker('a', 'c', node_index=1)
+        remote_broker.initialize(put_time, POLICIES.default.idx)
+        # ensure the remote has at least one shard range
+        remote_broker.enable_sharding(Timestamp.now())
+        # put an object into local broker
+        broker.put_object('obj', Timestamp.now().internal, 0, 'text/plain',
+                          EMPTY_ETAG)
+
+        replicate_hook = mock.MagicMock()
+        fake_repl_connection = attach_fake_replication_rpc(
+            self.rpc, errors={'get_shard_ranges': [
+                FakeHTTPResponse(HTTPServerError())]},
+            replicate_hook=replicate_hook)
+        db_replicator.ReplConnection = fake_repl_connection
+        part, node = self._get_broker_part_node(remote_broker)
+        info = broker.get_replication_info()
+        daemon = replicator.ContainerReplicator({})
+        success = daemon._repl_to_node(node, broker, part, info)
+        self.assertTrue(success)
+        # NB: remote had shard ranges, but there was... some sort of issue
+        # in getting them locally, so no call to merge_shard_ranges
         self.assertEqual(
             ['sync', 'get_shard_ranges', 'merge_items', 'merge_syncs'],
             [call[0][0] for call in replicate_hook.call_args_list])
@@ -1645,6 +1804,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
                                             remote_node_index,
                                             repl_conf,
                                             expected_shard_ranges,
+                                            remote_has_shards=True,
                                             expect_success=True):
         # expected_shard_ranges is expected final list of sync'd ranges
         daemon, repl_calls, rsync_calls = self.check_replicate(
@@ -1655,17 +1815,22 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertEqual(1, daemon.stats['deferred'])
         self.assertEqual(0, daemon.stats['diff'])
         self.assertEqual(0, daemon.stats['rsync'])
-        self.assertEqual(['sync', 'get_shard_ranges', 'merge_shard_ranges'],
-                         [call[0] for call in repl_calls])
+        if remote_has_shards:
+            exp_calls = ['sync', 'get_shard_ranges', 'merge_shard_ranges']
+        else:
+            exp_calls = ['sync', 'merge_shard_ranges']
+        self.assertEqual(exp_calls, [call[0] for call in repl_calls])
         self.assertFalse(rsync_calls)
         # sync
         local_id = local_broker.get_info()['id']
         self.assertEqual(local_id, repl_calls[0][1][2])
         # get_shard_ranges
-        self.assertEqual((), repl_calls[1][1])
+        if remote_has_shards:
+            self.assertEqual((), repl_calls[1][1])
         # merge_shard_ranges for sending local shard ranges
-        self.assertShardRangesEqual(expected_shard_ranges, repl_calls[2][1][0])
-        self.assertEqual(local_id, repl_calls[2][1][1])
+        self.assertShardRangesEqual(expected_shard_ranges,
+                                    repl_calls[-1][1][0])
+        self.assertEqual(local_id, repl_calls[-1][1][1])
         remote_broker = self._get_broker(
             local_broker.account, local_broker.container, node_index=1)
         self.assertNotEqual(local_id, remote_broker.get_info()['id'])
@@ -1836,7 +2001,8 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
 
         self._check_only_shard_ranges_replicated(
             local_broker, 1, repl_conf,
-            local_broker.get_shard_ranges(include_own=True))
+            local_broker.get_shard_ranges(include_own=True),
+            remote_has_shards=False)
 
         remote_broker = self._get_broker('a', 'c', node_index=1)
         self.assertEqual(
@@ -2063,6 +2229,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self._check_only_shard_ranges_replicated(
             local_broker, 1, repl_conf,
             local_broker.get_shard_ranges(include_own=True),
+            remote_has_shards=False,
             expect_success=True)
 
         # sharded broker takes object count from shard range whereas remote
@@ -2081,6 +2248,8 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self._check_only_shard_ranges_replicated(
             local_broker, 1, repl_conf,
             local_broker.get_shard_ranges(include_own=True),
+            # We just sent shards, so of course remote has some
+            remote_has_shards=True,
             expect_success=True)
 
         remote_broker = self._get_broker('a', 'c', node_index=1)
@@ -2247,7 +2416,9 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
                     repl_conf={'per_diff': 1})
 
         mock_get_items_since.assert_not_called()
-        self.assertEqual(['sync', 'get_shard_ranges', 'rsync_then_merge'],
+        # No call to get_shard_ranges because remote didn't have shard ranges
+        # when the sync arrived
+        self.assertEqual(['sync', 'rsync_then_merge'],
                          [call[0] for call in repl_calls])
         self.assertEqual(local_broker.db_file, rsync_calls[0][0])
         self.assertEqual(local_broker.get_info()['id'],
@@ -2286,7 +2457,9 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
                     repl_conf={'per_diff': 1})
 
         mock_get_items_since.assert_not_called()
-        self.assertEqual(['sync', 'get_shard_ranges', 'rsync_then_merge'],
+        # No call to get_shard_ranges because remote didn't have shard ranges
+        # when the sync arrived
+        self.assertEqual(['sync', 'rsync_then_merge'],
                          [call[0] for call in repl_calls])
         self.assertEqual(local_broker.db_file, rsync_calls[0][0])
         self.assertEqual(local_broker.get_info()['id'],
@@ -2327,7 +2500,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
                 local_broker, 1, expect_success=False,
                 repl_conf={'per_diff': 1})
 
-        self.assertEqual(['sync', 'get_shard_ranges', 'rsync_then_merge'],
+        self.assertEqual(['sync', 'rsync_then_merge'],
                          [call[0] for call in repl_calls])
         self.assertEqual(local_broker.db_file, rsync_calls[0][0])
         self.assertEqual(local_broker.get_info()['id'],
@@ -2370,7 +2543,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
                 local_broker, 1, expect_success=False,
                 repl_conf={'per_diff': 1})
 
-        self.assertEqual(['sync', 'get_shard_ranges', 'rsync_then_merge'],
+        self.assertEqual(['sync', 'rsync_then_merge'],
                          [call[0] for call in repl_calls])
         self.assertEqual(local_broker.db_file, rsync_calls[0][0])
         self.assertEqual(local_broker.get_info()['id'],

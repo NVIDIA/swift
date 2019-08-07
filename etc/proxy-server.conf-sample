@@ -129,6 +129,13 @@ use = egg:swift#proxy
 # log_handoffs = true
 # recheck_account_existence = 60
 # recheck_container_existence = 60
+#
+# How long the proxy should cache a set of shard ranges for a container.
+# Note that stale shard range info should be fine; updates will still
+# eventually make their way to the correct shard. As a result, you can
+# usually set this much higher than the existence checks above.
+# recheck_updating_shard_ranges = 3600
+#
 # object_chunk_size = 65536
 # client_chunk_size = 65536
 #
@@ -380,7 +387,7 @@ user_test5_tester5 = testing5 service
 # [filter:authtoken]
 # paste.filter_factory = keystonemiddleware.auth_token:filter_factory
 # www_authenticate_uri = http://keystonehost:5000
-# auth_url = http://keystonehost:35357
+# auth_url = http://keystonehost:5000
 # auth_plugin = password
 # The following credentials must match the Keystone credentials for the Swift
 # service and may need to be changed to match your Keystone configuration. The
@@ -599,7 +606,7 @@ delay_auth_decision = False
 
 # Keystone server details. Note that this differs from how swift3 was
 # configured: in particular, the Keystone API version must be included.
-auth_uri = http://keystonehost:35357/v3
+auth_uri = http://keystonehost:5000/v3
 
 # Connect/read timeout to use when communicating with Keystone
 http_timeout = 10.0
@@ -611,6 +618,20 @@ http_timeout = 10.0
 
 # You can override the default log routing for this filter here:
 # log_name = s3token
+
+# Secrets may be cached to reduce latency for the client and load on Keystone.
+# Set this to some number of seconds greater than zero to enable caching.
+# secret_cache_duration = 0
+
+# Secret caching requires Keystone credentials similar to the authtoken middleware;
+# these credentials require access to view all project credentials.
+# auth_url = http://keystonehost:5000
+# auth_type = password
+# project_domain_id = default
+# project_name = service
+# user_domain_id = default
+# username = swift
+# password = password
 
 [filter:healthcheck]
 use = egg:swift#healthcheck
@@ -709,6 +730,8 @@ use = egg:swift#read_only
 # allow_deletes = false
 # Note: Put after ratelimit in the pipeline.
 
+# Note: needs to be placed before listing_formats;
+# otherwise remapped listings will always be JSON
 [filter:domain_remap]
 use = egg:swift#domain_remap
 # You can override the default log routing for this filter here:
