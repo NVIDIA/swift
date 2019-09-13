@@ -28,19 +28,19 @@ from test.unit import FakeLogger, FakeRing
 
 
 class LeakTrackingIter(object):
-    def __init__(self, inner_iter, mark_closed, path):
+    def __init__(self, inner_iter, mark_closed, key):
         if isinstance(inner_iter, bytes):
             inner_iter = (inner_iter, )
         self.inner_iter = inner_iter
         self.mark_closed = mark_closed
-        self.path = path
+        self.key = key
 
     def __iter__(self):
         for x in self.inner_iter:
             yield x
 
     def close(self):
-        self.mark_closed(self.path)
+        self.mark_closed(self.key)
 
 
 FakeSwiftCall = namedtuple('FakeSwiftCall', ['method', 'path', 'headers'])
@@ -171,19 +171,19 @@ class FakeSwift(object):
                 conditional_response=req.method in ('GET', 'HEAD'),
                 conditional_etag=conditional_etag)
         wsgi_iter = resp(env, start_response)
-        self.mark_opened(path)
-        return LeakTrackingIter(wsgi_iter, self.mark_closed, path)
+        self.mark_opened((method, path))
+        return LeakTrackingIter(wsgi_iter, self.mark_closed, (method, path))
 
-    def mark_opened(self, path):
-        self._unclosed_req_paths[path] += 1
+    def mark_opened(self, key):
+        self._unclosed_req_paths[key] += 1
 
-    def mark_closed(self, path):
-        self._unclosed_req_paths[path] -= 1
+    def mark_closed(self, key):
+        self._unclosed_req_paths[key] -= 1
 
     @property
     def unclosed_requests(self):
-        return {path: count
-                for path, count in self._unclosed_req_paths.items()
+        return {key: count
+                for key, count in self._unclosed_req_paths.items()
                 if count > 0}
 
     @property
