@@ -748,8 +748,9 @@ class ObjectController(BaseStorageServer):
             'PUT', account, container, obj, request, update_headers,
             device, policy)
 
-        # Add sysmeta to response
-        resp_headers = {}
+        # Add current content-type and sysmeta to response
+        resp_headers = {
+            'X-Backend-Content-Type': content_type_headers['Content-Type']}
         for key, value in orig_metadata.items():
             if is_sys_meta('object', key):
                 resp_headers[key] = value

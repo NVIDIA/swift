@@ -858,6 +858,32 @@ class TestTimestamp(unittest.TestCase):
         self.assertIn(ts_0, d)  # sanity
         self.assertIn(ts_0_also, d)
 
+    def test_inversion(self):
+        ts = utils.Timestamp(0)
+        self.assertIsInstance(~ts, utils.Timestamp)
+        self.assertEqual((~ts).internal, '9999999999.99999')
+
+        ts = utils.Timestamp(123456.789)
+        self.assertIsInstance(~ts, utils.Timestamp)
+        self.assertEqual(ts.internal, '0000123456.78900')
+        self.assertEqual((~ts).internal, '9999876543.21099')
+
+        timestamps = sorted(utils.Timestamp(random.random() * 1e10)
+                            for _ in range(20))
+        self.assertEqual([x.internal for x in timestamps],
+                         sorted(x.internal for x in timestamps))
+        self.assertEqual([(~x).internal for x in reversed(timestamps)],
+                         sorted((~x).internal for x in timestamps))
+
+        ts = utils.Timestamp.now()
+        self.assertGreater(~ts, ts)  # NB: will break around 2128
+
+        ts = utils.Timestamp.now(offset=1)
+        with self.assertRaises(ValueError) as caught:
+            ~ts
+        self.assertEqual(caught.exception.args[0],
+                         'Cannot invert timestamps with offsets')
+
 
 class TestTimestampEncoding(unittest.TestCase):
 

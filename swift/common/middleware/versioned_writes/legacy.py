@@ -14,6 +14,11 @@
 # limitations under the License.
 
 """
+.. note::
+    This middleware supports two legacy modes of object versioning that is
+    now replaced by a new mode. It is recommended to use the new
+    :ref:`Object Versioning <object_versioning>` mode for new containers.
+
 Object versioning in swift is implemented by setting a flag on the container
 to tell swift to version all objects in the container. The value of the flag is
 the URL-encoded container name where the versions are stored (commonly referred
@@ -225,7 +230,7 @@ import json
 import time
 
 from swift.common.utils import get_logger, Timestamp, \
-    register_swift_info, config_true_value, close_if_possible, FileLikeIter
+    config_true_value, close_if_possible, FileLikeIter
 from swift.common.request_helpers import get_sys_meta_prefix, \
     copy_header_subset
 from swift.common.wsgi import WSGIContext, make_pre_authed_request
@@ -856,16 +861,3 @@ class VersionedWritesMiddleware(object):
                 return error_response(env, start_response)
         else:
             return self.app(env, start_response)
-
-
-def filter_factory(global_conf, **local_conf):
-    conf = global_conf.copy()
-    conf.update(local_conf)
-    if config_true_value(conf.get('allow_versioned_writes')):
-        register_swift_info('versioned_writes', allowed_flags=(
-            CLIENT_VERSIONS_LOC, CLIENT_HISTORY_LOC))
-
-    def obj_versions_filter(app):
-        return VersionedWritesMiddleware(app, conf)
-
-    return obj_versions_filter
