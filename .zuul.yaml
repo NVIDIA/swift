@@ -97,6 +97,18 @@
       python_version: 3.7
 
 - job:
+    name: swift-tox-func-encryption-py37
+    parent: swift-tox-func-py37
+    description: |
+      Run functional tests for swift under cPython version 3.7.
+
+      Uses tox with the ``func-encryption-py3`` environment.
+      It sets TMPDIR to an XFS mount point created via
+      tools/test-setup.sh.
+    vars:
+      tox_envlist: func-encryption-py3
+
+- job:
     name: swift-tox-func-ec-py37
     parent: swift-tox-func-py37
     description: |
@@ -119,6 +131,18 @@
       tools/test-setup.sh.
     vars:
       tox_envlist: func-domain-remap-staticweb-py3
+
+- job:
+    name: swift-tox-func-s3api-py37
+    parent: swift-tox-func-py37
+    description: |
+      Run functional tests for swift under cPython version 3.7.
+
+      Uses tox with the ``func-s3api`` environment.
+      It sets TMPDIR to an XFS mount point created via
+      tools/test-setup.sh.
+    vars:
+      tox_envlist: func-s3api-py3
 
 - job:
     name: swift-tox-func-centos-7
@@ -151,7 +175,6 @@
       Uses tox with the ``func-ec`` environment.
       It sets TMPDIR to an XFS mount point created via
       tools/test-setup.sh.
-    branches: ^(?!stable/ocata).*$
     vars:
       tox_envlist: func-ec
 
@@ -222,8 +245,10 @@
     parent: swift-dsvm-functional
     description: |
       Setup a Swift/Keystone environment under py3 and run Swift's func tests
-      (but under py2).
+      (also under py3).
     vars:
+      # This tox env get run twice; once for Keystone and once for tempauth
+      tox_envlist: func-py3
       devstack_localrc:
         USE_PYTHON3: true
         # explicitly clear swift's default-disabled status
@@ -235,8 +260,7 @@
     vars:
       devstack_localrc:
         SERVICE_IP_VERSION: 6
-        HOST_IPV6: '[::1]'
-        SERVICE_HOST: '[::1]'
+        SERVICE_HOST: ""
 
 - job:
     name: swift-tox-func-s3api-ceph-s3tests-tempauth
@@ -248,6 +272,7 @@
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
+      - tools/playbooks/saio_single_node_setup/add_s3api.yaml
       - tools/playbooks/saio_single_node_setup/make_rings.yaml
     run: tools/playbooks/ceph-s3tests/run.yaml
     post-run:
@@ -338,6 +363,12 @@
       previous_swift_version: origin/stable/rocky
 
 - job:
+    name: swift-multinode-rolling-upgrade-stein
+    parent: swift-multinode-rolling-upgrade
+    vars:
+      previous_swift_version: origin/stable/stein
+
+- job:
     name: swift-tox-lower-constraints
     parent: openstack-tox-lower-constraints
     vars:
@@ -393,6 +424,41 @@
       pass-to-parent: true
     vars: *swift_image_vars
 
+- job:
+    name: swift-build-image-py3
+    parent: opendev-build-docker-image
+    voting: false
+    description: Build py3 SAIO docker images.
+    vars: &swift_image_vars_py3
+      docker_images:
+        - context: .
+          dockerfile: Dockerfile-py3
+          repository: openstackswift/saio
+          tags:
+           - py3
+
+- job:
+    name: swift-upload-image-py3
+    parent: opendev-upload-docker-image
+    voting: false
+    description: Build py3 SAIO docker images and upload to Docker Hub.
+    secrets:
+      name: docker_credentials
+      secret: swift-dockerhub
+      pass-to-parent: true
+    vars: *swift_image_vars_py3
+
+- job:
+    name: swift-promote-image-py3
+    parent: opendev-promote-docker-image
+    voting: false
+    description: Promote previously uploaded Docker images.
+    secrets:
+      name: docker_credentials
+      secret: swift-dockerhub
+      pass-to-parent: true
+    vars: *swift_image_vars_py3
+
 - project:
     templates:
       - publish-openstack-docs-pti
@@ -403,6 +469,10 @@
     check:
       jobs:
         - swift-build-image:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/(functional|probe)/.*$
+        - swift-build-image-py3:
             irrelevant-files:
               - ^(api-ref|doc|releasenotes)/.*$
               - ^test/(functional|probe)/.*$
@@ -454,12 +524,22 @@
               - ^(api-ref|doc|releasenotes)/.*$
               - ^test/probe/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-tox-func-encryption-py37:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
         - swift-tox-func-domain-remap-staticweb-py37:
             irrelevant-files:
               - ^(api-ref|doc|releasenotes)/.*$
               - ^test/probe/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
         - swift-tox-func-ec-py37:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/probe/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - swift-tox-func-s3api-py37:
             irrelevant-files:
               - ^(api-ref|doc|releasenotes)/.*$
               - ^test/probe/.*$
@@ -515,6 +595,11 @@
               - ^(api-ref|doc|releasenotes)/.*$
               - ^test/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - tempest-ipv6-only:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
         - grenade-py3:
             irrelevant-files:
               - ^(api-ref|doc|releasenotes)/.*$
@@ -527,6 +612,7 @@
         # long-running jobs, like probetests or (once they move to
         # in-tree definitions) dsvm jobs.
         - swift-upload-image
+        - swift-upload-image-py3
         - swift-tox-py27
         - swift-tox-py36
         - swift-tox-py37
@@ -536,8 +622,10 @@
         - swift-tox-func-ec
         - swift-tox-func-s3api
         - swift-tox-func-py37
+        - swift-tox-func-encryption
         - swift-tox-func-domain-remap-staticweb-py37
         - swift-tox-func-ec-py37
+        - swift-tox-func-s3api-py37
         - swift-probetests-centos-7:
             irrelevant-files:
               - ^(api-ref|releasenotes)/.*$
@@ -574,6 +662,11 @@
               - ^(api-ref|doc|releasenotes)/.*$
               - ^test/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
+        - tempest-ipv6-only:
+            irrelevant-files:
+              - ^(api-ref|doc|releasenotes)/.*$
+              - ^test/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
         - grenade-py3:
             irrelevant-files:
               - ^(api-ref|doc|releasenotes)/.*$
@@ -587,6 +680,7 @@
         - swift-tox-func-ec-centos-7
         - swift-multinode-rolling-upgrade-queens
         - swift-multinode-rolling-upgrade-rocky
+        - swift-multinode-rolling-upgrade-stein
 
     post:
       jobs:
@@ -594,3 +688,4 @@
     promote:
       jobs:
         - swift-promote-image
+        - swift-promote-image-py3

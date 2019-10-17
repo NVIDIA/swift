@@ -16,6 +16,7 @@
 from __future__ import print_function
 import mock
 import os
+import six
 from six.moves.urllib.parse import urlparse, urlsplit, urlunsplit
 import sys
 import pickle
@@ -25,6 +26,7 @@ import eventlet
 import eventlet.debug
 import functools
 import random
+import base64
 
 from time import time, sleep
 from contextlib import closing
@@ -41,8 +43,6 @@ from swift.common.storage_policy import parse_storage_policies, PolicyError
 from swift.common.utils import set_swift_dir
 
 from test import get_config, listen_zero
-from test.functional.swift_test_client import Account, Connection, Container, \
-    ResponseError
 
 from test.unit import debug_logger, FakeMemcache
 # importing skip_if_no_xattrs so that functional tests can grab it from the
@@ -72,6 +72,10 @@ DEBUG = True
 eventlet.hubs.use_hub(utils.get_hub())
 eventlet.patcher.monkey_patch(all=False, socket=True)
 eventlet.debug.hub_exceptions(False)
+
+# swift_test_client import from swiftclient, so move after the monkey-patching
+from test.functional.swift_test_client import Account, Connection, Container, \
+    ResponseError
 
 from swiftclient import get_auth, http_connection
 
@@ -319,7 +323,9 @@ def _load_encryption(proxy_conf_file, swift_conf_file, **kwargs):
             "proxy-logging proxy-server",
             "keymaster encryption proxy-logging proxy-server")
         conf.set(section, 'pipeline', pipeline)
-        root_secret = os.urandom(32).encode("base64")
+        root_secret = base64.b64encode(os.urandom(32))
+        if not six.PY2:
+            root_secret = root_secret.decode('ascii')
         conf.set('filter:keymaster', 'encryption_root_secret', root_secret)
     except NoSectionError as err:
         msg = 'Error problem with proxy conf file %s: %s' % \
@@ -918,12 +924,18 @@ def setup_package():
             swift_test_user[0] = config['username']
             swift_test_tenant[0] = config['account']
             swift_test_key[0] = config['password']
+            if 'domain' in config:
+                swift_test_domain[0] = config['domain']
             swift_test_user[1] = config['username2']
             swift_test_tenant[1] = config['account2']
             swift_test_key[1] = config['password2']
+            if 'domain2' in config:
+                swift_test_domain[1] = config['domain2']
             swift_test_user[2] = config['username3']
             swift_test_tenant[2] = config['account']
             swift_test_key[2] = config['password3']
+            if 'domain3' in config:
+                swift_test_domain[2] = config['domain3']
             if 'username4' in config:
                 swift_test_user[3] = config['username4']
                 swift_test_tenant[3] = config['account4']
@@ -933,10 +945,14 @@ def setup_package():
                 swift_test_user[4] = config['username5']
                 swift_test_tenant[4] = config['account5']
                 swift_test_key[4] = config['password5']
+                if 'domain5' in config:
+                    swift_test_domain[4] = config['domain5']
             if 'username6' in config:
                 swift_test_user[5] = config['username6']
                 swift_test_tenant[5] = config['account6']
                 swift_test_key[5] = config['password6']
+                if 'domain6' in config:
+                    swift_test_domain[5] = config['domain6']
 
             for _ in range(5):
                 swift_test_perm[_] = swift_test_tenant[_] + ':' \

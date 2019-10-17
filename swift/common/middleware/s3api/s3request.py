@@ -33,7 +33,8 @@ from swift.common.http import HTTP_OK, HTTP_CREATED, HTTP_ACCEPTED, \
     HTTP_CONFLICT, HTTP_UNPROCESSABLE_ENTITY, HTTP_REQUEST_ENTITY_TOO_LARGE, \
     HTTP_PARTIAL_CONTENT, HTTP_NOT_MODIFIED, HTTP_PRECONDITION_FAILED, \
     HTTP_REQUESTED_RANGE_NOT_SATISFIABLE, HTTP_LENGTH_REQUIRED, \
-    HTTP_BAD_REQUEST, HTTP_REQUEST_TIMEOUT, is_success
+    HTTP_BAD_REQUEST, HTTP_REQUEST_TIMEOUT, HTTP_SERVICE_UNAVAILABLE, \
+    is_success
 
 from swift.common.constraints import check_utf8
 from swift.proxy.controllers.base import get_container_info, \
@@ -52,7 +53,8 @@ from swift.common.middleware.s3api.s3response import AccessDenied, \
     InternalError, NoSuchBucket, NoSuchKey, PreconditionFailed, InvalidRange, \
     MissingContentLength, InvalidStorageClass, S3NotImplemented, InvalidURI, \
     MalformedXML, InvalidRequest, RequestTimeout, InvalidBucketName, \
-    BadDigest, AuthorizationHeaderMalformed, AuthorizationQueryParametersError
+    BadDigest, AuthorizationHeaderMalformed, \
+    AuthorizationQueryParametersError, ServiceUnavailable
 from swift.common.middleware.s3api.exception import NotS3Request, \
     BadSwiftRequest
 from swift.common.middleware.s3api.utils import utf8encode, \
@@ -535,7 +537,6 @@ class S3Request(swob.Request):
             'string_to_sign': self.string_to_sign,
             'check_signature': self.check_signature,
         }
-        self.token = None
         self.account = None
         self.user_id = None
         self.slo_enabled = slo_enabled
@@ -1134,8 +1135,6 @@ class S3Request(swob.Request):
         if method is not None:
             env['REQUEST_METHOD'] = method
 
-        env['HTTP_X_AUTH_TOKEN'] = self.token
-
         if obj:
             path = '/v1/%s/%s/%s' % (account, container, obj)
         elif container:
@@ -1332,7 +1331,7 @@ class S3Request(swob.Request):
         except swob.HTTPException as err:
             sw_resp = err
         else:
-            # reuse account and tokens
+            # reuse account
             _, self.account, _ = split_path(sw_resp.environ['PATH_INFO'],
                                             2, 3, True)
 
@@ -1342,10 +1341,11 @@ class S3Request(swob.Request):
         if not self.user_id:
             if 'HTTP_X_USER_NAME' in sw_resp.environ:
                 # keystone
-                self.user_id = \
-                    utf8encode("%s:%s" %
-                               (sw_resp.environ['HTTP_X_TENANT_NAME'],
-                                sw_resp.environ['HTTP_X_USER_NAME']))
+                self.user_id = "%s:%s" % (
+                    sw_resp.environ['HTTP_X_TENANT_NAME'],
+                    sw_resp.environ['HTTP_X_USER_NAME'])
+                if six.PY2 and not isinstance(self.user_id, bytes):
+                    self.user_id = self.user_id.encode('utf8')
             else:
                 # tempauth
                 self.user_id = self.access_key
@@ -1374,6 +1374,8 @@ class S3Request(swob.Request):
                 **self.signature_does_not_match_kwargs())
         if status == HTTP_FORBIDDEN:
             raise AccessDenied()
+        if status == HTTP_SERVICE_UNAVAILABLE:
+            raise ServiceUnavailable()
 
         raise InternalError('unexpected status code %d' % status)
 
@@ -1506,8 +1508,8 @@ class S3AclRequest(S3Request):
             # keystone
             self.user_id = "%s:%s" % (sw_resp.environ['HTTP_X_TENANT_NAME'],
                                       sw_resp.environ['HTTP_X_USER_NAME'])
-            self.user_id = utf8encode(self.user_id)
-            self.token = sw_resp.environ.get('HTTP_X_AUTH_TOKEN')
+            if six.PY2 and not isinstance(self.user_id, bytes):
+                self.user_id = self.user_id.encode('utf8')
         else:
             # tempauth
             self.user_id = self.access_key

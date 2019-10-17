@@ -339,8 +339,9 @@ from swift.common.utils import get_logger, config_true_value, \
     closing_if_possible, LRUCache, StreamingPile, strict_b64decode, \
     Timestamp
 from swift.common.request_helpers import SegmentedIterable, \
-    get_sys_meta_prefix, update_etag_is_at_header, resolve_etag_is_at_header
-from swift.common.constraints import check_utf8, MAX_BUFFERED_SLO_SEGMENTS
+    get_sys_meta_prefix, update_etag_is_at_header, resolve_etag_is_at_header, \
+    get_container_update_override_key
+from swift.common.constraints import check_utf8
 from swift.common.http import HTTP_NOT_FOUND, HTTP_UNAUTHORIZED, is_success
 from swift.common.wsgi import WSGIContext, make_subrequest
 from swift.common.middleware.bulk import get_response_body, \
@@ -502,10 +503,7 @@ def parse_and_validate_input(req_body, req_path):
                               % (seg_index,))
                 continue
             # re-encode to normalize padding
-            if six.PY2:
-                seg_dict['data'] = base64.b64encode(data)
-            else:
-                seg_dict['data'] = base64.b64encode(data).decode('ascii')
+            seg_dict['data'] = base64.b64encode(data).decode('ascii')
 
     if parsed_data and all('data' in d for d in parsed_data):
         errors.append(b"Inline data segments require at least one "
@@ -826,6 +824,7 @@ class SloGetContext(WSGIContext):
                 conditional_response=True)
             resp.headers.update({
                 'Etag': '"%s"' % slo_etag,
+                'X-Manifest-Etag': self._response_header_value('etag'),
                 'Content-Length': slo_size,
             })
             return resp(req.environ, start_response)
@@ -930,7 +929,9 @@ class SloGetContext(WSGIContext):
         response_headers = []
         for header, value in resp_headers:
             lheader = header.lower()
-            if lheader not in ('etag', 'content-length'):
+            if lheader == 'etag':
+                response_headers.append(('X-Manifest-Etag', value))
+            elif lheader != 'content-length':
                 response_headers.append((header, value))
 
             if lheader == SYSMETA_SLO_ETAG:
@@ -959,7 +960,7 @@ class SloGetContext(WSGIContext):
                     r = '%s:%s;' % (seg_dict['hash'], seg_dict['range'])
                 else:
                     r = seg_dict['hash']
-                calculated_etag.update(r.encode('ascii') if six.PY3 else r)
+                calculated_etag.update(r.encode('ascii'))
 
             if content_length is None:
                 if config_true_value(seg_dict.get('sub_slo')):
@@ -1095,7 +1096,10 @@ class StaticLargeObject(object):
         delete_concurrency = int(self.conf.get(
             'delete_concurrency', self.concurrency))
         self.bulk_deleter = Bulk(
-            app, {}, delete_concurrency=delete_concurrency, logger=self.logger)
+            app, {},
+            max_deletes_per_request=float('inf'),
+            delete_concurrency=delete_concurrency,
+            logger=self.logger)
 
     def handle_multipart_get_or_head(self, req, start_response):
         """
@@ -1297,9 +1301,7 @@ class StaticLargeObject(object):
                 resp_dict = {}
                 if heartbeat:
                     resp_dict['Response Status'] = err.status
-                    err_body = err.body
-                    if six.PY3:
-                        err_body = err_body.decode('utf-8', errors='replace')
+                    err_body = err.body.decode('utf-8')
                     resp_dict['Response Body'] = err_body or '\n'.join(
                         RESPONSE_REASONS.get(err.status_int, ['']))
                 else:
@@ -1354,7 +1356,7 @@ class StaticLargeObject(object):
 
             # Ensure container listings have both etags. However, if any
             # middleware to the left of us touched the base value, trust them.
-            override_header = 'X-Object-Sysmeta-Container-Update-Override-Etag'
+            override_header = get_container_update_override_key('etag')
             val, sep, params = req.headers.get(
                 override_header, '').partition(';')
             req.headers[override_header] = '%s; slo_etag=%s' % (
@@ -1413,7 +1415,13 @@ class StaticLargeObject(object):
             'sub_slo': True,
             'name': obj_path}]
         while segments:
-            if len(segments) > MAX_BUFFERED_SLO_SEGMENTS:
+            # We chose not to set the limit at max_manifest_segments
+            # in the case this value was decreased by operators.
+            # Still it is important to set a limit to avoid this list
+            # growing too large and causing OOM failures.
+            # x10 is a best guess as to how much operators would change
+            # the value of max_manifest_segments.
+            if len(segments) > self.max_manifest_segments * 10:
                 raise HTTPBadRequest(
                     'Too many buffered slo segments to delete.')
             seg_data = segments.pop(0)

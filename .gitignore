@@ -24,3 +24,4 @@ subunit.log
 test/probe/.noseids
 RELEASENOTES.rst
 releasenotes/notes/reno.cache
+/tools/playbooks/**/*.retry

@@ -60,6 +60,7 @@ Static Large Object when the multipart upload is completed.
 """
 
 import binascii
+import copy
 from hashlib import md5
 import os
 import re
@@ -70,6 +71,7 @@ import six
 from swift.common.swob import Range, bytes_to_wsgi
 from swift.common.utils import json, public, reiterate
 from swift.common.db import utf8encode
+from swift.common.request_helpers import get_container_update_override_key
 
 from six.moves.urllib.parse import quote, urlparse
 
@@ -85,6 +87,7 @@ from swift.common.middleware.s3api.utils import unique_id, \
     MULTIUPLOAD_SUFFIX, S3Timestamp, sysmeta_header
 from swift.common.middleware.s3api.etree import Element, SubElement, \
     fromstring, tostring, XMLSyntaxError, DocumentInvalid
+from swift.common.storage_policy import POLICIES
 
 DEFAULT_MAX_PARTS_LISTING = 1000
 DEFAULT_MAX_UPLOADS = 1000
@@ -182,7 +185,7 @@ class PartController(Controller):
                 'X-Object-Sysmeta-Swift3-Etag': '',  # for legacy data
                 'X-Object-Sysmeta-Slo-Etag': '',
                 'X-Object-Sysmeta-Slo-Size': '',
-                'X-Object-Sysmeta-Container-Update-Override-Etag': '',
+                get_container_update_override_key('etag'): '',
             })
         resp = req.get_response(self.app)
 
@@ -363,8 +366,7 @@ class UploadsController(Controller):
         # Create a unique S3 upload id from UUID to avoid duplicates.
         upload_id = unique_id()
 
-        orig_container = req.container_name
-        seg_container = orig_container + MULTIUPLOAD_SUFFIX
+        seg_container = req.container_name + MULTIUPLOAD_SUFFIX
         content_type = req.headers.get('Content-Type')
         if content_type:
             req.headers[sysmeta_header('object', 'has-content-type')] = 'yes'
@@ -375,15 +377,21 @@ class UploadsController(Controller):
         req.headers['Content-Type'] = 'application/directory'
 
         try:
-            req.container_name = seg_container
-            req.get_container_info(self.app)
+            seg_req = copy.copy(req)
+            seg_req.environ = copy.copy(req.environ)
+            seg_req.container_name = seg_container
+            seg_req.get_container_info(self.app)
         except NoSuchBucket:
             try:
-                req.get_response(self.app, 'PUT', seg_container, '')
+                # multi-upload bucket doesn't exist, create one with
+                # same storage policy as the primary bucket
+                info = req.get_container_info(self.app)
+                policy_name = POLICIES[info['storage_policy']].name
+                hdrs = {'X-Storage-Policy': policy_name}
+                seg_req.get_response(self.app, 'PUT', seg_container, '',
+                                     headers=hdrs)
             except (BucketAlreadyExists, BucketAlreadyOwnedByYou):
                 pass
-        finally:
-            req.container_name = orig_container
 
         obj = '%s/%s' % (req.object_name, upload_id)
 
@@ -542,10 +550,15 @@ class UploadController(Controller):
 
         #  Iterate over the segment objects and delete them individually
         objects = json.loads(resp.body)
-        for o in objects:
-            container = req.container_name + MULTIUPLOAD_SUFFIX
-            obj = bytes_to_wsgi(o['name'].encode('utf-8'))
-            req.get_response(self.app, container=container, obj=obj)
+        while objects:
+            for o in objects:
+                container = req.container_name + MULTIUPLOAD_SUFFIX
+                obj = bytes_to_wsgi(o['name'].encode('utf-8'))
+                req.get_response(self.app, container=container, obj=obj)
+            query['marker'] = objects[-1]['name']
+            resp = req.get_response(self.app, 'GET', container, '',
+                                    query=query)
+            objects = json.loads(resp.body)
 
         return HTTPNoContent()
 
@@ -634,7 +647,7 @@ class UploadController(Controller):
         headers[sysmeta_header('object', 'etag')] = s3_etag
         # Leave base header value blank; SLO will populate
         c_etag = '; s3_etag=%s' % s3_etag
-        headers['X-Object-Sysmeta-Container-Update-Override-Etag'] = c_etag
+        headers[get_container_update_override_key('etag')] = c_etag
 
         too_small_message = ('s3api requires that each segment be at least '
                              '%d bytes' % self.conf.min_segment_size)

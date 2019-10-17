@@ -364,13 +364,15 @@ class RingBuilder(object):
             # shift an unsigned int >I right to obtain the partition for the
             # int).
             if not self._replica2part2dev:
-                self._ring = RingData([], devs, self.part_shift)
+                self._ring = RingData([], devs, self.part_shift,
+                                      version=self.version)
             else:
                 self._ring = \
                     RingData([array('H', p2d) for p2d in
                               self._replica2part2dev],
                              devs, self.part_shift,
-                             self.next_part_power)
+                             self.next_part_power,
+                             self.version)
         return self._ring
 
     def add_dev(self, dev):
@@ -447,6 +449,46 @@ class RingBuilder(object):
             raise ValueError("Can not set weight of dev_id %s because it "
                              "is marked for removal" % (dev_id,))
         self.devs[dev_id]['weight'] = weight
+        self.devs_changed = True
+        self.version += 1
+
+    def set_dev_region(self, dev_id, region):
+        """
+        Set the region of a device. This should be called rather than just
+        altering the region key in the device dict directly, as the builder
+        will need to rebuild some internal state to reflect the change.
+
+        .. note::
+            This will not rebalance the ring immediately as you may want to
+            make multiple changes for a single rebalance.
+
+        :param dev_id: device id
+        :param region: new region for device
+        """
+        if any(dev_id == d['id'] for d in self._remove_devs):
+            raise ValueError("Can not set region of dev_id %s because it "
+                             "is marked for removal" % (dev_id,))
+        self.devs[dev_id]['region'] = region
+        self.devs_changed = True
+        self.version += 1
+
+    def set_dev_zone(self, dev_id, zone):
+        """
+        Set the zone of a device. This should be called rather than just
+        altering the zone key in the device dict directly, as the builder
+        will need to rebuild some internal state to reflect the change.
+
+        .. note::
+            This will not rebalance the ring immediately as you may want to
+            make multiple changes for a single rebalance.
+
+        :param dev_id: device id
+        :param zone: new zone for device
+        """
+        if any(dev_id == d['id'] for d in self._remove_devs):
+            raise ValueError("Can not set zone of dev_id %s because it "
+                             "is marked for removal" % (dev_id,))
+        self.devs[dev_id]['zone'] = zone
         self.devs_changed = True
         self.version += 1
 
