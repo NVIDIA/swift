@@ -46,8 +46,9 @@ import uuid
 import mock
 from eventlet import sleep, spawn, wsgi, Timeout, debug
 from eventlet.green import httplib
+from io import BytesIO
+
 import six
-from six import BytesIO
 from six.moves import range
 from six.moves.urllib.parse import quote, parse_qsl
 
@@ -82,7 +83,7 @@ from swift.common.swob import Request, Response, HTTPUnauthorized, \
     HTTPException, HTTPBadRequest, wsgi_to_str
 from swift.common.storage_policy import StoragePolicy, POLICIES
 import swift.common.request_helpers
-from swift.common.request_helpers import get_sys_meta_prefix
+from swift.common.request_helpers import get_sys_meta_prefix, get_reserved_name
 
 # mocks
 logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
@@ -570,11 +571,31 @@ class TestController(unittest.TestCase):
 
 @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
 class TestProxyServerConfiguration(unittest.TestCase):
+
+    def setUp(self):
+        self.logger = debug_logger('test-proxy-config')
+
     def _make_app(self, conf):
+        self.logger.clear()
         # helper function to instantiate a proxy server instance
         return proxy_server.Application(conf, FakeMemcache(),
                                         container_ring=FakeRing(),
-                                        account_ring=FakeRing())
+                                        account_ring=FakeRing(),
+                                        logger=self.logger)
+
+    def test_auto_create_account(self):
+        app = self._make_app({})
+        self.assertEqual(app.auto_create_account_prefix, '.')
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+
+        app = self._make_app({'auto_create_account_prefix': '-'})
+        self.assertEqual(app.auto_create_account_prefix, '-')
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [
+            'Option auto_create_account_prefix is deprecated. '
+            'Configure auto_create_account_prefix under the '
+            'swift-constraints section of swift.conf. This option '
+            'will be ignored in a future release.'
+        ])
 
     def test_node_timeout(self):
         # later config should be extended to assert more config options
@@ -696,6 +717,29 @@ class TestProxyServer(unittest.TestCase):
         self.assertEqual(resp.status, '405 Method Not Allowed')
         self.assertEqual(sorted(resp.headers['Allow'].split(', ')), [
             'DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'UPDATE'])
+
+    def test_internal_reserved_name_request(self):
+        # set account info
+        fake_cache = FakeMemcache()
+        fake_cache.store[get_cache_key('a')] = {'status': 200}
+        app = proxy_server.Application({}, fake_cache,
+                                       container_ring=FakeRing(),
+                                       account_ring=FakeRing())
+        # build internal container request
+        container = get_reserved_name('c')
+        req = Request.blank('/v1/a/%s' % container)
+        app.update_request(req)
+
+        # try client request to reserved name
+        resp = app.handle_request(req)
+        self.assertEqual(resp.status_int, 412)
+        self.assertEqual(resp.body, b'Invalid UTF8 or contains NULL')
+
+        # set backend header
+        req.headers['X-Backend-Allow-Reserved-Names'] = 'true'
+        with mocked_http_conn(200):
+            resp = app.handle_request(req)
+        self.assertEqual(resp.status_int, 200)
 
     def test_calls_authorize_allow(self):
         called = [False]
@@ -1068,9 +1112,11 @@ class TestProxyServer(unittest.TestCase):
 
         self.assertTrue(app.expose_info)
         self.assertIsInstance(app.disallowed_sections, list)
-        self.assertEqual(1, len(app.disallowed_sections))
-        self.assertEqual(['swift.valid_api_versions'],
-                         app.disallowed_sections)
+        self.assertEqual(2, len(app.disallowed_sections))
+        self.assertEqual([
+            'swift.auto_create_account_prefix',
+            'swift.valid_api_versions',
+        ], sorted(app.disallowed_sections))
         self.assertIsNone(app.admin_key)
 
     def test_get_info_controller(self):
@@ -3808,7 +3854,7 @@ class TestReplicatedObjectController(
                         'Host': 'localhost:80',
                         'Referer': '%s http://localhost/v1/a/c/o' % method,
                         'X-Backend-Storage-Policy-Index': '1',
-                        'X-Backend-Container-Path': shard_range.name
+                        'X-Backend-Quoted-Container-Path': shard_range.name
                     },
                 }
                 check_request(request, **expectations)
@@ -3919,7 +3965,7 @@ class TestReplicatedObjectController(
                         'Host': 'localhost:80',
                         'Referer': '%s http://localhost/v1/a/c/o' % method,
                         'X-Backend-Storage-Policy-Index': '1',
-                        'X-Backend-Container-Path': shard_ranges[1].name
+                        'X-Backend-Quoted-Container-Path': shard_ranges[1].name
                     },
                 }
                 check_request(request, **expectations)
@@ -4021,7 +4067,7 @@ class TestReplicatedObjectController(
                         'Host': 'localhost:80',
                         'Referer': '%s http://localhost/v1/a/c/o' % method,
                         'X-Backend-Storage-Policy-Index': '1',
-                        'X-Backend-Container-Path': shard_ranges[1].name
+                        'X-Backend-Quoted-Container-Path': shard_ranges[1].name
                     },
                 }
                 check_request(request, **expectations)
@@ -10404,7 +10450,8 @@ class TestAccountControllerFakeGetResponse(unittest.TestCase):
         self.app = listing_formats.ListingFilter(
             proxy_server.Application(conf, FakeMemcache(),
                                      account_ring=FakeRing(),
-                                     container_ring=FakeRing()))
+                                     container_ring=FakeRing()),
+            {})
         self.app.app.memcache = FakeMemcacheReturnsNone()
 
     def test_GET_autocreate_accept_json(self):
@@ -10755,11 +10802,13 @@ class TestSwiftInfo(unittest.TestCase):
         utils._swift_admin_info = {}
 
     def test_registered_defaults(self):
-        proxy_server.Application({}, FakeMemcache(),
-                                 account_ring=FakeRing(),
-                                 container_ring=FakeRing())
+        app = proxy_server.Application({}, FakeMemcache(),
+                                       account_ring=FakeRing(),
+                                       container_ring=FakeRing())
+        req = Request.blank('/info')
+        resp = req.get_response(app)
+        si = json.loads(resp.body)['swift']
 
-        si = utils.get_swift_info()['swift']
         self.assertIn('version', si)
         self.assertEqual(si['max_file_size'], constraints.MAX_FILE_SIZE)
         self.assertEqual(si['max_meta_name_length'],
@@ -10783,12 +10832,16 @@ class TestSwiftInfo(unittest.TestCase):
         self.assertIn('strict_cors_mode', si)
         self.assertFalse(si['allow_account_management'])
         self.assertFalse(si['account_autocreate'])
-        # This setting is by default excluded by disallowed_sections
-        self.assertEqual(si['valid_api_versions'],
-                         constraints.VALID_API_VERSIONS)
         # this next test is deliberately brittle in order to alert if
         # other items are added to swift info
-        self.assertEqual(len(si), 18)
+        self.assertEqual(len(si), 17)
+
+        si = utils.get_swift_info()['swift']
+        # Tehse settings is by default excluded by disallowed_sections
+        self.assertEqual(si['valid_api_versions'],
+                         constraints.VALID_API_VERSIONS)
+        self.assertEqual(si['auto_create_account_prefix'],
+                         constraints.AUTO_CREATE_ACCOUNT_PREFIX)
 
         self.assertIn('policies', si)
         sorted_pols = sorted(si['policies'], key=operator.itemgetter('name'))
@@ -10822,7 +10875,8 @@ class TestSocketObjectVersions(unittest.TestCase):
                         _test_servers[0], conf,
                         logger=_test_servers[0].logger), {}),
                 {}
-            )
+            ),
+            {}, logger=_test_servers[0].logger
         )
         self.coro = spawn(wsgi.server, prolis, prosrv, NullLogger(),
                           protocol=SwiftHttpProtocol)

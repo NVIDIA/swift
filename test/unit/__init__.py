@@ -38,10 +38,10 @@ import json
 import random
 import errno
 import xattr
+from io import BytesIO
 
 import six
 import six.moves.cPickle as pickle
-from six import BytesIO
 from six.moves import range
 from six.moves.http_client import HTTPException
 
@@ -1181,6 +1181,14 @@ class StubResponse(object):
 
     def read(self, amt=0):
         return self.readable.read(amt)
+
+    def __repr__(self):
+        info = ['Status: %s' % self.status]
+        if self.headers:
+            info.append('Headers: %r' % dict(self.headers))
+        if self.body:
+            info.append('Body: %r' % self.body)
+        return '<StubResponse %s>' % ', '.join(info)
 
 
 def encode_frag_archive_bodies(policy, body):

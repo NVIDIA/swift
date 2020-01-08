@@ -16,12 +16,13 @@ bind_port = 8080
 #
 # Allows the ability to withhold sections from showing up in the public calls
 # to /info.  You can withhold subsections by separating the dict level with a
-# ".".  The following would cause the sections 'container_quotas' and 'tempurl'
-# to not be listed, and the key max_failed_deletes would be removed from
-# bulk_delete.  Default value is 'swift.valid_api_versions' which allows all
-# registered features to be listed via HTTP GET /info except
-# swift.valid_api_versions information
-# disallowed_sections = swift.valid_api_versions, container_quotas, tempurl
+# ".". Default value is 'swift.valid_api_versions, swift.auto_create_account_prefix'
+# which allows all registered features to be listed via HTTP GET /info except
+# swift.valid_api_versions and swift.auto_create_account_prefix information.
+# As an example, the following would cause the sections 'container_quotas' and
+# 'tempurl' to not be listed, and the key max_failed_deletes would be removed from
+# bulk_delete.
+# disallowed_sections = swift.valid_api_versions, container_quotas, tempurl, bulk_delete.max_failed_deletes
 
 # Use an integer to override the number of pre-forked processes that will
 # accept connections.  Should default to the number of effective cpu
@@ -184,12 +185,6 @@ use = egg:swift#proxy
 #
 # Comma separated list of Host headers to which the proxy will deny requests.
 # deny_host_headers =
-#
-# Prefix used when automatically creating accounts.
-# auto_create_account_prefix = .
-#
-# Depth of the proxy put queue.
-# put_queue_depth = 10
 #
 # During GET and HEAD requests, storage nodes can be chosen at random
 # (shuffle), by using timing measurements (timing), or by using an explicit
@@ -1019,6 +1014,11 @@ use = egg:swift#gatekeeper
 # difficult-to-delete data.
 # shunt_inbound_x_timestamp = true
 #
+# Set this to true if you want to allow clients to access and manipulate the
+# (normally internal-to-swift) null namespace by including a header like
+#    X-Allow-Reserved-Names: true
+# allow_reserved_names_header = false
+#
 # You can override the default log routing for this filter here:
 # set log_name = gatekeeper
 # set log_facility = LOG_LOCAL0
@@ -1080,6 +1080,8 @@ use = egg:swift#versioned_writes
 # in the container configuration file, which will be eventually
 # deprecated. See documentation for more details.
 # allow_versioned_writes = false
+# Enables Swift object-versioning API
+# allow_object_versioning = false
 
 # Note: Put after auth and before dlo and slo middlewares.
 # If you don't put it in the pipeline, it will be inserted for you.

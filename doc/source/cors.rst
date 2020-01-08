@@ -3,7 +3,7 @@ CORS
 ====
 
 CORS_ is a mechanism to allow code running in a browser (Javascript for
-example) make requests to a domain other then the one from where it originated.
+example) make requests to a domain other than the one from where it originated.
 
 Swift supports CORS requests to containers and objects.
 
@@ -28,7 +28,7 @@ The supported headers are,
 |                                                | Space separated.             |
 +------------------------------------------------+------------------------------+
 
-In addition the the values set in container metadata, some cluster-wide values
+In addition the values set in container metadata, some cluster-wide values
 may also be configured using the ``strict_cors_mode``, ``cors_allow_origin``
 and ``cors_expose_headers`` in ``proxy-server.conf``. See
 ``proxy-server.conf-sample`` for more information.

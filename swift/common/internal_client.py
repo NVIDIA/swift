@@ -25,6 +25,7 @@ import zlib
 from time import gmtime, strftime, time
 from zlib import compressobj
 
+from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common.exceptions import ClientException
 from swift.common.http import (HTTP_NOT_FOUND, HTTP_MULTIPLE_CHOICES,
                                is_server_error)
@@ -158,7 +159,7 @@ class InternalClient(object):
     container_ring = pipeline_property('container_ring')
     account_ring = pipeline_property('account_ring')
     auto_create_account_prefix = pipeline_property(
-        'auto_create_account_prefix', default='.')
+        'auto_create_account_prefix', default=AUTO_CREATE_ACCOUNT_PREFIX)
 
     def make_request(
             self, method, path, headers, acceptable_statuses, body_file=None,
@@ -184,6 +185,7 @@ class InternalClient(object):
 
         headers = dict(headers)
         headers['user-agent'] = self.user_agent
+        headers.setdefault('x-backend-allow-reserved-names', 'true')
         for attempt in range(self.request_tries):
             resp = exc_type = exc_value = exc_traceback = None
             req = Request.blank(
@@ -384,6 +386,34 @@ class InternalClient(object):
         return self._iter_items(path, marker, end_marker, prefix,
                                 acceptable_statuses)
 
+    def create_account(self, account):
+        """
+        Creates an account.
+
+        :param account: Account to create.
+        :raises UnexpectedResponse: Exception raised when requests fail
+                                    to get a response with an acceptable status
+        :raises Exception: Exception is raised when code fails in an
+                           unexpected way.
+        """
+        path = self.make_path(account)
+        self.make_request('PUT', path, {}, (201, 202))
+
+    def delete_account(self, account, acceptable_statuses=(2, HTTP_NOT_FOUND)):
+        """
+        Deletes an account.
+
+        :param account: Account to delete.
+        :param acceptable_statuses: List of status for valid responses,
+                                    defaults to (2, HTTP_NOT_FOUND).
+        :raises UnexpectedResponse: Exception raised when requests fail
+                                    to get a response with an acceptable status
+        :raises Exception: Exception is raised when code fails in an
+                           unexpected way.
+        """
+        path = self.make_path(account)
+        self.make_request('DELETE', path, {}, acceptable_statuses)
+
     def get_account_info(
             self, account, acceptable_statuses=(2, HTTP_NOT_FOUND)):
         """
@@ -499,7 +529,8 @@ class InternalClient(object):
         self.make_request('PUT', path, headers, acceptable_statuses)
 
     def delete_container(
-            self, account, container, acceptable_statuses=(2, HTTP_NOT_FOUND)):
+            self, account, container, headers=None,
+            acceptable_statuses=(2, HTTP_NOT_FOUND)):
         """
         Deletes a container.
 
@@ -514,8 +545,9 @@ class InternalClient(object):
                            unexpected way.
         """
 
+        headers = headers or {}
         path = self.make_path(account, container)
-        self.make_request('DELETE', path, {}, acceptable_statuses)
+        self.make_request('DELETE', path, headers, acceptable_statuses)
 
     def get_container_metadata(
             self, account, container, metadata_prefix='',
@@ -618,7 +650,14 @@ class InternalClient(object):
         """
 
         path = self.make_path(account, container, obj)
-        self.make_request('DELETE', path, (headers or {}), acceptable_statuses)
+        resp = self.make_request('DELETE', path, (headers or {}),
+                                 acceptable_statuses)
+
+        # Drain the response body to prevent unexpected disconnect
+        # in proxy-server
+        with closing_if_possible(resp.app_iter):
+            for iter_body in resp.app_iter:
+                pass
 
     def get_object_metadata(
             self, account, container, obj, metadata_prefix='',
@@ -647,7 +686,7 @@ class InternalClient(object):
         return self._get_metadata(path, metadata_prefix, acceptable_statuses,
                                   headers=headers, params=params)
 
-    def get_object(self, account, container, obj, headers,
+    def get_object(self, account, container, obj, headers=None,
                    acceptable_statuses=(2,), params=None):
         """
         Gets an object.
@@ -749,13 +788,17 @@ class InternalClient(object):
             path, metadata, metadata_prefix, acceptable_statuses)
 
     def upload_object(
-            self, fobj, account, container, obj, headers=None):
+            self, fobj, account, container, obj, headers=None,
+            acceptable_statuses=(2,), params=None):
         """
         :param fobj: File object to read object's content from.
         :param account: The object's account.
         :param container: The object's container.
         :param obj: The object.
         :param headers: Headers to send with request, defaults to empty dict.
+        :param acceptable_statuses: List of acceptable statuses for request.
+        :param params: A dict of params to be set in request query string,
+                       defaults to None.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
@@ -767,7 +810,8 @@ class InternalClient(object):
         if 'Content-Length' not in headers:
             headers['Transfer-Encoding'] = 'chunked'
         path = self.make_path(account, container, obj)
-        self.make_request('PUT', path, headers, (2,), fobj)
+        self.make_request('PUT', path, headers, acceptable_statuses, fobj,
+                          params=params)
 
 
 def get_auth(url, user, key, auth_version='1.0', **kwargs):

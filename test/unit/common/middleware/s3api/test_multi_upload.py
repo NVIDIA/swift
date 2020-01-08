@@ -20,7 +20,7 @@ from mock import patch
 import os
 import time
 import unittest
-from six.moves.urllib.parse import quote
+from six.moves.urllib.parse import quote, quote_plus
 
 from swift.common import swob
 from swift.common.swob import Request
@@ -251,7 +251,7 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
 
     @s3acl
     @patch('swift.common.middleware.s3api.s3request.get_container_info',
-           lambda x, y: {'status': 404})
+           lambda env, app, swift_source: {'status': 404})
     def test_bucket_multipart_uploads_GET_without_bucket(self):
         self.swift.register('HEAD', '/v1/AUTH_test/bucket',
                             swob.HTTPNotFound, {}, '')
@@ -346,7 +346,7 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
             query[key] = arg
         self.assertEqual(query['format'], 'json')
         self.assertEqual(query['limit'], '1001')
-        self.assertEqual(query['marker'], 'object/Y')
+        self.assertEqual(query['marker'], quote_plus('object/Y'))
 
     @s3acl
     def test_bucket_multipart_uploads_GET_with_key_marker(self):
@@ -380,7 +380,7 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
             query[key] = arg
         self.assertEqual(query['format'], 'json')
         self.assertEqual(query['limit'], '1001')
-        self.assertEqual(query['marker'], quote('object/~'))
+        self.assertEqual(query['marker'], quote_plus('object/~'))
 
     @s3acl
     def test_bucket_multipart_uploads_GET_with_prefix(self):
@@ -550,7 +550,7 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
             query[key] = arg
         self.assertEqual(query['format'], 'json')
         self.assertEqual(query['limit'], '1001')
-        self.assertEqual(query['prefix'], 'dir/')
+        self.assertEqual(query['prefix'], quote_plus('dir/'))
         self.assertTrue(query.get('delimiter') is None)
 
     @patch('swift.common.middleware.s3api.controllers.'
@@ -784,7 +784,7 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
                             body=XML)
         with patch(
                 'swift.common.middleware.s3api.s3request.get_container_info',
-                lambda x, y: {'status': 404}):
+                lambda env, app, swift_source: {'status': 404}):
             self.swift.register('HEAD', '/v1/AUTH_test/nobucket',
                                 swob.HTTPNotFound, {}, None)
             status, headers, body = self.call_s3api(req)
@@ -1304,7 +1304,7 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
                                      'Date': self.get_date_header()})
         with patch(
                 'swift.common.middleware.s3api.s3request.get_container_info',
-                lambda x, y: {'status': 404}):
+                lambda env, app, swift_source: {'status': 404}):
             self.swift.register('HEAD', '/v1/AUTH_test/nobucket',
                                 swob.HTTPNotFound, {}, None)
             status, headers, body = self.call_s3api(req)
@@ -1320,8 +1320,8 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
         self.assertEqual(status.split()[0], '204')
 
     @s3acl
-    @patch('swift.common.middleware.s3api.s3request.'
-           'get_container_info', lambda x, y: {'status': 204})
+    @patch('swift.common.middleware.s3api.s3request.get_container_info',
+           lambda env, app, swift_source: {'status': 204})
     def test_object_upload_part_error(self):
         # without upload id
         req = Request.blank('/bucket/object?partNumber=1',
@@ -1367,7 +1367,7 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
                             body='part object')
         with patch(
                 'swift.common.middleware.s3api.s3request.get_container_info',
-                lambda x, y: {'status': 404}):
+                lambda env, app, swift_source: {'status': 404}):
             self.swift.register('HEAD', '/v1/AUTH_test/nobucket',
                                 swob.HTTPNotFound, {}, None)
             status, headers, body = self.call_s3api(req)
@@ -1399,7 +1399,7 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
                                      'Date': self.get_date_header()})
         with patch(
                 'swift.common.middleware.s3api.s3request.get_container_info',
-                lambda x, y: {'status': 404}):
+                lambda env, app, swift_source: {'status': 404}):
             self.swift.register('HEAD', '/v1/AUTH_test/nobucket',
                                 swob.HTTPNotFound, {}, None)
             status, headers, body = self.call_s3api(req)

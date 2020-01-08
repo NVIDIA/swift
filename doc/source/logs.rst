@@ -126,6 +126,7 @@ SW                      :ref:`staticweb`
 TU                      :ref:`tempurl`
 BD                      :ref:`bulk` (delete)
 EA                      :ref:`bulk` (extract)
+AQ                      :ref:`account-quotas`
 CQ                      :ref:`container-quotas`
 CS                      :ref:`container-sync`
 TA                      :ref:`common_tempauth`
@@ -138,6 +139,8 @@ VW                      :ref:`versioned_writes`
 SSC                     :ref:`copy`
 SYM                     :ref:`symlink`
 SH                      :ref:`sharding_doc`
+S3                      :ref:`s3api`
+OV                      :ref:`object_versioning`
 ======================= =============================
 
 

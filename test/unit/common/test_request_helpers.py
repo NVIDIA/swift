@@ -18,12 +18,8 @@
 import unittest
 from swift.common.swob import Request, HTTPException, HeaderKeyDict
 from swift.common.storage_policy import POLICIES, EC_POLICY, REPL_POLICY
-from swift.common.request_helpers import is_sys_meta, is_user_meta, \
-    is_sys_or_user_meta, strip_sys_meta_prefix, strip_user_meta_prefix, \
-    remove_items, copy_header_subset, get_name_and_placement, \
-    http_response_to_document_iters, is_object_transient_sysmeta, \
-    update_etag_is_at_header, resolve_etag_is_at_header, \
-    strip_object_transient_sysmeta_prefix
+from swift.common import request_helpers as rh
+from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX
 
 from test.unit import patch_policies
 from test.unit.common.test_utils import FakeResponse
@@ -36,70 +32,70 @@ class TestRequestHelpers(unittest.TestCase):
     def test_is_user_meta(self):
         m_type = 'meta'
         for st in server_types:
-            self.assertTrue(is_user_meta(st, 'x-%s-%s-foo' % (st, m_type)))
-            self.assertFalse(is_user_meta(st, 'x-%s-%s-' % (st, m_type)))
-            self.assertFalse(is_user_meta(st, 'x-%s-%sfoo' % (st, m_type)))
+            self.assertTrue(rh.is_user_meta(st, 'x-%s-%s-foo' % (st, m_type)))
+            self.assertFalse(rh.is_user_meta(st, 'x-%s-%s-' % (st, m_type)))
+            self.assertFalse(rh.is_user_meta(st, 'x-%s-%sfoo' % (st, m_type)))
 
     def test_is_sys_meta(self):
         m_type = 'sysmeta'
         for st in server_types:
-            self.assertTrue(is_sys_meta(st, 'x-%s-%s-foo' % (st, m_type)))
-            self.assertFalse(is_sys_meta(st, 'x-%s-%s-' % (st, m_type)))
-            self.assertFalse(is_sys_meta(st, 'x-%s-%sfoo' % (st, m_type)))
+            self.assertTrue(rh.is_sys_meta(st, 'x-%s-%s-foo' % (st, m_type)))
+            self.assertFalse(rh.is_sys_meta(st, 'x-%s-%s-' % (st, m_type)))
+            self.assertFalse(rh.is_sys_meta(st, 'x-%s-%sfoo' % (st, m_type)))
 
     def test_is_sys_or_user_meta(self):
         m_types = ['sysmeta', 'meta']
         for mt in m_types:
             for st in server_types:
-                self.assertTrue(is_sys_or_user_meta(st, 'x-%s-%s-foo'
-                                                    % (st, mt)))
-                self.assertFalse(is_sys_or_user_meta(st, 'x-%s-%s-'
-                                                     % (st, mt)))
-                self.assertFalse(is_sys_or_user_meta(st, 'x-%s-%sfoo'
-                                                     % (st, mt)))
+                self.assertTrue(rh.is_sys_or_user_meta(
+                    st, 'x-%s-%s-foo' % (st, mt)))
+                self.assertFalse(rh.is_sys_or_user_meta(
+                    st, 'x-%s-%s-' % (st, mt)))
+                self.assertFalse(rh.is_sys_or_user_meta(
+                    st, 'x-%s-%sfoo' % (st, mt)))
 
     def test_strip_sys_meta_prefix(self):
         mt = 'sysmeta'
         for st in server_types:
-            self.assertEqual(strip_sys_meta_prefix(st, 'x-%s-%s-a'
-                                                   % (st, mt)), 'a')
+            self.assertEqual(rh.strip_sys_meta_prefix(
+                st, 'x-%s-%s-a' % (st, mt)), 'a')
         mt = 'not-sysmeta'
         for st in server_types:
             with self.assertRaises(ValueError):
-                strip_sys_meta_prefix(st, 'x-%s-%s-a' % (st, mt))
+                rh.strip_sys_meta_prefix(st, 'x-%s-%s-a' % (st, mt))
 
     def test_strip_user_meta_prefix(self):
         mt = 'meta'
         for st in server_types:
-            self.assertEqual(strip_user_meta_prefix(st, 'x-%s-%s-a'
-                                                    % (st, mt)), 'a')
+            self.assertEqual(rh.strip_user_meta_prefix(
+                st, 'x-%s-%s-a' % (st, mt)), 'a')
         mt = 'not-meta'
         for st in server_types:
             with self.assertRaises(ValueError):
-                strip_sys_meta_prefix(st, 'x-%s-%s-a' % (st, mt))
+                rh.strip_sys_meta_prefix(st, 'x-%s-%s-a' % (st, mt))
 
     def test_is_object_transient_sysmeta(self):
-        self.assertTrue(is_object_transient_sysmeta(
+        self.assertTrue(rh.is_object_transient_sysmeta(
             'x-object-transient-sysmeta-foo'))
-        self.assertFalse(is_object_transient_sysmeta(
+        self.assertFalse(rh.is_object_transient_sysmeta(
             'x-object-transient-sysmeta-'))
-        self.assertFalse(is_object_transient_sysmeta(
+        self.assertFalse(rh.is_object_transient_sysmeta(
             'x-object-meatmeta-foo'))
 
     def test_strip_object_transient_sysmeta_prefix(self):
         mt = 'object-transient-sysmeta'
-        self.assertEqual(strip_object_transient_sysmeta_prefix('x-%s-a' % mt),
-                         'a')
+        self.assertEqual(rh.strip_object_transient_sysmeta_prefix(
+            'x-%s-a' % mt), 'a')
 
         mt = 'object-sysmeta-transient'
         with self.assertRaises(ValueError):
-            strip_object_transient_sysmeta_prefix('x-%s-a' % mt)
+            rh.strip_object_transient_sysmeta_prefix('x-%s-a' % mt)
 
     def test_remove_items(self):
         src = {'a': 'b',
                'c': 'd'}
         test = lambda x: x == 'a'
-        rem = remove_items(src, test)
+        rem = rh.remove_items(src, test)
         self.assertEqual(src, {'c': 'd'})
         self.assertEqual(rem, {'a': 'b'})
 
@@ -109,7 +105,7 @@ class TestRequestHelpers(unittest.TestCase):
         from_req = Request.blank('/path', environ={}, headers=src)
         to_req = Request.blank('/path', {})
         test = lambda x: x.lower() == 'a'
-        copy_header_subset(from_req, to_req, test)
+        rh.copy_header_subset(from_req, to_req, test)
         self.assertTrue('A' in to_req.headers)
         self.assertEqual(to_req.headers['A'], 'b')
         self.assertFalse('c' in to_req.headers)
@@ -121,7 +117,7 @@ class TestRequestHelpers(unittest.TestCase):
         req = Request.blank(path, headers={
             'X-Backend-Storage-Policy-Index': '0'})
         device, part, account, container, obj, policy = \
-            get_name_and_placement(req, 5, 5, True)
+            rh.get_name_and_placement(req, 5, 5, True)
         self.assertEqual(device, 'device')
         self.assertEqual(part, 'part')
         self.assertEqual(account, 'account')
@@ -132,7 +128,7 @@ class TestRequestHelpers(unittest.TestCase):
 
         req.headers['X-Backend-Storage-Policy-Index'] = 1
         device, part, account, container, obj, policy = \
-            get_name_and_placement(req, 5, 5, True)
+            rh.get_name_and_placement(req, 5, 5, True)
         self.assertEqual(device, 'device')
         self.assertEqual(part, 'part')
         self.assertEqual(account, 'account')
@@ -144,7 +140,7 @@ class TestRequestHelpers(unittest.TestCase):
         req.headers['X-Backend-Storage-Policy-Index'] = 'foo'
         with self.assertRaises(HTTPException) as raised:
             device, part, account, container, obj, policy = \
-                get_name_and_placement(req, 5, 5, True)
+                rh.get_name_and_placement(req, 5, 5, True)
         e = raised.exception
         self.assertEqual(e.status_int, 503)
         self.assertEqual(str(e), '503 Service Unavailable')
@@ -157,7 +153,7 @@ class TestRequestHelpers(unittest.TestCase):
         req = Request.blank(path, headers={
             'X-Backend-Storage-Policy-Index': '0'})
         device, partition, suffix_parts, policy = \
-            get_name_and_placement(req, 2, 3, True)
+            rh.get_name_and_placement(req, 2, 3, True)
         self.assertEqual(device, 'device')
         self.assertEqual(partition, 'part')
         self.assertEqual(suffix_parts, '012-345-678-9ab-cde')
@@ -168,7 +164,7 @@ class TestRequestHelpers(unittest.TestCase):
         req = Request.blank(path, headers={
             'X-Backend-Storage-Policy-Index': '1'})
         device, partition, suffix_parts, policy = \
-            get_name_and_placement(req, 2, 3, True)
+            rh.get_name_and_placement(req, 2, 3, True)
         self.assertEqual(device, 'device')
         self.assertEqual(partition, 'part')
         self.assertIsNone(suffix_parts)  # false-y
@@ -179,12 +175,185 @@ class TestRequestHelpers(unittest.TestCase):
         req = Request.blank(path, headers={
             'X-Backend-Storage-Policy-Index': '1'})
         device, partition, suffix_parts, policy = \
-            get_name_and_placement(req, 2, 3, True)
+            rh.get_name_and_placement(req, 2, 3, True)
         self.assertEqual(device, 'device')
         self.assertEqual(partition, 'part')
         self.assertEqual(suffix_parts, '')  # still false-y
         self.assertEqual(policy, POLICIES[1])
         self.assertEqual(policy.policy_type, REPL_POLICY)
+
+    def test_validate_internal_name(self):
+        self.assertIsNone(rh._validate_internal_name('foo'))
+        self.assertIsNone(rh._validate_internal_name(
+            rh.get_reserved_name('foo')))
+        self.assertIsNone(rh._validate_internal_name(
+            rh.get_reserved_name('foo', 'bar')))
+        self.assertIsNone(rh._validate_internal_name(''))
+        self.assertIsNone(rh._validate_internal_name(rh.RESERVED))
+
+    def test_invalid_reserved_name(self):
+        with self.assertRaises(HTTPException) as raised:
+            rh._validate_internal_name('foo' + rh.RESERVED)
+        e = raised.exception
+        self.assertEqual(e.status_int, 400)
+        self.assertEqual(str(e), '400 Bad Request')
+        self.assertEqual(e.body, b"Invalid reserved-namespace name")
+
+    def test_validate_internal_account(self):
+        self.assertIsNone(rh.validate_internal_account('AUTH_foo'))
+        self.assertIsNone(rh.validate_internal_account(
+            rh.get_reserved_name('AUTH_foo')))
+        with self.assertRaises(HTTPException) as raised:
+            rh.validate_internal_account('AUTH_foo' + rh.RESERVED)
+        e = raised.exception
+        self.assertEqual(e.status_int, 400)
+        self.assertEqual(str(e), '400 Bad Request')
+        self.assertEqual(e.body, b"Invalid reserved-namespace account")
+
+    def test_validate_internal_container(self):
+        self.assertIsNone(rh.validate_internal_container('AUTH_foo', 'bar'))
+        self.assertIsNone(rh.validate_internal_container(
+            rh.get_reserved_name('AUTH_foo'), 'bar'))
+        self.assertIsNone(rh.validate_internal_container(
+            'foo', rh.get_reserved_name('bar')))
+        self.assertIsNone(rh.validate_internal_container(
+            rh.get_reserved_name('AUTH_foo'), rh.get_reserved_name('bar')))
+        with self.assertRaises(HTTPException) as raised:
+            rh.validate_internal_container('AUTH_foo' + rh.RESERVED, 'bar')
+        e = raised.exception
+        self.assertEqual(e.status_int, 400)
+        self.assertEqual(str(e), '400 Bad Request')
+        self.assertEqual(e.body, b"Invalid reserved-namespace account")
+        with self.assertRaises(HTTPException) as raised:
+            rh.validate_internal_container('AUTH_foo', 'bar' + rh.RESERVED)
+        e = raised.exception
+        self.assertEqual(e.status_int, 400)
+        self.assertEqual(str(e), '400 Bad Request')
+        self.assertEqual(e.body, b"Invalid reserved-namespace container")
+
+        # These should always be operating on split_path outputs so this
+        # shouldn't really be an issue, but just in case...
+        for acct in ('', None):
+            with self.assertRaises(ValueError) as raised:
+                rh.validate_internal_container(
+                    acct, 'bar')
+            self.assertEqual(raised.exception.args[0], 'Account is required')
+
+    def test_validate_internal_object(self):
+        self.assertIsNone(rh.validate_internal_obj('AUTH_foo', 'bar', 'baz'))
+        self.assertIsNone(rh.validate_internal_obj(
+            rh.get_reserved_name('AUTH_foo'), 'bar', 'baz'))
+        for acct in ('AUTH_foo', rh.get_reserved_name('AUTH_foo')):
+            self.assertIsNone(rh.validate_internal_obj(
+                acct,
+                rh.get_reserved_name('bar'),
+                rh.get_reserved_name('baz')))
+        for acct in ('AUTH_foo', rh.get_reserved_name('AUTH_foo')):
+            with self.assertRaises(HTTPException) as raised:
+                rh.validate_internal_obj(
+                    acct, 'bar', rh.get_reserved_name('baz'))
+            e = raised.exception
+            self.assertEqual(e.status_int, 400)
+            self.assertEqual(str(e), '400 Bad Request')
+            self.assertEqual(e.body, b"Invalid reserved-namespace object "
+                             b"in user-namespace container")
+        for acct in ('AUTH_foo', rh.get_reserved_name('AUTH_foo')):
+            with self.assertRaises(HTTPException) as raised:
+                rh.validate_internal_obj(
+                    acct, rh.get_reserved_name('bar'), 'baz')
+            e = raised.exception
+            self.assertEqual(e.status_int, 400)
+            self.assertEqual(str(e), '400 Bad Request')
+            self.assertEqual(e.body, b"Invalid user-namespace object "
+                             b"in reserved-namespace container")
+
+        # These should always be operating on split_path outputs so this
+        # shouldn't really be an issue, but just in case...
+        for acct in ('', None):
+            with self.assertRaises(ValueError) as raised:
+                rh.validate_internal_obj(
+                    acct, 'bar', 'baz')
+            self.assertEqual(raised.exception.args[0], 'Account is required')
+
+        for cont in ('', None):
+            with self.assertRaises(ValueError) as raised:
+                rh.validate_internal_obj(
+                    'AUTH_foo', cont, 'baz')
+            self.assertEqual(raised.exception.args[0], 'Container is required')
+
+    def test_invalid_names_in_system_accounts(self):
+        self.assertIsNone(rh.validate_internal_obj(
+            AUTO_CREATE_ACCOUNT_PREFIX + 'system_account', 'foo',
+            'crazy%stown' % rh.RESERVED))
+
+    def test_invalid_reserved_names(self):
+        with self.assertRaises(HTTPException) as raised:
+            rh.validate_internal_obj('AUTH_foo' + rh.RESERVED, 'bar', 'baz')
+        e = raised.exception
+        self.assertEqual(e.status_int, 400)
+        self.assertEqual(str(e), '400 Bad Request')
+        self.assertEqual(e.body, b"Invalid reserved-namespace account")
+        with self.assertRaises(HTTPException) as raised:
+            rh.validate_internal_obj('AUTH_foo', 'bar' + rh.RESERVED, 'baz')
+        e = raised.exception
+        self.assertEqual(e.status_int, 400)
+        self.assertEqual(str(e), '400 Bad Request')
+        self.assertEqual(e.body, b"Invalid reserved-namespace container")
+        with self.assertRaises(HTTPException) as raised:
+            rh.validate_internal_obj('AUTH_foo', 'bar', 'baz' + rh.RESERVED)
+        e = raised.exception
+        self.assertEqual(e.status_int, 400)
+        self.assertEqual(str(e), '400 Bad Request')
+        self.assertEqual(e.body, b"Invalid reserved-namespace object")
+
+    def test_get_reserved_name(self):
+        expectations = {
+            tuple(): rh.RESERVED,
+            ('',): rh.RESERVED,
+            ('foo',): rh.RESERVED + 'foo',
+            ('foo', 'bar'): rh.RESERVED + 'foo' + rh.RESERVED + 'bar',
+            ('foo', ''): rh.RESERVED + 'foo' + rh.RESERVED,
+            ('', ''): rh.RESERVED * 2,
+        }
+        failures = []
+        for parts, expected in expectations.items():
+            name = rh.get_reserved_name(*parts)
+            if name != expected:
+                failures.append('get given %r expected %r != %r' % (
+                    parts, expected, name))
+        if failures:
+            self.fail('Unexpected reults:\n' + '\n'.join(failures))
+
+    def test_invalid_get_reserved_name(self):
+        self.assertRaises(ValueError)
+        with self.assertRaises(ValueError) as ctx:
+            rh.get_reserved_name('foo', rh.RESERVED + 'bar', 'baz')
+        self.assertEqual(str(ctx.exception),
+                         'Invalid reserved part in components')
+
+    def test_split_reserved_name(self):
+        expectations = {
+            rh.RESERVED: ('',),
+            rh.RESERVED + 'foo': ('foo',),
+            rh.RESERVED + 'foo' + rh.RESERVED + 'bar': ('foo', 'bar'),
+            rh.RESERVED + 'foo' + rh.RESERVED: ('foo', ''),
+            rh.RESERVED * 2: ('', ''),
+        }
+        failures = []
+        for name, expected in expectations.items():
+            parts = rh.split_reserved_name(name)
+            if tuple(parts) != expected:
+                failures.append('split given %r expected %r != %r' % (
+                    name, expected, parts))
+        if failures:
+            self.fail('Unexpected reults:\n' + '\n'.join(failures))
+
+    def test_invalid_split_reserved_name(self):
+        self.assertRaises(ValueError)
+        with self.assertRaises(ValueError) as ctx:
+            rh.split_reserved_name('foo')
+        self.assertEqual(str(ctx.exception),
+                         'Invalid reserved name')
 
 
 class TestHTTPResponseToDocumentIters(unittest.TestCase):
@@ -194,7 +363,7 @@ class TestHTTPResponseToDocumentIters(unittest.TestCase):
             {'Content-Length': '10', 'Content-Type': 'application/lunch'},
             b'sandwiches')
 
-        doc_iters = http_response_to_document_iters(fr)
+        doc_iters = rh.http_response_to_document_iters(fr)
         first_byte, last_byte, length, headers, body = next(doc_iters)
         self.assertEqual(first_byte, 0)
         self.assertEqual(last_byte, 9)
@@ -212,7 +381,7 @@ class TestHTTPResponseToDocumentIters(unittest.TestCase):
              'Content-Type': 'application/lunch'},
             b'sandwiches')
 
-        doc_iters = http_response_to_document_iters(fr)
+        doc_iters = rh.http_response_to_document_iters(fr)
         first_byte, last_byte, length, headers, body = next(doc_iters)
         self.assertEqual(first_byte, 0)
         self.assertIsNone(last_byte)
@@ -231,7 +400,7 @@ class TestHTTPResponseToDocumentIters(unittest.TestCase):
              'Content-Range': 'bytes 1-8/10'},
             b'andwiche')
 
-        doc_iters = http_response_to_document_iters(fr)
+        doc_iters = rh.http_response_to_document_iters(fr)
         first_byte, last_byte, length, headers, body = next(doc_iters)
         self.assertEqual(first_byte, 1)
         self.assertEqual(last_byte, 8)
@@ -251,7 +420,7 @@ class TestHTTPResponseToDocumentIters(unittest.TestCase):
              'Content-Range': 'bytes 1-8/10'},
             b'andwiche')
 
-        doc_iters = http_response_to_document_iters(fr)
+        doc_iters = rh.http_response_to_document_iters(fr)
         first_byte, last_byte, length, headers, body = next(doc_iters)
         self.assertEqual(first_byte, 1)
         self.assertEqual(last_byte, 8)
@@ -278,7 +447,7 @@ class TestHTTPResponseToDocumentIters(unittest.TestCase):
              b"ches\r\n"
              b"--asdfasdfasdf--"))
 
-        doc_iters = http_response_to_document_iters(fr)
+        doc_iters = rh.http_response_to_document_iters(fr)
 
         first_byte, last_byte, length, headers, body = next(doc_iters)
         self.assertEqual(first_byte, 0)
@@ -301,15 +470,15 @@ class TestHTTPResponseToDocumentIters(unittest.TestCase):
     def test_update_etag_is_at_header(self):
         # start with no existing X-Backend-Etag-Is-At
         req = Request.blank('/v/a/c/o')
-        update_etag_is_at_header(req, 'X-Object-Sysmeta-My-Etag')
+        rh.update_etag_is_at_header(req, 'X-Object-Sysmeta-My-Etag')
         self.assertEqual('X-Object-Sysmeta-My-Etag',
                          req.headers['X-Backend-Etag-Is-At'])
         # add another alternate
-        update_etag_is_at_header(req, 'X-Object-Sysmeta-Ec-Etag')
+        rh.update_etag_is_at_header(req, 'X-Object-Sysmeta-Ec-Etag')
         self.assertEqual('X-Object-Sysmeta-My-Etag,X-Object-Sysmeta-Ec-Etag',
                          req.headers['X-Backend-Etag-Is-At'])
         with self.assertRaises(ValueError) as cm:
-            update_etag_is_at_header(req, 'X-Object-Sysmeta-,-Bad')
+            rh.update_etag_is_at_header(req, 'X-Object-Sysmeta-,-Bad')
         self.assertEqual('Header name must not contain commas',
                          cm.exception.args[0])
 
@@ -317,49 +486,49 @@ class TestHTTPResponseToDocumentIters(unittest.TestCase):
         def do_test():
             req = Request.blank('/v/a/c/o')
             # ok to have no X-Backend-Etag-Is-At
-            self.assertIsNone(resolve_etag_is_at_header(req, metadata))
+            self.assertIsNone(rh.resolve_etag_is_at_header(req, metadata))
 
             # ok to have no matching metadata
             req.headers['X-Backend-Etag-Is-At'] = 'X-Not-There'
-            self.assertIsNone(resolve_etag_is_at_header(req, metadata))
+            self.assertIsNone(rh.resolve_etag_is_at_header(req, metadata))
 
             # selects from metadata
             req.headers['X-Backend-Etag-Is-At'] = 'X-Object-Sysmeta-Ec-Etag'
             self.assertEqual('an etag value',
-                             resolve_etag_is_at_header(req, metadata))
+                             rh.resolve_etag_is_at_header(req, metadata))
             req.headers['X-Backend-Etag-Is-At'] = 'X-Object-Sysmeta-My-Etag'
             self.assertEqual('another etag value',
-                             resolve_etag_is_at_header(req, metadata))
+                             rh.resolve_etag_is_at_header(req, metadata))
 
             # first in list takes precedence
             req.headers['X-Backend-Etag-Is-At'] = \
                 'X-Object-Sysmeta-My-Etag,X-Object-Sysmeta-Ec-Etag'
             self.assertEqual('another etag value',
-                             resolve_etag_is_at_header(req, metadata))
+                             rh.resolve_etag_is_at_header(req, metadata))
 
             # non-existent alternates are passed over
             req.headers['X-Backend-Etag-Is-At'] = \
                 'X-Bogus,X-Object-Sysmeta-My-Etag,X-Object-Sysmeta-Ec-Etag'
             self.assertEqual('another etag value',
-                             resolve_etag_is_at_header(req, metadata))
+                             rh.resolve_etag_is_at_header(req, metadata))
 
             # spaces in list are ok
             alts = 'X-Foo, X-Object-Sysmeta-My-Etag , X-Object-Sysmeta-Ec-Etag'
             req.headers['X-Backend-Etag-Is-At'] = alts
             self.assertEqual('another etag value',
-                             resolve_etag_is_at_header(req, metadata))
+                             rh.resolve_etag_is_at_header(req, metadata))
 
             # lower case in list is ok
             alts = alts.lower()
             req.headers['X-Backend-Etag-Is-At'] = alts
             self.assertEqual('another etag value',
-                             resolve_etag_is_at_header(req, metadata))
+                             rh.resolve_etag_is_at_header(req, metadata))
 
             # upper case in list is ok
             alts = alts.upper()
             req.headers['X-Backend-Etag-Is-At'] = alts
             self.assertEqual('another etag value',
-                             resolve_etag_is_at_header(req, metadata))
+                             rh.resolve_etag_is_at_header(req, metadata))
 
         metadata = {'X-Object-Sysmeta-Ec-Etag': 'an etag value',
                     'X-Object-Sysmeta-My-Etag': 'another etag value'}

@@ -1050,8 +1050,9 @@ is false.
 .IP \fBaccount_autocreate\fR
 If set to 'true' authorized accounts that do not yet exist within the Swift cluster
 will be automatically created. The default is set to false.
-.IP \fBauto_create_account_prefix\fR
-Prefix used when automatically creating accounts. The default is '.'.
+.IP "\fBauto_create_account_prefix [deprecated]\fR"
+Prefix used when automatically creating accounts. The default is '.'. Should
+be configured in swift.conf instead.
 .IP \fBmax_containers_per_account\fR
 If set to a positive value, trying to create a container when the account
 already has at least this maximum containers will result in a 403 Forbidden.
@@ -1061,8 +1062,6 @@ recheck_account_existence before the 403s kick in.
 This is a comma separated list of account hashes that ignore the max_containers_per_account cap.
 .IP \fBdeny_host_headers\fR
 Comma separated list of Host headers to which the proxy will deny requests. The default is empty.
-.IP \fBput_queue_depth\fR
-Depth of the proxy put queue. The default is 10.
 .IP \fBsorting_method\fR
 Storage nodes can be chosen at random (shuffle - default), by using timing
 measurements (timing), or by using an explicit match (affinity).

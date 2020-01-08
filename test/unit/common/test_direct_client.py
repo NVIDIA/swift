@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
 import unittest
 import os
@@ -22,7 +23,6 @@ import time
 import pickle
 
 import mock
-import six
 from six.moves import urllib
 
 from swift.common import direct_client
@@ -72,7 +72,7 @@ class FakeConn(object):
         return self.resp_headers.items()
 
     def read(self, amt=None):
-        if isinstance(self.body, six.BytesIO):
+        if isinstance(self.body, io.BytesIO):
             return self.body.read(amt)
         elif amt is None:
             return self.body
@@ -132,66 +132,76 @@ class TestDirectClient(unittest.TestCase):
         stub_user_agent = 'direct-client %s' % os.getpid()
 
         headers = direct_client.gen_headers(add_ts=False)
-        self.assertEqual(headers['user-agent'], stub_user_agent)
-        self.assertEqual(1, len(headers))
+        self.assertEqual(dict(headers), {
+            'User-Agent': stub_user_agent,
+            'X-Backend-Allow-Reserved-Names': 'true',
+        })
 
-        now = time.time()
-        headers = direct_client.gen_headers()
-        self.assertEqual(headers['user-agent'], stub_user_agent)
-        self.assertTrue(now - 1 < Timestamp(headers['x-timestamp']) < now + 1)
-        self.assertEqual(headers['x-timestamp'],
-                         Timestamp(headers['x-timestamp']).internal)
-        self.assertEqual(2, len(headers))
+        with mock.patch('swift.common.utils.Timestamp.now',
+                        return_value=Timestamp('123.45')):
+            headers = direct_client.gen_headers()
+        self.assertEqual(dict(headers), {
+            'User-Agent': stub_user_agent,
+            'X-Backend-Allow-Reserved-Names': 'true',
+            'X-Timestamp': '0000000123.45000',
+        })
 
         headers = direct_client.gen_headers(hdrs_in={'x-timestamp': '15'})
-        self.assertEqual(headers['x-timestamp'], '15')
-        self.assertEqual(headers['user-agent'], stub_user_agent)
-        self.assertEqual(2, len(headers))
+        self.assertEqual(dict(headers), {
+            'User-Agent': stub_user_agent,
+            'X-Backend-Allow-Reserved-Names': 'true',
+            'X-Timestamp': '15',
+        })
 
-        headers = direct_client.gen_headers(hdrs_in={'foo-bar': '63'})
-        self.assertEqual(headers['user-agent'], stub_user_agent)
-        self.assertEqual(headers['foo-bar'], '63')
-        self.assertTrue(now - 1 < Timestamp(headers['x-timestamp']) < now + 1)
-        self.assertEqual(headers['x-timestamp'],
-                         Timestamp(headers['x-timestamp']).internal)
-        self.assertEqual(3, len(headers))
+        with mock.patch('swift.common.utils.Timestamp.now',
+                        return_value=Timestamp('12345.6789')):
+            headers = direct_client.gen_headers(hdrs_in={'foo-bar': '63'})
+        self.assertEqual(dict(headers), {
+            'User-Agent': stub_user_agent,
+            'Foo-Bar': '63',
+            'X-Backend-Allow-Reserved-Names': 'true',
+            'X-Timestamp': '0000012345.67890',
+        })
 
         hdrs_in = {'foo-bar': '55'}
         headers = direct_client.gen_headers(hdrs_in, add_ts=False)
-        self.assertEqual(headers['user-agent'], stub_user_agent)
-        self.assertEqual(headers['foo-bar'], '55')
-        self.assertEqual(2, len(headers))
+        self.assertEqual(dict(headers), {
+            'User-Agent': stub_user_agent,
+            'Foo-Bar': '55',
+            'X-Backend-Allow-Reserved-Names': 'true',
+        })
 
-        headers = direct_client.gen_headers(hdrs_in={'user-agent': '32'})
-        self.assertEqual(headers['user-agent'], '32')
-        self.assertTrue(now - 1 < Timestamp(headers['x-timestamp']) < now + 1)
-        self.assertEqual(headers['x-timestamp'],
-                         Timestamp(headers['x-timestamp']).internal)
-        self.assertEqual(2, len(headers))
+        with mock.patch('swift.common.utils.Timestamp.now',
+                        return_value=Timestamp('12345')):
+            headers = direct_client.gen_headers(hdrs_in={'user-agent': '32'})
+        self.assertEqual(dict(headers), {
+            'User-Agent': '32',
+            'X-Backend-Allow-Reserved-Names': 'true',
+            'X-Timestamp': '0000012345.00000',
+        })
 
         hdrs_in = {'user-agent': '47'}
         headers = direct_client.gen_headers(hdrs_in, add_ts=False)
-        self.assertEqual(headers['user-agent'], '47')
-        self.assertEqual(1, len(headers))
+        self.assertEqual(dict(headers), {
+            'User-Agent': '47',
+            'X-Backend-Allow-Reserved-Names': 'true',
+        })
 
         for policy in POLICIES:
             for add_ts in (True, False):
-                now = time.time()
-                headers = direct_client.gen_headers(
-                    {'X-Backend-Storage-Policy-Index': policy.idx},
-                    add_ts=add_ts)
-                self.assertEqual(headers['user-agent'], stub_user_agent)
-                self.assertEqual(headers['X-Backend-Storage-Policy-Index'],
-                                 str(policy.idx))
-                expected_header_count = 2
+                with mock.patch('swift.common.utils.Timestamp.now',
+                                return_value=Timestamp('123456789')):
+                    headers = direct_client.gen_headers(
+                        {'X-Backend-Storage-Policy-Index': policy.idx},
+                        add_ts=add_ts)
+                expected = {
+                    'User-Agent': stub_user_agent,
+                    'X-Backend-Storage-Policy-Index': str(policy.idx),
+                    'X-Backend-Allow-Reserved-Names': 'true',
+                }
                 if add_ts:
-                    expected_header_count += 1
-                    self.assertEqual(
-                        headers['x-timestamp'],
-                        Timestamp(headers['x-timestamp']).internal)
-                    self.assertTrue(
-                        now - 1 < Timestamp(headers['x-timestamp']) < now + 1)
-                self.assertEqual(expected_header_count, len(headers))
+                    expected['X-Timestamp'] = '0123456789.00000'
+                self.assertEqual(dict(headers), expected)
 
     def test_direct_get_account(self):
         def do_test(req_params):
@@ -628,7 +638,7 @@ class TestDirectClient(unittest.TestCase):
             important_timestamp)
 
     def test_direct_get_object(self):
-        contents = six.BytesIO(b'123456')
+        contents = io.BytesIO(b'123456')
 
         with mocked_http_conn(200, body=contents) as conn:
             resp_header, obj_body = direct_client.direct_get_object(
@@ -654,7 +664,7 @@ class TestDirectClient(unittest.TestCase):
         self.assertTrue('GET' in str(raised.exception))
 
     def test_direct_get_object_chunks(self):
-        contents = six.BytesIO(b'123456')
+        contents = io.BytesIO(b'123456')
 
         with mocked_http_conn(200, body=contents) as conn:
             resp_header, obj_body = direct_client.direct_get_object(
@@ -774,7 +784,7 @@ class TestDirectClient(unittest.TestCase):
         self._test_direct_get_suffix_hashes_fail(507)
 
     def test_direct_put_object_with_content_length(self):
-        contents = six.BytesIO(b'123456')
+        contents = io.BytesIO(b'123456')
 
         with mocked_http_conn(200) as conn:
             resp = direct_client.direct_put_object(
@@ -787,7 +797,7 @@ class TestDirectClient(unittest.TestCase):
         self.assertEqual(md5(b'123456').hexdigest(), resp)
 
     def test_direct_put_object_fail(self):
-        contents = six.BytesIO(b'123456')
+        contents = io.BytesIO(b'123456')
 
         with mocked_http_conn(500) as conn:
             with self.assertRaises(ClientException) as raised:
@@ -801,7 +811,7 @@ class TestDirectClient(unittest.TestCase):
         self.assertEqual(raised.exception.http_status, 500)
 
     def test_direct_put_object_chunked(self):
-        contents = six.BytesIO(b'123456')
+        contents = io.BytesIO(b'123456')
 
         with mocked_http_conn(200) as conn:
             resp = direct_client.direct_put_object(
@@ -829,7 +839,7 @@ class TestDirectClient(unittest.TestCase):
         self.assertEqual(md5(b'0\r\n\r\n').hexdigest(), resp)
 
     def test_direct_put_object_header_content_length(self):
-        contents = six.BytesIO(b'123456')
+        contents = io.BytesIO(b'123456')
         stub_headers = HeaderKeyDict({
             'Content-Length': '6'})
 

@@ -46,7 +46,7 @@ import math
 import inspect
 
 import six
-from six import BytesIO, StringIO
+from six import StringIO
 from six.moves.queue import Queue, Empty
 from six.moves import http_client
 from six.moves import range
@@ -59,6 +59,7 @@ import fcntl
 import shutil
 
 from getpass import getuser
+from io import BytesIO
 from shutil import rmtree
 from functools import partial
 from tempfile import TemporaryFile, NamedTemporaryFile, mkdtemp
@@ -856,6 +857,32 @@ class TestTimestamp(unittest.TestCase):
         d = {ts_0: 'whatever'}
         self.assertIn(ts_0, d)  # sanity
         self.assertIn(ts_0_also, d)
+
+    def test_inversion(self):
+        ts = utils.Timestamp(0)
+        self.assertIsInstance(~ts, utils.Timestamp)
+        self.assertEqual((~ts).internal, '9999999999.99999')
+
+        ts = utils.Timestamp(123456.789)
+        self.assertIsInstance(~ts, utils.Timestamp)
+        self.assertEqual(ts.internal, '0000123456.78900')
+        self.assertEqual((~ts).internal, '9999876543.21099')
+
+        timestamps = sorted(utils.Timestamp(random.random() * 1e10)
+                            for _ in range(20))
+        self.assertEqual([x.internal for x in timestamps],
+                         sorted(x.internal for x in timestamps))
+        self.assertEqual([(~x).internal for x in reversed(timestamps)],
+                         sorted((~x).internal for x in timestamps))
+
+        ts = utils.Timestamp.now()
+        self.assertGreater(~ts, ts)  # NB: will break around 2128
+
+        ts = utils.Timestamp.now(offset=1)
+        with self.assertRaises(ValueError) as caught:
+            ~ts
+        self.assertEqual(caught.exception.args[0],
+                         'Cannot invert timestamps with offsets')
 
 
 class TestTimestampEncoding(unittest.TestCase):
@@ -2284,15 +2311,16 @@ log_name = %(yarr)s'''
         }
         self.assertEqual(conf, expected)
 
-    def _check_drop_privileges(self, mock_os, required_func_calls,
-                               call_setsid=True):
+    def test_drop_privileges(self):
+        required_func_calls = ('setgroups', 'setgid', 'setuid')
+        mock_os = MockOs(called_funcs=required_func_calls)
         user = getuser()
         user_data = pwd.getpwnam(user)
         self.assertFalse(mock_os.called_funcs)  # sanity check
         # over-ride os with mock
         with mock.patch('swift.common.utils.os', mock_os):
             # exercise the code
-            utils.drop_privileges(user, call_setsid=call_setsid)
+            utils.drop_privileges(user)
 
         for func in required_func_calls:
             self.assertIn(func, mock_os.called_funcs)
@@ -2301,34 +2329,41 @@ log_name = %(yarr)s'''
         self.assertEqual(groups, set(mock_os.called_funcs['setgroups'][0]))
         self.assertEqual(user_data[3], mock_os.called_funcs['setgid'][0])
         self.assertEqual(user_data[2], mock_os.called_funcs['setuid'][0])
-        self.assertEqual('/', mock_os.called_funcs['chdir'][0])
-        self.assertEqual(0o22, mock_os.called_funcs['umask'][0])
 
-    def test_drop_privileges(self):
-        required_func_calls = ('setgroups', 'setgid', 'setuid', 'setsid',
-                               'chdir', 'umask')
+    def test_drop_privileges_no_setgroups(self):
+        required_func_calls = ('geteuid', 'setgid', 'setuid')
         mock_os = MockOs(called_funcs=required_func_calls)
-        self._check_drop_privileges(mock_os, required_func_calls)
+        user = getuser()
+        user_data = pwd.getpwnam(user)
+        self.assertFalse(mock_os.called_funcs)  # sanity check
+        # over-ride os with mock
+        with mock.patch('swift.common.utils.os', mock_os):
+            # exercise the code
+            utils.drop_privileges(user)
 
-    def test_drop_privileges_setsid_error(self):
-        # OSError trying to get session leader
-        required_func_calls = ('setgroups', 'setgid', 'setuid', 'setsid',
-                               'chdir', 'umask')
-        mock_os = MockOs(called_funcs=required_func_calls,
-                         raise_funcs=('setsid',))
-        self._check_drop_privileges(mock_os, required_func_calls)
+        for func in required_func_calls:
+            self.assertIn(func, mock_os.called_funcs)
+        self.assertNotIn('setgroups', mock_os.called_funcs)
+        self.assertEqual(user_data[5], mock_os.environ['HOME'])
+        self.assertEqual(user_data[3], mock_os.called_funcs['setgid'][0])
+        self.assertEqual(user_data[2], mock_os.called_funcs['setuid'][0])
 
-    def test_drop_privileges_no_call_setsid(self):
-        required_func_calls = ('setgroups', 'setgid', 'setuid', 'chdir',
-                               'umask')
-        # OSError if trying to get session leader, but it shouldn't be called
+    def test_clean_up_daemon_hygene(self):
+        required_func_calls = ('chdir', 'umask')
+        # OSError if trying to get session leader, but setsid() OSError is
+        # ignored by the code under test.
         bad_func_calls = ('setsid',)
         mock_os = MockOs(called_funcs=required_func_calls,
                          raise_funcs=bad_func_calls)
-        self._check_drop_privileges(mock_os, required_func_calls,
-                                    call_setsid=False)
+        with mock.patch('swift.common.utils.os', mock_os):
+            # exercise the code
+            utils.clean_up_daemon_hygiene()
+        for func in required_func_calls:
+            self.assertIn(func, mock_os.called_funcs)
         for func in bad_func_calls:
-            self.assertNotIn(func, mock_os.called_funcs)
+            self.assertIn(func, mock_os.called_funcs)
+        self.assertEqual('/', mock_os.called_funcs['chdir'][0])
+        self.assertEqual(0o22, mock_os.called_funcs['umask'][0])
 
     @reset_logger_state
     def test_capture_stdio(self):
@@ -7979,6 +8014,15 @@ class TestFallocate(unittest.TestCase):
         # work the way you'd expect with ctypes :-/
         self.assertEqual(sys_fallocate_mock.mock_calls[0][1][2].value, 0)
         self.assertEqual(sys_fallocate_mock.mock_calls[0][1][3].value, 0)
+        sys_fallocate_mock.reset_mock()
+
+        # negative size will be adjusted as 0
+        utils.fallocate(0, -1, 0)
+        self.assertEqual(
+            [mock.call(0, utils.FALLOC_FL_KEEP_SIZE, mock.ANY, mock.ANY)],
+            sys_fallocate_mock.mock_calls)
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][2].value, 0)
+        self.assertEqual(sys_fallocate_mock.mock_calls[0][1][3].value, 0)
 
 
 @patch.object(os, 'fstatvfs')
@@ -8170,6 +8214,8 @@ class TestPunchHole(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             utils.punch_hole(0, 1, -1)
+        with self.assertRaises(ValueError):
+            utils.punch_hole(0, 1 << 64, 1)
         with self.assertRaises(ValueError):
             utils.punch_hole(0, -1, 1)
         with self.assertRaises(ValueError):
