@@ -59,8 +59,7 @@ from swift.common.middleware.s3api.utils import MULTIUPLOAD_SUFFIX, \
 
 
 def get_acl_handler(controller_name):
-    for base_klass in [BaseAclHandler, MultiUploadAclHandler,
-                       BucketAclHandler]:
+    for base_klass in [BaseAclHandler, MultiUploadAclHandler]:
         # pylint: disable-msg=E1101
         for handler in base_klass.__subclasses__():
             handler_suffix_len = len('AclHandler') \
@@ -226,11 +225,6 @@ class BucketAclHandler(BaseAclHandler):
         # FIXME If this request is failed, there is a possibility that the
         # bucket which has no ACL is left.
         return self.req.get_acl_response(app, 'POST')
-
-
-class VersioningAclHandler(BucketAclHandler):
-    def POST(self, app):
-        return self._handle_acl(app, 'POST')
 
 
 class ObjectAclHandler(BaseAclHandler):
@@ -474,10 +468,6 @@ ACL_MAP = {
     # Versioning
     ('PUT', 'POST', 'container'):
     {'Permission': 'WRITE'},
-    ('DELETE', 'POST', 'container'):
-    {'Permission': 'WRITE'},
     ('DELETE', 'GET', 'container'):
-    {'Permission': 'READ'},
-    ('DELETE', 'GET', 'object'):
-    {'Permission': 'READ'},
+    {'Permission': 'WRITE'},
 }

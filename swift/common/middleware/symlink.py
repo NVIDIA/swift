@@ -207,7 +207,8 @@ from swift.common.utils import get_logger, register_swift_info, split_path, \
 from swift.common.constraints import check_account_format
 from swift.common.wsgi import WSGIContext, make_subrequest
 from swift.common.request_helpers import get_sys_meta_prefix, \
-    check_path_header, get_container_update_override_key
+    check_path_header, get_container_update_override_key, \
+    update_ignore_range_header
 from swift.common.swob import Request, HTTPBadRequest, HTTPTemporaryRedirect, \
     HTTPException, HTTPConflict, HTTPPreconditionFailed, wsgi_quote, \
     wsgi_unquote, status_map
@@ -431,6 +432,7 @@ class SymlinkObjectContext(WSGIContext):
         :param req: HTTP GET or HEAD object request
         :returns: Response Iterator
         """
+        update_ignore_range_header(req, TGT_OBJ_SYSMETA_SYMLINK_HDR)
         try:
             return self._recursive_get_head(req)
         except LinkIterError:
@@ -513,6 +515,12 @@ class SymlinkObjectContext(WSGIContext):
 
     def _validate_etag_and_update_sysmeta(self, req, symlink_target_path,
                                           etag):
+        if req.environ.get('swift.symlink_override'):
+            req.headers[TGT_ETAG_SYSMETA_SYMLINK_HDR] = etag
+            req.headers[TGT_BYTES_SYSMETA_SYMLINK_HDR] = \
+                req.headers[TGT_BYTES_SYMLINK_HDR]
+            return
+
         # next we'll make sure the E-Tag matches a real object
         new_req = make_subrequest(
             req.environ, path=wsgi_quote(symlink_target_path), method='HEAD',

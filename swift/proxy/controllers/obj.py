@@ -520,8 +520,9 @@ class BaseObjectController(Controller):
         req = constraints.check_delete_headers(req)
 
         if 'x-delete-at' in req.headers:
-            x_delete_at = int(normalize_delete_at_timestamp(
-                int(req.headers['x-delete-at'])))
+            req.headers['x-delete-at'] = normalize_delete_at_timestamp(
+                int(req.headers['x-delete-at']))
+            x_delete_at = int(req.headers['x-delete-at'])
 
             req.environ.setdefault('swift.log_info', []).append(
                 'x-delete-at:%s' % x_delete_at)
@@ -2388,6 +2389,8 @@ class ECObjectController(BaseObjectController):
                                safe_iter, partition, policy,
                                buckets.get_extra_headers)
 
+        # Put this back, since we *may* need it for kickoff()/_fix_response()
+        # (but note that _fix_ranges() may also pop it back off before then)
         req.range = orig_range
         if best_bucket and best_bucket.shortfall <= 0 and best_bucket.durable:
             # headers can come from any of the getters
@@ -2411,6 +2414,7 @@ class ECObjectController(BaseObjectController):
                 conditional_response=True,
                 app_iter=app_iter)
             update_headers(resp, resp_headers)
+            self._fix_ranges(req, resp)
             try:
                 app_iter.kickoff(req, resp)
             except HTTPException as err_resp:
@@ -2455,6 +2459,10 @@ class ECObjectController(BaseObjectController):
                 req, statuses, reasons, bodies, 'Object',
                 headers=headers)
         self._fix_response(req, resp)
+
+        # For sure put this back before actually returning the response
+        # to the rest of the pipeline, so we don't modify the client headers
+        req.range = orig_range
         return resp
 
     def _fix_response(self, req, resp):
@@ -2476,6 +2484,21 @@ class ECObjectController(BaseObjectController):
         if resp.status_int == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE:
             resp.headers['Content-Range'] = 'bytes */%s' % resp.headers[
                 'X-Object-Sysmeta-Ec-Content-Length']
+
+    def _fix_ranges(self, req, resp):
+        # Has to be called *before* kickoff()!
+        if is_success(resp.status_int):
+            ignore_range_headers = set(
+                h.strip().lower()
+                for h in req.headers.get(
+                    'X-Backend-Ignore-Range-If-Metadata-Present',
+                    '').split(','))
+            if ignore_range_headers.intersection(
+                    h.lower() for h in resp.headers):
+                # If we leave the Range header around, swob (or somebody) will
+                # try to "fix" things for us when we kickoff() the app_iter.
+                req.headers.pop('Range', None)
+                resp.app_iter.range_specs = []
 
     def _make_putter(self, node, part, req, headers):
         return MIMEPutter.connect(

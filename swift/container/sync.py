@@ -42,8 +42,10 @@ from swift.common.utils import (
     FileLikeIter, get_logger, hash_path, quote, validate_sync_to,
     whataremyips, Timestamp, decode_timestamps)
 from swift.common.daemon import Daemon
-from swift.common.http import HTTP_UNAUTHORIZED, HTTP_NOT_FOUND
+from swift.common.http import HTTP_UNAUTHORIZED, HTTP_NOT_FOUND, HTTP_CONFLICT
 from swift.common.wsgi import ConfigString
+from swift.common.middleware.versioned_writes.object_versioning import (
+    SYSMETA_VERSIONS_CONT, SYSMETA_VERSIONS_SYMLINK)
 
 
 # The default internal client config body is to support upgrades without
@@ -358,6 +360,13 @@ class ContainerSync(Daemon):
                     break
             else:
                 return
+            if broker.metadata.get(SYSMETA_VERSIONS_CONT):
+                self.container_skips += 1
+                self.logger.increment('skips')
+                self.logger.warning('Skipping container %s/%s with '
+                                    'object versioning configured' % (
+                                        info['account'], info['container']))
+                return
             if not broker.is_deleted():
                 sync_to = None
                 user_key = None
@@ -561,7 +570,8 @@ class ContainerSync(Daemon):
                                   logger=self.logger,
                                   timeout=self.conn_timeout)
                 except ClientException as err:
-                    if err.http_status != HTTP_NOT_FOUND:
+                    if err.http_status not in (
+                            HTTP_NOT_FOUND, HTTP_CONFLICT):
                         raise
                 self.container_deletes += 1
                 self.container_stats['deletes'] += 1
@@ -594,6 +604,16 @@ class ContainerSync(Daemon):
                     headers = {}
                     body = None
                     exc = err
+
+                # skip object_versioning links; this is in case the container
+                # metadata is out of date
+                if headers.get(SYSMETA_VERSIONS_SYMLINK):
+                    self.logger.info(
+                        'Skipping versioning symlink %s/%s/%s ' % (
+                            info['account'], info['container'],
+                            row['name']))
+                    return True
+
                 timestamp = Timestamp(headers.get('x-timestamp', 0))
                 if timestamp < ts_meta:
                     if exc:

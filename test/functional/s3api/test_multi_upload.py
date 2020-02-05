@@ -15,7 +15,7 @@
 
 import base64
 import binascii
-import unittest2
+import unittest
 import os
 import boto
 
@@ -1106,4 +1106,4 @@ class TestS3ApiMultiUploadSigV4(TestS3ApiMultiUpload):
         self.assertEqual(status, 204)  # sanity
 
 if __name__ == '__main__':
-    unittest2.main()
+    unittest.main()
