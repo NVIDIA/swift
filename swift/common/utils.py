@@ -3366,6 +3366,12 @@ class GreenAsyncPile(object):
             return rv
     __next__ = next
 
+    def killall(self):
+        # Get a copy so we aren't modifying as we iterate
+        to_kill = list(self._pool.coroutines_running)
+        for gt in to_kill:
+            gt.kill()
+
 
 class StreamingPile(GreenAsyncPile):
     """

@@ -39,6 +39,7 @@ from swift import gettext_ as _
 
 from eventlet import sleep
 from eventlet.timeout import Timeout
+from eventlet.support.greenlets import GreenletExit
 import six
 
 from swift.common.wsgi import make_pre_authed_env, make_pre_authed_request
@@ -1260,6 +1261,7 @@ class ResumingGetter(object):
             req_headers.update(self.header_provider())
         start_node_timing = time.time()
         try:
+            conn = None
             with ConnectionTimeout(self.app.conn_timeout):
                 conn = http_connect(
                     node['ip'], node['port'], node['device'],
@@ -1272,6 +1274,11 @@ class ResumingGetter(object):
                 possible_source = conn.getresponse()
                 # See NOTE: swift_conn at top of file about this.
                 possible_source.swift_conn = conn
+        except GreenletExit:
+            # Make sure socket gets cleaned up
+            if conn:
+                conn.close()
+            raise
         except (Exception, Timeout):
             self.app.exception_occurred(
                 node, self.server_type,
@@ -1375,6 +1382,8 @@ class ResumingGetter(object):
         else:
             # ran out of nodes, see if any stragglers will finish
             any(pile)
+        # clean up the pile before we let it go out of scope
+        pile.killall()
 
         # this helps weed out any sucess status that were found before a 404
         # and added to the list in the case of x-newest.
