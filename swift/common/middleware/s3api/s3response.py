@@ -46,6 +46,49 @@ class HeaderKeyDict(header_key_dict.HeaderKeyDict):
         return s
 
 
+def translate_swift_to_s3(key, val):
+    _key = swob.bytes_to_wsgi(swob.wsgi_to_bytes(key).lower())
+
+    if _key.startswith('x-object-meta-'):
+        # Note that AWS ignores user-defined headers with '=' in the
+        # header name. We translated underscores to '=5F' on the way
+        # in, though.
+        return 'x-amz-meta-' + _key[14:].replace('=5f', '_'), val
+    elif _key in ('content-length', 'content-type',
+                  'content-range', 'content-encoding',
+                  'content-disposition', 'content-language',
+                  'etag', 'last-modified', 'x-robots-tag',
+                  'cache-control', 'expires'):
+        return key, val
+    elif _key == 'x-object-version-id':
+        return 'x-amz-version-id', val
+    elif _key == 'x-copied-from-version-id':
+        return 'x-amz-copy-source-version-id', val
+    elif _key == 'x-backend-content-type' and \
+            val == DELETE_MARKER_CONTENT_TYPE:
+        return 'x-amz-delete-marker', 'true'
+    elif _key == 'access-control-expose-headers':
+        exposed_headers = val.split(', ')
+        exposed_headers.extend([
+            'x-amz-request-id',
+            'x-amz-id-2',
+        ])
+        return 'access-control-expose-headers', ', '.join(
+            'x-amz-meta-' + h[14:] if h.startswith('x-object-meta-') else h
+            for h in exposed_headers)
+
+    elif _key == 'access-control-allow-methods':
+        methods = val.split(', ')
+        try:
+            methods.remove('COPY')  # that's not a thing in S3
+        except ValueError:
+            pass  # not there? don't worry about it
+        return key, ', '.join(methods)
+    elif _key.startswith('access-control-'):
+        return key, val
+    return None
+
+
 class S3ResponseBase(object):
     """
     Base class for swift3 responses.
@@ -98,29 +141,13 @@ class S3Response(S3ResponseBase, swob.Response):
 
         # Handle swift headers
         for key, val in sw_headers.items():
-            _key = swob.bytes_to_wsgi(swob.wsgi_to_bytes(key).lower())
+            s3_pair = translate_swift_to_s3(key, val)
+            if s3_pair is None:
+                continue
+            headers[s3_pair[0]] = s3_pair[1]
 
-            if _key.startswith('x-object-meta-'):
-                # Note that AWS ignores user-defined headers with '=' in the
-                # header name. We translated underscores to '=5F' on the way
-                # in, though.
-                headers['x-amz-meta-' + _key[14:].replace('=5f', '_')] = val
-            elif _key in ('content-length', 'content-type',
-                          'content-range', 'content-encoding',
-                          'content-disposition', 'content-language',
-                          'etag', 'last-modified', 'x-robots-tag',
-                          'cache-control', 'expires'):
-                headers[key] = val
-            elif _key == 'x-object-version-id':
-                headers['x-amz-version-id'] = val
-            elif _key == 'x-copied-from-version-id':
-                headers['x-amz-copy-source-version-id'] = val
-            elif _key == 'x-static-large-object':
-                # for delete slo
-                self.is_slo = config_true_value(val)
-            elif _key == 'x-backend-content-type' and \
-                    val == DELETE_MARKER_CONTENT_TYPE:
-                headers['x-amz-delete-marker'] = 'true'
+        self.is_slo = config_true_value(sw_headers.get(
+            'x-static-large-object'))
 
         # Check whether we stored the AWS-style etag on upload
         override_etag = s3_sysmeta_headers.get(
