@@ -118,6 +118,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             'min_segment_size': 5242880,
             'multi_delete_concurrency': 2,
             's3_acl': False,
+            'cors_preflight_allow_origin': [],
         })
         s3api = S3ApiMiddleware(None, {})
         self.assertEqual(expected, s3api.conf)
@@ -140,8 +141,11 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             'min_segment_size': 1000000,
             'multi_delete_concurrency': 1,
             's3_acl': True,
+            'cors_preflight_allow_origin': 'foo.example.com,bar.example.com',
         }
         s3api = S3ApiMiddleware(None, conf)
+        conf['cors_preflight_allow_origin'] = \
+            conf['cors_preflight_allow_origin'].split(',')
         self.assertEqual(conf, s3api.conf)
 
         def check_bad_positive_ints(**kwargs):
