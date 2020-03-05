@@ -92,9 +92,12 @@ class ObjectVersioningBaseTestCase(unittest.TestCase):
         self.cache_version_off.set(
             get_cache_key('a', self.build_container_name('c')),
             {'status': 200})
+        self.expected_unread_requests = {}
 
     def tearDown(self):
         self.assertEqual(self.app.unclosed_requests, {})
+        self.assertEqual(self.app.unread_requests,
+                         self.expected_unread_requests)
 
     def call_ov(self, req):
         self.authorized = []
@@ -1776,6 +1779,38 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertIn(('X-Object-Version-Id', 'null'), headers)
         self.assertEqual(b'foobar', body)
 
+    def test_GET_null_id_versioned_obj(self):
+        self.app.register(
+            'GET', '/v1/a/c/o', swob.HTTPOk, {
+                'Content-Location': self.build_versions_path(
+                    obj='o', version='9999998765.99999')},
+            '')
+        req = Request.blank(
+            '/v1/a/c/o', method='GET',
+            environ={'swift.cache': self.cache_version_on},
+            params={'version-id': 'null'})
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '404 Not Found')
+        self.assertEqual(1, len(self.authorized))
+        self.assertEqual(1, len(self.app.calls))
+        self.assertNotIn(('X-Object-Version-Id', '0000001234.00000'), headers)
+        # This will log a 499 but (at the moment, anyway)
+        # we don't have a good way to avoid it
+        self.expected_unread_requests[('GET', '/v1/a/c/o?version-id=null')] = 1
+
+    def test_GET_null_id_404(self):
+        self.app.register(
+            'GET', '/v1/a/c/o', swob.HTTPNotFound, {}, '')
+        req = Request.blank(
+            '/v1/a/c/o', method='GET',
+            environ={'swift.cache': self.cache_version_on},
+            params={'version-id': 'null'})
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '404 Not Found')
+        self.assertEqual(1, len(self.authorized))
+        self.assertEqual(1, len(self.app.calls))
+        self.assertNotIn(('X-Object-Version-Id', 'null'), headers)
+
     def test_HEAD_null_id(self):
         self.app.register(
             'HEAD', '/v1/a/c/o', swob.HTTPOk, {'X-Object-Meta-Foo': 'bar'}, '')
@@ -2680,6 +2715,20 @@ class ObjectVersioningTestAccountOperations(ObjectVersioningBaseTestCase):
             'last_modified': '1970-01-01T00:00:20.000000',
         }]
         self.assertEqual(expected, json.loads(body))
+
+        req.query_string = 'limit=1'
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '200 OK')
+        self.assertEqual(1, len(json.loads(body)))
+
+        req.query_string = 'limit=foo'
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '200 OK')
+        self.assertEqual(2, len(json.loads(body)))
+
+        req.query_string = 'limit=100000000000000000000000'
+        status, headers, body = self.call_ov(req)
+        self.assertEqual(status, '412 Precondition Failed')
 
     def test_list_containers_prefix(self):
         listing_body = [{

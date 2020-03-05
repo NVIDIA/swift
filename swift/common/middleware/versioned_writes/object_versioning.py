@@ -151,12 +151,14 @@ import time
 from cgi import parse_header
 from six.moves.urllib.parse import unquote
 
-from swift.common.constraints import MAX_FILE_SIZE
+from swift.common.constraints import MAX_FILE_SIZE, valid_api_version, \
+    ACCOUNT_LISTING_LIMIT
 from swift.common.exceptions import ListingIterNotFound, ListingIterError
 from swift.common.http import is_success, is_client_error, HTTP_NOT_FOUND, \
     HTTP_CONFLICT
 from swift.common.request_helpers import get_sys_meta_prefix, \
-    copy_header_subset, get_reserved_name, split_reserved_name
+    copy_header_subset, get_reserved_name, split_reserved_name, \
+    constrain_req_limit
 from swift.common.middleware.symlink import TGT_OBJ_SYMLINK_HDR, \
     TGT_ETAG_SYSMETA_SYMLINK_HDR, SYMLOOP_EXTEND, ALLOW_RESERVED_NAMES, \
     TGT_BYTES_SYSMETA_SYMLINK_HDR, TGT_ACCT_SYMLINK_HDR
@@ -166,7 +168,7 @@ from swift.common.swob import HTTPPreconditionFailed, HTTPServiceUnavailable, \
     HTTPRequestEntityTooLarge, HTTPInternalServerError, HTTPNotAcceptable, \
     HTTPConflict
 from swift.common.storage_policy import POLICIES
-from swift.common.utils import get_logger, Timestamp, \
+from swift.common.utils import get_logger, Timestamp, drain_and_close, \
     config_true_value, close_if_possible, closing_if_possible, \
     FileLikeIter, split_path, parse_content_type, RESERVED_STR
 from swift.common.wsgi import WSGIContext, make_pre_authed_request
@@ -184,6 +186,7 @@ SYSMETA_VERSIONS_SYMLINK = get_sys_meta_prefix('object') + 'versions-symlink'
 
 def build_listing(*to_splice, **kwargs):
     reverse = kwargs.pop('reverse')
+    limit = kwargs.pop('limit')
     if kwargs:
         raise TypeError('Invalid keyword arguments received: %r' % kwargs)
 
@@ -196,7 +199,7 @@ def build_listing(*to_splice, **kwargs):
         itertools.chain(*to_splice),
         key=merge_key,
         reverse=reverse,
-    )).encode('ascii')
+    )[:limit]).encode('ascii')
 
 
 def non_expiry_header(header):
@@ -346,6 +349,8 @@ class ObjectContext(ObjectVersioningContext):
             put_req.headers['Content-Type'] += '; swift_bytes=%s' % slo_size
             put_req.environ['swift.content_type_overridden'] = True
         put_resp = put_req.get_response(self.app)
+        drain_and_close(put_resp)
+        # the PUT should have already drained source_resp
         close_if_possible(source_resp.app_iter)
         return put_resp
 
@@ -382,11 +387,19 @@ class ObjectContext(ObjectVersioningContext):
 
         # do the write
         put_resp = put_req.get_response(self.app)
+<<<<<<< HEAD
+=======
+        drain_and_close(put_resp)
+        close_if_possible(put_req.environ['wsgi.input'])
+
+        if put_resp.status_int == HTTP_NOT_FOUND:
+            raise HTTPInternalServerError(
+                request=req, content_type='text/plain',
+                body=b'The versions container does not exist. You may '
+                     b'want to re-enable object versioning.')
+
+>>>>>>> ss-release-2.24.0.3
         self._check_response_error(req, put_resp)
-        with closing_if_possible(put_resp.app_iter), closing_if_possible(
-                put_req.environ['wsgi.input']):
-            for chunk in put_resp.app_iter:
-                pass
         put_bytes = byte_counter.bytes_read
         # N.B. this is essentially the same hack that symlink does in
         # _validate_etag_and_update_sysmeta to deal with SLO
@@ -440,7 +453,7 @@ class ObjectContext(ObjectVersioningContext):
         """
         if is_success(resp.status_int):
             return
-        close_if_possible(resp.app_iter)
+        drain_and_close(resp)
         if is_client_error(resp.status_int):
             # missing container or bad permissions
             if resp.status_int == 404:
@@ -479,10 +492,7 @@ class ObjectContext(ObjectVersioningContext):
 
         if get_resp.status_int == HTTP_NOT_FOUND:
             # nothing to version, proceed with original request
-            for chunk in get_resp.app_iter:
-                # Should be short; just avoiding the 499
-                pass
-            close_if_possible(get_resp.app_iter)
+            drain_and_close(get_resp)
             return get_resp
 
         # check for any other errors
@@ -490,7 +500,7 @@ class ObjectContext(ObjectVersioningContext):
 
         if get_resp.headers.get(SYSMETA_VERSIONS_SYMLINK) == 'true':
             # existing object is a VW symlink; no action required
-            close_if_possible(get_resp.app_iter)
+            drain_and_close(get_resp)
             return get_resp
 
         # if there's an existing object, then copy it to
@@ -507,9 +517,16 @@ class ObjectContext(ObjectVersioningContext):
             api_version, account_name, versions_cont, vers_obj_name)
         put_resp = self._put_versioned_obj(req, put_path_info, get_resp)
 
+<<<<<<< HEAD
+=======
+        if put_resp.status_int == HTTP_NOT_FOUND:
+            raise HTTPInternalServerError(
+                request=req, content_type='text/plain',
+                body=b'The versions container does not exist. You may '
+                     b'want to re-enable object versioning.')
+
+>>>>>>> ss-release-2.24.0.3
         self._check_response_error(req, put_resp)
-        close_if_possible(put_resp.app_iter)
-        return put_resp
 
     def handle_put(self, req, versions_cont, api_version,
                    account_name, object_name, is_enabled):
@@ -596,7 +613,7 @@ class ObjectContext(ObjectVersioningContext):
         marker_req.environ['swift.content_type_overridden'] = True
         marker_resp = marker_req.get_response(self.app)
         self._check_response_error(req, marker_resp)
-        close_if_possible(marker_resp.app_iter)
+        drain_and_close(marker_resp)
 
         # successfully copied and created delete marker; safe to delete
         resp = req.get_response(self.app)
@@ -604,7 +621,7 @@ class ObjectContext(ObjectVersioningContext):
             resp.headers['X-Object-Version-Id'] = \
                 self._split_version_from_name(marker_name)[1].internal
             resp.headers['X-Backend-Content-Type'] = DELETE_MARKER_CONTENT_TYPE
-        close_if_possible(resp.app_iter)
+        drain_and_close(resp)
         return resp
 
     def handle_post(self, req, versions_cont, account):
@@ -638,7 +655,7 @@ class ObjectContext(ObjectVersioningContext):
             # Only follow if the version container matches
             if split_path(loc, 4, 4, True)[1:3] == [
                     account, versions_cont]:
-                close_if_possible(resp.app_iter)
+                drain_and_close(resp)
                 post_req.path_info = loc
                 resp = post_req.get_response(self.app)
         return resp
@@ -664,7 +681,7 @@ class ObjectContext(ObjectVersioningContext):
             self._check_response_error(req, hresp)
             if hresp.headers.get(SYSMETA_VERSIONS_SYMLINK) == 'true':
                 symlink_target = hresp.headers.get(TGT_OBJ_SYMLINK_HDR)
-        close_if_possible(hresp.app_iter)
+        drain_and_close(hresp)
         return head_is_tombstone, symlink_target
 
     def handle_delete_version(self, req, versions_cont, api_version,
@@ -700,7 +717,7 @@ class ObjectContext(ObjectVersioningContext):
             req.environ['QUERY_STRING'] = ''
             link_resp = req.get_response(self.app)
             self._check_response_error(req, link_resp)
-            close_if_possible(link_resp.app_iter)
+            drain_and_close(link_resp)
 
             # *then* the backing data
             req.path_info = "/%s/%s/%s/%s" % (
@@ -739,8 +756,24 @@ class ObjectContext(ObjectVersioningContext):
             req.environ, path=wsgi_quote(versioned_obj_path) + '?symlink=get',
             method='HEAD', headers=obj_head_headers, swift_source='OV')
         head_resp = head_req.get_response(self.app)
+<<<<<<< HEAD
+=======
+        if head_resp.status_int == HTTP_NOT_FOUND:
+            drain_and_close(head_resp)
+            if is_success(get_container_info(
+                    head_req.environ, self.app, swift_source='OV')['status']):
+                raise HTTPNotFound(
+                    request=req, content_type='text/plain',
+                    body=b'The specified version does not exist')
+            else:
+                raise HTTPInternalServerError(
+                    request=req, content_type='text/plain',
+                    body=b'The versions container does not exist. You may '
+                         b'want to re-enable object versioning.')
+
+>>>>>>> ss-release-2.24.0.3
         self._check_response_error(req, head_resp)
-        close_if_possible(head_resp.app_iter)
+        drain_and_close(head_resp)
 
         put_etag = head_resp.headers['ETag']
         put_bytes = head_resp.content_length
@@ -807,7 +840,7 @@ class ObjectContext(ObjectVersioningContext):
                     raise HTTPNotFound(request=req)
                 resp.headers['X-Object-Version-Id'] = 'null'
                 if req.method == 'HEAD':
-                    close_if_possible(resp.app_iter)
+                    drain_and_close(resp)
             return resp
         else:
             # Re-write the path; most everything else goes through normally
@@ -825,7 +858,7 @@ class ObjectContext(ObjectVersioningContext):
                 'X-Backend-Content-Type', resp.headers['Content-Type'])
 
             if req.method == 'HEAD':
-                close_if_possible(resp.app_iter)
+                drain_and_close(resp)
 
             if is_del_marker:
                 hdrs = {'X-Object-Version-Id': version,
@@ -916,7 +949,7 @@ class ContainerContext(ObjectVersioningContext):
                     self._response_headers[bytes_idx] = (
                         'X-Container-Bytes-Used',
                         str(int(curr_bytes) + int(ver_bytes)))
-                close_if_possible(vresp.app_iter)
+                drain_and_close(vresp)
         elif is_success(self._get_status_int()):
             # If client is doing a version-aware listing for a container that
             # (as best we could tell) has never had versioning enabled,
@@ -1006,7 +1039,7 @@ class ContainerContext(ObjectVersioningContext):
                     account, str_to_wsgi(versions_cont))),
                 headers={'X-Backend-Allow-Reserved-Names': 'true'})
             vresp = versions_req.get_response(self.app)
-            close_if_possible(vresp.app_iter)
+            drain_and_close(vresp)
             if vresp.is_success and int(vresp.headers.get(
                     'X-Container-Object-Count', 0)) > 0:
                 raise HTTPConflict(
@@ -1018,7 +1051,7 @@ class ContainerContext(ObjectVersioningContext):
             else:
                 versions_req.method = 'DELETE'
                 resp = versions_req.get_response(self.app)
-                close_if_possible(resp.app_iter)
+                drain_and_close(resp)
                 if not is_success(resp.status_int) and resp.status_int != 404:
                     raise HTTPInternalServerError(
                         'Error deleting versioned container')
@@ -1096,9 +1129,7 @@ class ContainerContext(ObjectVersioningContext):
                 method='PUT', headers=hdrs, swift_source='OV')
             resp = ver_cont_req.get_response(self.app)
             # Should always be short; consume the body
-            for chunk in resp.app_iter:
-                pass
-            close_if_possible(resp.app_iter)
+            drain_and_close(resp)
             if is_success(resp.status_int) or resp.status_int == HTTP_CONFLICT:
                 req.headers[SYSMETA_VERSIONS_CONT] = wsgi_quote(versions_cont)
             else:
@@ -1121,7 +1152,7 @@ class ContainerContext(ObjectVersioningContext):
 
             # TODO: what if this one fails??
             resp = ver_cont_req.get_response(self.app)
-            close_if_possible(resp.app_iter)
+            drain_and_close(resp)
 
         if self._response_headers is None:
             self._response_headers = []
@@ -1221,12 +1252,14 @@ class ContainerContext(ObjectVersioningContext):
                     'hash': item['hash'],
                     'last_modified': item['last_modified'],
                 })
+            limit = constrain_req_limit(req, ACCOUNT_LISTING_LIMIT)
             body = build_listing(
                 null_listing, subdir_listing, broken_listing,
-                reverse=config_true_value(params.get('reverse', 'no')))
+                reverse=config_true_value(params.get('reverse', 'no')),
+                limit=limit)
             self.update_content_length(len(body))
             app_resp = [body]
-            close_if_possible(versions_resp.app_iter)
+            drain_and_close(versions_resp)
         elif is_success(versions_resp.status_int):
             try:
                 listing = json.loads(versions_resp.body)
@@ -1284,10 +1317,13 @@ class ContainerContext(ObjectVersioningContext):
                         'last_modified': item['last_modified'],
                     })
 
+                limit = constrain_req_limit(req, ACCOUNT_LISTING_LIMIT)
                 body = build_listing(
                     null_listing, versions_listing,
                     subdir_listing, broken_listing,
-                    reverse=config_true_value(params.get('reverse', 'no')))
+                    reverse=config_true_value(params.get('reverse', 'no')),
+                    limit=limit,
+                )
                 self.update_content_length(len(body))
                 app_resp = [body]
         else:
@@ -1331,6 +1367,7 @@ class AccountContext(ObjectVersioningContext):
                             # don't touch params['prefix'],
                             # RESERVED_STR probably came from looping around
                             pass
+<<<<<<< HEAD
                     else:
                         params['prefix'] = get_reserved_name('versions')
 
@@ -1387,16 +1424,33 @@ class AccountContext(ObjectVersioningContext):
                                 self._build_versions_container_name(last_cont)
                     else:
                         break
+=======
+
+                versions_req.params = params
+                versions_resp = versions_req.get_response(self.app)
+                try:
+                    versions_listing = json.loads(versions_resp.body)
+                except ValueError:
+                    versions_listing = []
+                finally:
+                    close_if_possible(versions_resp.app_iter)
+
+                # create a dict from versions listing to facilitate
+                # look-up by name. Ignore 'subdir' items
+                for item in [item for item in versions_listing
+                             if 'name' in item]:
+                    container_name = self._split_versions_container_name(
+                        item['name'])
+                    versions_dict[container_name] = item
+>>>>>>> ss-release-2.24.0.3
 
                 # update bytes from original listing with bytes from
                 # versions cont
                 if len(versions_dict) > 0:
                     # ignore 'subdir' items
                     for item in [item for item in listing if 'name' in item]:
-                        container_name = bytes_to_wsgi(
-                            item['name'].encode('utf-8'))
-                        if container_name in versions_dict:
-                            v_info = versions_dict.pop(container_name)
+                        if item['name'] in versions_dict:
+                            v_info = versions_dict.pop(item['name'])
                             item['bytes'] = item['bytes'] + v_info['bytes']
 
                 # if there are items left in versions_dict, it indicates an
@@ -1409,9 +1463,12 @@ class AccountContext(ObjectVersioningContext):
                     item['name'] = key
                     listing.append(item)
 
+                limit = constrain_req_limit(req, ACCOUNT_LISTING_LIMIT)
                 body = build_listing(
                     listing,
-                    reverse=config_true_value(params.get('reverse', 'no')))
+                    reverse=config_true_value(params.get('reverse', 'no')),
+                    limit=limit,
+                )
                 self.update_content_length(len(body))
                 app_resp = [body]
 
