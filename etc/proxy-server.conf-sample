@@ -576,6 +576,13 @@ use = egg:swift#s3api
 # AWS S3 document says that each part must be at least 5 MB in a multipart
 # upload, except the last part.
 # min_segment_size = 5242880
+#
+# When there's a failure during a CompleteMultipartUpload operation, clients
+# need to be able to retry the operation. If the original request completed
+# successfully, the upload marker will already have been removed. Ordinarilly,
+# this would result in a NoSuchUploadId error, but if it completed within the
+# grace period (measured in seconds), allow the retried Complete to continue.
+# completed_grace_period = 300
 
 # You can override the default log routing for this filter here:
 # log_name = s3api
