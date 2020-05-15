@@ -99,6 +99,11 @@ class ObjectController(Controller):
 
         resp = req.get_response(self.app, query=query)
 
+        stored_upload_id = resp.sysmeta_headers.get(
+            sysmeta_header('object', 'upload-id'))
+        if self.conf.annotate_with_upload_id and stored_upload_id:
+            resp.headers['x-swift-s3api-upload-id'] = stored_upload_id
+
         if req.method == 'HEAD':
             resp.app_iter = None
 

@@ -293,7 +293,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
             self._complete_multi_upload(bucket, key, upload_id, xml)
         self.assertEqual(status, 200)
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('content-type' in headers)
+        self.assertIn('content-type', headers)
         self.assertEqual(headers['content-type'], 'application/xml')
         if 'content-length' in headers:
             self.assertEqual(headers['content-length'], str(len(body)))
@@ -388,6 +388,12 @@ class TestS3ApiMultiUpload(S3ApiBase):
                     self.assertEqual(headers['content-length'], '0')
                 else:
                     self.assertEqual(headers['content-length'], str(exp_size))
+
+            if tf.cluster_info['s3api'].get('annotate_with_upload_id'):
+                self.assertIn('x-amz-upload-id', headers)
+                self.assertEqual(headers['x-amx-upload-id'], uploads[0][1])
+            else:
+                self.assertNotIn('x-amz-upload-id', headers)
 
         check_obj({}, 200)
 

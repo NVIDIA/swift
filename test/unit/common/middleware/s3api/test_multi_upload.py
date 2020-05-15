@@ -843,6 +843,7 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
         override_etag = '; s3_etag=%s' % S3_ETAG.strip('"')
         h = 'X-Object-Sysmeta-Container-Update-Override-Etag'
         self.assertEqual(headers.get(h), override_etag)
+        self.assertEqual(headers.get('X-Object-Sysmeta-S3Api-Upload-Id'), 'X')
 
     def test_object_multipart_upload_invalid_md5(self):
         bad_md5 = base64.b64encode(hashlib.md5(
