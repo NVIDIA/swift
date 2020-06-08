@@ -44,6 +44,7 @@ import sys
 import json
 import math
 import inspect
+import warnings
 
 import six
 from six import StringIO
@@ -4341,6 +4342,69 @@ cluster_dfw1 = http://dfw1.host/v1/
             utils.load_pkg_resource(*args)
         self.assertEqual("Unhandled URI scheme: 'nog'", str(cm.exception))
 
+    def test_systemd_notify(self):
+        m_sock = mock.Mock(connect=mock.Mock(), sendall=mock.Mock())
+        with mock.patch('swift.common.utils.socket.socket',
+                        return_value=m_sock) as m_socket:
+            # No notification socket
+            m_socket.reset_mock()
+            m_sock.reset_mock()
+            utils.systemd_notify()
+            self.assertEqual(m_socket.call_count, 0)
+            self.assertEqual(m_sock.connect.call_count, 0)
+            self.assertEqual(m_sock.sendall.call_count, 0)
+
+            # File notification socket
+            m_socket.reset_mock()
+            m_sock.reset_mock()
+            os.environ['NOTIFY_SOCKET'] = 'foobar'
+            utils.systemd_notify()
+            m_socket.assert_called_once_with(socket.AF_UNIX, socket.SOCK_DGRAM)
+            m_sock.connect.assert_called_once_with('foobar')
+            m_sock.sendall.assert_called_once_with(b'READY=1')
+            self.assertNotIn('NOTIFY_SOCKET', os.environ)
+
+            # Abstract notification socket
+            m_socket.reset_mock()
+            m_sock.reset_mock()
+            os.environ['NOTIFY_SOCKET'] = '@foobar'
+            utils.systemd_notify()
+            m_socket.assert_called_once_with(socket.AF_UNIX, socket.SOCK_DGRAM)
+            m_sock.connect.assert_called_once_with('\0foobar')
+            m_sock.sendall.assert_called_once_with(b'READY=1')
+            self.assertNotIn('NOTIFY_SOCKET', os.environ)
+
+        # Test logger with connection error
+        m_sock = mock.Mock(connect=mock.Mock(side_effect=EnvironmentError),
+                           sendall=mock.Mock())
+        m_logger = mock.Mock(debug=mock.Mock())
+        with mock.patch('swift.common.utils.socket.socket',
+                        return_value=m_sock) as m_socket:
+            os.environ['NOTIFY_SOCKET'] = '@foobar'
+            m_sock.reset_mock()
+            m_logger.reset_mock()
+            utils.systemd_notify()
+            self.assertEqual(0, m_sock.sendall.call_count)
+            self.assertEqual(0, m_logger.debug.call_count)
+
+            m_sock.reset_mock()
+            m_logger.reset_mock()
+            utils.systemd_notify(logger=m_logger)
+            self.assertEqual(0, m_sock.sendall.call_count)
+            m_logger.debug.assert_called_once_with(
+                "Systemd notification failed", exc_info=True)
+
+        # Test it for real
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.settimeout(5)
+        sock.bind('\0foobar')
+        os.environ['NOTIFY_SOCKET'] = '@foobar'
+        utils.systemd_notify()
+        msg = sock.recv(512)
+        sock.close()
+        self.assertEqual(msg, b'READY=1')
+        self.assertNotIn('NOTIFY_SOCKET', os.environ)
+
 
 class ResellerConfReader(unittest.TestCase):
 
@@ -5594,7 +5658,7 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
                         'some.counter')
         self.assertStat('some-name.some.operation:4900.0|ms',
                         self.logger.timing, 'some.operation', 4.9 * 1000)
-        self.assertStatMatches('some-name\.another\.operation:\d+\.\d+\|ms',
+        self.assertStatMatches(r'some-name\.another\.operation:\d+\.\d+\|ms',
                                self.logger.timing_since, 'another.operation',
                                time.time())
         self.assertStat('some-name.another.counter:42|c',
@@ -5609,7 +5673,7 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStat('pfx.some.operation:4900.0|ms|@0.972',
                         self.logger.timing, 'some.operation', 4.9 * 1000,
                         sample_rate=0.972)
-        self.assertStatMatches('pfx\.another\.op:\d+\.\d+\|ms|@0.972',
+        self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.972',
                                self.logger.timing_since, 'another.op',
                                time.time(), sample_rate=0.972)
         self.assertStat('pfx.another.counter:3|c|@0.972',
@@ -5625,7 +5689,7 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStat('some.operation:4900.0|ms|@0.939',
                         self.logger.timing, 'some.operation',
                         4.9 * 1000, 0.939)
-        self.assertStatMatches('another\.op:\d+\.\d+\|ms|@0.939',
+        self.assertStatMatches(r'another\.op:\d+\.\d+\|ms|@0.939',
                                self.logger.timing_since, 'another.op',
                                time.time(), 0.939)
         self.assertStat('another.counter:3|c|@0.939',
@@ -5643,7 +5707,7 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
                         'some.counter')
         self.assertStat('pfx.some.operation:4760.0|ms|@0.93',
                         self.logger.timing, 'some.operation', 4.76 * 1000)
-        self.assertStatMatches('pfx\.another\.op:\d+\.\d+\|ms|@0.93',
+        self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.93',
                                self.logger.timing_since, 'another.op',
                                time.time())
         self.assertStat('pfx.another.counter:3|c|@0.93',
@@ -5657,7 +5721,7 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStat('pfx.some.operation:4900.0|ms|@0.9912',
                         self.logger.timing, 'some.operation', 4.9 * 1000,
                         sample_rate=0.9912)
-        self.assertStatMatches('pfx\.another\.op:\d+\.\d+\|ms|@0.9912',
+        self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.9912',
                                self.logger.timing_since, 'another.op',
                                time.time(), sample_rate=0.9912)
         self.assertStat('pfx.another.counter:3|c|@0.9912',
@@ -5673,7 +5737,7 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStat('some.operation:4900.0|ms|@0.987654',
                         self.logger.timing, 'some.operation',
                         4.9 * 1000, 0.987654)
-        self.assertStatMatches('another\.op:\d+\.\d+\|ms|@0.987654',
+        self.assertStatMatches(r'another\.op:\d+\.\d+\|ms|@0.987654',
                                self.logger.timing_since, 'another.op',
                                time.time(), 0.987654)
         self.assertStat('another.counter:3|c|@0.987654',
@@ -5693,7 +5757,7 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStat('alpha.beta.pfx.some.operation:4760.0|ms',
                         self.logger.timing, 'some.operation', 4.76 * 1000)
         self.assertStatMatches(
-            'alpha\.beta\.pfx\.another\.op:\d+\.\d+\|ms',
+            r'alpha\.beta\.pfx\.another\.op:\d+\.\d+\|ms',
             self.logger.timing_since, 'another.op', time.time())
         self.assertStat('alpha.beta.pfx.another.counter:3|c',
                         self.logger.update_stats, 'another.counter', 3)
@@ -5707,9 +5771,10 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStat('alpha.beta.some.operation:4900.0|ms|@0.9912',
                         self.logger.timing, 'some.operation', 4.9 * 1000,
                         sample_rate=0.9912)
-        self.assertStatMatches('alpha\.beta\.another\.op:\d+\.\d+\|ms|@0.9912',
-                               self.logger.timing_since, 'another.op',
-                               time.time(), sample_rate=0.9912)
+        self.assertStatMatches(
+            r'alpha\.beta\.another\.op:\d+\.\d+\|ms|@0.9912',
+            self.logger.timing_since, 'another.op',
+            time.time(), sample_rate=0.9912)
         self.assertStat('alpha.beta.another.counter:3|c|@0.9912',
                         self.logger.update_stats, 'another.counter', 3,
                         sample_rate=0.9912)
@@ -5983,6 +6048,136 @@ class TestAuditLocationGenerator(unittest.TestCase):
             )
             self.assertEqual(list(locations),
                              [(obj_path, "drive", "partition2")])
+
+    def test_hooks(self):
+        with temptree([]) as tmpdir:
+            logger = FakeLogger()
+            data = os.path.join(tmpdir, "drive", "data")
+            os.makedirs(data)
+            partition = os.path.join(data, "partition1")
+            os.makedirs(partition)
+            suffix = os.path.join(partition, "suffix1")
+            os.makedirs(suffix)
+            hash_path = os.path.join(suffix, "hash1")
+            os.makedirs(hash_path)
+            obj_path = os.path.join(hash_path, "obj1.dat")
+            with open(obj_path, "w"):
+                pass
+            meta_path = os.path.join(hash_path, "obj1.meta")
+            with open(meta_path, "w"):
+                pass
+            hook_pre_device = MagicMock()
+            hook_post_device = MagicMock()
+            hook_pre_partition = MagicMock()
+            hook_post_partition = MagicMock()
+            hook_pre_suffix = MagicMock()
+            hook_post_suffix = MagicMock()
+            hook_pre_hash = MagicMock()
+            hook_post_hash = MagicMock()
+            locations = utils.audit_location_generator(
+                tmpdir, "data", ".dat", mount_check=False, logger=logger,
+                hook_pre_device=hook_pre_device,
+                hook_post_device=hook_post_device,
+                hook_pre_partition=hook_pre_partition,
+                hook_post_partition=hook_post_partition,
+                hook_pre_suffix=hook_pre_suffix,
+                hook_post_suffix=hook_post_suffix,
+                hook_pre_hash=hook_pre_hash,
+                hook_post_hash=hook_post_hash
+            )
+            list(locations)
+            hook_pre_device.assert_called_once_with(os.path.join(tmpdir,
+                                                                 "drive"))
+            hook_post_device.assert_called_once_with(os.path.join(tmpdir,
+                                                                  "drive"))
+            hook_pre_partition.assert_called_once_with(partition)
+            hook_post_partition.assert_called_once_with(partition)
+            hook_pre_suffix.assert_called_once_with(suffix)
+            hook_post_suffix.assert_called_once_with(suffix)
+            hook_pre_hash.assert_called_once_with(hash_path)
+            hook_post_hash.assert_called_once_with(hash_path)
+
+    def test_filters(self):
+        with temptree([]) as tmpdir:
+            logger = FakeLogger()
+            data = os.path.join(tmpdir, "drive", "data")
+            os.makedirs(data)
+            partition = os.path.join(data, "partition1")
+            os.makedirs(partition)
+            suffix = os.path.join(partition, "suffix1")
+            os.makedirs(suffix)
+            hash_path = os.path.join(suffix, "hash1")
+            os.makedirs(hash_path)
+            obj_path = os.path.join(hash_path, "obj1.dat")
+            with open(obj_path, "w"):
+                pass
+            meta_path = os.path.join(hash_path, "obj1.meta")
+            with open(meta_path, "w"):
+                pass
+
+            def audit_location_generator(**kwargs):
+                return utils.audit_location_generator(
+                    tmpdir, "data", ".dat", mount_check=False, logger=logger,
+                    **kwargs)
+
+            # Return the list of devices
+
+            with patch('os.listdir', side_effect=os.listdir) as m_listdir:
+                # devices_filter
+                m_listdir.reset_mock()
+                devices_filter = MagicMock(return_value=["drive"])
+                list(audit_location_generator(devices_filter=devices_filter))
+                devices_filter.assert_called_once_with(tmpdir, ["drive"])
+                self.assertIn(((data,),), m_listdir.call_args_list)
+
+                m_listdir.reset_mock()
+                devices_filter = MagicMock(return_value=[])
+                list(audit_location_generator(devices_filter=devices_filter))
+                devices_filter.assert_called_once_with(tmpdir, ["drive"])
+                self.assertNotIn(((data,),), m_listdir.call_args_list)
+
+                # partitions_filter
+                m_listdir.reset_mock()
+                partitions_filter = MagicMock(return_value=["partition1"])
+                list(audit_location_generator(
+                    partitions_filter=partitions_filter))
+                partitions_filter.assert_called_once_with(data,
+                                                          ["partition1"])
+                self.assertIn(((partition,),), m_listdir.call_args_list)
+
+                m_listdir.reset_mock()
+                partitions_filter = MagicMock(return_value=[])
+                list(audit_location_generator(
+                    partitions_filter=partitions_filter))
+                partitions_filter.assert_called_once_with(data,
+                                                          ["partition1"])
+                self.assertNotIn(((partition,),), m_listdir.call_args_list)
+
+                # suffixes_filter
+                m_listdir.reset_mock()
+                suffixes_filter = MagicMock(return_value=["suffix1"])
+                list(audit_location_generator(suffixes_filter=suffixes_filter))
+                suffixes_filter.assert_called_once_with(partition, ["suffix1"])
+                self.assertIn(((suffix,),), m_listdir.call_args_list)
+
+                m_listdir.reset_mock()
+                suffixes_filter = MagicMock(return_value=[])
+                list(audit_location_generator(suffixes_filter=suffixes_filter))
+                suffixes_filter.assert_called_once_with(partition, ["suffix1"])
+                self.assertNotIn(((suffix,),), m_listdir.call_args_list)
+
+                # hashes_filter
+                m_listdir.reset_mock()
+                hashes_filter = MagicMock(return_value=["hash1"])
+                list(audit_location_generator(hashes_filter=hashes_filter))
+                hashes_filter.assert_called_once_with(suffix, ["hash1"])
+                self.assertIn(((hash_path,),), m_listdir.call_args_list)
+
+                m_listdir.reset_mock()
+                hashes_filter = MagicMock(return_value=[])
+                list(audit_location_generator(hashes_filter=hashes_filter))
+                hashes_filter.assert_called_once_with(suffix, ["hash1"])
+                self.assertNotIn(((hash_path,),), m_listdir.call_args_list)
 
 
 class TestGreenAsyncPile(unittest.TestCase):
@@ -7128,7 +7323,8 @@ class TestShardRange(unittest.TestCase):
                       upper='', object_count=0, bytes_used=0,
                       meta_timestamp=ts_1.internal, deleted=0,
                       state=utils.ShardRange.FOUND,
-                      state_timestamp=ts_1.internal, epoch=None)
+                      state_timestamp=ts_1.internal, epoch=None,
+                      reported=0)
         assert_initialisation_ok(dict(empty_run, name='a/c', timestamp=ts_1),
                                  expect)
         assert_initialisation_ok(dict(name='a/c', timestamp=ts_1), expect)
@@ -7137,11 +7333,13 @@ class TestShardRange(unittest.TestCase):
                         upper='u', object_count=2, bytes_used=10,
                         meta_timestamp=ts_2, deleted=0,
                         state=utils.ShardRange.CREATED,
-                        state_timestamp=ts_3.internal, epoch=ts_4)
+                        state_timestamp=ts_3.internal, epoch=ts_4,
+                        reported=0)
         expect.update({'lower': 'l', 'upper': 'u', 'object_count': 2,
                        'bytes_used': 10, 'meta_timestamp': ts_2.internal,
                        'state': utils.ShardRange.CREATED,
-                       'state_timestamp': ts_3.internal, 'epoch': ts_4})
+                       'state_timestamp': ts_3.internal, 'epoch': ts_4,
+                       'reported': 0})
         assert_initialisation_ok(good_run.copy(), expect)
 
         # obj count and bytes used as int strings
@@ -7158,6 +7356,11 @@ class TestShardRange(unittest.TestCase):
         good_deleted['deleted'] = 1
         assert_initialisation_ok(good_deleted,
                                  dict(expect, deleted=1))
+
+        good_reported = good_run.copy()
+        good_reported['reported'] = 1
+        assert_initialisation_ok(good_reported,
+                                 dict(expect, reported=1))
 
         assert_initialisation_fails(dict(good_run, timestamp='water balloon'))
 
@@ -7197,7 +7400,7 @@ class TestShardRange(unittest.TestCase):
             'upper': upper, 'object_count': 10, 'bytes_used': 100,
             'meta_timestamp': ts_2.internal, 'deleted': 0,
             'state': utils.ShardRange.FOUND, 'state_timestamp': ts_3.internal,
-            'epoch': ts_4}
+            'epoch': ts_4, 'reported': 0}
         self.assertEqual(expected, sr_dict)
         self.assertIsInstance(sr_dict['lower'], six.string_types)
         self.assertIsInstance(sr_dict['upper'], six.string_types)
@@ -7212,6 +7415,14 @@ class TestShardRange(unittest.TestCase):
         for key in sr_dict:
             bad_dict = dict(sr_dict)
             bad_dict.pop(key)
+            if key == 'reported':
+                # This was added after the fact, and we need to be able to eat
+                # data from old servers
+                utils.ShardRange.from_dict(bad_dict)
+                utils.ShardRange(**bad_dict)
+                continue
+
+            # The rest were present from the beginning
             with self.assertRaises(KeyError):
                 utils.ShardRange.from_dict(bad_dict)
             # But __init__ still (generally) works!
@@ -7490,8 +7701,10 @@ class TestShardRange(unittest.TestCase):
         expected = u'\N{SNOWMAN}'
         if six.PY2:
             expected = expected.encode('utf-8')
-        do_test(u'\N{SNOWMAN}', expected)
-        do_test(u'\N{SNOWMAN}'.encode('utf-8'), expected)
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            do_test(u'\N{SNOWMAN}', expected)
+            do_test(u'\N{SNOWMAN}'.encode('utf-8'), expected)
+        self.assertFalse(captured_warnings)
 
         sr = utils.ShardRange('a/c', utils.Timestamp.now(), 'b', 'y')
         sr.lower = ''
@@ -7538,8 +7751,10 @@ class TestShardRange(unittest.TestCase):
         expected = u'\N{SNOWMAN}'
         if six.PY2:
             expected = expected.encode('utf-8')
-        do_test(u'\N{SNOWMAN}', expected)
-        do_test(u'\N{SNOWMAN}'.encode('utf-8'), expected)
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            do_test(u'\N{SNOWMAN}', expected)
+            do_test(u'\N{SNOWMAN}'.encode('utf-8'), expected)
+        self.assertFalse(captured_warnings)
 
         sr = utils.ShardRange('a/c', utils.Timestamp.now(), 'b', 'y')
         sr.upper = ''
@@ -8287,3 +8502,86 @@ class Test_LibcWrapper(unittest.TestCase):
                           # 0 is SEEK_SET
                           0)
             self.assertEqual(tf.read(100), b"defgh")
+
+
+class TestWatchdog(unittest.TestCase):
+    def test_start_stop(self):
+        w = utils.Watchdog()
+        w._evt.send = mock.Mock(side_effect=w._evt.send)
+        gth = object()
+
+        with patch('eventlet.greenthread.getcurrent', return_value=gth),\
+                patch('time.time', return_value=10.0):
+            # On first call, _next_expiration is None, it should unblock
+            # greenthread that is blocked for ever
+            key = w.start(1.0, Timeout)
+            self.assertIn(key, w._timeouts)
+            self.assertEqual(w._timeouts[key], (1.0, 11.0, gth, Timeout))
+            w._evt.send.assert_called_once()
+
+            w.stop(key)
+            self.assertNotIn(key, w._timeouts)
+
+    def test_timeout_concurrency(self):
+        w = utils.Watchdog()
+        w._evt.send = mock.Mock(side_effect=w._evt.send)
+        w._evt.wait = mock.Mock()
+        gth = object()
+
+        w._run()
+        w._evt.wait.assert_called_once_with(None)
+
+        with patch('eventlet.greenthread.getcurrent', return_value=gth):
+            w._evt.send.reset_mock()
+            w._evt.wait.reset_mock()
+            with patch('time.time', return_value=10.00):
+                # On first call, _next_expiration is None, it should unblock
+                # greenthread that is blocked for ever
+                w.start(5.0, Timeout)  # Will end at 15.0
+                w._evt.send.assert_called_once()
+
+            with patch('time.time', return_value=10.01):
+                w._run()
+                self.assertEqual(15.0, w._next_expiration)
+                w._evt.wait.assert_called_once_with(15.0 - 10.01)
+
+            w._evt.send.reset_mock()
+            w._evt.wait.reset_mock()
+            with patch('time.time', return_value=12.00):
+                # Now _next_expiration is 15.0, it won't unblock greenthread
+                # because this expiration is later
+                w.start(5.0, Timeout)  # Will end at 17.0
+                w._evt.send.assert_not_called()
+
+            w._evt.send.reset_mock()
+            w._evt.wait.reset_mock()
+            with patch('time.time', return_value=14.00):
+                # Now _next_expiration is still 15.0, it will unblock
+                # greenthread because this new expiration is 14.5
+                w.start(0.5, Timeout)  # Will end at 14.5
+                w._evt.send.assert_called_once()
+
+            with patch('time.time', return_value=14.01):
+                w._run()
+                w._evt.wait.assert_called_once_with(14.5 - 14.01)
+                self.assertEqual(14.5, w._next_expiration)
+                # Should wakeup at 14.5
+
+    def test_timeout_expire(self):
+        w = utils.Watchdog()
+        w._evt.send = mock.Mock()  # To avoid it to call get_hub()
+        w._evt.wait = mock.Mock()  # To avoid it to call get_hub()
+
+        with patch('eventlet.hubs.get_hub') as m_gh:
+            with patch('time.time', return_value=10.0):
+                w.start(5.0, Timeout)  # Will end at 15.0
+
+            with patch('time.time', return_value=16.0):
+                w._run()
+                m_gh.assert_called_once()
+                m_gh.return_value.schedule_call_global.assert_called_once()
+                exc = m_gh.return_value.schedule_call_global.call_args[0][2]
+                self.assertIsInstance(exc, Timeout)
+                self.assertEqual(exc.seconds, 5.0)
+                self.assertEqual(None, w._next_expiration)
+                w._evt.wait.assert_called_once_with(None)

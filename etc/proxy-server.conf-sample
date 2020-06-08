@@ -470,7 +470,10 @@ use = egg:swift#s3api
 # With either tempauth or your custom auth:
 # - Put s3api just before your auth filter(s) in the pipeline
 # With keystone:
-# - Put s3api and s3token before keystoneauth in the pipeline
+# - Put s3api and s3token before keystoneauth in the pipeline, but after
+#   auth_token
+# If you have ratelimit enabled for Swift requests, you may want to place a
+# second copy after auth to also ratelimit S3 requests.
 #
 # Swift has no concept of the S3's resource owner; the resources
 # (i.e. containers and objects) created via the Swift API have no owner
@@ -573,6 +576,12 @@ use = egg:swift#s3api
 # AWS S3 document says that each part must be at least 5 MB in a multipart
 # upload, except the last part.
 # min_segment_size = 5242880
+#
+# Sometimes it's useful to see the uploadId that was used to create an MPU; enable
+# this option to include it as a new x-swift-s3api-upload-id header on GET or HEAD.
+# Note that AWS does not return such a header; if your client relies on this, it
+# (or s3api) probably has other issues.
+# annotate_with_upload_id = true
 #
 # Multi-delete requests can take a long time to complete when writing out
 # tombstones for every object, which may trip client timeouts. Enable this

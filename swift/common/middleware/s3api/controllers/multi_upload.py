@@ -580,7 +580,8 @@ class UploadController(Controller):
         """
         upload_id = req.params['uploadId']
         resp = _get_upload_info(req, self.app, upload_id)
-        headers = {'Accept': 'application/json'}
+        headers = {'Accept': 'application/json',
+                   sysmeta_header('object', 'upload-id'): upload_id}
         for key, val in resp.headers.items():
             _key = key.lower()
             if _key.startswith('x-amz-meta-'):

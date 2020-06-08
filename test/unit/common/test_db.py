@@ -1154,7 +1154,7 @@ class TestDatabaseBroker(unittest.TestCase):
         return broker
 
     # only testing _reclaim_metadata here
-    @patch.object(DatabaseBroker, '_reclaim')
+    @patch.object(DatabaseBroker, '_reclaim', return_value='')
     def test_metadata(self, mock_reclaim):
         # Initializes a good broker for us
         broker = self.get_replication_info_tester(metadata=True)
@@ -1289,7 +1289,7 @@ class TestDatabaseBroker(unittest.TestCase):
         for c in range(MAX_META_COUNT):
             key = 'X-Account-Meta-F{0}'.format(c)
             metadata[key] = ('B', normalize_timestamp(1))
-        key = 'X-Account-Meta-Foo'.format(c)
+        key = 'X-Account-Meta-Foo'
         metadata[key] = ('', normalize_timestamp(1))
         self.assertIsNone(DatabaseBroker.validate_metadata(metadata))
 

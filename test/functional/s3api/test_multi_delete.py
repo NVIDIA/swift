@@ -16,8 +16,8 @@
 import unittest
 import os
 import test.functional as tf
-from swift.common.middleware.s3api.etree import fromstring, tostring, Element, \
-    SubElement
+from swift.common.middleware.s3api.etree import fromstring, tostring, \
+    Element, SubElement
 
 from test.functional.s3api import S3ApiBase
 from test.functional.s3api.s3_test_client import Connection
@@ -134,7 +134,7 @@ class TestS3ApiMultiDelete(S3ApiBase):
         content_md5 = calculate_md5(xml)
         query = 'delete'
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('POST', bucket, body=xml,
                                          headers={

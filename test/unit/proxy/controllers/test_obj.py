@@ -51,7 +51,8 @@ from swift.common.storage_policy import POLICIES, ECDriverError, \
 from test.unit import FakeRing, FakeMemcache, fake_http_connect, \
     debug_logger, patch_policies, SlowBody, FakeStatus, \
     DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub, \
-    fake_ec_node_response, StubResponse, mocked_http_conn
+    fake_ec_node_response, StubResponse, mocked_http_conn, \
+    quiet_eventlet_exceptions
 from test.unit.proxy.test_server import node_error_count
 
 
@@ -1617,7 +1618,8 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         # to the next node rather than hang the request
         headers = [{'X-Backend-Timestamp': 'not-a-timestamp'}, {}]
         codes = [200, 200]
-        with set_http_connect(*codes, headers=headers):
+        with quiet_eventlet_exceptions(), set_http_connect(
+                *codes, headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
@@ -2279,6 +2281,18 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
         self.assertNotIn('Connection', resp.headers)
+
+    def test_GET_not_found_when_404_newer(self):
+        # if proxy receives a 404, it keeps waiting for other connections until
+        # max number of nodes in hopes of finding an object, but if 404 is
+        # more recent than a 200, then it should ignore 200 and return 404
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        rest = 2 * self.policy.object_ring.replica_count - 2
+        codes = [200, 404] + [200] * rest
+        ts_iter = iter([1, 2] + [1] * rest)
+        with set_http_connect(*codes, timestamps=ts_iter):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
 
     def _test_if_match(self, method):
         num_responses = self.policy.ec_ndata if method == 'GET' else 1

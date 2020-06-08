@@ -48,6 +48,7 @@ import ctypes.util
 from copy import deepcopy
 from optparse import OptionParser
 import traceback
+import warnings
 
 from tempfile import gettempdir, mkstemp, NamedTemporaryFile
 import glob
@@ -62,6 +63,7 @@ import eventlet.patcher
 import eventlet.semaphore
 import pkg_resources
 from eventlet import GreenPool, sleep, Timeout
+from eventlet.event import Event
 from eventlet.green import socket, threading
 import eventlet.hubs
 import eventlet.queue
@@ -137,6 +139,7 @@ def NR_ioprio_set():
     raise OSError("Swift doesn't support ionice priority for %s %s" %
                   (architecture, arch_bits))
 
+
 # this syscall integer probably only works on x86_64 linux systems, you
 # can check if it's correct on yours with something like this:
 """
@@ -168,6 +171,7 @@ IOPRIO_CLASS_SHIFT = 13
 def IOPRIO_PRIO_VALUE(class_, data):
     return (((class_) << IOPRIO_CLASS_SHIFT) | data)
 
+
 # Used by hash_path to offer a bit more security when generating hashes for
 # paths. It simply appends this value to all paths; guessing the hash a path
 # will end up with would also require knowing this suffix.
@@ -185,7 +189,7 @@ F_SETPIPE_SZ = getattr(fcntl, 'F_SETPIPE_SZ', 1031)
 O_TMPFILE = getattr(os, 'O_TMPFILE', 0o20000000 | os.O_DIRECTORY)
 
 # Used by the parse_socket_string() function to validate IPv6 addresses
-IPV6_RE = re.compile("^\[(?P<address>.*)\](:(?P<port>[0-9]+))?$")
+IPV6_RE = re.compile(r"^\[(?P<address>.*)\](:(?P<port>[0-9]+))?$")
 
 MD5_OF_EMPTY_STRING = 'd41d8cd98f00b204e9800998ecf8427e'
 RESERVED_BYTE = b'\x00'
@@ -3148,10 +3152,25 @@ def remove_directory(path):
 
 
 def audit_location_generator(devices, datadir, suffix='',
-                             mount_check=True, logger=None):
+                             mount_check=True, logger=None,
+                             devices_filter=None, partitions_filter=None,
+                             suffixes_filter=None, hashes_filter=None,
+                             hook_pre_device=None, hook_post_device=None,
+                             hook_pre_partition=None, hook_post_partition=None,
+                             hook_pre_suffix=None, hook_post_suffix=None,
+                             hook_pre_hash=None, hook_post_hash=None):
     """
     Given a devices path and a data directory, yield (path, device,
     partition) for all files in that directory
+
+    (devices|partitions|suffixes|hashes)_filter are meant to modify the list of
+    elements that will be iterated. eg: they can be used to exclude some
+    elements based on a custom condition defined by the caller.
+
+    hook_pre_(device|partition|suffix|hash) are called before yielding the
+    element, hook_pos_(device|partition|suffix|hash) are called after the
+    element was yielded. They are meant to do some pre/post processing.
+    eg: saving a progress status.
 
     :param devices: parent directory of the devices to be audited
     :param datadir: a directory located under self.devices. This should be
@@ -3161,11 +3180,31 @@ def audit_location_generator(devices, datadir, suffix='',
     :param mount_check: Flag to check if a mount check should be performed
                     on devices
     :param logger: a logger object
+    :devices_filter: a callable taking (devices, [list of devices]) as
+                     parameters and returning a [list of devices]
+    :partitions_filter: a callable taking (datadir_path, [list of parts]) as
+                        parameters and returning a [list of parts]
+    :suffixes_filter: a callable taking (part_path, [list of suffixes]) as
+                      parameters and returning a [list of suffixes]
+    :hashes_filter: a callable taking (suff_path, [list of hashes]) as
+                    parameters and returning a [list of hashes]
+    :hook_pre_device: a callable taking device_path as parameter
+    :hook_post_device: a callable taking device_path as parameter
+    :hook_pre_partition: a callable taking part_path as parameter
+    :hook_post_partition: a callable taking part_path as parameter
+    :hook_pre_suffix: a callable taking suff_path as parameter
+    :hook_post_suffix: a callable taking suff_path as parameter
+    :hook_pre_hash: a callable taking hash_path as parameter
+    :hook_post_hash: a callable taking hash_path as parameter
     """
     device_dir = listdir(devices)
     # randomize devices in case of process restart before sweep completed
     shuffle(device_dir)
+    if devices_filter:
+        device_dir = devices_filter(devices, device_dir)
     for device in device_dir:
+        if hook_pre_device:
+            hook_pre_device(os.path.join(devices, device))
         if mount_check and not ismount(os.path.join(devices, device)):
             if logger:
                 logger.warning(
@@ -3179,24 +3218,36 @@ def audit_location_generator(devices, datadir, suffix='',
                 logger.warning(_('Skipping %(datadir)s because %(err)s'),
                                {'datadir': datadir_path, 'err': e})
             continue
+        if partitions_filter:
+            partitions = partitions_filter(datadir_path, partitions)
         for partition in partitions:
             part_path = os.path.join(datadir_path, partition)
+            if hook_pre_partition:
+                hook_pre_partition(part_path)
             try:
                 suffixes = listdir(part_path)
             except OSError as e:
                 if e.errno != errno.ENOTDIR:
                     raise
                 continue
+            if suffixes_filter:
+                suffixes = suffixes_filter(part_path, suffixes)
             for asuffix in suffixes:
                 suff_path = os.path.join(part_path, asuffix)
+                if hook_pre_suffix:
+                    hook_pre_suffix(suff_path)
                 try:
                     hashes = listdir(suff_path)
                 except OSError as e:
                     if e.errno != errno.ENOTDIR:
                         raise
                     continue
+                if hashes_filter:
+                    hashes = hashes_filter(suff_path, hashes)
                 for hsh in hashes:
                     hash_path = os.path.join(suff_path, hsh)
+                    if hook_pre_hash:
+                        hook_pre_hash(hash_path)
                     try:
                         files = sorted(listdir(hash_path), reverse=True)
                     except OSError as e:
@@ -3208,6 +3259,14 @@ def audit_location_generator(devices, datadir, suffix='',
                             continue
                         path = os.path.join(hash_path, fname)
                         yield path, device, partition
+                    if hook_post_hash:
+                        hook_post_hash(hash_path)
+                if hook_post_suffix:
+                    hook_post_suffix(suff_path)
+            if hook_post_partition:
+                hook_post_partition(part_path)
+        if hook_post_device:
+            hook_post_device(os.path.join(devices, device))
 
 
 def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
@@ -3505,7 +3564,7 @@ def affinity_key_function(affinity_str):
     pieces = [s.strip() for s in affinity_str.split(',')]
     for piece in pieces:
         # matches r<number>=<number> or r<number>z<number>=<number>
-        match = re.match("r(\d+)(?:z(\d+))?=(\d+)$", piece)
+        match = re.match(r"r(\d+)(?:z(\d+))?=(\d+)$", piece)
         if match:
             region, zone, priority = match.groups()
             region = int(region)
@@ -3558,7 +3617,7 @@ def affinity_locality_predicate(write_affinity_str):
     pieces = [s.strip() for s in affinity_str.split(',')]
     for piece in pieces:
         # matches r<number> or r<number>z<number>
-        match = re.match("r(\d+)(?:z(\d+))?$", piece)
+        match = re.match(r"r(\d+)(?:z(\d+))?$", piece)
         if match:
             region, zone = match.groups()
             region = int(region)
@@ -4810,6 +4869,8 @@ class ShardRange(object):
         value.
     :param epoch: optional epoch timestamp which represents the time at which
         sharding was enabled for a container.
+    :param reported: optional indicator that this shard and its stats have
+        been reported to the root container.
     """
     FOUND = 10
     CREATED = 20
@@ -4860,7 +4921,8 @@ class ShardRange(object):
 
     def __init__(self, name, timestamp, lower=MIN, upper=MAX,
                  object_count=0, bytes_used=0, meta_timestamp=None,
-                 deleted=False, state=None, state_timestamp=None, epoch=None):
+                 deleted=False, state=None, state_timestamp=None, epoch=None,
+                 reported=False):
         self.account = self.container = self._timestamp = \
             self._meta_timestamp = self._state_timestamp = self._epoch = None
         self._lower = ShardRange.MIN
@@ -4879,6 +4941,7 @@ class ShardRange(object):
         self.state = self.FOUND if state is None else state
         self.state_timestamp = state_timestamp
         self.epoch = epoch
+        self.reported = reported
 
     @classmethod
     def _encode(cls, value):
@@ -4982,8 +5045,10 @@ class ShardRange(object):
 
     @lower.setter
     def lower(self, value):
-        if value in (None, b'', u''):
-            value = ShardRange.MIN
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', UnicodeWarning)
+            if value in (None, b'', u''):
+                value = ShardRange.MIN
         try:
             value = self._encode_bound(value)
         except TypeError as err:
@@ -5008,8 +5073,10 @@ class ShardRange(object):
 
     @upper.setter
     def upper(self, value):
-        if value in (None, b'', u''):
-            value = ShardRange.MAX
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', UnicodeWarning)
+            if value in (None, b'', u''):
+                value = ShardRange.MAX
         try:
             value = self._encode_bound(value)
         except TypeError as err:
@@ -5055,8 +5122,14 @@ class ShardRange(object):
             cast to an int, or if meta_timestamp is neither None nor can be
             cast to a :class:`~swift.common.utils.Timestamp`.
         """
-        self.object_count = int(object_count)
-        self.bytes_used = int(bytes_used)
+        if self.object_count != int(object_count):
+            self.object_count = int(object_count)
+            self.reported = False
+
+        if self.bytes_used != int(bytes_used):
+            self.bytes_used = int(bytes_used)
+            self.reported = False
+
         if meta_timestamp is None:
             self.meta_timestamp = Timestamp.now()
         else:
@@ -5137,6 +5210,14 @@ class ShardRange(object):
     def epoch(self, epoch):
         self._epoch = self._to_timestamp(epoch)
 
+    @property
+    def reported(self):
+        return self._reported
+
+    @reported.setter
+    def reported(self, value):
+        self._reported = bool(value)
+
     def update_state(self, state, state_timestamp=None):
         """
         Set state to the given value and optionally update the state_timestamp
@@ -5153,6 +5234,7 @@ class ShardRange(object):
         self.state = state
         if state_timestamp is not None:
             self.state_timestamp = state_timestamp
+        self.reported = False
         return True
 
     @property
@@ -5275,6 +5357,7 @@ class ShardRange(object):
         yield 'state', self.state
         yield 'state_timestamp', self.state_timestamp.internal
         yield 'epoch', self.epoch.internal if self.epoch is not None else None
+        yield 'reported', 1 if self.reported else 0
 
     def copy(self, timestamp=None, **kwargs):
         """
@@ -5306,7 +5389,8 @@ class ShardRange(object):
             params['name'], params['timestamp'], params['lower'],
             params['upper'], params['object_count'], params['bytes_used'],
             params['meta_timestamp'], params['deleted'], params['state'],
-            params['state_timestamp'], params['epoch'])
+            params['state_timestamp'], params['epoch'],
+            params.get('reported', 0))
 
 
 def find_shard_range(item, ranges):
@@ -5820,3 +5904,159 @@ def get_db_files(db_path):
             continue
         results.append(os.path.join(db_dir, f))
     return sorted(results)
+
+
+def systemd_notify(logger=None):
+    """
+    Notify the service manager that started this process, if it is
+    systemd-compatible, that this process correctly started. To do so,
+    it communicates through a Unix socket stored in environment variable
+    NOTIFY_SOCKET. More information can be found in systemd documentation:
+    https://www.freedesktop.org/software/systemd/man/sd_notify.html
+
+    :param logger: a logger object
+    """
+    msg = b'READY=1'
+    notify_socket = os.getenv('NOTIFY_SOCKET')
+    if notify_socket:
+        if notify_socket.startswith('@'):
+            # abstract namespace socket
+            notify_socket = '\0%s' % notify_socket[1:]
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        with closing(sock):
+            try:
+                sock.connect(notify_socket)
+                sock.sendall(msg)
+                del os.environ['NOTIFY_SOCKET']
+            except EnvironmentError:
+                if logger:
+                    logger.debug("Systemd notification failed", exc_info=True)
+
+
+class Watchdog(object):
+    """
+    Implements a watchdog to efficiently manage concurrent timeouts.
+
+    Compared to eventlet.timeouts.Timeout, it reduces the number of context
+    switching in eventlet by avoiding to schedule actions (throw an Exception),
+    then unschedule them if the timeouts are cancelled.
+
+    1. at T+0, request timeout(10)
+        => wathdog greenlet sleeps 10 seconds
+    2. at T+1, request timeout(15)
+        => the timeout will expire after the current, no need to wake up the
+           watchdog greenlet
+    3. at T+2, request timeout(5)
+        => the timeout will expire before the first timeout, wake up the
+           watchdog greenlet to calculate a new sleep period
+    4. at T+7, the 3rd timeout expires
+        => the exception is raised, then the greenlet watchdog sleep(3) to
+           wake up for the 1st timeout expiration
+    """
+    def __init__(self):
+        # key => (timeout, timeout_at, caller_greenthread, exception)
+        self._timeouts = dict()
+        self._evt = Event()
+        self._next_expiration = None
+        self._run_gth = None
+
+    def start(self, timeout, exc, timeout_at=None):
+        """
+        Schedule a timeout action
+
+        :param timeout: duration before the timeout expires
+        :param exc: exception to throw when the timeout expire, must inherit
+                    from eventlet.timeouts.Timeout
+        :param timeout_at: allow to force the expiration timestamp
+        :return: id of the scheduled timeout, needed to cancel it
+        """
+        if not timeout_at:
+            timeout_at = time.time() + timeout
+        gth = eventlet.greenthread.getcurrent()
+        timeout_definition = (timeout, timeout_at, gth, exc)
+        key = id(timeout_definition)
+        self._timeouts[key] = timeout_definition
+
+        # Wake up the watchdog loop only when there is a new shorter timeout
+        if (self._next_expiration is None
+                or self._next_expiration > timeout_at):
+            # There could be concurrency on .send(), so wrap it in a try
+            try:
+                if not self._evt.ready():
+                    self._evt.send()
+            except AssertionError:
+                pass
+
+        return key
+
+    def stop(self, key):
+        """
+        Cancel a scheduled timeout
+
+        :param key: timeout id, as returned by start()
+        """
+        try:
+            if key in self._timeouts:
+                del(self._timeouts[key])
+        except KeyError:
+            pass
+
+    def spawn(self):
+        """
+        Start the watchdog greenthread.
+        """
+        if self._run_gth is None:
+            self._run_gth = eventlet.spawn(self.run)
+
+    def run(self):
+        while True:
+            self._run()
+
+    def _run(self):
+        now = time.time()
+        self._next_expiration = None
+        if self._evt.ready():
+            self._evt.reset()
+        for k, (timeout, timeout_at, gth, exc) in list(self._timeouts.items()):
+            if timeout_at <= now:
+                try:
+                    if k in self._timeouts:
+                        del(self._timeouts[k])
+                except KeyError:
+                    pass
+                e = exc()
+                e.seconds = timeout
+                eventlet.hubs.get_hub().schedule_call_global(0, gth.throw, e)
+            else:
+                if (self._next_expiration is None
+                        or self._next_expiration > timeout_at):
+                    self._next_expiration = timeout_at
+        if self._next_expiration is None:
+            sleep_duration = self._next_expiration
+        else:
+            sleep_duration = self._next_expiration - now
+        self._evt.wait(sleep_duration)
+
+
+class WatchdogTimeout(object):
+    """
+    Context manager to schedule a timeout in a Watchdog instance
+    """
+    def __init__(self, watchdog, timeout, exc, timeout_at=None):
+        """
+        Schedule a timeout in a Watchdog instance
+
+        :param watchdog: Watchdog instance
+        :param timeout: duration before the timeout expires
+        :param exc: exception to throw when the timeout expire, must inherit
+                    from eventlet.timeouts.Timeout
+        :param timeout_at: allow to force the expiration timestamp
+        """
+        self.watchdog = watchdog
+        self.key = watchdog.start(timeout, exc, timeout_at=timeout_at)
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, type, value, traceback):
+        self.watchdog.stop(self.key)

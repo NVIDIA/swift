@@ -275,6 +275,8 @@ class S3ApiMiddleware(object):
             conf.get('allow_multipart_uploads', True))
         self.conf.min_segment_size = config_positive_int_value(
             conf.get('min_segment_size', 5242880))
+        self.conf.annotate_with_upload_id = config_true_value(
+            conf.get('annotate_with_upload_id', True))
         self.conf.use_async_delete = config_true_value(
             conf.get('use_async_delete', False))
 
@@ -419,7 +421,9 @@ def filter_factory(global_conf, **local_conf):
         max_multi_delete_objects=conf.get('max_multi_delete_objects', 1000),
         allow_multipart_uploads=conf.get('allow_multipart_uploads', True),
         min_segment_size=conf.get('min_segment_size', 5242880),
-        s3_acl=conf.get('s3_acl', False)
+        s3_acl=config_true_value(conf.get('s3_acl', False)),
+        annotate_with_upload_id=config_true_value(
+            conf.get('annotate_with_upload_id', True)),
     )
 
     def s3api_filter(app):

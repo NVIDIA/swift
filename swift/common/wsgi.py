@@ -45,7 +45,7 @@ from swift.common.swob import Request, wsgi_quote, wsgi_unquote, \
 from swift.common.utils import capture_stdio, disable_fallocate, \
     drop_privileges, get_logger, NullLogger, config_true_value, \
     validate_configuration, get_hub, config_auto_int_value, \
-    reiterate, clean_up_daemon_hygiene
+    reiterate, clean_up_daemon_hygiene, systemd_notify
 
 SIGNUM_TO_NAME = {getattr(signal, n): n for n in dir(signal)
                   if n.startswith('SIG') and '_' not in n}
@@ -501,6 +501,8 @@ class SwiftHttpProtocol(wsgi.HttpProtocol):
         def get_environ(self, *args, **kwargs):
             environ = wsgi.HttpProtocol.get_environ(self, *args, **kwargs)
             header_payload = self.headers.get_payload()
+            if isinstance(header_payload, list) and len(header_payload) == 1:
+                header_payload = header_payload[0].get_payload()
             if header_payload:
                 # This shouldn't be here. We must've bumped up against
                 # https://bugs.python.org/issue37093
@@ -1185,6 +1187,9 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
         os.write(reexec_signal_fd, str(os.getpid()).encode('utf8'))
         os.close(reexec_signal_fd)
 
+    # Finally, signal systemd (if appropriate) that process started properly.
+    systemd_notify(logger=logger)
+
     no_fork_sock = strategy.no_fork_sock()
     if no_fork_sock:
         run_server(conf, logger, no_fork_sock, global_conf=global_conf)
@@ -1297,7 +1302,7 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
                         os.getpid(), orig_server_pid)
             try:
                 got_pid = os.read(read_fd, 30)
-            except Exception as e:
+            except Exception:
                 logger.warning('Unexpected exception while reading from '
                                'pipe:', exc_info=True)
             else:

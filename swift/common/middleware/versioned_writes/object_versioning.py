@@ -151,8 +151,8 @@ import time
 from cgi import parse_header
 from six.moves.urllib.parse import unquote
 
-from swift.common.constraints import MAX_FILE_SIZE, valid_api_version, \
-    ACCOUNT_LISTING_LIMIT
+from swift.common.constraints import MAX_FILE_SIZE, \
+    ACCOUNT_LISTING_LIMIT, CONTAINER_LISTING_LIMIT
 from swift.common.exceptions import ListingIterNotFound, ListingIterError
 from swift.common.http import is_success, is_client_error, HTTP_NOT_FOUND, \
     HTTP_CONFLICT
@@ -387,8 +387,6 @@ class ObjectContext(ObjectVersioningContext):
 
         # do the write
         put_resp = put_req.get_response(self.app)
-<<<<<<< HEAD
-=======
         drain_and_close(put_resp)
         close_if_possible(put_req.environ['wsgi.input'])
 
@@ -398,7 +396,6 @@ class ObjectContext(ObjectVersioningContext):
                 body=b'The versions container does not exist. You may '
                      b'want to re-enable object versioning.')
 
->>>>>>> ss-release-2.24.0.3
         self._check_response_error(req, put_resp)
         put_bytes = byte_counter.bytes_read
         # N.B. this is essentially the same hack that symlink does in
@@ -517,15 +514,12 @@ class ObjectContext(ObjectVersioningContext):
             api_version, account_name, versions_cont, vers_obj_name)
         put_resp = self._put_versioned_obj(req, put_path_info, get_resp)
 
-<<<<<<< HEAD
-=======
         if put_resp.status_int == HTTP_NOT_FOUND:
             raise HTTPInternalServerError(
                 request=req, content_type='text/plain',
                 body=b'The versions container does not exist. You may '
                      b'want to re-enable object versioning.')
 
->>>>>>> ss-release-2.24.0.3
         self._check_response_error(req, put_resp)
 
     def handle_put(self, req, versions_cont, api_version,
@@ -756,8 +750,6 @@ class ObjectContext(ObjectVersioningContext):
             req.environ, path=wsgi_quote(versioned_obj_path) + '?symlink=get',
             method='HEAD', headers=obj_head_headers, swift_source='OV')
         head_resp = head_req.get_response(self.app)
-<<<<<<< HEAD
-=======
         if head_resp.status_int == HTTP_NOT_FOUND:
             drain_and_close(head_resp)
             if is_success(get_container_info(
@@ -771,7 +763,6 @@ class ObjectContext(ObjectVersioningContext):
                     body=b'The versions container does not exist. You may '
                          b'want to re-enable object versioning.')
 
->>>>>>> ss-release-2.24.0.3
         self._check_response_error(req, head_resp)
         drain_and_close(head_resp)
 
@@ -1252,7 +1243,7 @@ class ContainerContext(ObjectVersioningContext):
                     'hash': item['hash'],
                     'last_modified': item['last_modified'],
                 })
-            limit = constrain_req_limit(req, ACCOUNT_LISTING_LIMIT)
+            limit = constrain_req_limit(req, CONTAINER_LISTING_LIMIT)
             body = build_listing(
                 null_listing, subdir_listing, broken_listing,
                 reverse=config_true_value(params.get('reverse', 'no')),
@@ -1317,7 +1308,7 @@ class ContainerContext(ObjectVersioningContext):
                         'last_modified': item['last_modified'],
                     })
 
-                limit = constrain_req_limit(req, ACCOUNT_LISTING_LIMIT)
+                limit = constrain_req_limit(req, CONTAINER_LISTING_LIMIT)
                 body = build_listing(
                     null_listing, versions_listing,
                     subdir_listing, broken_listing,
@@ -1367,7 +1358,6 @@ class AccountContext(ObjectVersioningContext):
                             # don't touch params['prefix'],
                             # RESERVED_STR probably came from looping around
                             pass
-<<<<<<< HEAD
                     else:
                         params['prefix'] = get_reserved_name('versions')
 
@@ -1424,25 +1414,6 @@ class AccountContext(ObjectVersioningContext):
                                 self._build_versions_container_name(last_cont)
                     else:
                         break
-=======
-
-                versions_req.params = params
-                versions_resp = versions_req.get_response(self.app)
-                try:
-                    versions_listing = json.loads(versions_resp.body)
-                except ValueError:
-                    versions_listing = []
-                finally:
-                    close_if_possible(versions_resp.app_iter)
-
-                # create a dict from versions listing to facilitate
-                # look-up by name. Ignore 'subdir' items
-                for item in [item for item in versions_listing
-                             if 'name' in item]:
-                    container_name = self._split_versions_container_name(
-                        item['name'])
-                    versions_dict[container_name] = item
->>>>>>> ss-release-2.24.0.3
 
                 # update bytes from original listing with bytes from
                 # versions cont

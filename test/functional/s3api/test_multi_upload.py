@@ -27,8 +27,8 @@ from hashlib import md5
 from six.moves import zip, zip_longest
 
 import test.functional as tf
-from swift.common.middleware.s3api.etree import fromstring, tostring, Element, \
-    SubElement
+from swift.common.middleware.s3api.etree import fromstring, tostring, \
+    Element, SubElement
 from swift.common.middleware.s3api.utils import mktime
 
 from test.functional.s3api import S3ApiBase
@@ -293,7 +293,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
             self._complete_multi_upload(bucket, key, upload_id, xml)
         self.assertEqual(status, 200)
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('content-type' in headers)
+        self.assertIn('content-type', headers)
         self.assertEqual(headers['content-type'], 'application/xml')
         if 'content-length' in headers:
             self.assertEqual(headers['content-length'], str(len(body)))
@@ -304,9 +304,8 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.assertTrue(lines[0].startswith(b'<?xml'), body)
         self.assertTrue(lines[0].endswith(b'?>'), body)
         elem = fromstring(body, 'CompleteMultipartUploadResult')
-        # TODO: use tf.config value
         self.assertEqual(
-            'http://%s:%s/bucket/obj1' % (self.conn.host, self.conn.port),
+            '%s/bucket/obj1' % tf.config['s3_storage_url'].rstrip('/'),
             elem.find('Location').text)
         self.assertEqual(elem.find('Bucket').text, bucket)
         self.assertEqual(elem.find('Key').text, key)
@@ -390,6 +389,12 @@ class TestS3ApiMultiUpload(S3ApiBase):
                 else:
                     self.assertEqual(headers['content-length'], str(exp_size))
 
+            if tf.cluster_info['s3api'].get('annotate_with_upload_id'):
+                self.assertIn('x-amz-upload-id', headers)
+                self.assertEqual(headers['x-amx-upload-id'], uploads[0][1])
+            else:
+                self.assertNotIn('x-amz-upload-id', headers)
+
         check_obj({}, 200)
 
         # Sanity check conditionals
@@ -428,7 +433,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.conn.make_request('PUT', bucket)
         query = 'uploads'
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('POST', bucket, key, query=query)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -442,7 +447,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.conn.make_request('PUT', bucket)
         query = 'uploads'
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('GET', bucket, query=query)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -462,7 +467,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         upload_id = elem.find('UploadId').text
 
         query = 'partNumber=%s&uploadId=%s' % (1, upload_id)
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('PUT', bucket, key, query=query)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -500,7 +505,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         upload_id = elem.find('UploadId').text
 
         query = 'partNumber=%s&uploadId=%s' % (1, upload_id)
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('PUT', bucket, key,
                                          headers={
@@ -541,7 +546,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         upload_id = elem.find('UploadId').text
 
         query = 'uploadId=%s' % upload_id
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
 
         status, headers, body = \
             auth_error_conn.make_request('GET', bucket, key, query=query)
@@ -568,7 +573,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self._upload_part(bucket, key, upload_id)
 
         query = 'uploadId=%s' % upload_id
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('DELETE', bucket, key, query=query)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -612,7 +617,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.assertEqual(get_error_code(body), 'EntityTooSmall')
 
         # invalid credentials
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('POST', bucket, keys[0], body=xml,
                                          query=query)
@@ -1104,6 +1109,7 @@ class TestS3ApiMultiUploadSigV4(TestS3ApiMultiUpload):
         status, headers, body = \
             self.conn.make_request('DELETE', bucket)
         self.assertEqual(status, 204)  # sanity
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -248,7 +248,7 @@ def _in_process_setup_ring(swift_conf, conf_src_dir, testdir):
     try:
         ring_file_src = _in_process_find_conf_file(conf_src_dir, ring_file_src,
                                                    use_sample=False)
-    except InProcessException as e:
+    except InProcessException:
         if policy_specified:
             raise InProcessException('Failed to find ring file %s'
                                      % ring_file_src)
@@ -322,12 +322,16 @@ def _load_encryption(proxy_conf_file, swift_conf_file, **kwargs):
         pipeline = pipeline.replace(
             "proxy-logging proxy-server",
             "keymaster encryption proxy-logging proxy-server")
+        pipeline = pipeline.replace(
+            "cache listing_formats",
+            "cache etag-quoter listing_formats")
         conf.set(section, 'pipeline', pipeline)
         root_secret = base64.b64encode(os.urandom(32))
         if not six.PY2:
             root_secret = root_secret.decode('ascii')
         conf.set('filter:keymaster', 'encryption_root_secret', root_secret)
         conf.set('filter:versioned_writes', 'allow_object_versioning', 'true')
+        conf.set('filter:etag-quoter', 'enable_by_default', 'true')
     except NoSectionError as err:
         msg = 'Error problem with proxy conf file %s: %s' % \
               (proxy_conf_file, err)
@@ -479,8 +483,6 @@ def _load_s3api(proxy_conf_file, swift_conf_file, **kwargs):
 conf_loaders = {
     'encryption': _load_encryption,
     'ec': _load_ec_as_default_policy,
-    'domain_remap_staticweb': _load_domain_remap_staticweb,
-    's3api': _load_s3api,
 }
 
 
@@ -517,6 +519,11 @@ def in_process_setup(the_object_server=object_server):
 
     swift_conf = _in_process_setup_swift_conf(swift_conf_src, _testdir)
     _info('prepared swift.conf: %s' % swift_conf)
+
+    # load s3api and staticweb configs
+    proxy_conf, swift_conf = _load_s3api(proxy_conf, swift_conf)
+    proxy_conf, swift_conf = _load_domain_remap_staticweb(proxy_conf,
+                                                          swift_conf)
 
     # Call the associated method for the value of
     # 'SWIFT_TEST_IN_PROCESS_CONF_LOADER', if one exists
@@ -587,6 +594,7 @@ def in_process_setup(the_object_server=object_server):
         # Below are values used by the functional test framework, as well as
         # by the various in-process swift servers
         'auth_uri': 'http://127.0.0.1:%d/auth/v1.0/' % prolis.getsockname()[1],
+        's3_storage_url': 'http://%s:%d/' % prolis.getsockname(),
         # Primary functional test account (needs admin access to the
         # account)
         'account': 'test',
@@ -724,6 +732,7 @@ def in_process_setup(the_object_server=object_server):
 
     create_account('AUTH_test')
     create_account('AUTH_test2')
+
 
 cluster_info = {}
 
@@ -867,6 +876,8 @@ def setup_package():
                     443 if parsed.scheme == 'https' else 80),
                 'auth_prefix': parsed.path,
             })
+            config.setdefault('s3_storage_url',
+                              urlunsplit(parsed[:2] + ('', None, None)))
         elif 'auth_host' in config:
             scheme = 'http'
             if config_true_value(config.get('auth_ssl', 'no')):
@@ -879,12 +890,14 @@ def setup_package():
                 auth_prefix += 'v1.0'
             config['auth_uri'] = swift_test_auth = urlunsplit(
                 (scheme, netloc, auth_prefix, None, None))
+            config.setdefault('s3_storage_url', urlunsplit(
+                (scheme, netloc, '', None, None)))
         # else, neither auth_uri nor auth_host; swift_test_auth will be unset
         # and we'll skip everything later
 
         if 'service_prefix' in config:
-                swift_test_service_prefix = utils.append_underscore(
-                    config['service_prefix'])
+            swift_test_service_prefix = utils.append_underscore(
+                config['service_prefix'])
 
         if swift_test_auth_version == "1":
 
@@ -1120,10 +1133,15 @@ def get_url_token(user_index, os_options):
                     auth_version=swift_test_auth_version,
                     os_options=os_options,
                     insecure=insecure)
-    return get_auth(swift_test_auth,
-                    swift_test_user[user_index],
-                    swift_test_key[user_index],
-                    **authargs)
+    url, token = get_auth(swift_test_auth,
+                          swift_test_user[user_index],
+                          swift_test_key[user_index],
+                          **authargs)
+    if six.PY2 and not isinstance(url, bytes):
+        url = url.encode('utf-8')
+    if six.PY2 and not isinstance(token, bytes):
+        token = token.encode('utf-8')
+    return url, token
 
 
 def retry(func, *args, **kwargs):

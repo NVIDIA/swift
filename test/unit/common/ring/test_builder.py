@@ -231,19 +231,21 @@ class TestRingBuilder(unittest.TestCase):
     def test_add_dev(self):
         rb = ring.RingBuilder(8, 3, 1)
         dev = {'id': 0, 'region': 0, 'zone': 0, 'weight': 1,
-               'ip': '127.0.0.1', 'port': 10000}
+               'ip': '127.0.0.1', 'port': 10000, 'device': 'sda1'}
         dev_id = rb.add_dev(dev)
         self.assertRaises(exceptions.DuplicateDeviceError, rb.add_dev, dev)
         self.assertEqual(dev_id, 0)
         rb = ring.RingBuilder(8, 3, 1)
         # test add new dev with no id
         dev_id = rb.add_dev({'zone': 0, 'region': 1, 'weight': 1,
-                             'ip': '127.0.0.1', 'port': 6200})
+                             'ip': '127.0.0.1', 'port': 6200,
+                             'device': 'sda2'})
         self.assertEqual(rb.devs[0]['id'], 0)
         self.assertEqual(dev_id, 0)
         # test add another dev with no id
         dev_id = rb.add_dev({'zone': 3, 'region': 2, 'weight': 1,
-                             'ip': '127.0.0.1', 'port': 6200})
+                             'ip': '127.0.0.1', 'port': 6200,
+                             'device': 'sda3'})
         self.assertEqual(rb.devs[1]['id'], 1)
         self.assertEqual(dev_id, 1)
         # some keys are required
@@ -384,9 +386,9 @@ class TestRingBuilder(unittest.TestCase):
     def test_shuffled_gather(self):
         if self._shuffled_gather_helper() and \
                 self._shuffled_gather_helper():
-                raise AssertionError('It is highly likely the ring is no '
-                                     'longer shuffling the set of partitions '
-                                     'to reassign on a rebalance.')
+            raise AssertionError('It is highly likely the ring is no '
+                                 'longer shuffling the set of partitions '
+                                 'to reassign on a rebalance.')
 
     def _shuffled_gather_helper(self):
         rb = ring.RingBuilder(8, 3, 1)
@@ -2111,7 +2113,7 @@ class TestRingBuilder(unittest.TestCase):
         orig_rb = ring.RingBuilder(8, 3, 1)
         copy_rb = ring.RingBuilder(8, 3, 1)
         copy_rb.copy_from(orig_rb)
-        for rb in(orig_rb, copy_rb):
+        for rb in (orig_rb, copy_rb):
             with self.assertRaises(AttributeError) as cm:
                 rb.id
             self.assertIn('id attribute has not been initialised',
