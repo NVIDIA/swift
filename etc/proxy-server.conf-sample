@@ -577,11 +577,12 @@ use = egg:swift#s3api
 # upload, except the last part.
 # min_segment_size = 5242880
 #
-# Sometimes it's useful to see the uploadId that was used to create an MPU; enable
-# this option to include it as a new x-swift-s3api-upload-id header on GET or HEAD.
-# Note that AWS does not return such a header; if your client relies on this, it
-# (or s3api) probably has other issues.
-# annotate_with_upload_id = true
+# When there's a failure during a CompleteMultipartUpload operation, clients
+# need to be able to retry the operation. If the original request completed
+# successfully, the upload marker will already have been removed. Ordinarilly,
+# this would result in a NoSuchUploadId error, but if it completed within the
+# grace period (measured in seconds), allow the retried Complete to continue.
+# completed_grace_period = 300
 #
 # Multi-delete requests can take a long time to complete when writing out
 # tombstones for every object, which may trip client timeouts. Enable this

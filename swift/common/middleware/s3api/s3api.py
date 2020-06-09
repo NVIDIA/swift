@@ -275,8 +275,8 @@ class S3ApiMiddleware(object):
             conf.get('allow_multipart_uploads', True))
         self.conf.min_segment_size = config_positive_int_value(
             conf.get('min_segment_size', 5242880))
-        self.conf.annotate_with_upload_id = config_true_value(
-            conf.get('annotate_with_upload_id', True))
+        self.conf.completed_grace_period = int(
+            conf.get('completed_grace_period', 300))
         self.conf.use_async_delete = config_true_value(
             conf.get('use_async_delete', False))
 
@@ -417,13 +417,14 @@ def filter_factory(global_conf, **local_conf):
         # TODO: make default values as variables
         max_bucket_listing=conf.get('max_bucket_listing', 1000),
         max_parts_listing=conf.get('max_parts_listing', 1000),
-        max_upload_part_num=conf.get('max_upload_part_num', 1000),
-        max_multi_delete_objects=conf.get('max_multi_delete_objects', 1000),
-        allow_multipart_uploads=conf.get('allow_multipart_uploads', True),
-        min_segment_size=conf.get('min_segment_size', 5242880),
+        max_upload_part_num=int(conf.get('max_upload_part_num', 1000)),
+        max_multi_delete_objects=int(
+            conf.get('max_multi_delete_objects', 1000)),
+        allow_multipart_uploads=config_true_value(
+            conf.get('allow_multipart_uploads', True)),
+        min_segment_size=int(conf.get('min_segment_size', 5242880)),
         s3_acl=config_true_value(conf.get('s3_acl', False)),
-        annotate_with_upload_id=config_true_value(
-            conf.get('annotate_with_upload_id', True)),
+        completed_grace_period=int(conf.get('completed_grace_period', 300)),
     )
 
     def s3api_filter(app):
