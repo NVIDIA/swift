@@ -4073,8 +4073,9 @@ class TestReplicatedObjectController(
 
         def do_test(method, sharding_state):
             self.app.logger = debug_logger('proxy-ut')  # clean capture state
+            cache = FakeMemcache()
             req = Request.blank(
-                '/v1/a/c/o', {'swift.cache': FakeMemcache()},
+                '/v1/a/c/o', {'swift.cache': cache},
                 method=method, body='', headers={'Content-Type': 'text/plain'})
 
             # we want the container_info response to say policy index of 1 and
@@ -4100,6 +4101,9 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
+            self.assertEqual(1, cache.calls.count(
+                mock.call.get('shard-updating/a/c', skip_cache_pct=0.0)
+            ), cache.calls)
             stats = self.app.logger.get_increment_counts()
             self.assertEqual({'shard_updating.cache.miss': 1,
                               'shard_updating.backend.200': 1}, stats)
@@ -4166,6 +4170,9 @@ class TestReplicatedObjectController(
         # directed to the shard container
         # reset the router post patch_policies
         self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
+        self.app.container_updating_shard_ranges_skip_cache_pct = 1.0
+        # set this just to ensure the correct option is applied for updating...
+        self.app.container_listing_shard_ranges_skip_cache_pct = 99.0
         self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
         self.app.recheck_updating_shard_ranges = 3600
 
@@ -4201,6 +4208,9 @@ class TestReplicatedObjectController(
             stats = self.app.logger.get_increment_counts()
             self.assertEqual({'shard_updating.cache.hit': 1}, stats)
 
+            self.assertEqual(1, cache.calls.count(
+                mock.call.get('shard-updating/a/c', skip_cache_pct=1.0)
+            ), cache.calls)
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]
             self._check_request(

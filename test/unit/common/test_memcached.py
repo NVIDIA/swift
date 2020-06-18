@@ -400,6 +400,45 @@ class TestMemcached(unittest.TestCase):
             ['Error setting value in memcached: 1.2.3.4:11211: '
              'SERVER_ERROR object too large for cache'])
 
+    @mock.patch('random.random')
+    def test_get_skip_cache(self, mock_random):
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
+                                                 logger=self.logger)
+        mock = MockMemcached()
+        memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock, mock)] * 2)
+        memcache_client.set('some_key', [1, 2, 3])
+
+        mock_random.return_value = 0.5
+        self.assertEqual(
+            memcache_client.get('some_key', skip_cache_pct=0.1),
+            [1, 2, 3])
+
+        mock_random.return_value = 0.00101
+        self.assertEqual(
+            memcache_client.get('some_key', skip_cache_pct=0.1),
+            [1, 2, 3])
+
+        mock_random.return_value = 0.00099
+        self.assertEqual(
+            memcache_client.get('some_key', skip_cache_pct=0.1),
+            None)
+
+        mock_random.return_value = 0.5
+        self.assertEqual(
+            memcache_client.get('some_other_key', skip_cache_pct=0.1),
+            None)
+
+        self.assertEqual(len(mock_random.mock_calls), 4)
+        self.assertEqual(
+            [call[0][0] for call in self.logger.logger.log_dict['increment']],
+            [
+                'memcache.get.hit',
+                'memcache.get.hit',
+                'memcache.get.skip',
+                'memcache.get.miss',
+            ])
+
     def test_get_failed_connection_mid_request(self):
         memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
                                                  logger=self.logger)

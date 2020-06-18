@@ -420,7 +420,7 @@ class FakeMemcache(object):
         del self.calls[:]
 
     @track
-    def get(self, key):
+    def get(self, key, skip_cache_pct=0.0):
         return self.store.get(key)
 
     @property

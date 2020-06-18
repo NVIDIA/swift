@@ -144,6 +144,10 @@ use = egg:swift#proxy
 # so this value should be set less than recheck_updating_shard_ranges.
 # recheck_listing_shard_ranges = 600
 #
+# Sometimes you want a chance of skipping the cache to ensure it stays alive.
+# container_updating_shard_ranges_skip_cache_pct = 0.0
+# container_listing_shard_ranges_skip_cache_pct = 0.0
+#
 # object_chunk_size = 65536
 # client_chunk_size = 65536
 #
