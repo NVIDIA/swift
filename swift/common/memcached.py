@@ -48,6 +48,7 @@ import six
 import six.moves.cPickle as pickle
 import json
 import logging
+import random
 import time
 from bisect import bisect
 
@@ -330,15 +331,22 @@ class MemcacheRing(object):
             except (Exception, Timeout) as e:
                 self._exception_occurred(server, e, sock=sock, fp=fp)
 
-    def get(self, key):
+    def get(self, key, skip_cache_pct=0.0):
         """
         Gets the object specified by key.  It will also unserialize the object
         before returning if it is serialized in memcache with JSON, or if it
         is pickled and unpickling is allowed.
 
         :param key: key
+        :param skip_cache_pct: probability of skipping talking to memcache and
+                               returning None, as though it were a cache miss.
+                               Should be in the range [0.0, 100.0]
         :returns: value of the key in memcache
         """
+        if skip_cache_pct > 0 and random.random() * 100 < skip_cache_pct:
+            self.logger.increment('memcache.get.skip')
+            return None
+
         key = md5hash(key)
         value = None
         for (server, fp, sock) in self._get_conns(key):
@@ -364,8 +372,13 @@ class MemcacheRing(object):
                             fp.readline()
                         line = fp.readline().strip().split()
                     self._return_conn(server, fp, sock)
+                    if value is None:
+                        self.logger.increment('memcache.get.miss')
+                    else:
+                        self.logger.increment('memcache.get.hit')
                     return value
             except (Exception, Timeout) as e:
+                self.logger.increment('memcache.get.error')
                 self._exception_occurred(server, e, sock=sock, fp=fp)
 
     def incr(self, key, delta=1, time=0):

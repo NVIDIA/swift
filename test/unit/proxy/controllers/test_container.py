@@ -2134,7 +2134,7 @@ class TestContainerController(TestRingBase):
             'X-Backend-Sharding-State': sharding_state})
         self.assertEqual(
             [mock.call.get('container/a/c'),
-             mock.call.get('shard-listing/a/c')],
+             mock.call.get('shard-listing/a/c', skip_cache_pct=0.0)],
             self.memcache.calls)
         self.assertIn('swift.infocache', req.environ)
         self.assertIn('shard-listing/a/c', req.environ['swift.infocache'])
@@ -2281,7 +2281,7 @@ class TestContainerController(TestRingBase):
         # deleted from cache
         self.assertEqual(
             [mock.call.get('container/a/c'),
-             mock.call.get('shard-listing/a/c'),
+             mock.call.get('shard-listing/a/c', skip_cache_pct=0.0),
              mock.call.set('container/a/c', mock.ANY, time=6.0)],
             self.memcache.calls)
         self.assertEqual(404, self.memcache.calls[2][1][1]['status'])
@@ -2304,11 +2304,12 @@ class TestContainerController(TestRingBase):
         resp = req.get_response(self.app)
         self.assertEqual(
             [mock.call.get('container/a/c'),
-             mock.call.get('shard-listing/a/c')],
+             mock.call.get('shard-listing/a/c', skip_cache_pct=0.1)],
             self.memcache.calls)
         return resp
 
     def test_GET_shard_ranges_read_from_cache(self):
+        self.app.container_listing_shard_ranges_skip_cache_pct = 0.1
         self._setup_shard_range_stubs()
         exp_hdrs = {'X-Backend-Cached-Results': 'true',
                     'X-Backend-Record-Type': 'shard',

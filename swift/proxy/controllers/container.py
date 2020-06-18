@@ -150,7 +150,10 @@ class ContainerController(Controller):
                                           shard='listing')
                 cached_ranges = infocache.get(cache_key)
                 if cached_ranges is None and memcache:
-                    cached_ranges = memcache.get(cache_key)
+                    skip_pct = \
+                        self.app.container_listing_shard_ranges_skip_cache_pct
+                    cached_ranges = memcache.get(cache_key,
+                                                 skip_cache_pct=skip_pct)
                 if cached_ranges is not None:
                     infocache[cache_key] = tuple(cached_ranges)
                     # shard ranges can be returned from cache
