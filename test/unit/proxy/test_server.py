@@ -1061,8 +1061,10 @@ class TestProxyServer(unittest.TestCase):
                 baseapp = proxy_server.Application(app_conf,
                                                    container_ring=FakeRing(),
                                                    account_ring=FakeRing())
-                self.assertTrue(baseapp.concurrent_gets)
-                self.assertEqual(baseapp.concurrency_timeout, 0)
+                policy_opts = baseapp.get_policy_options(None)
+                self.assertTrue(policy_opts.concurrent_gets)
+                self.assertEqual(policy_opts.concurrency_timeout, 0)
+
                 baseapp.update_request(req)
                 resp = baseapp.handle_request(req)
 
@@ -1085,7 +1087,8 @@ class TestProxyServer(unittest.TestCase):
                 baseapp = proxy_server.Application(app_conf,
                                                    container_ring=FakeRing(),
                                                    account_ring=FakeRing())
-                self.assertEqual(baseapp.concurrency_timeout, 2)
+                policy_opts = baseapp.get_policy_options(None)
+                self.assertEqual(policy_opts.concurrency_timeout, 2)
                 baseapp.update_request(req)
                 resp = baseapp.handle_request(req)
 
@@ -1324,7 +1327,6 @@ class TestProxyServerLoading(unittest.TestCase):
             'client_timeout': '1.7',
             'post_quorum_timeout': '0.3',
             'concurrency_timeout': '0.2',
-
         }
         for policy in POLICIES:
             policy.object_ring = FakeRing()
@@ -1335,7 +1337,8 @@ class TestProxyServerLoading(unittest.TestCase):
         self.assertEqual(app.conn_timeout, 0.7)
         self.assertEqual(app.client_timeout, 1.7)
         self.assertEqual(app.post_quorum_timeout, 0.3)
-        self.assertEqual(app.concurrency_timeout, 0.2)
+        self.assertEqual(app.get_policy_options(
+            None).concurrency_timeout, 0.2)
 
     def test_concurrent_ec_options(self):
         conf = {
@@ -1347,9 +1350,11 @@ class TestProxyServerLoading(unittest.TestCase):
             policy.object_ring = FakeRing()
         app = proxy_server.Application(conf, debug_logger(),
                                        FakeRing(), FakeRing())
-        self.assertEqual(app.concurrent_ec_extra_requests, 4)
-        self.assertEqual(app.concurrent_gets, True)
-        self.assertEqual(app.concurrency_timeout, 0.5)
+        for policy in POLICIES:
+            policy_opts = app.get_policy_options(policy)
+            self.assertEqual(policy_opts.concurrent_ec_extra_requests, 4)
+            self.assertEqual(policy_opts.concurrent_gets, True)
+            self.assertEqual(policy_opts.concurrency_timeout, 0.5)
 
     def test_load_policy_rings(self):
         for policy in POLICIES:
@@ -1549,28 +1554,22 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         self._check_policy_options(app, exp_options, exp_is_local)
 
         default_options = app.get_policy_options(None)
-        self.assertEqual(
-            "ProxyOverrideOptions({}, {'sorting_method': 'shuffle', "
-            "'read_affinity': '', 'write_affinity': '', "
-            "'write_affinity_node_count': '2 * replicas', "
-            "'write_affinity_handoff_delete_count': None})",
-            repr(default_options))
-        self.assertEqual(default_options, eval(repr(default_options), {
-            'ProxyOverrideOptions': default_options.__class__}))
-
         policy_0_options = app.get_policy_options(POLICIES[0])
-        self.assertEqual(
-            "ProxyOverrideOptions({}, {'sorting_method': 'affinity', "
-            "'read_affinity': 'r1=100', 'write_affinity': 'r1', "
-            "'write_affinity_node_count': '1 * replicas', "
-            "'write_affinity_handoff_delete_count': 4})",
-            repr(policy_0_options))
-        self.assertEqual(policy_0_options, eval(repr(policy_0_options), {
-            'ProxyOverrideOptions': policy_0_options.__class__}))
         self.assertNotEqual(default_options, policy_0_options)
-
         policy_1_options = app.get_policy_options(POLICIES[1])
         self.assertIs(default_options, policy_1_options)
+
+    def test_per_policy_conf_repr_and_equal(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        """
+        app = self._write_conf_and_load_app(conf_sections)
+        self.assertIn('ProxyOverrideOptions',
+                      repr(app.get_policy_options(None)))
+        # this is instance equivilence, not value
+        self.assertEqual(app.get_policy_options(None),
+                         app.get_policy_options(POLICIES[0]))
 
     def test_per_policy_conf_inherits_defaults(self):
         conf_sections = """
@@ -1998,6 +1997,39 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         do_test('')
         do_test('uno')
         do_test('0.0')
+
+    def test_per_policy_conf_overrides_default_concurrency_settings(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        concurrent_gets = True
+        concurrency_timeout = 0.5
+
+        [proxy-server:policy:0]
+        concurrent_gets = off
+        concurrency_timeout = 0.6
+
+        [proxy-server:policy:1]
+        concurrent_gets = True
+        concurrency_timeout = 0.3
+        concurrent_ec_extra_requests = 1
+        """
+        exp_options = {
+            None: {
+                "concurrent_gets": True,
+                "concurrency_timeout": 0.5,
+                "concurrent_ec_extra_requests": 0,
+            }, POLICIES[0]: {
+                "concurrent_gets": False,
+                "concurrency_timeout": 0.6,
+                "concurrent_ec_extra_requests": 0,
+            }, POLICIES[1]: {
+                "concurrent_gets": True,
+                "concurrency_timeout": 0.3,
+                "concurrent_ec_extra_requests": 1,
+            }}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, {})
 
 
 class TestProxyServerConfigStringLoading(TestProxyServerConfigLoading):
