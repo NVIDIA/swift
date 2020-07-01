@@ -500,8 +500,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                         'S3Request.check_signature') as mock_cs:
             status, headers, body = self.call_s3api(req)
             self.assertIn('swift.backend_path', req.environ)
-            self.assertEqual('/v1/AUTH_test/bucket',
-                             req.environ['swift.backend_path'])
+            self.assertEqual(
+                '/v1/AUTH_test/bucket+segments/object/123456789abcdef/1',
+                req.environ['swift.backend_path'])
 
         _, _, headers = self.swift.calls_with_headers[-1]
         self.assertEqual(req.environ['s3api.auth_details'], {
@@ -530,8 +531,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                         'S3Request.check_signature') as mock_cs:
             status, headers, body = self.call_s3api(req)
             self.assertIn('swift.backend_path', req.environ)
-            self.assertEqual('/v1/AUTH_test/bucket',
-                             req.environ['swift.backend_path'])
+            self.assertEqual(
+                '/v1/AUTH_test/bucket+segments/object/123456789abcdef/1',
+                req.environ['swift.backend_path'])
 
         _, _, headers = self.swift.calls_with_headers[-1]
         self.assertEqual(req.environ['s3api.auth_details'], {
@@ -705,7 +707,24 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self._test_unsupported_resource('cors')
 
     def test_tagging(self):
-        self._test_unsupported_resource('tagging')
+        req = Request.blank('/bucket?tagging',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200')
+        req = Request.blank('/bucket?tagging',
+                            environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(self._get_error_code(body), 'NotImplemented')
+        req = Request.blank('/bucket?tagging',
+                            environ={'REQUEST_METHOD': 'DELETE'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(self._get_error_code(body), 'NotImplemented')
 
     def test_restore(self):
         self._test_unsupported_resource('restore')

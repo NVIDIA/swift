@@ -577,13 +577,6 @@ use = egg:swift#s3api
 # upload, except the last part.
 # min_segment_size = 5242880
 #
-# When there's a failure during a CompleteMultipartUpload operation, clients
-# need to be able to retry the operation. If the original request completed
-# successfully, the upload marker will already have been removed. Ordinarilly,
-# this would result in a NoSuchUploadId error, but if it completed within the
-# grace period (measured in seconds), allow the retried Complete to continue.
-# completed_grace_period = 300
-#
 # Multi-delete requests can take a long time to complete when writing out
 # tombstones for every object, which may trip client timeouts. Enable this
 # option to bulk-insert object-expirer jobs to delete objects in the

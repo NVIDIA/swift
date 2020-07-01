@@ -108,18 +108,13 @@ def _get_upload_info(req, app, upload_id, completed_grace_period=0):
     try:
         return req.get_response(app, 'HEAD', container=container, obj=obj)
     except NoSuchKey:
-        if completed_grace_period > 0:
-            cutoff = S3Timestamp.now(delta=-completed_grace_period * 100000)
-            try:
-                resp = req.get_response(app, 'HEAD')
-                upload_id_matches = resp.sysmeta_headers.get(sysmeta_header(
-                    'object', 'upload-id')) == upload_id
-                recently_completed = cutoff < S3Timestamp(
-                    resp.sw_headers.get('x-timestamp'))
-                if upload_id_matches and recently_completed:
-                    return resp
-            except NoSuchKey:
-                pass
+        try:
+            resp = req.get_response(app, 'HEAD')
+            if resp.sysmeta_headers.get(sysmeta_header(
+                    'object', 'upload-id')) == upload_id:
+                return resp
+        except NoSuchKey:
+            pass
         raise NoSuchUpload(upload_id=upload_id)
     finally:
         # ...making sure to restore any copy-source before returning
@@ -616,9 +611,7 @@ class UploadController(Controller):
         Handles Complete Multipart Upload.
         """
         upload_id = req.params['uploadId']
-        resp = _get_upload_info(
-            req, self.app, upload_id,
-            completed_grace_period=self.conf.completed_grace_period)
+        resp = _get_upload_info(req, self.app, upload_id)
         headers = {'Accept': 'application/json',
                    sysmeta_header('object', 'upload-id'): upload_id}
         for key, val in resp.headers.items():
@@ -778,7 +771,10 @@ class UploadController(Controller):
                 try:
                     req.get_response(self.app, 'DELETE', container, obj)
                 except NoSuchKey:
-                    # We know that this existed long enough for us to HEAD
+                    # The important thing is that we wrote out a tombstone to
+                    # make sure the marker got cleaned up. If it's already
+                    # gone (e.g., because of concurrent completes or a retried
+                    # complete), so much the better.
                     pass
 
                 yield _make_complete_body(req, s3_etag, yielded_anything)

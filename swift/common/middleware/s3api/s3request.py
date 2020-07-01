@@ -37,15 +37,15 @@ from swift.common.http import HTTP_OK, HTTP_CREATED, HTTP_ACCEPTED, \
     is_success
 
 from swift.common.constraints import check_utf8
-from swift.proxy.controllers.base import get_container_info, \
-    headers_to_container_info
+from swift.proxy.controllers.base import get_container_info
 from swift.common.request_helpers import check_path_header
 
 from swift.common.middleware.s3api.controllers import ServiceController, \
     ObjectController, AclController, MultiObjectDeleteController, \
     LocationController, LoggingStatusController, PartController, \
     UploadController, UploadsController, VersioningController, \
-    UnsupportedController, S3AclController, BucketController
+    UnsupportedController, S3AclController, BucketController, \
+    TaggingController
 from swift.common.middleware.s3api.s3response import AccessDenied, \
     InvalidArgument, InvalidDigest, BucketAlreadyOwnedByYou, \
     RequestTimeTooSkewed, S3Response, SignatureDoesNotMatch, \
@@ -1027,9 +1027,11 @@ class S3Request(swob.Request):
             return UploadsController
         if 'versioning' in self.params:
             return VersioningController
+        if 'tagging' in self.params:
+            return TaggingController
 
         unsupported = ('notification', 'policy', 'requestPayment', 'torrent',
-                       'website', 'cors', 'tagging', 'restore')
+                       'website', 'cors', 'restore')
         if set(unsupported) & set(self.params):
             return UnsupportedController
 
@@ -1340,10 +1342,8 @@ class S3Request(swob.Request):
                                             2, 3, True)
             # Propagate swift.backend_path in environ for middleware
             # in pipeline that need Swift PATH_INFO like ceilometermiddleware.
-            # Store PATH_INFO only the first time to ignore multipart requests.
-            if 'swift.backend_path' not in self.environ:
-                self.environ['swift.backend_path'] = \
-                    sw_resp.environ['PATH_INFO']
+            self.environ['s3api.backend_path'] = \
+                sw_resp.environ['PATH_INFO']
 
         resp = S3Response.from_swift_resp(sw_resp)
         status = resp.status_int  # pylint: disable-msg=E1101
@@ -1440,25 +1440,28 @@ class S3Request(swob.Request):
         :raises: NoSuchBucket when the container doesn't exist
         :raises: InternalError when the request failed without 404
         """
-        if self.is_authenticated:
-            # if we have already authenticated, yes we can use the account
-            # name like as AUTH_xxx for performance efficiency
-            sw_req = self.to_swift_req(app, self.container_name, None)
-            info = get_container_info(sw_req.environ, app, swift_source='S3')
-            if is_success(info['status']):
-                return info
-            elif info['status'] == 404:
-                raise NoSuchBucket(self.container_name)
-            else:
-                raise InternalError(
-                    'unexpected status code %d' % info['status'])
+        if not self.is_authenticated:
+            sw_req = self.to_swift_req('TEST', None, None, body='')
+            # don't show log message of this request
+            sw_req.environ['swift.proxy_access_log_made'] = True
+
+            sw_resp = sw_req.get_response(app)
+
+            if not sw_req.remote_user:
+                raise SignatureDoesNotMatch(
+                    **self.signature_does_not_match_kwargs())
+
+            _, self.account, _ = split_path(sw_resp.environ['PATH_INFO'],
+                                            2, 3, True)
+        sw_req = self.to_swift_req(app, self.container_name, None)
+        info = get_container_info(sw_req.environ, app, swift_source='S3')
+        if is_success(info['status']):
+            return info
+        elif info['status'] == 404:
+            raise NoSuchBucket(self.container_name)
         else:
-            # otherwise we do naive HEAD request with the authentication
-            resp = self.get_response(app, 'HEAD', self.container_name, '')
-            headers = resp.sw_headers.copy()
-            headers.update(resp.sysmeta_headers)
-            return headers_to_container_info(
-                headers, resp.status_int)  # pylint: disable-msg=E1101
+            raise InternalError(
+                'unexpected status code %d' % info['status'])
 
     def gen_multipart_manifest_delete_query(self, app, obj=None, version=None):
         if not self.allow_multipart_uploads:

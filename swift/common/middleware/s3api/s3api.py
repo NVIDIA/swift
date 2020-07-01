@@ -275,8 +275,6 @@ class S3ApiMiddleware(object):
             conf.get('allow_multipart_uploads', True))
         self.conf.min_segment_size = config_positive_int_value(
             conf.get('min_segment_size', 5242880))
-        self.conf.completed_grace_period = int(
-            conf.get('completed_grace_period', 300))
         self.conf.use_async_delete = config_true_value(
             conf.get('use_async_delete', False))
 
@@ -319,6 +317,8 @@ class S3ApiMiddleware(object):
             resp.headers['x-amz-id-2'] = env['swift.trans_id']
             resp.headers['x-amz-request-id'] = env['swift.trans_id']
 
+        if 's3api.backend_path' in env and 'swift.backend_path' not in env:
+            env['swift.backend_path'] = env['s3api.backend_path']
         return resp(env, start_response)
 
     def handle_request(self, req):
