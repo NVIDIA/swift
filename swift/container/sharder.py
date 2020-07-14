@@ -145,6 +145,54 @@ def find_sharding_candidates(broker, threshold, shard_ranges=None):
     return candidates
 
 
+def find_shrinking_acceptors(donor, shard_ranges):
+    """
+    Find the best list of contiguous shard ranges to accept for a given donor
+    """
+    acceptors = []
+
+    all_but_donor = [sr for sr in shard_ranges if sr.name != donor.name
+                     and sr.state in (ShardRange.ACTIVE, ShardRange.CLEAVED)
+                     and not sr.deleted]
+
+    first_lower = None
+    index = 1
+    for i, sr in enumerate(all_but_donor):
+        if sr.lower <= donor.lower:
+            if not first_lower:
+                index = i
+                first_lower = sr
+            elif sr.lower > first_lower.lower:
+                index = i
+                first_lower = sr
+            # else sr.lower == first_lower.lower i.e. *second* lower :P
+            continue
+        if not first_lower:
+            # because of order this only happens when
+            #   donor.lower == ShardRange.MIN
+            index = 1
+            first_lower = sr
+            break
+
+    acceptors.append(first_lower)
+    if donor.upper <= first_lower.upper:
+        # fully overlapping first_lower range
+        return acceptors
+
+    # extend a contiguous range over donor
+    end = first_lower.upper
+    for sr in all_but_donor[index:]:
+        if end >= donor.upper:
+            break
+        if sr.lower >= donor.upper:
+            continue
+        if sr.lower == end:
+            end = sr.upper
+            acceptors.append(sr)
+
+    return acceptors
+
+
 def find_shrinking_candidates(broker, shrink_threshold, merge_size):
     # this should only execute on root containers that have sharded; the
     # goal is to find small shard containers that could be retired by
@@ -768,8 +816,9 @@ class ContainerSharder(ContainerReplicator):
             return False
 
         if shard_range:
-            self.logger.debug('Updating shard from root %s', dict(shard_range))
-            broker.merge_shard_ranges(shard_range)
+            self.logger.debug('Updating %s shard_range(s) from root',
+                              len(shard_ranges))
+            broker.merge_shard_ranges(shard_ranges)
             own_shard_range = broker.get_own_shard_range()
 
         delete_age = time.time() - self.reclaim_age
@@ -1369,11 +1418,9 @@ class ContainerSharder(ContainerReplicator):
 
         ranges_done = []
         for shard_range in ranges_todo:
-            if shard_range.state == ShardRange.FOUND:
-                break
-            elif shard_range.state in (ShardRange.CREATED,
-                                       ShardRange.CLEAVED,
-                                       ShardRange.ACTIVE):
+            if shard_range.state in (ShardRange.CREATED,
+                                     ShardRange.CLEAVED,
+                                     ShardRange.ACTIVE):
                 cleave_result = self._cleave_shard_range(
                     broker, cleaving_context, shard_range)
                 if cleave_result == CLEAVE_SUCCESS:
@@ -1385,8 +1432,7 @@ class ContainerSharder(ContainerReplicator):
                 # else, no errors, but no rows found either. keep going,
                 # and don't count it against our batch size
             else:
-                self.logger.warning('Unexpected shard range state for cleave',
-                                    shard_range.state)
+                self.logger.info('Stopped cleave at unready %s', shard_range)
                 break
 
         if not ranges_done:
