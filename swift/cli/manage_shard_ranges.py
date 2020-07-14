@@ -167,7 +167,7 @@ from six.moves import input
 from swift.common.utils import Timestamp, get_logger, ShardRange
 from swift.container.backend import ContainerBroker, UNSHARDED
 from swift.container.sharder import make_shard_ranges, sharding_enabled, \
-    CleavingContext
+    CleavingContext, find_shrinking_acceptors
 
 
 def _load_and_validate_shard_data(args):
@@ -410,6 +410,35 @@ def enable_sharding(broker, args):
     return 0
 
 
+def shrink(broker, args):
+    shard_ranges = broker.get_shard_ranges()
+    try:
+        donor = [sr for sr in shard_ranges if sr.name == args.donor][0]
+    except IndexError:
+        print("Specified donor not found.")
+        return 2
+
+    acceptors = find_shrinking_acceptors(donor, shard_ranges)
+    donor.epoch = Timestamp.now()
+    donor.update_state(ShardRange.SHRINKING, state_timestamp=donor.epoch)
+    if acceptors[0].lower > donor.lower:
+        acceptors[0].lower = donor.lower
+        acceptors[0].timestamp = donor.state_timestamp
+    if acceptors[-1].upper < donor.upper:
+        acceptors[-1].upper = donor.upper
+        acceptors[-1].timestamp = donor.state_timestamp
+    print('Donor:\n  %s: %s' % (donor.name, donor))
+    print('Acceptors:\n%s' % ('\n'.join(
+        '  %s: %s' % (a.name, a) for a in acceptors)))
+    choice = input('Do you want to continue? [Y/n]')
+    if choice and choice.lower()[0] != 'y':
+        print('No changes made.')
+        return 1
+    acceptors.append(donor)
+    broker.merge_shard_ranges(acceptors)
+    print("Success!")
+
+
 def _add_find_args(parser):
     parser.add_argument('rows_per_shard', nargs='?', type=int, default=500000)
 
@@ -500,6 +529,13 @@ def _make_parser():
     _add_enable_args(enable_parser)
     enable_parser.set_defaults(func=enable_sharding)
     _add_replace_args(enable_parser)
+
+    # shrink
+    shrink_parser = subparsers.add_parser(
+        'shrink', help='Update the state of shard to shrinking.')
+    shrink_parser.set_defaults(func=shrink)
+    shrink_parser.add_argument('donor', type=str,
+                               help='name of shard to shrink')
     return parser
 
 
