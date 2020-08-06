@@ -92,7 +92,7 @@ class TestObjectHandoff(ReplProbeTest):
         # drop a tempfile in the handoff's datadir, like it might have
         # had if there was an rsync failure while it was previously a
         # primary
-        handoff_device_path = self.device_dir('object', another_onode)
+        handoff_device_path = self.device_dir(another_onode)
         data_filename = None
         for root, dirs, files in os.walk(handoff_device_path):
             for filename in files:
@@ -139,13 +139,13 @@ class TestObjectHandoff(ReplProbeTest):
                 port_num = node['replication_port']
             except KeyError:
                 port_num = node['port']
-            node_id = (port_num - 6000) // 10
+            node_id = (port_num % 100) // 10
             Manager(['object-replicator']).once(number=node_id)
         try:
             another_port_num = another_onode['replication_port']
         except KeyError:
             another_port_num = another_onode['port']
-        another_num = (another_port_num - 6000) // 10
+        another_num = (another_port_num % 100) // 10
         Manager(['object-replicator']).once(number=another_num)
 
         # Assert the first container/obj primary server now has container/obj
@@ -156,7 +156,7 @@ class TestObjectHandoff(ReplProbeTest):
 
         # and that it does *not* have a temporary rsync dropping!
         found_data_filename = False
-        primary_device_path = self.device_dir('object', onode)
+        primary_device_path = self.device_dir(onode)
         for root, dirs, files in os.walk(primary_device_path):
             for filename in files:
                 if filename.endswith('.6MbL6r'):
@@ -231,9 +231,9 @@ class TestObjectHandoff(ReplProbeTest):
                 port_num = node['replication_port']
             except KeyError:
                 port_num = node['port']
-            node_id = (port_num - 6000) // 10
+            node_id = (port_num % 100) // 10
             Manager(['object-replicator']).once(number=node_id)
-        another_node_id = (another_port_num - 6000) // 10
+        another_node_id = (another_port_num % 100) // 10
         Manager(['object-replicator']).once(number=another_node_id)
 
         # Assert primary node no longer has container/obj
@@ -398,7 +398,7 @@ class TestECObjectHandoff(ECProbeTest):
 
         # shutdown one of the primary data nodes
         failed_primary = random.choice(onodes)
-        failed_primary_device_path = self.device_dir('object', failed_primary)
+        failed_primary_device_path = self.device_dir(failed_primary)
         # first read its ec etag value for future reference - this may not
         # equal old_contents.etag if for example the proxy has crypto enabled
         req_headers = {'X-Backend-Storage-Policy-Index': int(self.policy)}
@@ -437,7 +437,7 @@ class TestECObjectHandoff(ECProbeTest):
             object_name, headers=req_headers)
         new_backend_etag = headers['X-Object-Sysmeta-EC-Etag']
         for node in other_nodes[:2]:
-            self.kill_drive(self.device_dir('object', node))
+            self.kill_drive(self.device_dir(node))
 
         # sanity, after taking out two primaries we should be down to
         # only four primaries, one of which has the old etag - but we
@@ -600,8 +600,7 @@ class TestECObjectHandoff(ECProbeTest):
         # shutdown three of the primary data nodes
         for i in range(3):
             failed_primary = onodes[i]
-            failed_primary_device_path = self.device_dir('object',
-                                                         failed_primary)
+            failed_primary_device_path = self.device_dir(failed_primary)
             self.kill_drive(failed_primary_device_path)
 
         # Indirectly (i.e., through proxy) try to GET object, it should return

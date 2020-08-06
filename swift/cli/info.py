@@ -16,6 +16,7 @@ import json
 import os
 import sqlite3
 from hashlib import md5
+from collections import defaultdict
 
 from six.moves import urllib
 
@@ -312,9 +313,14 @@ def print_db_info_metadata(db_type, info, metadata, drop_prefixes=False,
     if info.get('shard_ranges'):
         num_shards = len(info['shard_ranges'])
         print('Shard Ranges (%d):' % num_shards)
-        if num_shards > 10 and not verbose:
-            print('  (More than 10 shard ranges; use -v/--verbose to show)')
-        else:
+        count_by_state = defaultdict(int)
+        for srange in info['shard_ranges']:
+            count_by_state[(srange.state, srange.state_text)] += 1
+        print('  States:')
+        for key_state, count in sorted(count_by_state.items()):
+            key, state = key_state
+            print('    %9s: %s' % (state, count))
+        if verbose:
             for srange in info['shard_ranges']:
                 srange = dict(srange, state_text=srange.state_text)
                 print('  Name: %(name)s' % srange)
@@ -328,6 +334,8 @@ def print_db_info_metadata(db_type, info, metadata, drop_prefixes=False,
                 print('    Meta Timestamp: %s (%s)'
                       % (Timestamp(srange['meta_timestamp']).isoformat,
                          srange['meta_timestamp']))
+        else:
+            print('(Use -v/--verbose to show more Shard Ranges details)')
 
 
 def print_obj_metadata(metadata, drop_prefixes=False):

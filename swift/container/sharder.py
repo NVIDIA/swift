@@ -29,6 +29,7 @@ from swift.common.constraints import check_drive, AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common.direct_client import (direct_put_container,
                                         DirectClientException)
 from swift.common.exceptions import DeviceUnavailable
+from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER
 from swift.common.ring.utils import is_local_device
 from swift.common.swob import str_to_wsgi
 from swift.common.utils import get_logger, config_true_value, \
@@ -142,6 +143,46 @@ def find_sharding_candidates(broker, threshold, shard_ranges=None):
         shard_range.epoch = shard_range.state_timestamp
         candidates.append(shard_range)
     return candidates
+
+
+def find_shinrking_acceptors(donor, shard_ranges):
+    """
+    Find the best list of contiguous shard ranges to accept for a given donor
+    """
+    acceptors = []
+
+    all_but_donor = [sr for sr in shard_ranges if sr.name != donor.name
+                     and sr.state == ShardRange.ACTIVE and not sr.deleted]
+
+    first_lower = None
+    for i, sr in enumerate(all_but_donor):
+        if sr.lower <= donor.lower:
+            if not first_lower:
+                first_lower = sr
+            elif sr.lower > first_lower.lower:
+                first_lower = sr
+            # else sr.lower == first_lower.lower i.e. *second* lower :P
+            continue
+        if not first_lower:
+            assert donor.lower == ShardRange.MIN
+            first_lower = sr
+        break
+
+    acceptors.append(first_lower)
+    if donor.upper <= first_lower.upper:
+        # fully overlapping first_lower range
+        return acceptors
+
+    # extend a contiguous range over donor
+    end = first_lower.upper
+    for sr in all_but_donor[i - 1:]:
+        if sr.lower >= donor.upper:
+            break
+        if sr.lower == end:
+            end = sr.upper
+            acceptors.append(sr)
+
+    return acceptors
 
 
 def find_shrinking_candidates(broker, shrink_threshold, merge_size):
@@ -409,7 +450,8 @@ class ContainerSharder(ContainerReplicator):
                 internal_client_conf_path,
                 'Swift Container Sharder',
                 request_tries,
-                allow_modify_pipeline=False)
+                allow_modify_pipeline=False,
+                use_replication_network=True)
         except (OSError, IOError) as err:
             if err.errno != errno.ENOENT and \
                     not str(err).endswith(' not found'):
@@ -623,6 +665,7 @@ class ContainerSharder(ContainerReplicator):
         part, nodes = self.ring.get_nodes(account, container)
         headers = headers or {}
         headers.update({'X-Backend-Record-Type': RECORD_TYPE_SHARD,
+                        USE_REPLICATION_NETWORK_HEADER: 'True',
                         'User-Agent': 'container-sharder %s' % os.getpid(),
                         'X-Timestamp': Timestamp.now().normal,
                         'Content-Length': len(body),
@@ -746,8 +789,9 @@ class ContainerSharder(ContainerReplicator):
                     # root may not yet know about this shard container
                     warnings.append('root has no matching shard range')
                     shard_range = None
-            else:
+            elif not own_shard_range.deleted:
                 warnings.append('unable to get shard ranges from root')
+            # else, our shard range is deleted, so root may have reclaimed it
         else:
             errors.append('missing own shard range')
 
@@ -764,17 +808,20 @@ class ContainerSharder(ContainerReplicator):
             return False
 
         if shard_range:
-            self.logger.debug('Updating shard from root %s', dict(shard_range))
-            broker.merge_shard_ranges(shard_range)
+            self.logger.debug('Updating %s shard_range(s) from root',
+                              len(shard_ranges))
+            broker.merge_shard_ranges(shard_ranges)
             own_shard_range = broker.get_own_shard_range()
-            delete_age = time.time() - self.reclaim_age
-            if (own_shard_range.state == ShardRange.SHARDED and
-                    own_shard_range.deleted and
-                    own_shard_range.timestamp < delete_age and
-                    broker.empty()):
-                broker.delete_db(Timestamp.now().internal)
-                self.logger.debug('Deleted shard container %s (%s)',
-                                  broker.db_file, quote(broker.path))
+
+        delete_age = time.time() - self.reclaim_age
+        if (own_shard_range.state == ShardRange.SHARDED and
+                own_shard_range.deleted and
+                own_shard_range.timestamp < delete_age and
+                broker.empty()):
+            broker.delete_db(Timestamp.now().internal)
+            self.logger.debug('Deleted shard container %s (%s)',
+                              broker.db_file, quote(broker.path))
+
         self._increment_stat('audit_shard', 'success', statsd=True)
         return True
 
@@ -1363,11 +1410,9 @@ class ContainerSharder(ContainerReplicator):
 
         ranges_done = []
         for shard_range in ranges_todo:
-            if shard_range.state == ShardRange.FOUND:
-                break
-            elif shard_range.state in (ShardRange.CREATED,
-                                       ShardRange.CLEAVED,
-                                       ShardRange.ACTIVE):
+            if shard_range.state in (ShardRange.CREATED,
+                                     ShardRange.CLEAVED,
+                                     ShardRange.ACTIVE):
                 cleave_result = self._cleave_shard_range(
                     broker, cleaving_context, shard_range)
                 if cleave_result == CLEAVE_SUCCESS:
@@ -1379,8 +1424,7 @@ class ContainerSharder(ContainerReplicator):
                 # else, no errors, but no rows found either. keep going,
                 # and don't count it against our batch size
             else:
-                self.logger.warning('Unexpected shard range state for cleave',
-                                    shard_range.state)
+                self.logger.info('Stopped cleave at unready %s', shard_range)
                 break
 
         if not ranges_done:

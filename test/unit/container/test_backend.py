@@ -26,6 +26,7 @@ import random
 from collections import defaultdict
 from contextlib import contextmanager
 import sqlite3
+import string
 import pickle
 import json
 import itertools
@@ -442,6 +443,7 @@ class TestContainerBroker(unittest.TestCase):
             self.assertTrue(broker_to_test.empty())
 
         self.assertTrue(broker.empty())
+        self.assertFalse(broker.is_root_container())
         check_object_counted(broker, broker)
 
         # own shard range is not considered for object count
@@ -498,6 +500,20 @@ class TestContainerBroker(unittest.TestCase):
         own_sr.update_meta(3, 4, meta_timestamp=next(self.ts))
         broker.merge_shard_ranges([own_sr])
         self.assertTrue(broker.empty())
+        self.assertFalse(broker.is_deleted())
+        self.assertFalse(broker.is_root_container())
+
+        # sharder won't call delete_db() unless own_shard_range is deleted
+        own_sr.deleted = True
+        own_sr.timestamp = next(self.ts)
+        broker.merge_shard_ranges([own_sr])
+        broker.delete_db(next(self.ts).internal)
+
+        # Get a fresh broker, with instance cache unset
+        broker = ContainerBroker(db_path, account='.shards_a', container='cc')
+        self.assertTrue(broker.empty())
+        self.assertTrue(broker.is_deleted())
+        self.assertFalse(broker.is_root_container())
 
     def test_reclaim(self):
         broker = ContainerBroker(':memory:', account='test_account',
@@ -3911,6 +3927,45 @@ class TestContainerBroker(unittest.TestCase):
         actual = broker.get_shard_ranges(
             include_own=False, exclude_others=True)
         self.assertFalse(actual)
+
+    @with_tempdir
+    def test_overloap_shard_range_order(self, tempdir):
+        db_path = os.path.join(tempdir, 'container.db')
+        broker = ContainerBroker(db_path, account='a', container='c')
+        broker.initialize(next(self.ts).internal, 0)
+
+        epoch0 = next(self.ts)
+        epoch1 = next(self.ts)
+        shard_ranges = [
+            ShardRange('.shard_a/shard_%d-%d' % (e, s), epoch, l, u,
+                       state=ShardRange.ACTIVE)
+            for s, (l, u) in enumerate(zip(string.ascii_letters[:7],
+                                           string.ascii_letters[1:]))
+            for e, epoch in enumerate((epoch0, epoch1))
+        ]
+
+        random.shuffle(shard_ranges)
+        for sr in shard_ranges:
+            broker.merge_shard_ranges([sr])
+
+        expected = [
+            '.shard_a/shard_0-0',
+            '.shard_a/shard_1-0',
+            '.shard_a/shard_0-1',
+            '.shard_a/shard_1-1',
+            '.shard_a/shard_0-2',
+            '.shard_a/shard_1-2',
+            '.shard_a/shard_0-3',
+            '.shard_a/shard_1-3',
+            '.shard_a/shard_0-4',
+            '.shard_a/shard_1-4',
+            '.shard_a/shard_0-5',
+            '.shard_a/shard_1-5',
+            '.shard_a/shard_0-6',
+            '.shard_a/shard_1-6',
+        ]
+        self.assertEqual(expected, [
+            sr.name for sr in broker.get_shard_ranges()])
 
     @with_tempdir
     def test_get_shard_ranges_with_sharding_overlaps(self, tempdir):

@@ -380,3 +380,111 @@ class TestManageShardRanges(unittest.TestCase):
         self.assertEqual(expected, out.getvalue().splitlines())
         self.assertEqual(['Loaded db broker for a/c.'],
                          err.getvalue().splitlines())
+
+    def test_shrink(self):
+        db_file = os.path.join(self.testdir, 'hash.db')
+        broker = ContainerBroker(db_file)
+        broker.account = 'a'
+        broker.container = 'c'
+        broker.initialize()
+        out = StringIO()
+        err = StringIO()
+        with mock.patch('sys.stdout', out), mock.patch('sys.stderr', err), \
+                mock_timestamp_now():
+            main([broker.db_file, 'shrink', '.shards_a/c-xxx-2'])
+        self.assertEqual(['Specified donor not found.'],
+                         out.getvalue().splitlines())
+        ts = utils.Timestamp.now()
+        shard_ranges = [
+            ShardRange('.shards_a/c-xxx-1', ts, 'a', 'c', 25000001,
+                       state=ShardRange.ACTIVE),
+            ShardRange('.shards_a/c-xxx-2', ts, 'c', 'e', 10,
+                       state=ShardRange.ACTIVE),
+            ShardRange('.shards_a/c-xxx-3', ts, 'e', 'g', 25000001,
+                       state=ShardRange.ACTIVE),
+        ]
+        broker.merge_shard_ranges(shard_ranges)
+        out = StringIO()
+        err = StringIO()
+        in_ = StringIO()
+        with mock.patch('sys.stdout', out), mock.patch('sys.stderr', err), \
+                mock.patch('sys.stdin', in_), mock_timestamp_now():
+            in_.write('Y\n')
+            in_.seek(0)
+            main([broker.db_file, 'shrink', '.shards_a/c-xxx-2'])
+        new_shard_ranges = broker.get_shard_ranges()
+        donor = new_shard_ranges[1]
+        self.assertEqual('.shards_a/c-xxx-2', donor.name)
+        self.assertEqual(ShardRange.SHRINKING, donor.state)
+        acceptor = new_shard_ranges[0]
+        self.assertEqual('.shards_a/c-xxx-1', acceptor.name)
+        self.assertEqual('e', acceptor.upper)
+
+        out_lines = out.getvalue().splitlines()
+        self.assertEqual('Donor:', out_lines[0])
+        self.assertEqual('  .shards_a/c-xxx-2: %s' % donor,
+                         out_lines[1])
+        self.assertEqual('Acceptors:', out_lines[2])
+        self.assertEqual('  .shards_a/c-xxx-1: %s' % acceptor,
+                         out_lines[3])
+
+    def test_overlap_shrink(self):
+        db_file = os.path.join(self.testdir, 'hash.db')
+        broker = ContainerBroker(db_file)
+        broker.account = 'a'
+        broker.container = 'c'
+        broker.initialize()
+        ts = utils.Timestamp.now()
+        shard_ranges = [
+            ShardRange('.shards_a/c-xxx-1', ts, 'a', 'c', 100,
+                       state=ShardRange.ACTIVE),
+            ShardRange('.shards_a/c-yyy-0', ts, 'b', 'd', 10,
+                       state=ShardRange.ACTIVE),
+            ShardRange('.shards_a/c-xxx-2', ts, 'c', 'e', 100,
+                       state=ShardRange.ACTIVE),
+            ShardRange('.shards_a/c-xxx-3', ts, 'e', 'g', 1000,
+                       state=ShardRange.ACTIVE),
+        ]
+        broker.merge_shard_ranges(shard_ranges)
+
+        out = StringIO()
+        err = StringIO()
+        in_ = StringIO()
+        with mock.patch('sys.stdout', out), mock.patch('sys.stderr', err), \
+                mock.patch('sys.stdin', in_), mock_timestamp_now():
+            in_.write('N\n')  # don't do it!!
+            in_.seek(0)
+            main([broker.db_file, 'shrink', '.shards_a/c-yyy-0'])
+        # ... no changes made
+        self.assertEqual(shard_ranges, broker.get_shard_ranges())
+
+        out = StringIO()
+        err = StringIO()
+        in_ = StringIO()
+        with mock.patch('sys.stdout', out), mock.patch('sys.stderr', err), \
+                mock.patch('sys.stdin', in_), mock_timestamp_now():
+            in_.write('Y\n')  # do it!!
+            in_.seek(0)
+            main([broker.db_file, 'shrink', '.shards_a/c-yyy-0'])
+        out_lines = out.getvalue().splitlines()
+
+        new_shard_ranges = broker.get_shard_ranges()
+        donor = new_shard_ranges[1]
+        self.assertEqual('.shards_a/c-yyy-0', donor.name)
+        self.assertEqual(ShardRange.SHRINKING, donor.state)
+        acceptor1 = new_shard_ranges[0]
+        self.assertEqual('.shards_a/c-xxx-1', acceptor1.name)
+        self.assertEqual('a', acceptor1.lower)
+        acceptor2 = new_shard_ranges[2]
+        self.assertEqual('.shards_a/c-xxx-2', acceptor2.name)
+        self.assertEqual('e', acceptor2.upper)
+
+        out_lines = out.getvalue().splitlines()
+        self.assertEqual('Donor:', out_lines[0])
+        self.assertEqual('  .shards_a/c-yyy-0: %s' % donor,
+                         out_lines[1])
+        self.assertEqual('Acceptors:', out_lines[2])
+        self.assertEqual('  .shards_a/c-xxx-1: %s' % acceptor1,
+                         out_lines[3])
+        self.assertEqual('  .shards_a/c-xxx-2: %s' % acceptor2,
+                         out_lines[4])

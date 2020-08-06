@@ -45,7 +45,8 @@ from swift.common.wsgi import make_pre_authed_env, make_pre_authed_request
 from swift.common.utils import Timestamp, WatchdogTimeout, config_true_value, \
     public, split_path, list_from_csv, GreenthreadSafeIterator, \
     GreenAsyncPile, quorum_size, parse_content_type, drain_and_close, \
-    document_iters_to_http_response_body, ShardRange, find_shard_range
+    document_iters_to_http_response_body, ShardRange, find_shard_range, \
+    cache_from_env
 from swift.common.bufferedhttp import http_connect
 from swift.common import constraints
 from swift.common.exceptions import ChunkReadTimeout, ChunkWriteTimeout, \
@@ -62,7 +63,7 @@ from swift.common.swob import Request, Response, Range, \
 from swift.common.request_helpers import strip_sys_meta_prefix, \
     strip_user_meta_prefix, is_user_meta, is_sys_meta, is_sys_or_user_meta, \
     http_response_to_document_iters, is_object_transient_sysmeta, \
-    strip_object_transient_sysmeta_prefix
+    strip_object_transient_sysmeta_prefix, get_ip_port
 from swift.common.storage_policy import POLICIES
 
 
@@ -541,8 +542,7 @@ def set_info_cache(app, env, account, container, resp):
     """
     cache_key = get_cache_key(account, container)
     infocache = env.setdefault('swift.infocache', {})
-    memcache = getattr(app, 'memcache', None) or env.get('swift.cache')
-
+    memcache = cache_from_env(env, True)
     if resp is None:
         infocache.pop(cache_key, None)
         if memcache:
@@ -645,7 +645,7 @@ def _get_info_from_memcache(app, env, account, container=None):
       returns None if memcache is not in use.
     """
     cache_key = get_cache_key(account, container)
-    memcache = getattr(app, 'memcache', None) or env.get('swift.cache')
+    memcache = cache_from_env(env, True)
     if memcache:
         info = memcache.get(cache_key)
         if info and six.PY2:
@@ -854,10 +854,10 @@ class ByteCountEnforcer(object):
             return chunk
 
 
-class ResumingGetter(object):
+class GetOrHeadHandler(object):
     def __init__(self, app, req, server_type, node_iter, partition, path,
-                 backend_headers, concurrency=1, client_chunk_size=None,
-                 newest=None, header_provider=None):
+                 backend_headers, concurrency=1, policy=None,
+                 client_chunk_size=None, newest=None):
         self.app = app
         self.node_iter = node_iter
         self.server_type = server_type
@@ -870,8 +870,8 @@ class ResumingGetter(object):
         self.used_nodes = []
         self.used_source_etag = ''
         self.concurrency = concurrency
+        self.policy = policy
         self.node = None
-        self.header_provider = header_provider
         self.latest_404_timestamp = Timestamp(0)
 
         # stuff from request
@@ -1010,13 +1010,6 @@ class ResumingGetter(object):
         if self.server_type == 'Object' and src.status == 416:
             return True
         return is_success(src.status) or is_redirection(src.status)
-
-    def response_parts_iter(self, req):
-        source, node = self._get_source_and_node()
-        it = None
-        if source:
-            it = self._get_response_parts_iter(req, node, source)
-        return it
 
     def _get_response_parts_iter(self, req, node, source):
         # Someday we can replace this [mess] with python 3's "nonlocal"
@@ -1261,14 +1254,12 @@ class ResumingGetter(object):
         if node in self.used_nodes:
             return False
         req_headers = dict(self.backend_headers)
-        # a request may be specialised with specific backend headers
-        if self.header_provider:
-            req_headers.update(self.header_provider())
+        ip, port = get_ip_port(node, req_headers)
         start_node_timing = time.time()
         try:
             with ConnectionTimeout(self.app.conn_timeout):
                 conn = http_connect(
-                    node['ip'], node['port'], node['device'],
+                    ip, port, node['device'],
                     self.partition, self.req_method, self.path,
                     headers=req_headers,
                     query_string=self.req_query_string)
@@ -1298,9 +1289,8 @@ class ResumingGetter(object):
                 close_swift_conn(possible_source)
             else:
                 if self.used_source_etag and \
-                    self.used_source_etag != normalize_etag(src_headers.get(
-                        'x-object-sysmeta-ec-etag',
-                        src_headers.get('etag', ''))):
+                        self.used_source_etag != normalize_etag(
+                            src_headers.get('etag', '')):
                     self.statuses.append(HTTP_NOT_FOUND)
                     self.reasons.append('')
                     self.bodies.append('')
@@ -1374,7 +1364,8 @@ class ResumingGetter(object):
         for node in nodes:
             pile.spawn(self._make_node_request, node, node_timeout,
                        self.app.logger.thread_locals)
-            _timeout = self.app.concurrency_timeout \
+            _timeout = self.app.get_policy_options(
+                self.policy).concurrency_timeout \
                 if pile.inflight < self.concurrency else None
             if pile.waitfirst(_timeout):
                 break
@@ -1400,18 +1391,14 @@ class ResumingGetter(object):
 
             # Save off the source etag so that, if we lose the connection
             # and have to resume from a different node, we can be sure that
-            # we have the same object (replication) or a fragment archive
-            # from the same object (EC). Otherwise, if the cluster has two
-            # versions of the same object, we might end up switching between
-            # old and new mid-stream and giving garbage to the client.
-            self.used_source_etag = normalize_etag(src_headers.get(
-                'x-object-sysmeta-ec-etag', src_headers.get('etag', '')))
+            # we have the same object (replication). Otherwise, if the cluster
+            # has two versions of the same object, we might end up switching
+            # between old and new mid-stream and giving garbage to the client.
+            self.used_source_etag = normalize_etag(src_headers.get('etag', ''))
             self.node = node
             return source, node
         return None, None
 
-
-class GetOrHeadHandler(ResumingGetter):
     def _make_app_iter(self, req, node, source):
         """
         Returns an iterator over the contents of the source (via its read
@@ -1503,17 +1490,21 @@ class NodeIter(object):
         if node_iter is None:
             node_iter = itertools.chain(
                 part_nodes, ring.get_more_nodes(partition))
-        num_primary_nodes = len(part_nodes)
-        self.nodes_left = self.app.request_node_count(num_primary_nodes)
-        self.expected_handoffs = self.nodes_left - num_primary_nodes
+        self.num_primary_nodes = len(part_nodes)
+        self.nodes_left = self.app.request_node_count(self.num_primary_nodes)
+        self.expected_handoffs = self.nodes_left - self.num_primary_nodes
 
         # Use of list() here forcibly yanks the first N nodes (the primary
         # nodes) from node_iter, so the rest of its values are handoffs.
         self.primary_nodes = self.app.sort_nodes(
-            list(itertools.islice(node_iter, num_primary_nodes)),
+            list(itertools.islice(node_iter, self.num_primary_nodes)),
             policy=policy)
         self.handoff_iter = node_iter
         self._node_provider = None
+
+    @property
+    def primaries_left(self):
+        return len(self.primary_nodes)
 
     def __iter__(self):
         self._node_iter = self._node_gen()
@@ -1538,7 +1529,7 @@ class NodeIter(object):
             self.app.logger.increment('handoff_count')
             self.app.logger.warning(
                 'Handoff requested (%d)' % handoffs)
-            if (extra_handoffs == len(self.primary_nodes)):
+            if (extra_handoffs == self.num_primary_nodes):
                 # all the primaries were skipped, and handoffs didn't help
                 self.app.logger.increment('handoff_all_count')
 
@@ -1554,7 +1545,8 @@ class NodeIter(object):
         self._node_provider = callback
 
     def _node_gen(self):
-        for node in self.primary_nodes:
+        while self.primary_nodes:
+            node = self.primary_nodes.pop(0)
             if not self.app.error_limited(node):
                 yield node
                 if not self.app.error_limited(node):
@@ -1678,12 +1670,12 @@ class Controller(object):
         headers['referer'] = referer
         return headers
 
-    def account_info(self, account, req=None):
+    def account_info(self, account, req):
         """
         Get account information, and also verify that the account exists.
 
         :param account: native str name of the account to get the info for
-        :param req: caller's HTTP request context object (optional)
+        :param req: caller's HTTP request context object
         :returns: tuple of (account partition, account nodes, container_count)
                   or (None, None, None) if it does not exist
         """
@@ -1704,14 +1696,14 @@ class Controller(object):
         partition, nodes = self.app.account_ring.get_nodes(account)
         return partition, nodes, container_count
 
-    def container_info(self, account, container, req=None):
+    def container_info(self, account, container, req):
         """
         Get container information and thusly verify container existence.
         This will also verify account existence.
 
         :param account: native-str account name for the container
         :param container: native-str container name to look up
-        :param req: caller's HTTP request context object (optional)
+        :param req: caller's HTTP request context object
         :returns: dict containing at least container partition ('partition'),
                   container nodes ('containers'), container read
                   acl ('read_acl'), container write acl ('write_acl'),
@@ -1766,11 +1758,12 @@ class Controller(object):
             headers['Content-Length'] = str(len(body))
         for node in nodes:
             try:
+                ip, port = get_ip_port(node, headers)
                 start_node_timing = time.time()
                 with ConnectionTimeout(self.app.conn_timeout):
-                    conn = http_connect(node['ip'], node['port'],
-                                        node['device'], part, method, path,
-                                        headers=headers, query_string=query)
+                    conn = http_connect(
+                        ip, port, node['device'], part, method, path,
+                        headers=headers, query_string=query)
                     conn.node = node
                 self.app.set_node_timing(node, time.time() - start_node_timing)
                 if body:
@@ -2007,7 +2000,7 @@ class Controller(object):
             return False
 
     def GETorHEAD_base(self, req, server_type, node_iter, partition, path,
-                       concurrency=1, client_chunk_size=None):
+                       concurrency=1, policy=None, client_chunk_size=None):
         """
         Base handler for HTTP GET or HEAD requests.
 
@@ -2017,6 +2010,7 @@ class Controller(object):
         :param partition: partition
         :param path: path for the request
         :param concurrency: number of requests to run concurrently
+        :param policy: the policy instance, or None if Account or Container
         :param client_chunk_size: chunk size for response body iterator
         :returns: swob.Response object
         """
@@ -2025,7 +2019,7 @@ class Controller(object):
 
         handler = GetOrHeadHandler(self.app, req, self.server_type, node_iter,
                                    partition, path, backend_headers,
-                                   concurrency,
+                                   concurrency, policy=policy,
                                    client_chunk_size=client_chunk_size)
         res = handler.get_working_response(req)
 
@@ -2268,8 +2262,7 @@ class Controller(object):
 
         cache_key = get_cache_key(account, container, shard='updating')
         infocache = req.environ.setdefault('swift.infocache', {})
-        memcache = getattr(self.app, 'memcache', None) or req.environ.get(
-            'swift.cache')
+        memcache = cache_from_env(req.environ, True)
 
         cached_ranges = infocache.get(cache_key)
         if cached_ranges is None and memcache:

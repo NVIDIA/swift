@@ -63,7 +63,7 @@ class TestObjectFailures(ReplProbeTest):
         opart, onodes = self.object_ring.get_nodes(
             self.account, container, obj)
         onode = onodes[0]
-        node_id = (onode['port'] - 6000) / 10
+        node_id = (onode['port'] % 100) / 10
         device = onode['device']
         hash_str = hash_path(self.account, container, obj)
         obj_server_conf = readconf(self.configs['object-server'][node_id])
@@ -233,7 +233,7 @@ class TestECObjectFailures(ECProbeTest):
 
         # make all fragments non-durable
         for node in onodes:
-            part_dir = self.storage_dir('object', node, part=opart)
+            part_dir = self.storage_dir(node, part=opart)
             for dirs, subdirs, files in os.walk(part_dir):
                 for fname in files:
                     if fname.endswith('.data'):
