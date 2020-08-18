@@ -2412,6 +2412,12 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
+    def test_GET_no_response_error(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        with set_http_connect():
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+
     def test_feed_remaining_primaries(self):
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
@@ -3104,7 +3110,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                 collected_indexes[fi].append(conn)
         self.assertEqual(len(collected_indexes), 7)
 
-    def test_GET_with_mixed_nondurable_frags_and_no_quorum_will_503(self):
+    def test_GET_with_mixed_nondurable_frags_and_will_404(self):
         # all nodes have a frag but there is no one set that reaches quorum,
         # which means there is no backend 404 response, but proxy should still
         # return 404 rather than 503
@@ -3166,10 +3172,72 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             collected_etags)
         self.assertEqual({200}, collected_status)
 
-    def test_GET_with_mixed_frags_and_no_quorum_will_503(self):
+    def test_GET_with_mixed_durable_and_nondurable_frags_will_503(self):
         # all nodes have a frag but there is no one set that reaches quorum,
-        # but since they're all marked durable (so we *should* be able to
-        # reconstruct), proxy will 503
+        # but since one is marked durable we *should* be able to reconstruct,
+        # so proxy should 503
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
+        obj3 = self._make_ec_object_stub(pattern='obj3')
+        obj4 = self._make_ec_object_stub(pattern='obj4')
+
+        node_frags = [
+            {'obj': obj1, 'frag': 0, 'durable': False},
+            {'obj': obj2, 'frag': 0, 'durable': False},
+            {'obj': obj3, 'frag': 0, 'durable': False},
+            {'obj': obj1, 'frag': 1, 'durable': False},
+            {'obj': obj2, 'frag': 1, 'durable': False},
+            {'obj': obj3, 'frag': 1, 'durable': False},
+            {'obj': obj1, 'frag': 2, 'durable': False},
+            {'obj': obj2, 'frag': 2, 'durable': False},
+            {'obj': obj3, 'frag': 2, 'durable': False},
+            {'obj': obj1, 'frag': 3, 'durable': False},
+            {'obj': obj2, 'frag': 3, 'durable': False},
+            {'obj': obj3, 'frag': 3, 'durable': False},
+            {'obj': obj1, 'frag': 4, 'durable': False},
+            {'obj': obj2, 'frag': 4, 'durable': False},
+            {'obj': obj3, 'frag': 4, 'durable': False},
+            {'obj': obj1, 'frag': 5, 'durable': False},
+            {'obj': obj2, 'frag': 5, 'durable': False},
+            {'obj': obj3, 'frag': 5, 'durable': False},
+            {'obj': obj1, 'frag': 6, 'durable': False},
+            {'obj': obj2, 'frag': 6, 'durable': False},
+            {'obj': obj3, 'frag': 6, 'durable': False},
+            {'obj': obj1, 'frag': 7, 'durable': False},
+            {'obj': obj2, 'frag': 7, 'durable': False},
+            {'obj': obj3, 'frag': 7},
+            {'obj': obj1, 'frag': 8, 'durable': False},
+            {'obj': obj2, 'frag': 8, 'durable': False},
+            {'obj': obj3, 'frag': 8, 'durable': False},
+            {'obj': obj4, 'frag': 8, 'durable': False},
+        ]
+
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 503)
+
+        collected_etags = set()
+        collected_status = set()
+        for conn in log:
+            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
+            collected_etags.add(etag)
+            collected_status.add(conn.resp.status)
+
+        # default node_iter will exhaust at 2 * replicas
+        self.assertEqual(len(log), 2 * self.replicas())
+        self.assertEqual(
+            {obj1['etag'], obj2['etag'], obj3['etag'], obj4['etag']},
+            collected_etags)
+        self.assertEqual({200}, collected_status)
+
+    def test_GET_with_mixed_durable_frags_and_no_quorum_will_503(self):
+        # all nodes have a frag but there is no one set that reaches quorum,
+        # and since at least one is marked durable we *should* be able to
+        # reconstruct, so proxy will 503
         obj1 = self._make_ec_object_stub(pattern='obj1')
         obj2 = self._make_ec_object_stub(pattern='obj2')
         obj3 = self._make_ec_object_stub(pattern='obj3')

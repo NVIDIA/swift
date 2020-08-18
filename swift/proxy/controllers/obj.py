@@ -2977,7 +2977,7 @@ class ECObjectController(BaseObjectController):
             headers = []
             for status, bad_bucket in buckets.bad_buckets.items():
                 for getter, _parts_iter in bad_bucket.get_responses():
-                    if best_bucket and best_bucket.durable:
+                    if best_bucket.durable:
                         bad_resp_headers = getter.last_headers
                         t_data_file = bad_resp_headers.get(
                             'X-Backend-Data-Timestamp')
@@ -2995,7 +2995,8 @@ class ECObjectController(BaseObjectController):
                         bodies.append(getter.body)
                         headers.append(getter.source_headers)
 
-            if not statuses and best_bucket and not best_bucket.durable:
+            if not statuses and is_success(best_bucket.status) and \
+                    not best_bucket.durable:
                 # pretend that non-durable bucket was 404s
                 statuses.append(404)
                 reasons.append('404 Not Found')
