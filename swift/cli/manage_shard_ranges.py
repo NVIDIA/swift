@@ -167,7 +167,7 @@ from six.moves import input
 from swift.common.utils import Timestamp, get_logger, ShardRange
 from swift.container.backend import ContainerBroker, UNSHARDED
 from swift.container.sharder import make_shard_ranges, sharding_enabled, \
-    CleavingContext, find_shinrking_acceptors
+    CleavingContext, find_shrinking_acceptors
 
 
 def _load_and_validate_shard_data(args):
@@ -418,7 +418,7 @@ def shrink(broker, args):
         print("Specified donor not found.")
         return 2
 
-    acceptors = find_shinrking_acceptors(donor, shard_ranges)
+    acceptors = find_shrinking_acceptors(donor, shard_ranges)
     donor.epoch = Timestamp.now()
     donor.update_state(ShardRange.SHRINKING, state_timestamp=donor.epoch)
     if acceptors[0].lower > donor.lower:

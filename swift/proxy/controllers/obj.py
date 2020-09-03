@@ -1400,7 +1400,7 @@ class ECAppIter(object):
                 # killed by contextpool
                 pass
             except ChunkReadTimeout:
-                # unable to resume in GetOrHeadHandler
+                # unable to resume in ECFragGetter
                 self.logger.exception(_("Timeout fetching fragments for %r"),
                                       quote(self.path))
             except:  # noqa
@@ -2004,15 +2004,20 @@ class ECGetResponseBucket(object):
         return self._durable
 
     def add_response(self, getter, parts_iter):
+        """
+        Add another response to this bucket.  Response buckets can be for
+        fragments with the same timestamp, or for errors with the same status.
+        """
         headers = getter.last_headers
         timestamp_str = headers.get('X-Backend-Timestamp',
                                     headers.get('X-Timestamp'))
         if timestamp_str:
+            # 404s will keep the most recent timestamp
             self.timestamp = max(Timestamp(timestamp_str), self.timestamp)
         if not self.gets:
-            self.status = getter.last_status
             # stash first set of backend headers, which will be used to
             # populate a client response
+            self.status = getter.last_status
             # TODO: each bucket is for a single *data* timestamp, but sources
             # in the same bucket may have different *metadata* timestamps if
             # some backends have more recent .meta files than others. Currently
@@ -2022,18 +2027,17 @@ class ECGetResponseBucket(object):
             # recent metadata. We could alternatively choose to the *newest*
             # metadata headers for self.headers by selecting the source with
             # the latest X-Timestamp.
-            self.headers = getter.last_headers
-        elif (self.timestamp is not None and  # ie, not bad_bucket
-              getter.last_headers.get('X-Object-Sysmeta-Ec-Etag') !=
-              self.headers.get('X-Object-Sysmeta-Ec-Etag')):
+            self.headers = headers
+        elif headers.get('X-Object-Sysmeta-Ec-Etag') != \
+                self.headers.get('X-Object-Sysmeta-Ec-Etag'):
             # Fragments at the same timestamp with different etags are never
-            # expected. If somehow it happens then ignore those fragments
-            # to avoid mixing fragments that will not reconstruct otherwise
-            # an exception from pyeclib is almost certain. This strategy leaves
-            # a possibility that a set of consistent frags will be gathered.
+            # expected and error buckets shouldn't have this header. If somehow
+            # this happens then ignore those responses to avoid mixing
+            # fragments that will not reconstruct otherwise an exception from
+            # pyeclib is almost certain.
             raise ValueError("ETag mismatch")
 
-        frag_index = getter.last_headers.get('X-Object-Sysmeta-Ec-Frag-Index')
+        frag_index = headers.get('X-Object-Sysmeta-Ec-Frag-Index')
         frag_index = int(frag_index) if frag_index is not None else None
         self.gets[frag_index].append((getter, parts_iter))
 
@@ -2062,7 +2066,7 @@ class ECGetResponseBucket(object):
     @property
     def shortfall(self):
         """
-        The number of additional responses needed complete this bucket;
+        The number of additional responses needed to complete this bucket;
         typically (ndata - resp_count).
 
         If the bucket has no durable responses, shortfall is extended out to
@@ -2327,7 +2331,7 @@ def is_good_source(status):
 class ECFragGetter(object):
 
     def __init__(self, app, req, node_iter, partition, policy, path,
-                 backend_headers, header_provider=None):
+                 backend_headers, header_provider, logger_thread_locals):
         self.app = app
         self.req = req
         self.node_iter = node_iter
@@ -2339,6 +2343,7 @@ class ECFragGetter(object):
         self.client_chunk_size = policy.fragment_size
         self.skip_bytes = 0
         self.bytes_used_from_backend = 0
+        self.logger_thread_locals = logger_thread_locals
 
     def fast_forward(self, num_bytes):
         """
@@ -2685,10 +2690,10 @@ class ECFragGetter(object):
         if self.source_headers:
             return HeaderKeyDict(self.source_headers)
         else:
-            return {}
+            return HeaderKeyDict()
 
-    def _make_node_request(self, node, node_timeout, logger_thread_locals):
-        self.app.logger.thread_locals = logger_thread_locals
+    def _make_node_request(self, node, node_timeout):
+        self.app.logger.thread_locals = self.logger_thread_locals
         req_headers = dict(self.backend_headers)
         ip, port = get_ip_port(node, req_headers)
         req_headers.update(self.header_provider())
@@ -2716,24 +2721,23 @@ class ECFragGetter(object):
         src_headers = dict(
             (k.lower(), v) for k, v in
             possible_source.getheaders())
+
+        if 'handoff_index' in node and \
+                (is_server_error(possible_source.status) or
+                 possible_source.status == HTTP_NOT_FOUND) and \
+                not Timestamp(src_headers.get('x-backend-timestamp', 0)):
+            # throw out 5XX and 404s from handoff nodes unless the data is
+            # really on disk and had been DELETEd
+            return None
+
+        self.status = possible_source.status
+        self.reason = possible_source.reason
+        self.source_headers = possible_source.getheaders()
         if is_good_source(possible_source.status):
-            self.status = possible_source.status
-            self.reason = possible_source.reason
             self.body = None
-            self.source_headers = possible_source.getheaders()
             return possible_source
         else:
-            if 'handoff_index' in node and \
-                    (is_server_error(possible_source.status) or
-                     possible_source.status == HTTP_NOT_FOUND) and \
-                    not Timestamp(src_headers.get('x-backend-timestamp', 0)):
-                # throw out 5XX and 404s from handoff nodes unless the data is
-                # really on disk and had been DELETEd
-                return None
-            self.status = possible_source.status
-            self.reason = possible_source.reason
             self.body = possible_source.read()
-            self.source_headers = possible_source.getheaders()
 
             if possible_source.status == HTTP_INSUFFICIENT_STORAGE:
                 self.app.error_limit(node, _('ERROR Insufficient Storage'))
@@ -2743,7 +2747,7 @@ class ECFragGetter(object):
                             'From Object Server') %
                     {'status': possible_source.status,
                      'body': self.body[:1024]})
-        return None
+            return None
 
     @property
     def source_and_node_iter(self):
@@ -2755,8 +2759,7 @@ class ECFragGetter(object):
         self.status = self.reason = self.body = self.source_headers = None
         for node in self.node_iter:
             source = self._make_node_request(
-                node, self.app.recoverable_node_timeout,
-                self.app.logger.thread_locals)
+                node, self.app.recoverable_node_timeout)
 
             if source:
                 self.node = node
@@ -2766,25 +2769,30 @@ class ECFragGetter(object):
             self.status = self.reason = self.body = self.source_headers = None
 
     def _dig_for_source_and_node(self):
+        # capture last used etag before continuation
+        used_etag = self.last_headers.get('X-Object-Sysmeta-EC-ETag')
         for source, node in self.source_and_node_iter:
-            if source and is_good_source(source.status):
+            if source and is_good_source(source.status) and \
+                    source.getheader('X-Object-Sysmeta-EC-ETag') == used_etag:
                 return source, node
         return None, None
 
 
 @ObjectControllerRouter.register(EC_POLICY)
 class ECObjectController(BaseObjectController):
-    def _fragment_GET_request(self, req, node_iter, partition, policy,
-                              header_provider=None):
+    def _fragment_GET_request(
+            self, req, node_iter, partition, policy,
+            header_provider, logger_thread_locals):
         """
         Makes a GET request for a fragment.
         """
+        self.app.logger.thread_locals = logger_thread_locals
         backend_headers = self.generate_request_headers(
             req, additional=req.headers)
 
         getter = ECFragGetter(self.app, req, node_iter, partition,
                               policy, req.swift_entity_path, backend_headers,
-                              header_provider=header_provider)
+                              header_provider, logger_thread_locals)
         return (getter, getter.response_parts_iter(req))
 
     def _convert_range(self, req, policy):
@@ -2840,7 +2848,7 @@ class ECObjectController(BaseObjectController):
         return range_specs
 
     def feed_remaining_primaries(self, safe_iter, pile, req, partition, policy,
-                                 buckets, feeder_q):
+                                 buckets, feeder_q, logger_thread_locals):
         timeout = self.app.get_policy_options(policy).concurrency_timeout
         while True:
             try:
@@ -2851,7 +2859,8 @@ class ECObjectController(BaseObjectController):
                     # primary we won't find out until the next pass
                     pile.spawn(self._fragment_GET_request,
                                req, safe_iter, partition,
-                               policy, buckets.get_extra_headers)
+                               policy, buckets.get_extra_headers,
+                               logger_thread_locals)
                 else:
                     # ran out of primaries
                     break
@@ -2883,8 +2892,9 @@ class ECObjectController(BaseObjectController):
 
         safe_iter = GreenthreadSafeIterator(node_iter)
 
-        ec_request_count = policy.ec_ndata + self.app.get_policy_options(
-            policy).concurrent_ec_extra_requests
+        policy_options = self.app.get_policy_options(policy)
+        ec_request_count = policy.ec_ndata + \
+            policy_options.concurrent_ec_extra_requests
         with ContextPool(ec_request_count) as pool:
             pile = GreenAsyncPile(pool)
             buckets = ECGetResponseCollection(policy)
@@ -2893,13 +2903,15 @@ class ECObjectController(BaseObjectController):
             for node_count in range(ec_request_count):
                 pile.spawn(self._fragment_GET_request,
                            req, safe_iter, partition,
-                           policy, buckets.get_extra_headers)
+                           policy, buckets.get_extra_headers,
+                           self.app.logger.thread_locals)
 
             feeder_q = None
             if self.app.get_policy_options(policy).concurrent_gets:
                 feeder_q = Queue()
                 pool.spawn(self.feed_remaining_primaries, safe_iter, pile, req,
-                           partition, policy, buckets, feeder_q)
+                           partition, policy, buckets, feeder_q,
+                           self.app.logger.thread_locals)
 
             extra_requests = 0
             # max_extra_requests is an arbitrary hard limit for spawning extra
@@ -2926,9 +2938,9 @@ class ECObjectController(BaseObjectController):
                 if requests_available and (
                         buckets.shortfall > pile._pending or bad_resp):
                     extra_requests += 1
-                    pile.spawn(self._fragment_GET_request,
-                               req, safe_iter, partition,
-                               policy, buckets.get_extra_headers)
+                    pile.spawn(self._fragment_GET_request, req, safe_iter,
+                               partition, policy, buckets.get_extra_headers,
+                               self.app.logger.thread_locals)
             if feeder_q:
                 feeder_q.put('stop')
 
@@ -2936,7 +2948,7 @@ class ECObjectController(BaseObjectController):
         # (but note that _fix_ranges() may also pop it back off before then)
         req.range = orig_range
         best_bucket = buckets.best_bucket
-        if best_bucket and best_bucket.shortfall <= 0 and best_bucket.durable:
+        if best_bucket.shortfall <= 0 and best_bucket.durable:
             # headers can come from any of the getters
             resp_headers = best_bucket.headers
             resp_headers.pop('Content-Range', None)
@@ -2975,6 +2987,9 @@ class ECObjectController(BaseObjectController):
             reasons = []
             bodies = []
             headers = []
+            rebalance_missing_suppression_count = min(
+                policy_options.rebalance_missing_suppression_count,
+                node_iter.num_primary_nodes - 1)
             for status, bad_bucket in buckets.bad_buckets.items():
                 for getter, _parts_iter in bad_bucket.get_responses():
                     if best_bucket.durable:
@@ -2990,6 +3005,14 @@ class ECObjectController(BaseObjectController):
                             # out there, it's just currently unavailable
                             continue
                     if getter.status:
+                        timestamp = Timestamp(getter.last_headers.get(
+                            'X-Backend-Timestamp',
+                            getter.last_headers.get('X-Timestamp', 0)))
+                        if (rebalance_missing_suppression_count > 0 and
+                                getter.status == HTTP_NOT_FOUND and
+                                not timestamp):
+                            rebalance_missing_suppression_count -= 1
+                            continue
                         statuses.append(getter.status)
                         reasons.append(getter.reason)
                         bodies.append(getter.body)

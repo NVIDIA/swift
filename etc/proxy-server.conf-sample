@@ -200,9 +200,15 @@ use = egg:swift#proxy
 # the number of seconds configured by timing_expiry.
 # timing_expiry = 300
 #
+# Normally, you should only be moving one replica's worth of data at a time
+# when rebalancing. If you're rebalancing more aggressively, increase this
+# to avoid erroneously returning a 404 when the primary assignments that
+# *didn't* change get overloaded.
+# rebalance_missing_suppression_count = 1
+#
 # By default on a GET/HEAD swift will connect to a minimum number storage nodes
 # in a minimum number of threads - for replicated data just a single request to
-# a single node one at a time.  When enabled concurrent_gets allows the proxy,
+# a single node one at a time.  When enabled concurrent_gets allows the proxy
 # to use up to replica count threads when waiting on a response.  In
 # conjunction with the concurrency_timeout option this will allow swift to send
 # out GET/HEAD requests to the storage nodes concurrently and answer as soon as
@@ -307,6 +313,10 @@ use = egg:swift#proxy
 # write_affinity =
 # write_affinity_node_count =
 # write_affinity_handoff_delete_count =
+<<<<<<< HEAD
+=======
+# rebalance_missing_suppression_count = 1
+>>>>>>> ss-release-2.25.0.7
 # concurrent_gets = off
 # concurrency_timeout = 0.5
 # concurrent_ec_extra_requests = 0
@@ -1136,6 +1146,18 @@ use = egg:swift#copy
 # <other middleware> keymaster encryption proxy-logging proxy-server
 [filter:keymaster]
 use = egg:swift#keymaster
+
+# Over time, the format of crypto metadata on disk may change slightly to resolve
+# ambiguities. In general, you want to be writing the newest version, but to
+# ensure that all writes can still be read during rolling upgrades, there's the
+# option to write older formats as well.
+# Before upgrading from Swift 2.20.0 or Swift 2.19.1 or earlier, ensure this is set to 1
+# Before upgrading from Swift 2.25.0 or earlier, ensure this is set to at most 2
+# After upgrading all proxy servers, set this to 3 (currently the highest version)
+#
+# The default is currently 2 to support upgrades with no configuration changes,
+# but may change to 3 in the future.
+meta_version_to_write = 2
 
 # Sets the root secret from which encryption keys are derived. This must be set
 # before first use to a value that is a base64 encoding of at least 32 bytes.

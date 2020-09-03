@@ -1,5 +1,5 @@
 # Copyright (c) 2010-2017 OpenStack Foundation
-#
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -40,7 +40,7 @@ from swift.container.backend import ContainerBroker, UNSHARDED, SHARDING, \
     SHARDED, DATADIR
 from swift.container.sharder import ContainerSharder, sharding_enabled, \
     CleavingContext, DEFAULT_SHARD_SHRINK_POINT, \
-    DEFAULT_SHARD_CONTAINER_THRESHOLD, find_shinrking_acceptors
+    DEFAULT_SHARD_CONTAINER_THRESHOLD, find_shrinking_acceptors
 from swift.common.utils import ShardRange, Timestamp, hash_path, \
     encode_timestamps, parse_db_filename, quorum_size, Everything
 from test import annotate_failure
@@ -5042,6 +5042,26 @@ class TestShardingHelpers(unittest.TestCase):
         self.assertEqual(shard_ranges, stable_order)
         return stable_order
 
+    def test_shrinks_into_cleaved(self):
+        epoch = next(self.ts)
+
+        orig_shard_ranges = [
+            ShardRange(self.srn(epoch, 0), epoch, ShardRange.MIN, 'a',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch, 1), epoch, 'a', 'b',
+                       object_count=100, state=ShardRange.CLEAVED),
+            ShardRange(self.srn(epoch, 2), epoch, 'b', 'c',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch, 3), epoch, 'c', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(orig_shard_ranges)
+
+        acceptors = find_shrinking_acceptors(shard_ranges[2], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[1]])
+        # nothing passed in gets mutated
+        self.assertEqual(shard_ranges, orig_shard_ranges)
+
     def test_middle_shrinks_to_the_left(self):
         epoch = next(self.ts)
 
@@ -5057,7 +5077,7 @@ class TestShardingHelpers(unittest.TestCase):
         ]
         shard_ranges = self._stabilize(orig_shard_ranges)
 
-        acceptors = find_shinrking_acceptors(shard_ranges[2], shard_ranges)
+        acceptors = find_shrinking_acceptors(shard_ranges[2], shard_ranges)
         self.assertEqual(acceptors, [shard_ranges[1]])
         # nothing passed in gets mutated
         self.assertEqual(shard_ranges, orig_shard_ranges)
@@ -5077,7 +5097,7 @@ class TestShardingHelpers(unittest.TestCase):
         ]
         shard_ranges = self._stabilize(shard_ranges)
 
-        acceptors = find_shinrking_acceptors(shard_ranges[-1], shard_ranges)
+        acceptors = find_shrinking_acceptors(shard_ranges[-1], shard_ranges)
         self.assertEqual(acceptors, [shard_ranges[-2]])
 
     def test_first_shrinks_to_the_right(self):
@@ -5095,7 +5115,7 @@ class TestShardingHelpers(unittest.TestCase):
         ]
         shard_ranges = self._stabilize(shard_ranges)
 
-        acceptors = find_shinrking_acceptors(shard_ranges[0], shard_ranges)
+        acceptors = find_shrinking_acceptors(shard_ranges[0], shard_ranges)
         self.assertEqual(acceptors, [shard_ranges[1]])
 
     def test_shadowed_overlap_shrinks_left(self):
@@ -5117,7 +5137,7 @@ class TestShardingHelpers(unittest.TestCase):
         ]
         shard_ranges = self._stabilize(shard_ranges)
 
-        acceptors = find_shinrking_acceptors(shard_ranges[2], shard_ranges)
+        acceptors = find_shrinking_acceptors(shard_ranges[2], shard_ranges)
         self.assertEqual(acceptors, [shard_ranges[1]])
 
     def test_covering_overlaps_shrinks_right(self):
@@ -5139,7 +5159,7 @@ class TestShardingHelpers(unittest.TestCase):
         ]
         shard_ranges = self._stabilize(shard_ranges)
 
-        acceptors = find_shinrking_acceptors(shard_ranges[1], shard_ranges)
+        acceptors = find_shrinking_acceptors(shard_ranges[1], shard_ranges)
         self.assertEqual(acceptors, [shard_ranges[2]])
 
     def test_shrink_to_covering_overlap(self):
@@ -5161,7 +5181,7 @@ class TestShardingHelpers(unittest.TestCase):
         ]
         shard_ranges = self._stabilize(shard_ranges)
 
-        acceptors = find_shinrking_acceptors(shard_ranges[3], shard_ranges)
+        acceptors = find_shrinking_acceptors(shard_ranges[3], shard_ranges)
         self.assertEqual(acceptors, [shard_ranges[1]])
 
     def test_shrink_shadow_to_multiple_convering_overlaps(self):
@@ -5182,7 +5202,7 @@ class TestShardingHelpers(unittest.TestCase):
         ]
         shard_ranges = self._stabilize(shard_ranges)
 
-        acceptors = find_shinrking_acceptors(shard_ranges[2], shard_ranges)
+        acceptors = find_shrinking_acceptors(shard_ranges[2], shard_ranges)
         self.assertEqual(acceptors, [shard_ranges[1], shard_ranges[3]])
 
     def test_shrink_fully_overlapping_sub_shards(self):
@@ -5225,7 +5245,7 @@ class TestShardingHelpers(unittest.TestCase):
         for i in range(3):
             donor = [sr for sr in shard_ranges
                      if sr.name == self.srn(epoch3, i)][0]
-            acceptors = find_shinrking_acceptors(donor, shard_ranges)
+            acceptors = find_shrinking_acceptors(donor, shard_ranges)
             expected = [sr for sr in shard_ranges
                         if sr.name == self.srn(epoch2, i)]
             self.assertEqual(expected, acceptors)
@@ -5269,14 +5289,14 @@ class TestShardingHelpers(unittest.TestCase):
 
         donor = [sr for sr in shard_ranges
                  if sr.name == self.srn(epoch3, 0)][0]
-        acceptors = find_shinrking_acceptors(donor, shard_ranges)
+        acceptors = find_shrinking_acceptors(donor, shard_ranges)
         expected = [sr for sr in shard_ranges
                     if sr.name in (self.srn(epoch2, i) for i in (0, 1))]
         self.assertEqual(expected, acceptors)
 
         donor = [sr for sr in shard_ranges
                  if sr.name == self.srn(epoch2, 2)][0]
-        acceptors = find_shinrking_acceptors(donor, shard_ranges)
+        acceptors = find_shrinking_acceptors(donor, shard_ranges)
         expected = [sr for sr in shard_ranges
                     if sr.name in (self.srn(epoch3, i) for i in (1, 2))]
         self.assertEqual(expected, acceptors)
@@ -5299,8 +5319,97 @@ class TestShardingHelpers(unittest.TestCase):
         ]
         shard_ranges = self._stabilize(shard_ranges)
 
-        acceptors = find_shinrking_acceptors(shard_ranges[3], shard_ranges)
+        acceptors = find_shrinking_acceptors(shard_ranges[3], shard_ranges)
         self.assertEqual(acceptors, [shard_ranges[i] for i in (1, 2, 4)])
+
+    def test_first_shrinks_into_little_cover(self):
+        epoch1 = next(self.ts)
+        epoch2 = next(self.ts)
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, ShardRange.MIN, 'a',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 0), epoch2, ShardRange.MIN, 'b',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'b', 'c',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 2), epoch2, 'c', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 3), epoch2, 'd', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        acceptors = find_shrinking_acceptors(shard_ranges[0], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[1]])
+
+        acceptors = find_shrinking_acceptors(shard_ranges[1], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[0]])
+
+        # now on the sneaky let's flip the ordering around
+        shard_ranges[0], shard_ranges[1] = shard_ranges[1], shard_ranges[0]
+
+        acceptors = find_shrinking_acceptors(shard_ranges[0], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[1]])
+
+        acceptors = find_shrinking_acceptors(shard_ranges[1], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[0]])
+
+    def test_second_shrinks_into_little_cover(self):
+        epoch1 = next(self.ts)
+        epoch2 = next(self.ts)
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, 'a', 'b',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 0), epoch2, ShardRange.MIN, 'c',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'c', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 2), epoch2, 'd', 'e',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 3), epoch2, 'e', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        acceptors = find_shrinking_acceptors(shard_ranges[0], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[1]])
+
+        acceptors = find_shrinking_acceptors(shard_ranges[1], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[0]])
+
+        # now on the sneaky let's flip the ordering around
+        shard_ranges[0], shard_ranges[1] = shard_ranges[1], shard_ranges[0]
+
+        acceptors = find_shrinking_acceptors(shard_ranges[0], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[1]])
+
+        acceptors = find_shrinking_acceptors(shard_ranges[1], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[0]])
+
+    def test_second_shrinks_into_covering_pair(self):
+        epoch1 = next(self.ts)
+        epoch2 = next(self.ts)
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, 'a', 'b',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 0), epoch2, ShardRange.MIN, 'c',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 1), epoch1, 'b', 'c',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'c', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 2), epoch2, 'd', 'e',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 3), epoch2, 'e', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        acceptors = find_shrinking_acceptors(shard_ranges[1], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[0], shard_ranges[2]])
 
 
 class TestCleavingContext(BaseTestSharder):

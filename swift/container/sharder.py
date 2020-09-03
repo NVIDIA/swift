@@ -145,14 +145,15 @@ def find_sharding_candidates(broker, threshold, shard_ranges=None):
     return candidates
 
 
-def find_shinrking_acceptors(donor, shard_ranges):
+def find_shrinking_acceptors(donor, shard_ranges):
     """
     Find the best list of contiguous shard ranges to accept for a given donor
     """
     acceptors = []
 
     all_but_donor = [sr for sr in shard_ranges if sr.name != donor.name
-                     and sr.state == ShardRange.ACTIVE and not sr.deleted]
+                     and sr.state in (ShardRange.ACTIVE, ShardRange.CLEAVED)
+                     and not sr.deleted]
 
     first_lower = None
     for i, sr in enumerate(all_but_donor):
@@ -164,7 +165,9 @@ def find_shinrking_acceptors(donor, shard_ranges):
             # else sr.lower == first_lower.lower i.e. *second* lower :P
             continue
         if not first_lower:
-            assert donor.lower == ShardRange.MIN
+            # because of order this only happens when
+            #   donor.lower == ShardRange.MIN
+            i = 1
             first_lower = sr
         break
 

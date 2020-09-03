@@ -1600,6 +1600,32 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
 
+    def test_GET_primaries_error_during_rebalance(self):
+        def do_test(primary_codes, expected, include_timestamp=False):
+            random.shuffle(primary_codes)
+            handoff_codes = [404] * self.obj_ring.max_more_nodes
+            headers = None
+            if include_timestamp:
+                headers = [{'X-Backend-Timestamp': '123.456'}] * 3
+                headers.extend({} for _ in handoff_codes)
+            with set_http_connect(*primary_codes + handoff_codes,
+                                  headers=headers):
+                req = swift.common.swob.Request.blank('/v1/a/c/o')
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, expected)
+
+        # with two of out three backend errors a client should retry
+        do_test([Timeout(), Exception('kaboom!'), 404], 503)
+        # unless there's a timestamp associated
+        do_test([Timeout(), Exception('kaboom!'), 404], 404,
+                include_timestamp=True)
+        # when there's more 404s, we trust it more
+        do_test([Timeout(), 404, 404], 404)
+        # unless we explicitly *don't* want to trust it
+        policy_opts = self.app.get_policy_options(None)
+        policy_opts.rebalance_missing_suppression_count = 2
+        do_test([Timeout(), 404, 404], 503)
+
     def test_GET_primaries_mixed_explode_and_timeout(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         primaries = []
@@ -2295,6 +2321,27 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
 
+    def test_GET_primaries_error_during_rebalance(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        codes = [404] * (2 * self.policy.object_ring.replica_count)
+        with mocked_http_conn(*codes):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+        for i in range(self.policy.object_ring.replica_count - 2):
+            codes[i] = Timeout()
+            with mocked_http_conn(*codes):
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 404)
+        # one more timeout is past the tipping point
+        codes[self.policy.object_ring.replica_count - 2] = Timeout()
+        with mocked_http_conn(*codes):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+        # unless we have tombstones
+        with mocked_http_conn(*codes, headers={'X-Backend-Timestamp': '1'}):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+
     def _test_if_match(self, method):
         num_responses = self.policy.ec_ndata if method == 'GET' else 1
 
@@ -2439,7 +2486,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         feeder_q.get.side_effect = feeder_timeout
         controller.feed_remaining_primaries(
             safe_iter, pile, req, 0, self.policy,
-            mock.MagicMock(), feeder_q)
+            mock.MagicMock(), feeder_q, mock.MagicMock())
         expected_timeout = self.app.get_policy_options(
             self.policy).concurrency_timeout
         expected_call = mock.call(timeout=expected_timeout)
@@ -2450,12 +2497,21 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_timeout(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         self.app.recoverable_node_timeout = 0.01
-        codes = [FakeStatus(404, response_sleep=1.0)] + \
+        codes = [FakeStatus(404, response_sleep=1.0)] * 2 + \
             [200] * (self.policy.ec_ndata)
         with mocked_http_conn(*codes) as log:
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(self.policy.ec_ndata + 1, len(log.requests))
+        self.assertEqual(self.policy.ec_ndata + 2, len(log.requests))
+        self.assertEqual(
+            len(self.logger.logger.records['ERROR']), 2,
+            'Expected 2 ERROR lines, got %r' % (
+                self.logger.logger.records['ERROR'], ))
+        for retry_line in self.logger.logger.records['ERROR']:
+            self.assertIn('ERROR with Object server', retry_line)
+            self.assertIn('Trying to GET', retry_line)
+            self.assertIn('Timeout (0.01s)', retry_line)
+            self.assertIn(req.headers['x-trans-id'], retry_line)
 
     def test_GET_with_slow_primaries(self):
         segment_size = self.policy.ec_segment_size
@@ -4042,7 +4098,10 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         test_data = (b'test' * segment_size)[:-333]
         etag = md5(test_data).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
-        headers = {'X-Object-Sysmeta-Ec-Etag': etag}
+        headers = {
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
+        }
         self.app.recoverable_node_timeout = 0.05
         # first one is slow
         responses = [(200, SlowBody(ec_archive_bodies[0], 0.1),
@@ -4059,10 +4118,101 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                               headers=headers):
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 200)
-            self.assertTrue(md5(resp.body).hexdigest(), etag)
+            self.assertEqual(md5(resp.body).hexdigest(), etag)
         error_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(1, len(error_lines))
         self.assertIn('retrying', error_lines[0])
+        retry_line = self.logger.logger.records['ERROR'][0]
+        self.assertIn(req.headers['x-trans-id'], retry_line)
+
+    def test_GET_read_timeout_resume_mixed_etag(self):
+        segment_size = self.policy.ec_segment_size
+        test_data2 = (b'blah1' * segment_size)[:-333]
+        test_data1 = (b'test' * segment_size)[:-333]
+        etag2 = md5(test_data2).hexdigest()
+        etag1 = md5(test_data1).hexdigest()
+        ec_archive_bodies2 = self._make_ec_archive_bodies(test_data2)
+        ec_archive_bodies1 = self._make_ec_archive_bodies(test_data1)
+        headers2 = {'X-Object-Sysmeta-Ec-Etag': etag2,
+                    'X-Object-Sysmeta-Ec-Content-Length': len(test_data2),
+                    'X-Backend-Timestamp': self.ts().internal}
+        headers1 = {'X-Object-Sysmeta-Ec-Etag': etag1,
+                    'X-Object-Sysmeta-Ec-Content-Length': len(test_data1),
+                    'X-Backend-Timestamp': self.ts().internal}
+        responses = [
+            # 404
+            (404, [b''], {}),
+            # etag1
+            (200, ec_archive_bodies1[1], self._add_frag_index(1, headers1)),
+            # 404
+            (404, [b''], {}),
+            # etag1
+            (200, SlowBody(ec_archive_bodies1[3], 0.1), self._add_frag_index(
+                3, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[4], self._add_frag_index(4, headers2)),
+            # etag1
+            (200, ec_archive_bodies1[5], self._add_frag_index(5, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[6], self._add_frag_index(6, headers2)),
+            # etag1
+            (200, ec_archive_bodies1[7], self._add_frag_index(7, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[8], self._add_frag_index(8, headers2)),
+            # etag1
+            (200, SlowBody(ec_archive_bodies1[9], 0.1), self._add_frag_index(
+                9, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[10], self._add_frag_index(10, headers2)),
+            # etag1
+            (200, ec_archive_bodies1[11], self._add_frag_index(11, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[12], self._add_frag_index(12, headers2)),
+            # 404
+            (404, [b''], {}),
+            # handoffs start here
+            # etag2
+            (200, ec_archive_bodies2[0], self._add_frag_index(0, headers2)),
+            # 404
+            (404, [b''], {}),
+            # etag1
+            (200, ec_archive_bodies1[2], self._add_frag_index(2, headers1)),
+            # 404
+            (404, [b''], {}),
+            # etag1
+            (200, ec_archive_bodies1[4], self._add_frag_index(4, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[1], self._add_frag_index(1, headers2)),
+            # etag1
+            (200, ec_archive_bodies1[6], self._add_frag_index(6, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[7], self._add_frag_index(7, headers2)),
+            # etag1
+            (200, ec_archive_bodies1[8], self._add_frag_index(8, headers1)),
+            # resume requests start here
+            # 404
+            (404, [b''], {}),
+            # etag2
+            (200, ec_archive_bodies2[3], self._add_frag_index(3, headers2)),
+            # 404
+            (404, [b''], {}),
+            # etag1
+            (200, ec_archive_bodies1[10], self._add_frag_index(10, headers1)),
+            # etag1
+            (200, ec_archive_bodies1[12], self._add_frag_index(12, headers1)),
+        ]
+        self.app.recoverable_node_timeout = 0.01
+        req = swob.Request.blank('/v1/a/c/o')
+        status_codes, body_iter, headers = zip(*responses)
+        with set_http_connect(*status_codes, body_iter=body_iter,
+                              headers=headers):
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(md5(resp.body).hexdigest(), etag1)
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(2, len(error_lines))
+        for line in error_lines:
+            self.assertIn('retrying', line)
 
     def test_fix_response_HEAD(self):
         headers = {'X-Object-Sysmeta-Ec-Content-Length': '10',

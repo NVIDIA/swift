@@ -101,7 +101,7 @@ class ProxyOverrideOptions(object):
     :param conf: the proxy-server config dict.
     :param override_conf: a dict of overriding configuration options.
     """
-    def __init__(self, base_conf, override_conf, app, policy):
+    def __init__(self, base_conf, override_conf, app):
 
         def get(key, default):
             return override_conf.get(key, base_conf.get(key, default))
@@ -148,11 +148,43 @@ class ProxyOverrideOptions(object):
             get('write_affinity_handoff_delete_count', 'auto'), None
         )
 
+        self.rebalance_missing_suppression_count = int(get(
+            'rebalance_missing_suppression_count', 1))
         self.concurrent_gets = config_true_value(get('concurrent_gets', False))
         self.concurrency_timeout = float(get(
             'concurrency_timeout', app.conn_timeout))
         self.concurrent_ec_extra_requests = int(get(
             'concurrent_ec_extra_requests', 0))
+
+    def __repr__(self):
+        return '%s({}, {%s}, app)' % (
+            self.__class__.__name__, ', '.join(
+                '%r: %r' % (k, getattr(self, k)) for k in (
+                    'sorting_method',
+                    'read_affinity',
+                    'write_affinity',
+                    'write_affinity_node_count',
+                    'write_affinity_handoff_delete_count',
+                    'rebalance_missing_suppression_count',
+                    'concurrent_gets',
+                    'concurrency_timeout',
+                    'concurrent_ec_extra_requests',
+                )))
+
+    def __eq__(self, other):
+        if not isinstance(other, ProxyOverrideOptions):
+            return False
+        return all(getattr(self, k) == getattr(other, k) for k in (
+            'sorting_method',
+            'read_affinity',
+            'write_affinity',
+            'write_affinity_node_count',
+            'write_affinity_handoff_delete_count',
+            'rebalance_missing_suppression_count',
+            'concurrent_gets',
+            'concurrency_timeout',
+            'concurrent_ec_extra_requests',
+        ))
 
 
 class Application(object):
@@ -307,7 +339,7 @@ class Application(object):
     def _make_policy_override(self, policy, conf, override_conf):
         label_for_policy = _label_for_policy(policy)
         try:
-            override = ProxyOverrideOptions(conf, override_conf, self, policy)
+            override = ProxyOverrideOptions(conf, override_conf, self)
             self.logger.debug("Loaded override config for %s: %r" %
                               (label_for_policy, override))
             return override
