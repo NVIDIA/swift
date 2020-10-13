@@ -313,10 +313,7 @@ use = egg:swift#proxy
 # write_affinity =
 # write_affinity_node_count =
 # write_affinity_handoff_delete_count =
-<<<<<<< HEAD
-=======
 # rebalance_missing_suppression_count = 1
->>>>>>> ss-release-2.25.0.7
 # concurrent_gets = off
 # concurrency_timeout = 0.5
 # concurrent_ec_extra_requests = 0

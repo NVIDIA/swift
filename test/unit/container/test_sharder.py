@@ -5118,6 +5118,40 @@ class TestShardingHelpers(unittest.TestCase):
         acceptors = find_shrinking_acceptors(shard_ranges[0], shard_ranges)
         self.assertEqual(acceptors, [shard_ranges[1]])
 
+    def test_simple_overlap(self):
+        epoch1 = next(self.ts)
+        epoch2 = next(self.ts)
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, ShardRange.MIN, 'b',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'a', 'c',
+                       object_count=10, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 1), epoch1, 'b', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 2), epoch1, 'd', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        acceptors = find_shrinking_acceptors(shard_ranges[1], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[0], shard_ranges[2]])
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, ShardRange.MIN, 'b',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 1), epoch1, 'b', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'c', 'e',
+                       object_count=10, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 2), epoch1, 'd', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        acceptors = find_shrinking_acceptors(shard_ranges[2], shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[1], shard_ranges[3]])
+
     def test_shadowed_overlap_shrinks_left(self):
         epoch1 = next(self.ts)
         epoch2 = next(self.ts)
@@ -5410,6 +5444,288 @@ class TestShardingHelpers(unittest.TestCase):
 
         acceptors = find_shrinking_acceptors(shard_ranges[1], shard_ranges)
         self.assertEqual(acceptors, [shard_ranges[0], shard_ranges[2]])
+
+    def test_shrinking_fork_leaders(self):
+        epoch1 = next(self.ts)
+        epoch2 = next(self.ts)
+        epoch3 = next(self.ts)
+
+        #    MIN
+        #     |
+        #     a
+        #    / \
+        #   b   c
+        #   |   |
+        #   d   e
+        #    \ /
+        #     f
+        #     |
+        #    MIN
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, ShardRange.MIN, 'a',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 0), epoch2, 'a', 'b',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 0), epoch3, 'a', 'c',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'b', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 1), epoch3, 'c', 'e',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 2), epoch2, 'd', 'f',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 2), epoch3, 'e', 'f',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 2), epoch1, 'f', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        # right hand split shrinks left
+        a_c_sr = shard_ranges[2]
+        self.assertEqual(a_c_sr.lower, 'a')
+        self.assertEqual(a_c_sr.upper, 'c')
+        self.assertEqual(a_c_sr.timestamp, epoch3)
+        acceptors = find_shrinking_acceptors(a_c_sr, shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[1], shard_ranges[3]])
+
+        # left hand split shrinks right
+        a_b_sr = shard_ranges[1]
+        self.assertEqual(a_b_sr.lower, 'a')
+        self.assertEqual(a_b_sr.upper, 'b')
+        self.assertEqual(a_b_sr.timestamp, epoch2)
+        acceptors = find_shrinking_acceptors(a_b_sr, shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[2]])
+
+    def test_shrinking_tree_branch_saw_left(self):
+        epoch1 = next(self.ts)
+        epoch2 = next(self.ts)
+        epoch3 = next(self.ts)
+
+        #    MIN
+        #     |
+        #     a
+        #    /
+        #   b   c
+        #   |   |
+        #   d   e
+        #    \ /
+        #     f
+        #     |
+        #    MIN
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, ShardRange.MIN, 'a',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 0), epoch2, 'a', 'b',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'b', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 1), epoch3, 'c', 'e',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 2), epoch2, 'd', 'f',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 2), epoch3, 'e', 'f',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 2), epoch1, 'f', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        c_e_sr = shard_ranges[3]
+        self.assertEqual(c_e_sr.lower, 'c')
+        self.assertEqual(c_e_sr.upper, 'e')
+        self.assertEqual(c_e_sr.timestamp, epoch3)
+        acceptors = find_shrinking_acceptors(c_e_sr, shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[2], shard_ranges[4]])
+
+    def test_shrinking_tree_branch_wedge_left(self):
+        epoch1 = next(self.ts)
+        epoch2 = next(self.ts)
+        epoch3 = next(self.ts)
+
+        #    MIN
+        #     |
+        #     a
+        #    /
+        #   b   c
+        #   |   |
+        #   e   d
+        #    \ /
+        #     f
+        #     |
+        #    MIN
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, ShardRange.MIN, 'a',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 0), epoch2, 'a', 'b',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 1), epoch3, 'c', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'b', 'e',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 2), epoch3, 'd', 'f',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 2), epoch2, 'e', 'f',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 2), epoch1, 'f', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        c_d_sr = shard_ranges[2]
+        self.assertEqual(c_d_sr.lower, 'c')
+        self.assertEqual(c_d_sr.upper, 'd')
+        self.assertEqual(c_d_sr.timestamp, epoch3)
+        acceptors = find_shrinking_acceptors(c_d_sr, shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[3]])
+
+    def test_shrinking_tree_branch_saw_right(self):
+        epoch1 = next(self.ts)
+        epoch2 = next(self.ts)
+        epoch3 = next(self.ts)
+
+        #    MIN
+        #     |
+        #     a
+        #    /
+        #   c   b
+        #   |   |
+        #   e   d
+        #    \ /
+        #     f
+        #     |
+        #    MIN
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, ShardRange.MIN, 'a',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 0), epoch2, 'a', 'c',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 1), epoch3, 'b', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'c', 'e',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 2), epoch3, 'd', 'f',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 2), epoch2, 'e', 'f',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 2), epoch1, 'f', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        b_d_sr = shard_ranges[2]
+        self.assertEqual(b_d_sr.lower, 'b')
+        self.assertEqual(b_d_sr.upper, 'd')
+        self.assertEqual(b_d_sr.timestamp, epoch3)
+        acceptors = find_shrinking_acceptors(b_d_sr, shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[1], shard_ranges[3]])
+
+    def test_shrinking_tree_branch_cliff_right(self):
+        epoch1 = next(self.ts)
+        epoch2 = next(self.ts)
+        epoch3 = next(self.ts)
+
+        #    MIN
+        #     |
+        #     a
+        #    /
+        #   c   b
+        #   |   |
+        #   d   f
+        #   |   |
+        #   e   g
+        #    \ /
+        #     h
+        #     |
+        #    MIN
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, ShardRange.MIN, 'a',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 0), epoch2, 'a', 'c',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'c', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 2), epoch2, 'd', 'e',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 1), epoch3, 'b', 'f',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 2), epoch3, 'f', 'g',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 3), epoch2, 'e', 'h',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 3), epoch3, 'g', 'h',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 2), epoch1, 'h', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        b_f_sr = shard_ranges[4]
+        self.assertEqual(b_f_sr.lower, 'b')
+        self.assertEqual(b_f_sr.upper, 'f')
+        self.assertEqual(b_f_sr.timestamp, epoch3)
+        acceptors = find_shrinking_acceptors(b_f_sr, shard_ranges)
+        self.assertEqual(acceptors, [
+            shard_ranges[1], shard_ranges[2], shard_ranges[3],
+            shard_ranges[6]])
+        self.assertGreaterEqual(acceptors[-1].upper, b_f_sr.upper)
+
+    def test_shrinking_tree_branch_cliff_left(self):
+        epoch1 = next(self.ts)
+        epoch2 = next(self.ts)
+        epoch3 = next(self.ts)
+
+        #    MIN
+        #     |
+        #     a
+        #    /
+        #   b   c
+        #   |   |
+        #   f   d
+        #   |   |
+        #   g   e
+        #    \ /
+        #     h
+        #     |
+        #    MIN
+
+        shard_ranges = [
+            ShardRange(self.srn(epoch1, 0), epoch1, ShardRange.MIN, 'a',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 0), epoch2, 'a', 'b',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 1), epoch3, 'c', 'd',
+                       object_count=100, state=ShardRange.ACTIVE),
+            # first lower picking sees d-e and thinks we're "past" a shard
+            # range that might hold us (like b-f) so it accepts a-b
+            ShardRange(self.srn(epoch3, 2), epoch3, 'd', 'e',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 1), epoch2, 'b', 'f',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 2), epoch2, 'f', 'g',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch2, 3), epoch2, 'g', 'h',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch3, 3), epoch3, 'g', 'h',
+                       object_count=100, state=ShardRange.ACTIVE),
+            ShardRange(self.srn(epoch1, 2), epoch1, 'h', ShardRange.MAX,
+                       object_count=100, state=ShardRange.ACTIVE),
+        ]
+        shard_ranges = self._stabilize(shard_ranges)
+
+        c_d_sr = shard_ranges[2]
+        self.assertEqual(c_d_sr.lower, 'c')
+        self.assertEqual(c_d_sr.upper, 'd')
+        self.assertEqual(c_d_sr.timestamp, epoch3)
+        acceptors = find_shrinking_acceptors(c_d_sr, shard_ranges)
+        self.assertEqual(acceptors, [shard_ranges[4]])
+        self.assertLessEqual(acceptors[0].lower, c_d_sr.lower)
+        self.assertGreaterEqual(acceptors[-1].upper, c_d_sr.upper)
 
 
 class TestCleavingContext(BaseTestSharder):

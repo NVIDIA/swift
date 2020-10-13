@@ -422,14 +422,18 @@ def shrink(broker, args):
     donor.epoch = Timestamp.now()
     donor.update_state(ShardRange.SHRINKING, state_timestamp=donor.epoch)
     if acceptors[0].lower > donor.lower:
+        print('*EXTENDING* first acceptor lower to cover donor')
+        print('  %s => %s' % (acceptors[0].lower, donor.lower))
         acceptors[0].lower = donor.lower
         acceptors[0].timestamp = donor.state_timestamp
     if acceptors[-1].upper < donor.upper:
+        print('*EXTENDING* last acceptor upper to cover donor')
+        print('  %s => %s' % (acceptors[-1].upper, donor.upper))
         acceptors[-1].upper = donor.upper
         acceptors[-1].timestamp = donor.state_timestamp
-    print('Donor:\n  %s: %s' % (donor.name, donor))
+    print('Donor:\n  %s: %s' % (donor.name, donor.object_count))
     print('Acceptors:\n%s' % ('\n'.join(
-        '  %s: %s' % (a.name, a) for a in acceptors)))
+        '  %s: %s' % (a.name, a.object_count) for a in acceptors)))
     choice = input('Do you want to continue? [Y/n]')
     if choice and choice.lower()[0] != 'y':
         print('No changes made.')

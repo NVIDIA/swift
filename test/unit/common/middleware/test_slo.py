@@ -3255,9 +3255,12 @@ class TestSloGetManifest(SloTestCase):
         headers = HeaderKeyDict(headers)
 
         self.assertEqual(status, '200 OK')
+        self.assertEqual(b"aaaaabbbbbbbbbb", body)
+        self.assertEqual(self.app.unread_requests, {})
         self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
             'While processing manifest /v1/AUTH_test/gettest/manifest-abcd, '
-            'got 401 while retrieving /v1/AUTH_test/gettest/c_15'
+            'got 401 (<html><h1>Unauthorized</h1><p>This server could not '
+            'verif...) while retrieving /v1/AUTH_test/gettest/c_15'
         ])
         self.assertEqual(self.app.calls, [
             ('GET', '/v1/AUTH_test/gettest/manifest-abcd'),
@@ -3277,10 +3280,12 @@ class TestSloGetManifest(SloTestCase):
 
         self.assertEqual("200 OK", status)
         self.assertEqual(b"aaaaa", body)
+        self.assertEqual(self.app.unread_requests, {})
         self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
             'while fetching /v1/AUTH_test/gettest/manifest-abcd, GET of '
             'submanifest /v1/AUTH_test/gettest/manifest-bc failed with '
-            'status 401'
+            'status 401 (<html><h1>Unauthorized</h1><p>This server could '
+            'not verif...)'
         ])
         self.assertEqual(self.app.calls, [
             ('GET', '/v1/AUTH_test/gettest/manifest-abcd'),
@@ -3311,10 +3316,12 @@ class TestSloGetManifest(SloTestCase):
         status, headers, body = self.call_slo(req)
 
         self.assertEqual('409 Conflict', status)
+        self.assertEqual(self.app.unread_requests, {})
         self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
             'while fetching /v1/AUTH_test/gettest/manifest-manifest-a, GET '
             'of submanifest /v1/AUTH_test/gettest/manifest-a failed with '
-            'status 403'
+            'status 403 (<html><h1>Forbidden</h1><p>Access was denied to '
+            'this reso...)'
         ])
 
     def test_invalid_json_submanifest(self):
@@ -3389,6 +3396,67 @@ class TestSloGetManifest(SloTestCase):
             'Object segment no longer valid: /v1/AUTH_test/gettest/b_10 '
             'etag: 82136b4240d6ce4ea7d03e51469a393b != '
             '82136b4240d6ce4ea7d03e51469a393b or 10 != 999999.'
+        ])
+
+    def test_mismatched_checksum(self):
+        self.app.register(
+            'GET', '/v1/AUTH_test/gettest/a_5',
+            swob.HTTPOk, {'Content-Length': '5',
+                          'Etag': md5hex('a' * 5)},
+            # this segment has invalid content
+            'x' * 5)
+
+        self.app.register(
+            'GET', '/v1/AUTH_test/gettest/manifest',
+            swob.HTTPOk, {'Content-Type': 'application/json',
+                          'X-Static-Large-Object': 'true'},
+            json.dumps([{'name': '/gettest/b_10', 'hash': md5hex('b' * 10),
+                         'content_type': 'text/plain', 'bytes': '10'},
+                        {'name': '/gettest/a_5', 'hash': md5hex('a' * 5),
+                         'content_type': 'text/plain', 'bytes': '5'},
+                        {'name': '/gettest/c_15', 'hash': md5hex('c' * 15),
+                         'content_type': 'text/plain', 'bytes': '15'}]))
+
+        req = Request.blank('/v1/AUTH_test/gettest/manifest')
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('200 OK', status)
+        self.assertEqual(body, (b'b' * 10 + b'x' * 5))
+        self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
+            'Bad MD5 checksum for /v1/AUTH_test/gettest/a_5 as part of '
+            '/v1/AUTH_test/gettest/manifest: headers had '
+            '594f803b380a41396ed63dca39503542, but object MD5 was '
+            'actually fb0e22c79ac75679e9881e6ba183b354',
+        ])
+
+    def test_mismatched_length(self):
+        self.app.register(
+            'GET', '/v1/AUTH_test/gettest/a_5',
+            swob.HTTPOk, {'Content-Length': '5',
+                          'Etag': md5hex('a' * 5)},
+            # this segment comes up short
+            [b'a' * 4])
+
+        self.app.register(
+            'GET', '/v1/AUTH_test/gettest/manifest',
+            swob.HTTPOk, {'Content-Type': 'application/json',
+                          'X-Static-Large-Object': 'true'},
+            json.dumps([{'name': '/gettest/b_10', 'hash': md5hex('b' * 10),
+                         'content_type': 'text/plain', 'bytes': '10'},
+                        {'name': '/gettest/a_5', 'hash': md5hex('a' * 5),
+                         'content_type': 'text/plain', 'bytes': '5'},
+                        {'name': '/gettest/c_15', 'hash': md5hex('c' * 15),
+                         'content_type': 'text/plain', 'bytes': '15'}]))
+
+        req = Request.blank('/v1/AUTH_test/gettest/manifest')
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('200 OK', status)
+        self.assertEqual(body, (b'b' * 10 + b'a' * 4))
+        self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
+            'Bad response length for /v1/AUTH_test/gettest/a_5 as part of '
+            '/v1/AUTH_test/gettest/manifest: headers had 5, but '
+            'response length was actually 4',
         ])
 
     def test_first_segment_mismatched_etag(self):
@@ -3473,9 +3541,11 @@ class TestSloGetManifest(SloTestCase):
         status, headers, body = self.call_slo(req)
 
         self.assertEqual('409 Conflict', status)
+        self.assertEqual(self.app.unread_requests, {})
         self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
             'While processing manifest /v1/AUTH_test/gettest/'
-            'manifest-not-exists, got 404 while retrieving /v1/AUTH_test/'
+            'manifest-not-exists, got 404 (<html><h1>Not Found</h1><p>The '
+            'resource could not be foun...) while retrieving /v1/AUTH_test/'
             'gettest/not_exists_obj'
         ])
 

@@ -156,20 +156,23 @@ def find_shrinking_acceptors(donor, shard_ranges):
                      and not sr.deleted]
 
     first_lower = None
+    index = 1
     for i, sr in enumerate(all_but_donor):
         if sr.lower <= donor.lower:
             if not first_lower:
+                index = i
                 first_lower = sr
             elif sr.lower > first_lower.lower:
+                index = i
                 first_lower = sr
             # else sr.lower == first_lower.lower i.e. *second* lower :P
             continue
         if not first_lower:
             # because of order this only happens when
             #   donor.lower == ShardRange.MIN
-            i = 1
+            index = 1
             first_lower = sr
-        break
+            break
 
     acceptors.append(first_lower)
     if donor.upper <= first_lower.upper:
@@ -178,9 +181,11 @@ def find_shrinking_acceptors(donor, shard_ranges):
 
     # extend a contiguous range over donor
     end = first_lower.upper
-    for sr in all_but_donor[i - 1:]:
-        if sr.lower >= donor.upper:
+    for sr in all_but_donor[index:]:
+        if end >= donor.upper:
             break
+        if sr.lower >= donor.upper:
+            continue
         if sr.lower == end:
             end = sr.upper
             acceptors.append(sr)

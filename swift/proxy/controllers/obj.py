@@ -931,7 +931,6 @@ class ReplicatedObjectController(BaseObjectController):
 
             ml = req.message_length()
             if ml and bytes_transferred < ml:
-                req.client_disconnect = True
                 self.app.logger.warning(
                     _('Client disconnected without sending enough data'))
                 self.app.logger.increment('client_disconnects')
@@ -954,7 +953,6 @@ class ReplicatedObjectController(BaseObjectController):
         except HTTPException:
             raise
         except ChunkReadError:
-            req.client_disconnect = True
             self.app.logger.warning(
                 _('Client disconnected without sending last chunk'))
             self.app.logger.increment('client_disconnects')
@@ -1065,7 +1063,7 @@ class ECAppIter(object):
         # cleanup the frag queue feeding coros that may be currently
         # executing the internal_parts_iters.
         if self.stashed_iter:
-            self.stashed_iter.close()
+            close_if_possible(self.stashed_iter)
         sleep()  # Give the per-frag threads a chance to clean up
         for it in self.internal_parts_iters:
             close_if_possible(it)
@@ -1202,9 +1200,14 @@ class ECAppIter(object):
 
     def __iter__(self):
         if self.stashed_iter is not None:
-            return iter(self.stashed_iter)
+            return self
         else:
             raise ValueError("Failed to call kickoff() before __iter__()")
+
+    def __next__(self):
+        return next(self.stashed_iter)
+
+    next = __next__  # py2
 
     def _real_iter(self, req, resp_headers):
         if not self.range_specs:
@@ -1390,7 +1393,8 @@ class ECAppIter(object):
         # segment at a time.
         queues = [Queue(1) for _junk in range(len(fragment_iters))]
 
-        def put_fragments_in_queue(frag_iter, queue):
+        def put_fragments_in_queue(frag_iter, queue, logger_thread_locals):
+            self.logger.thread_locals = logger_thread_locals
             try:
                 for fragment in frag_iter:
                     if fragment.startswith(b' '):
@@ -1413,7 +1417,8 @@ class ECAppIter(object):
 
         with ContextPool(len(fragment_iters)) as pool:
             for frag_iter, queue in zip(fragment_iters, queues):
-                pool.spawn(put_fragments_in_queue, frag_iter, queue)
+                pool.spawn(put_fragments_in_queue, frag_iter, queue,
+                           self.logger.thread_locals)
 
             while True:
                 fragments = []
@@ -2087,6 +2092,14 @@ class ECGetResponseBucket(object):
         result = self.policy.ec_ndata - (len(self.get_responses()) + len(alts))
         return max(result, 0)
 
+    def close_conns(self):
+        """
+        Close bucket's responses; they won't be used for a client response.
+        """
+        for getter, frag_iter in self.get_responses():
+            if getattr(getter.source, 'swift_conn', None):
+                close_swift_conn(getter.source)
+
     def __str__(self):
         # return a string summarising bucket state, useful for debugging.
         return '<%s, %s, %s, %s(%s), %s>' \
@@ -2227,6 +2240,15 @@ class ECGetResponseCollection(object):
             return bucket
         return self.least_bad_bucket
 
+    def choose_best_bucket(self):
+        best_bucket = self.best_bucket
+        # it's now or never -- close down any other requests
+        for bucket in self.buckets.values():
+            if bucket is best_bucket:
+                continue
+            bucket.close_conns()
+        return best_bucket
+
     @property
     def least_bad_bucket(self):
         """
@@ -2343,6 +2365,7 @@ class ECFragGetter(object):
         self.client_chunk_size = policy.fragment_size
         self.skip_bytes = 0
         self.bytes_used_from_backend = 0
+        self.source = None
         self.logger_thread_locals = logger_thread_locals
 
     def fast_forward(self, num_bytes):
@@ -2453,19 +2476,15 @@ class ECFragGetter(object):
 
     def response_parts_iter(self, req):
         try:
-            source, node = next(self.source_and_node_iter)
+            self.source, self.node = next(self.source_and_node_iter)
         except StopIteration:
             return
         it = None
-        if source:
-            it = self._get_response_parts_iter(req, node, source)
+        if self.source:
+            it = self._get_response_parts_iter(req)
         return it
 
-    def _get_response_parts_iter(self, req, node, source):
-        # Someday we can replace this [mess] with python 3's "nonlocal"
-        source = [source]
-        node = [node]
-
+    def _get_response_parts_iter(self, req):
         try:
             client_chunk_size = self.client_chunk_size
             node_timeout = self.app.recoverable_node_timeout
@@ -2474,7 +2493,7 @@ class ECFragGetter(object):
             # on it, so no IO is performed.
             parts_iter = [
                 http_response_to_document_iters(
-                    source[0], read_chunk_size=self.app.object_chunk_size)]
+                    self.source, read_chunk_size=self.app.object_chunk_size)]
 
             def get_next_doc_part():
                 while True:
@@ -2498,13 +2517,13 @@ class ECFragGetter(object):
                         new_source, new_node = self._dig_for_source_and_node()
                         if new_source:
                             self.app.error_occurred(
-                                node[0], _('Trying to read object during '
-                                           'GET (retrying)'))
+                                self.node, _('Trying to read object during '
+                                             'GET (retrying)'))
                             # Close-out the connection as best as possible.
-                            if getattr(source[0], 'swift_conn', None):
-                                close_swift_conn(source[0])
-                            source[0] = new_source
-                            node[0] = new_node
+                            if getattr(self.source, 'swift_conn', None):
+                                close_swift_conn(self.source)
+                            self.source = new_source
+                            self.node = new_node
                             # This is safe; it sets up a generator but does
                             # not call next() on it, so no IO is performed.
                             parts_iter[0] = http_response_to_document_iters(
@@ -2540,13 +2559,13 @@ class ECFragGetter(object):
                         new_source, new_node = self._dig_for_source_and_node()
                         if new_source:
                             self.app.error_occurred(
-                                node[0], _('Trying to read object during '
-                                           'GET (retrying)'))
+                                self.node, _('Trying to read object during '
+                                             'GET (retrying)'))
                             # Close-out the connection as best as possible.
-                            if getattr(source[0], 'swift_conn', None):
-                                close_swift_conn(source[0])
-                            source[0] = new_source
-                            node[0] = new_node
+                            if getattr(self.source, 'swift_conn', None):
+                                close_swift_conn(self.source)
+                            self.source = new_source
+                            self.node = new_node
                             # This is safe; it just sets up a generator but
                             # does not call next() on it, so no IO is
                             # performed.
@@ -2651,7 +2670,7 @@ class ECFragGetter(object):
                     part_iter.close()
 
         except ChunkReadTimeout:
-            self.app.exception_occurred(node[0], _('Object'),
+            self.app.exception_occurred(self.node, _('Object'),
                                         _('Trying to read during GET'))
             raise
         except ChunkWriteTimeout:
@@ -2678,8 +2697,8 @@ class ECFragGetter(object):
             raise
         finally:
             # Close-out the connection as best as possible.
-            if getattr(source[0], 'swift_conn', None):
-                close_swift_conn(source[0])
+            if getattr(self.source, 'swift_conn', None):
+                close_swift_conn(self.source)
 
     @property
     def last_status(self):
@@ -2728,6 +2747,7 @@ class ECFragGetter(object):
                 not Timestamp(src_headers.get('x-backend-timestamp', 0)):
             # throw out 5XX and 404s from handoff nodes unless the data is
             # really on disk and had been DELETEd
+            conn.close()
             return None
 
         self.status = possible_source.status
@@ -2738,6 +2758,7 @@ class ECFragGetter(object):
             return possible_source
         else:
             self.body = possible_source.read()
+            conn.close()
 
             if possible_source.status == HTTP_INSUFFICIENT_STORAGE:
                 self.app.error_limit(node, _('ERROR Insufficient Storage'))
@@ -2893,9 +2914,10 @@ class ECObjectController(BaseObjectController):
         safe_iter = GreenthreadSafeIterator(node_iter)
 
         policy_options = self.app.get_policy_options(policy)
-        ec_request_count = policy.ec_ndata + \
-            policy_options.concurrent_ec_extra_requests
-        with ContextPool(ec_request_count) as pool:
+        ec_request_count = policy.ec_ndata
+        if policy_options.concurrent_gets:
+            ec_request_count += policy_options.concurrent_ec_extra_requests
+        with ContextPool(policy.ec_n_unique_fragments) as pool:
             pile = GreenAsyncPile(pool)
             buckets = ECGetResponseCollection(policy)
             node_iter.set_node_provider(buckets.provide_alternate_node)
@@ -2907,7 +2929,7 @@ class ECObjectController(BaseObjectController):
                            self.app.logger.thread_locals)
 
             feeder_q = None
-            if self.app.get_policy_options(policy).concurrent_gets:
+            if policy_options.concurrent_gets:
                 feeder_q = Queue()
                 pool.spawn(self.feed_remaining_primaries, safe_iter, pile, req,
                            partition, policy, buckets, feeder_q,
@@ -2947,7 +2969,7 @@ class ECObjectController(BaseObjectController):
         # Put this back, since we *may* need it for kickoff()/_fix_response()
         # (but note that _fix_ranges() may also pop it back off before then)
         req.range = orig_range
-        best_bucket = buckets.best_bucket
+        best_bucket = buckets.choose_best_bucket()
         if best_bucket.shortfall <= 0 and best_bucket.durable:
             # headers can come from any of the getters
             resp_headers = best_bucket.headers
@@ -2987,6 +3009,7 @@ class ECObjectController(BaseObjectController):
             reasons = []
             bodies = []
             headers = []
+            best_bucket.close_conns()
             rebalance_missing_suppression_count = min(
                 policy_options.rebalance_missing_suppression_count,
                 node_iter.num_primary_nodes - 1)
@@ -3216,7 +3239,6 @@ class ECObjectController(BaseObjectController):
 
             ml = req.message_length()
             if ml and bytes_transferred < ml:
-                req.client_disconnect = True
                 self.app.logger.warning(
                     _('Client disconnected without sending enough data'))
                 self.app.logger.increment('client_disconnects')
@@ -3292,7 +3314,6 @@ class ECObjectController(BaseObjectController):
             self.app.logger.increment('client_timeouts')
             raise HTTPRequestTimeout(request=req)
         except ChunkReadError:
-            req.client_disconnect = True
             self.app.logger.warning(
                 _('Client disconnected without sending last chunk'))
             self.app.logger.increment('client_disconnects')

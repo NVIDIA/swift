@@ -421,12 +421,15 @@ class TestManageShardRanges(unittest.TestCase):
         self.assertEqual('e', acceptor.upper)
 
         out_lines = out.getvalue().splitlines()
-        self.assertEqual('Donor:', out_lines[0])
-        self.assertEqual('  .shards_a/c-xxx-2: %s' % donor,
-                         out_lines[1])
-        self.assertEqual('Acceptors:', out_lines[2])
-        self.assertEqual('  .shards_a/c-xxx-1: %s' % acceptor,
+        self.assertEqual('*EXTENDING* last acceptor upper to cover donor',
+                         out_lines[0])
+        self.assertEqual('  c => e', out_lines[1])
+        self.assertEqual('Donor:', out_lines[2])
+        self.assertEqual('  .shards_a/c-xxx-2: %s' % donor.object_count,
                          out_lines[3])
+        self.assertEqual('Acceptors:', out_lines[4])
+        self.assertEqual('  .shards_a/c-xxx-1: %s' % acceptor.object_count,
+                         out_lines[5])
 
     def test_overlap_shrink(self):
         db_file = os.path.join(self.testdir, 'hash.db')
@@ -466,7 +469,6 @@ class TestManageShardRanges(unittest.TestCase):
             in_.write('Y\n')  # do it!!
             in_.seek(0)
             main([broker.db_file, 'shrink', '.shards_a/c-yyy-0'])
-        out_lines = out.getvalue().splitlines()
 
         new_shard_ranges = broker.get_shard_ranges()
         donor = new_shard_ranges[1]
@@ -481,10 +483,10 @@ class TestManageShardRanges(unittest.TestCase):
 
         out_lines = out.getvalue().splitlines()
         self.assertEqual('Donor:', out_lines[0])
-        self.assertEqual('  .shards_a/c-yyy-0: %s' % donor,
+        self.assertEqual('  .shards_a/c-yyy-0: %s' % donor.object_count,
                          out_lines[1])
         self.assertEqual('Acceptors:', out_lines[2])
-        self.assertEqual('  .shards_a/c-xxx-1: %s' % acceptor1,
+        self.assertEqual('  .shards_a/c-xxx-1: %s' % acceptor1.object_count,
                          out_lines[3])
-        self.assertEqual('  .shards_a/c-xxx-2: %s' % acceptor2,
+        self.assertEqual('  .shards_a/c-xxx-2: %s' % acceptor2.object_count,
                          out_lines[4])
