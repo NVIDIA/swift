@@ -162,8 +162,8 @@ class MemcacheRing(object):
                  tries=TRY_COUNT, allow_pickle=False, allow_unpickle=False,
                  max_conns=2, logger=None):
         self._ring = {}
-        self._errors = dict(((serv, []) for serv in servers))
-        self._error_limited = dict(((serv, 0) for serv in servers))
+        self._errors = {serv: [] for serv in servers}
+        self._error_limited = {serv: 0 for serv in servers}
         for server in sorted(servers):
             for i in range(NODE_WEIGHT):
                 self._ring[md5hash('%s-%s' % (server, i))] = server
@@ -211,12 +211,22 @@ class MemcacheRing(object):
             # We need to return something to the pool
             # A new connection will be created the next time it is retrieved
             self._return_conn(server, None, None)
+
+        if len(self._errors) == 1:
+            # if there's only one server defined, skip the error-limiting
+            # book-keeping entirely
+            return
+
         now = time.time()
         self._errors[server].append(time.time())
-        if len(self._errors[server]) > ERROR_LIMIT_COUNT:
+        if len(self._errors[server]) >= ERROR_LIMIT_COUNT:
             self._errors[server] = [err for err in self._errors[server]
                                     if err > now - ERROR_LIMIT_TIME]
-            if len(self._errors[server]) > ERROR_LIMIT_COUNT:
+            remaining_servers = sum(
+                1 for _server, value in self._error_limited.items()
+                if value <= now)
+            if len(self._errors[server]) >= ERROR_LIMIT_COUNT and \
+                    remaining_servers > 1:
                 self._error_limited[server] = now + ERROR_LIMIT_DURATION
                 self.logger.error('Error limiting server %s', server)
 
