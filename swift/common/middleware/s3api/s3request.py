@@ -1489,7 +1489,14 @@ class S3Request(swob.Request):
         query = {} if version is None else {
             'version-id': version, 'symlink': 'get'}
         resp = self.get_response(app, 'HEAD', obj=obj, query=query)
-        return {'multipart-manifest': 'delete'} if resp.is_slo else {}
+        if not resp.is_slo:
+            return {}
+        elif resp.sysmeta_headers.get(sysmeta_header('object', 'etag')):
+            # Even if allow_asynd_delete is turned off, SLO will just handle
+            # the delete synchronously
+            return {'multipart-manifest': 'delete', 'async': 'on'}
+        else:
+            return {'multipart-manifest': 'delete'}
 
     def set_acl_handler(self, handler):
         pass
