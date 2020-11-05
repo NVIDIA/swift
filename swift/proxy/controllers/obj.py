@@ -1408,8 +1408,8 @@ class ECAppIter(object):
                 self.logger.exception(_("Timeout fetching fragments for %r"),
                                       quote(self.path))
             except:  # noqa
-                self.logger.exception(_("Exception fetching fragments for"
-                                        " %r"), quote(self.path))
+                self.logger.exception("Exception fetching fragments for %r",
+                                      quote(self.path))
             finally:
                 queue.resize(2)  # ensure there's room
                 queue.put(None)
@@ -2497,19 +2497,19 @@ class ECFragGetter(object):
 
             def get_next_doc_part():
                 while True:
+                    # the loop here is to resume if trying to parse
+                    # multipart/byteranges response raises a ChunkReadTimeout
+                    # and resets the parts_iter
                     try:
-                        # This call to next() performs IO when we have a
-                        # multipart/byteranges response; it reads the MIME
-                        # boundary and part headers.
-                        #
-                        # If we don't have a multipart/byteranges response,
-                        # but just a 200 or a single-range 206, then this
-                        # performs no IO, and either just returns source or
-                        # raises StopIteration.
                         with WatchdogTimeout(self.app.watchdog, node_timeout,
                                              ChunkReadTimeout):
-                            # if StopIteration is raised, it escapes and is
-                            # handled elsewhere
+                            # If we don't have a multipart/byteranges response,
+                            # but just a 200 or a single-range 206, then this
+                            # performs no IO, and just returns source (or
+                            # raises StopIteration).
+                            # Otherwise, this call to next() performs IO when
+                            # we have a multipart/byteranges response; as it
+                            # will read the MIME boundary and part headers.
                             start_byte, end_byte, length, headers, part = next(
                                 parts_iter[0])
                         return (start_byte, end_byte, length, headers, part)
@@ -2530,7 +2530,7 @@ class ECFragGetter(object):
                                 new_source,
                                 read_chunk_size=self.app.object_chunk_size)
                         else:
-                            raise StopIteration()
+                            raise
 
             def iter_bytes_from_response_part(part_file, nbytes):
                 nchunks = 0
@@ -2552,6 +2552,7 @@ class ECFragGetter(object):
                         try:
                             self.fast_forward(self.bytes_used_from_backend)
                         except (HTTPException, ValueError):
+                            self.app.logger.exception('Unable to fast forward')
                             six.reraise(exc_type, exc_value, exc_traceback)
                         except RangeAlreadyComplete:
                             break
@@ -2572,14 +2573,13 @@ class ECFragGetter(object):
                             parts_iter[0] = http_response_to_document_iters(
                                 new_source,
                                 read_chunk_size=self.app.object_chunk_size)
-
                             try:
                                 _junk, _junk, _junk, _junk, part_file = \
                                     get_next_doc_part()
                             except StopIteration:
-                                # Tried to find a new node from which to
-                                # finish the GET, but failed. There's
-                                # nothing more we can do here.
+                                # it's not clear to me how to make
+                                # get_next_doc_part raise StopIteration for the
+                                # first doc part of a new request
                                 six.reraise(exc_type, exc_value, exc_traceback)
                             part_file = ByteCountEnforcer(part_file, nbytes)
                         else:
@@ -2645,8 +2645,14 @@ class ECFragGetter(object):
             part_iter = None
             try:
                 while True:
-                    start_byte, end_byte, length, headers, part = \
-                        get_next_doc_part()
+                    try:
+                        start_byte, end_byte, length, headers, part = \
+                            get_next_doc_part()
+                    except StopIteration:
+                        # it seems this is the only way out of the loop; not
+                        # sure why the req.environ update is always needed
+                        req.environ['swift.non_client_disconnect'] = True
+                        break
                     # note: learn_size_from_content_range() sets
                     # self.skip_bytes
                     self.learn_size_from_content_range(
@@ -2663,15 +2669,13 @@ class ECFragGetter(object):
                            'entity_length': length, 'headers': headers,
                            'part_iter': part_iter}
                     self.pop_range()
-            except StopIteration:
-                req.environ['swift.non_client_disconnect'] = True
             finally:
                 if part_iter:
                     part_iter.close()
 
         except ChunkReadTimeout:
-            self.app.exception_occurred(self.node, _('Object'),
-                                        _('Trying to read during GET'))
+            self.app.exception_occurred(self.node, 'Object',
+                                        'Trying to read during GET')
             raise
         except ChunkWriteTimeout:
             self.app.logger.warning(
@@ -2747,6 +2751,8 @@ class ECFragGetter(object):
                 not Timestamp(src_headers.get('x-backend-timestamp', 0)):
             # throw out 5XX and 404s from handoff nodes unless the data is
             # really on disk and had been DELETEd
+            self.app.logger.info(
+                'Ignoring %s from handoff' % possible_source.status)
             conn.close()
             return None
 
@@ -2768,6 +2774,10 @@ class ECFragGetter(object):
                             'From Object Server') %
                     {'status': possible_source.status,
                      'body': self.body[:1024]})
+            else:
+                self.app.logger.info(
+                    'Ignoring %s from primary' % possible_source.status)
+
             return None
 
     @property
@@ -2793,8 +2803,14 @@ class ECFragGetter(object):
         # capture last used etag before continuation
         used_etag = self.last_headers.get('X-Object-Sysmeta-EC-ETag')
         for source, node in self.source_and_node_iter:
-            if source and is_good_source(source.status) and \
-                    source.getheader('X-Object-Sysmeta-EC-ETag') == used_etag:
+            if not source:
+                # _make_node_request only returns good sources
+                continue
+            if source.getheader('X-Object-Sysmeta-EC-ETag') != used_etag:
+                self.app.logger.warning(
+                    'Skipping source (etag mismatch: got %s, expected %s)',
+                    source.getheader('X-Object-Sysmeta-EC-ETag'), used_etag)
+            else:
                 return source, node
         return None, None
 
