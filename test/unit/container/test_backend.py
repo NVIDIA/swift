@@ -3979,10 +3979,10 @@ class TestContainerBroker(unittest.TestCase):
                        state=ShardRange.CLEAVED),
             ShardRange('.shards_a/c1_1', next(self.ts), 'g', 'j',
                        state=ShardRange.CLEAVED),
-            ShardRange('.shards_a/c1_2', next(self.ts), 'j', 'm',
-                       state=ShardRange.CREATED),
             ShardRange('.shards_a/c1', next(self.ts), 'd', 'm',
                        state=ShardRange.SHARDING),
+            ShardRange('.shards_a/c1_2', next(self.ts), 'j', 'm',
+                       state=ShardRange.CREATED),
             ShardRange('.shards_a/c2', next(self.ts), 'm', '',
                        state=ShardRange.ACTIVE),
         ]
@@ -3994,7 +3994,7 @@ class TestContainerBroker(unittest.TestCase):
 
         actual = broker.get_shard_ranges(states=SHARD_LISTING_STATES)
         self.assertEqual(
-            [dict(sr) for sr in shard_ranges[:3] + shard_ranges[4:]],
+            [dict(sr) for sr in shard_ranges[:4] + shard_ranges[5:]],
             [dict(sr) for sr in actual])
 
         actual = broker.get_shard_ranges(states=SHARD_UPDATE_STATES,

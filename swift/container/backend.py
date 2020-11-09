@@ -1778,7 +1778,7 @@ class ContainerBroker(DatabaseBroker):
         # note if this ever changes to *not* sort by upper first then it breaks
         # a key assumption for bisect, which is used by utils.find_shard_ranges
         shard_ranges.sort(key=lambda sr: (
-            sr.upper, sr.state, sr.lower, sr.name))
+            sr.upper, sr.lower, sr.state, sr.name))
         if includes:
             shard_range = find_shard_range(includes, shard_ranges)
             return [shard_range] if shard_range else []

@@ -1493,7 +1493,8 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         shard_ranges[1].update_meta(13, 123)
         broker.merge_shard_ranges(shard_ranges[1])
         broker_ranges = broker.get_all_shard_range_data()
-        self.assertShardRangesEqual(shard_ranges + [own_sr], broker_ranges)
+        expected_ranges = shard_ranges[:-1] + [own_sr] + shard_ranges[-1:]
+        self.assertShardRangesEqual(expected_ranges, broker_ranges)
 
         def check_stats(daemon):
             self.assertEqual(1, daemon.stats['deferred'])
@@ -1510,7 +1511,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         broker.merge_shard_ranges(shard_ranges[1])
         # sanity check
         broker_ranges = broker.get_all_shard_range_data()
-        self.assertShardRangesEqual(shard_ranges + [own_sr], broker_ranges)
+        self.assertShardRangesEqual(expected_ranges, broker_ranges)
         daemon = check_replicate(broker_ranges, broker, remote_broker)
         check_stats(daemon)
 
@@ -1520,7 +1521,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         broker.merge_shard_ranges(shard_ranges[0])
         # sanity check
         broker_ranges = broker.get_all_shard_range_data()
-        self.assertShardRangesEqual(shard_ranges + [own_sr], broker_ranges)
+        self.assertShardRangesEqual(expected_ranges, broker_ranges)
         daemon = check_replicate(broker_ranges, broker, remote_broker)
         check_stats(daemon)
 
@@ -1530,7 +1531,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         broker.merge_shard_ranges(shard_ranges[2])
         # sanity check
         broker_ranges = broker.get_all_shard_range_data()
-        self.assertShardRangesEqual(shard_ranges + [own_sr], broker_ranges)
+        self.assertShardRangesEqual(expected_ranges, broker_ranges)
         daemon = check_replicate(broker_ranges, broker, remote_broker)
         check_stats(daemon)
 
@@ -1545,8 +1546,9 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         remote_broker.merge_shard_ranges(remote_shard_ranges[-1])
         # sanity check
         remote_broker_ranges = remote_broker.get_all_shard_range_data()
-        self.assertShardRangesEqual(remote_shard_ranges + [own_sr],
-                                    remote_broker_ranges)
+        expected_ranges = remote_shard_ranges[:-1] + [own_sr] + \
+            remote_shard_ranges[-1:]
+        self.assertShardRangesEqual(expected_ranges, remote_broker_ranges)
         self.assertShardRangesNotEqual(shard_ranges, remote_shard_ranges)
         daemon = check_replicate(remote_broker_ranges, broker, remote_broker)
         check_stats(daemon)
@@ -1559,8 +1561,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         remote_broker.merge_shard_ranges(deleted_ranges[0])
         # sanity check
         remote_broker_ranges = remote_broker.get_all_shard_range_data()
-        self.assertShardRangesEqual(remote_shard_ranges + [own_sr],
-                                    remote_broker_ranges)
+        self.assertShardRangesEqual(expected_ranges, remote_broker_ranges)
         self.assertShardRangesNotEqual(shard_ranges, remote_shard_ranges)
         daemon = check_replicate(remote_broker_ranges, broker, remote_broker)
         check_stats(daemon)
@@ -1750,7 +1751,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
                                      "mismatch remote %s %r != %r" % (
                                          k, remote_info[k], v))
 
-        check_replicate([shard_ranges[0], own_sr])
+        check_replicate(shard_ranges[:1] + [own_sr])
 
         # delete and add some more shard ranges
         shard_ranges[0].deleted = 1
@@ -1759,7 +1760,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
             broker.merge_shard_ranges(shard_range)
         daemon = self._run_once(node)
         self.assertEqual(2, daemon.stats['deferred'])
-        check_replicate(shard_ranges + [own_sr])
+        check_replicate(shard_ranges[:-1] + [own_sr] + shard_ranges[-1:])
 
     def check_replicate(self, from_broker, remote_node_index, repl_conf=None,
                         expect_success=True):
