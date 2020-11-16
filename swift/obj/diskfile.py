@@ -72,7 +72,7 @@ from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
     DiskFileDeleted, DiskFileError, DiskFileNotOpen, PathNotDir, \
     ReplicationLockTimeout, DiskFileExpired, DiskFileXattrNotSupported, \
-    DiskFileBadMetadataChecksum
+    DiskFileBadMetadataChecksum, PartitionLockTimeout
 from swift.common.swob import multi_range_iterator
 from swift.common.storage_policy import (
     get_policy_string, split_policy_string, PolicyError, POLICIES,
@@ -1333,8 +1333,8 @@ class BaseDiskFileManager(object):
     @contextmanager
     def replication_lock(self, device, policy, partition):
         """
-        A context manager that will lock on the device given, if
-        configured to do so.
+        A context manager that will lock on the partition and, if configured
+        to do so, on the device given.
 
         :param device: name of target device
         :param policy: policy targeted by the replication request
@@ -1342,24 +1342,36 @@ class BaseDiskFileManager(object):
         :raises ReplicationLockTimeout: If the lock on the device
             cannot be granted within the configured timeout.
         """
-        if self.replication_concurrency_per_device:
-            dev_path = self.get_dev_path(device)
-            part_path = os.path.join(dev_path, get_data_dir(policy),
-                                     str(partition))
-            limit_time = time.time() + self.replication_lock_timeout
-            with lock_path(
-                    dev_path,
-                    timeout=self.replication_lock_timeout,
-                    timeout_class=ReplicationLockTimeout,
-                    limit=self.replication_concurrency_per_device):
-                with lock_path(
-                        part_path,
-                        timeout=limit_time - time.time(),
-                        timeout_class=ReplicationLockTimeout,
-                        limit=1,
-                        name='replication'):
+        limit_time = time.time() + self.replication_lock_timeout
+        with self.partition_lock(device, policy, partition, name='replication',
+                                 timeout=self.replication_lock_timeout):
+            if self.replication_concurrency_per_device:
+                with lock_path(self.get_dev_path(device),
+                               timeout=limit_time - time.time(),
+                               timeout_class=ReplicationLockTimeout,
+                               limit=self.replication_concurrency_per_device):
                     yield True
-        else:
+            else:
+                yield True
+
+    @contextmanager
+    def partition_lock(self, device, policy, partition, name=None,
+                       timeout=None):
+        """
+        A context manager that will lock on the partition given.
+
+        :param device: device targeted by the lock request
+        :param policy: policy targeted by the lock request
+        :param partition: partition targeted by the lock request
+        :raises PartitionLockTimeout: If the lock on the partition
+            cannot be granted within the configured timeout.
+        """
+        if timeout is None:
+            timeout = self.replication_lock_timeout
+        part_path = os.path.join(self.get_dev_path(device),
+                                 get_data_dir(policy), str(partition))
+        with lock_path(part_path, timeout=timeout,
+                       timeout_class=PartitionLockTimeout, limit=1, name=name):
             yield True
 
     def pickle_async_update(self, device, account, container, obj, data,
@@ -1497,13 +1509,15 @@ class BaseDiskFileManager(object):
                                  partition, account, container, obj,
                                  policy=policy, **kwargs)
 
-    def get_hashes(self, device, partition, suffixes, policy):
+    def get_hashes(self, device, partition, suffixes, policy,
+                   skip_rehash=False):
         """
 
         :param device: name of target device
         :param partition: partition name
         :param suffixes: a list of suffix directories to be recalculated
         :param policy: the StoragePolicy instance
+        :param skip_rehash: just mark the suffixes dirty; return None
         :returns: a dictionary that maps suffix directories
         """
         dev_path = self.get_dev_path(device)
@@ -1512,8 +1526,14 @@ class BaseDiskFileManager(object):
         partition_path = get_part_path(dev_path, policy, partition)
         if not os.path.exists(partition_path):
             mkdirs(partition_path)
-        _junk, hashes = tpool.execute(
-            self._get_hashes, device, partition, policy, recalculate=suffixes)
+        if skip_rehash:
+            for suffix in suffixes or []:
+                invalidate_hash(os.path.join(partition_path, suffix))
+            return None
+        else:
+            _junk, hashes = tpool.execute(
+                self._get_hashes, device, partition, policy,
+                recalculate=suffixes)
         return hashes
 
     def _listdir(self, path):
@@ -2310,6 +2330,9 @@ class BaseDiskFile(object):
             self._datadir = join(
                 device_path, storage_directory(get_data_dir(policy),
                                                partition, name_hash))
+
+    def __repr__(self):
+        return '<%s datadir=%r>' % (self.__class__.__name__, self._datadir)
 
     @property
     def manager(self):

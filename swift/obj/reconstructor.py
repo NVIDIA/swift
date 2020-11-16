@@ -45,7 +45,7 @@ from swift.obj.diskfile import DiskFileRouter, get_data_dir, \
     get_tmp_dir
 from swift.common.storage_policy import POLICIES, EC_POLICY
 from swift.common.exceptions import ConnectionTimeout, DiskFileError, \
-    SuffixSyncError
+    SuffixSyncError, PartitionLockTimeout
 
 SYNC, REVERT = ('sync_only', 'sync_revert')
 
@@ -168,12 +168,19 @@ class ObjectReconstructor(Daemon):
         self.partition_times = []
         self.interval = int(conf.get('interval') or
                             conf.get('run_pause') or 30)
-        if 'run_pause' in conf and 'interval' not in conf:
-            self.logger.warning('Option object-reconstructor/run_pause '
-                                'is deprecated and will be removed in a '
-                                'future version. Update your configuration'
-                                ' to use option object-reconstructor/'
-                                'interval.')
+        if 'run_pause' in conf:
+            if 'interval' in conf:
+                self.logger.warning(
+                    'Option object-reconstructor/run_pause is deprecated and '
+                    'object-reconstructor/interval is already configured. '
+                    'You can safely remove run_pause; it is now ignored and '
+                    'will be removed in a future version.')
+            else:
+                self.logger.warning(
+                    'Option object-reconstructor/run_pause is deprecated '
+                    'and will be removed in a future version. '
+                    'Update your configuration to use option '
+                    'object-reconstructor/interval.')
         self.http_timeout = int(conf.get('http_timeout', 60))
         self.lockup_timeout = int(conf.get('lockup_timeout', 1800))
         self.recon_cache_path = conf.get('recon_cache_path',
@@ -208,6 +215,17 @@ class ObjectReconstructor(Daemon):
                                 'of handoffs_only.')
         self.rebuild_handoff_node_count = int(conf.get(
             'rebuild_handoff_node_count', 2))
+
+        # When upgrading from liberasurecode<=1.5.0, you may want to continue
+        # writing legacy CRCs until all nodes are upgraded and capabale of
+        # reading fragments with zlib CRCs.
+        # See https://bugs.launchpad.net/liberasurecode/+bug/1886088 for more
+        # information.
+        if 'write_legacy_ec_crc' in conf:
+            os.environ['LIBERASURECODE_WRITE_LEGACY_CRC'] = \
+                '1' if config_true_value(conf['write_legacy_ec_crc']) else '0'
+        # else, assume operators know what they're doing and leave env alone
+
         self._df_router = DiskFileRouter(conf, self.logger)
         self.all_local_devices = self.get_local_devices()
         self.rings_mtime = None
@@ -670,22 +688,6 @@ class ObjectReconstructor(Daemon):
                 suffixes.append(suffix)
         return suffixes
 
-    def rehash_remote(self, node, job, suffixes):
-        headers = self.headers.copy()
-        headers['X-Backend-Storage-Policy-Index'] = int(job['policy'])
-        try:
-            with Timeout(self.http_timeout):
-                conn = http_connect(
-                    node['replication_ip'], node['replication_port'],
-                    node['device'], job['partition'], 'REPLICATE',
-                    '/' + '-'.join(sorted(suffixes)),
-                    headers=headers)
-                conn.getresponse().read()
-        except (Exception, Timeout):
-            self.logger.exception(
-                _("Trying to sync suffixes with %s") % _full_path(
-                    node, job['partition'], '', job['policy']))
-
     def _iter_nodes_for_frag(self, policy, partition, node):
         """
         Generate a priority list of nodes that can sync to the given node.
@@ -863,9 +865,6 @@ class ObjectReconstructor(Daemon):
             # ssync any out-of-sync suffixes with the remote node
             success, _ = ssync_sender(
                 self, node, job, suffixes)()
-            # let remote end know to rehash it's suffixes
-            if success:
-                self.rehash_remote(node, job, suffixes)
             # update stats for this attempt
             self.suffix_sync += len(suffixes)
             self.logger.update_stats('suffix.syncs', len(suffixes))
@@ -879,19 +878,33 @@ class ObjectReconstructor(Daemon):
             'partition.delete.count.%s' % (job['local_dev']['device'],))
         syncd_with = 0
         reverted_objs = {}
-        for node in job['sync_to']:
-            node['backend_index'] = job['policy'].get_backend_index(
-                node['index'])
-            success, in_sync_objs = ssync_sender(
-                self, node, job, job['suffixes'])()
-            if success:
-                self.rehash_remote(node, job, job['suffixes'])
-                syncd_with += 1
-                reverted_objs.update(in_sync_objs)
-        if syncd_with >= len(job['sync_to']):
-            self.delete_reverted_objs(
-                job, reverted_objs, job['frag_index'])
-        else:
+        try:
+            df_mgr = self._df_router[job['policy']]
+            # Only object-server can take this lock if an incoming SSYNC is
+            # running on the same partition. Taking the lock here ensure we
+            # won't enter a race condition where both nodes try to
+            # cross-replicate the same partition and both delete it.
+            with df_mgr.partition_lock(job['device'], job['policy'],
+                                       job['partition'], name='replication',
+                                       timeout=0.2):
+                for node in job['sync_to']:
+                    node['backend_index'] = job['policy'].get_backend_index(
+                        node['index'])
+                    success, in_sync_objs = ssync_sender(
+                        self, node, job, job['suffixes'])()
+                    if success:
+                        syncd_with += 1
+                        reverted_objs.update(in_sync_objs)
+                if syncd_with >= len(job['sync_to']):
+                    self.delete_reverted_objs(
+                        job, reverted_objs, job['frag_index'])
+                else:
+                    self.handoffs_remaining += 1
+        except PartitionLockTimeout:
+            self.logger.info("Unable to lock handoff partition %d for revert "
+                             "on device %s policy %d",
+                             job['partition'], job['device'], job['policy'])
+            self.logger.increment('partition.lock-failure.count')
             self.handoffs_remaining += 1
         self.logger.timing_since('partition.delete.timing', begin)
 

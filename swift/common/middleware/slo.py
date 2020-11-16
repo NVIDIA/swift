@@ -348,7 +348,7 @@ from swift.common.utils import get_logger, config_true_value, \
     get_valid_utf8_str, override_bytes_from_content_type, split_path, \
     register_swift_info, RateLimitedIterator, quote, close_if_possible, \
     closing_if_possible, LRUCache, StreamingPile, strict_b64decode, \
-    Timestamp, drain_and_close
+    Timestamp, drain_and_close, get_expirer_container
 from swift.common.request_helpers import SegmentedIterable, \
     get_sys_meta_prefix, update_etag_is_at_header, resolve_etag_is_at_header, \
     get_container_update_override_key, update_ignore_range_header
@@ -1133,6 +1133,8 @@ class StaticLargeObject(object):
             prefix = AUTO_CREATE_ACCOUNT_PREFIX
         self.expiring_objects_account = prefix + (
             conf.get('expiring_objects_account_name') or 'expiring_objects')
+        self.expiring_objects_container_divisor = int(
+            conf.get('expiring_objects_container_divisor', 86400))
 
     def handle_multipart_get_or_head(self, req, start_response):
         """
@@ -1588,10 +1590,13 @@ class StaticLargeObject(object):
         ts = req.ensure_x_timestamp()
         expirer_jobs = make_delete_jobs(
             wsgi_to_str(account), segment_container, segment_objects, ts)
+        expirer_cont = get_expirer_container(
+            ts, self.expiring_objects_container_divisor,
+            wsgi_to_str(account), wsgi_to_str(container), wsgi_to_str(obj))
         enqueue_req = make_pre_authed_request(
             req.environ,
             method='UPDATE',
-            path="/v1/%s/%d" % (self.expiring_objects_account, int(ts)),
+            path="/v1/%s/%s" % (self.expiring_objects_account, expirer_cont),
             body=json.dumps(expirer_jobs),
             headers={'Content-Type': 'application/json',
                      'X-Backend-Storage-Policy-Index': '0',

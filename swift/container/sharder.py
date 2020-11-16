@@ -740,7 +740,8 @@ class ContainerSharder(ContainerReplicator):
         own_shard_range = broker.get_own_shard_range()
 
         if own_shard_range.state in (ShardRange.SHARDING, ShardRange.SHARDED):
-            shard_ranges = broker.get_shard_ranges()
+            shard_ranges = [sr for sr in broker.get_shard_ranges()
+                            if sr.state != ShardRange.SHRINKING]
             missing_ranges = find_missing_ranges(shard_ranges)
             if missing_ranges:
                 warnings.append(
@@ -749,6 +750,10 @@ class ContainerSharder(ContainerReplicator):
                               for lower, upper in missing_ranges]))
 
         for state in ShardRange.STATES:
+            if state == ShardRange.SHRINKING:
+                # Shrinking is how we resolve overlaps; we've got to
+                # allow multiple shards in that state
+                continue
             shard_ranges = broker.get_shard_ranges(states=state)
             overlaps = find_overlapping_ranges(shard_ranges)
             for overlapping_ranges in overlaps:
@@ -779,7 +784,7 @@ class ContainerSharder(ContainerReplicator):
 
         own_shard_range = broker.get_own_shard_range(no_default=True)
 
-        shard_range = None
+        own_shard_range_from_root = None
         if own_shard_range:
             shard_ranges = self._fetch_shard_ranges(
                 broker, newest=True,
@@ -788,15 +793,13 @@ class ContainerSharder(ContainerReplicator):
                 include_deleted=True)
             if shard_ranges:
                 for shard_range in shard_ranges:
-                    if (shard_range.lower == own_shard_range.lower and
-                            shard_range.upper == own_shard_range.upper and
-                            shard_range.name == own_shard_range.name):
+                    if shard_range.name == own_shard_range.name:
+                        own_shard_range_from_root = shard_range
                         break
                 else:
                     # this is not necessarily an error - some replicas of the
                     # root may not yet know about this shard container
                     warnings.append('root has no matching shard range')
-                    shard_range = None
             elif not own_shard_range.deleted:
                 warnings.append('unable to get shard ranges from root')
             # else, our shard range is deleted, so root may have reclaimed it
@@ -815,7 +818,7 @@ class ContainerSharder(ContainerReplicator):
             self._increment_stat('audit_shard', 'failure', statsd=True)
             return False
 
-        if shard_range:
+        if own_shard_range_from_root:
             self.logger.debug('Updating %s shard_range(s) from root',
                               len(shard_ranges))
             broker.merge_shard_ranges(shard_ranges)
@@ -1418,9 +1421,11 @@ class ContainerSharder(ContainerReplicator):
 
         ranges_done = []
         for shard_range in ranges_todo:
-            if shard_range.state in (ShardRange.CREATED,
-                                     ShardRange.CLEAVED,
-                                     ShardRange.ACTIVE):
+            if shard_range.state == ShardRange.SHRINKING:
+                continue
+            elif shard_range.state in (ShardRange.CREATED,
+                                       ShardRange.CLEAVED,
+                                       ShardRange.ACTIVE):
                 cleave_result = self._cleave_shard_range(
                     broker, cleaving_context, shard_range)
                 if cleave_result == CLEAVE_SUCCESS:

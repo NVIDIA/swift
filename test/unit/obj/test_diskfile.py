@@ -56,7 +56,8 @@ from swift.common.splice import splice
 from swift.common.exceptions import DiskFileNotExist, DiskFileQuarantined, \
     DiskFileDeviceUnavailable, DiskFileDeleted, DiskFileNotOpen, \
     DiskFileError, ReplicationLockTimeout, DiskFileCollision, \
-    DiskFileExpired, SwiftException, DiskFileNoSpace, DiskFileXattrNotSupported
+    DiskFileExpired, SwiftException, DiskFileNoSpace, \
+    DiskFileXattrNotSupported, PartitionLockTimeout
 from swift.common.storage_policy import (
     POLICIES, get_policy_string, StoragePolicy, ECStoragePolicy, REPL_POLICY,
     EC_POLICY, PolicyError)
@@ -1205,9 +1206,57 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
         success = False
         with self.df_mgr.replication_lock(self.existing_device,
                                           POLICIES.legacy, '1'):
-            with self.assertRaises(ReplicationLockTimeout):
+            with self.assertRaises(PartitionLockTimeout):
                 with self.df_mgr.replication_lock(self.existing_device,
                                                   POLICIES.legacy, '1'):
+                    success = True
+        self.assertFalse(success)
+
+    def test_partition_lock_same_partition(self):
+        # Double check settings
+        self.df_mgr.replication_lock_timeout = 0.1
+        success = False
+        with self.df_mgr.partition_lock(self.existing_device,
+                                        POLICIES.legacy, '1', name='foo'):
+            with self.assertRaises(PartitionLockTimeout):
+                with self.df_mgr.partition_lock(self.existing_device,
+                                                POLICIES.legacy, '1',
+                                                name='foo'):
+                    success = True
+        self.assertFalse(success)
+
+    def test_partition_lock_same_partition_different_name(self):
+        # Double check settings
+        self.df_mgr.replication_lock_timeout = 0.1
+        success = False
+        with self.df_mgr.partition_lock(self.existing_device,
+                                        POLICIES.legacy, '1', name='foo'):
+            with self.df_mgr.partition_lock(self.existing_device,
+                                            POLICIES.legacy, '1',
+                                            name='bar'):
+                success = True
+        self.assertTrue(success)
+
+    def test_partition_lock_and_replication_lock_same_partition(self):
+        # Double check settings
+        self.df_mgr.replication_lock_timeout = 0.1
+        success = False
+        with self.df_mgr.partition_lock(self.existing_device,
+                                        POLICIES.legacy, '1',
+                                        name='replication'):
+            with self.assertRaises(PartitionLockTimeout):
+                with self.df_mgr.replication_lock(self.existing_device,
+                                                  POLICIES.legacy, '1'):
+                    success = True
+        self.assertFalse(success)
+
+        success = False
+        with self.df_mgr.replication_lock(self.existing_device,
+                                          POLICIES.legacy, '1'):
+            with self.assertRaises(PartitionLockTimeout):
+                with self.df_mgr.partition_lock(self.existing_device,
+                                                POLICIES.legacy, '1',
+                                                name='replication'):
                     success = True
         self.assertFalse(success)
 
@@ -6881,6 +6930,14 @@ class TestSuffixHashes(unittest.TestCase):
                 self.assertEqual('', f.read())
             # so hashes should have the latest suffix hash...
             self.assertEqual(hashes[suffix], non_local['hash'])
+
+            non_local['called'] = False
+            with mock.patch.object(df_mgr, '_hash_suffix', mock_hash_suffix):
+                df_mgr.get_hashes('sda1', '0', [suffix], policy,
+                                  skip_rehash=True)
+            self.assertFalse(non_local['called'])
+            with open(invalidations_file) as f:
+                self.assertEqual(suffix, f.read().strip('\n'))  # sanity
 
     def test_hash_invalidations_race_get_hashes_same_suffix_new(self):
         self._check_hash_invalidations_race_get_hashes_same_suffix(False)

@@ -32,7 +32,7 @@ from swift.common.swob import Request, HTTPException, str_to_wsgi, \
     bytes_to_wsgi
 from swift.common.utils import quote, closing_if_possible, close_if_possible, \
     parse_content_type, iter_multipart_mime_documents, parse_mime_headers, \
-    Timestamp
+    Timestamp, get_expirer_container
 from test.unit.common.middleware.helpers import FakeSwift
 
 
@@ -1587,8 +1587,10 @@ class TestSloDeleteManifest(SloTestCase):
     def test_handle_async_delete_whole(self):
         self.slo.allow_async_delete = True
         now = Timestamp(time.time())
+        exp_obj_cont = get_expirer_container(
+            int(now), 86400, 'AUTH_test', 'deltest', 'man-all-there')
         self.app.register(
-            'UPDATE', '/v1/.expiring_objects/%d' % int(now),
+            'UPDATE', '/v1/.expiring_objects/%s' % exp_obj_cont,
             swob.HTTPNoContent, {}, None)
         req = Request.blank(
             '/v1/AUTH_test/deltest/man-all-there'
@@ -1601,8 +1603,8 @@ class TestSloDeleteManifest(SloTestCase):
         self.assertEqual(self.app.calls, [
             ('GET',
              '/v1/AUTH_test/deltest/man-all-there?multipart-manifest=get'),
-            ('UPDATE', '/v1/.expiring_objects/%d'
-                       '?async=true&multipart-manifest=delete' % int(now)),
+            ('UPDATE', '/v1/.expiring_objects/%s'
+                       '?async=true&multipart-manifest=delete' % exp_obj_cont),
             ('DELETE', '/v1/AUTH_test/deltest/man-all-there'
                        '?async=true&multipart-manifest=delete'),
         ])
@@ -1639,8 +1641,10 @@ class TestSloDeleteManifest(SloTestCase):
         unicode_acct = u'AUTH_test-un\u00efcode'
         wsgi_acct = bytes_to_wsgi(unicode_acct.encode('utf-8'))
         now = Timestamp(time.time())
+        exp_obj_cont = get_expirer_container(
+            int(now), 86400, unicode_acct, 'deltest', 'man-all-there')
         self.app.register(
-            'UPDATE', '/v1/.expiring_objects/%d' % int(now),
+            'UPDATE', '/v1/.expiring_objects/%s' % exp_obj_cont,
             swob.HTTPNoContent, {}, None)
         authorize_calls = []
 
@@ -1666,8 +1670,8 @@ class TestSloDeleteManifest(SloTestCase):
             ('HEAD', '/v1/%s/deltest' % wsgi_acct),
             ('HEAD', '/v1/%s/\xe2\x98\x83' % wsgi_acct),
             ('UPDATE',
-             '/v1/.expiring_objects/%d'
-             '?async=1&heartbeat=1&multipart-manifest=delete' % int(now)),
+             '/v1/.expiring_objects/%s'
+             '?async=1&heartbeat=1&multipart-manifest=delete' % exp_obj_cont),
             ('DELETE',
              '/v1/%s/deltest/man-all-there'
              '?async=1&heartbeat=1&multipart-manifest=delete' % wsgi_acct),
@@ -1711,8 +1715,10 @@ class TestSloDeleteManifest(SloTestCase):
         unicode_acct = u'AUTH_test-un\u00efcode'
         wsgi_acct = bytes_to_wsgi(unicode_acct.encode('utf-8'))
         now = Timestamp(time.time())
+        exp_obj_cont = get_expirer_container(
+            int(now), 86400, unicode_acct, u'\N{SNOWMAN}', 'same-container')
         self.app.register(
-            'UPDATE', '/v1/.expiring_objects/%d' % int(now),
+            'UPDATE', '/v1/.expiring_objects/%s' % exp_obj_cont,
             swob.HTTPNoContent, {}, None)
         authorize_calls = []
 
@@ -1735,8 +1741,8 @@ class TestSloDeleteManifest(SloTestCase):
             ('HEAD', '/v1/%s' % wsgi_acct),
             ('HEAD', '/v1/%s/\xe2\x98\x83' % wsgi_acct),
             ('UPDATE',
-             '/v1/.expiring_objects/%d'
-             '?async=yes&multipart-manifest=delete' % int(now)),
+             '/v1/.expiring_objects/%s'
+             '?async=yes&multipart-manifest=delete' % exp_obj_cont),
             ('DELETE',
              '/v1/%s/\xe2\x98\x83/same-container'
              '?async=yes&multipart-manifest=delete' % wsgi_acct),
@@ -3832,6 +3838,32 @@ class TestSloGetManifest(SloTestCase):
             'resource could not be foun...) while retrieving /v1/AUTH_test/'
             'gettest/not_exists_obj'
         ])
+
+    def test_first_segment_not_available(self):
+        self.app.register('GET', '/v1/AUTH_test/gettest/not_avail_obj',
+                          swob.HTTPServiceUnavailable, {}, None)
+        self.app.register('GET', '/v1/AUTH_test/gettest/manifest-not-avail',
+                          swob.HTTPOk, {'Content-Type': 'application/json',
+                                        'X-Static-Large-Object': 'true'},
+                          json.dumps([{'name': '/gettest/not_avail_obj',
+                                       'hash': md5hex('not_avail_obj'),
+                                       'content_type': 'text/plain',
+                                       'bytes': '%d' % len('not_avail_obj')
+                                       }]))
+
+        req = Request.blank('/v1/AUTH_test/gettest/manifest-not-avail',
+                            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('503 Service Unavailable', status)
+        self.assertEqual(self.app.unread_requests, {})
+        self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
+            'While processing manifest /v1/AUTH_test/gettest/'
+            'manifest-not-avail, got 503 (<html><h1>Service Unavailable</h1>'
+            '<p>The server is curren...) while retrieving /v1/AUTH_test/'
+            'gettest/not_avail_obj'
+        ])
+        self.assertIn(b'Service Unavailable', body)
 
     def test_leading_data_segment(self):
         slo_etag = md5hex(

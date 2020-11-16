@@ -4430,7 +4430,7 @@ def quote(value, safe='/'):
 def get_expirer_container(x_delete_at, expirer_divisor, acc, cont, obj):
     """
     Returns an expiring object container name for given X-Delete-At and
-    a/c/o.
+    (native string) a/c/o.
     """
     shard_int = int(hash_path(acc, cont, obj), 16) % 100
     return normalize_delete_at_timestamp(
@@ -4539,7 +4539,7 @@ def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
 
     if got.strip() != boundary:
         raise swift.common.exceptions.MimeInvalid(
-            'invalid starting boundary: wanted %r, got %r', (boundary, got))
+            'invalid starting boundary: wanted %r, got %r' % (boundary, got))
     boundary = b'\r\n' + boundary
     input_buffer = b''
     done = False

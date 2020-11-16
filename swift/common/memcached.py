@@ -72,8 +72,7 @@ TRY_COUNT = 3
 # if ERROR_LIMIT_COUNT errors occur in ERROR_LIMIT_TIME seconds, the server
 # will be considered failed for ERROR_LIMIT_DURATION seconds.
 ERROR_LIMIT_COUNT = 10
-ERROR_LIMIT_TIME = 60
-ERROR_LIMIT_DURATION = 60
+ERROR_LIMIT_TIME = ERROR_LIMIT_DURATION = 60
 
 
 def md5hash(key):
@@ -160,10 +159,16 @@ class MemcacheRing(object):
     def __init__(self, servers, connect_timeout=CONN_TIMEOUT,
                  io_timeout=IO_TIMEOUT, pool_timeout=POOL_TIMEOUT,
                  tries=TRY_COUNT, allow_pickle=False, allow_unpickle=False,
-                 max_conns=2, logger=None):
+                 max_conns=2, logger=None,
+                 error_limit_count=ERROR_LIMIT_COUNT,
+                 error_limit_time=ERROR_LIMIT_TIME,
+                 error_limit_duration=ERROR_LIMIT_DURATION):
         self._ring = {}
-        self._errors = {serv: [] for serv in servers}
-        self._error_limited = {serv: 0 for serv in servers}
+        self._errors = dict(((serv, []) for serv in servers))
+        self._error_limited = dict(((serv, 0) for serv in servers))
+        self._error_limit_count = error_limit_count
+        self._error_limit_time = error_limit_time
+        self._error_limit_duration = error_limit_duration
         for server in sorted(servers):
             for i in range(NODE_WEIGHT):
                 self._ring[md5hash('%s-%s' % (server, i))] = server
@@ -212,22 +217,16 @@ class MemcacheRing(object):
             # A new connection will be created the next time it is retrieved
             self._return_conn(server, None, None)
 
-        if len(self._errors) == 1:
-            # if there's only one server defined, skip the error-limiting
-            # book-keeping entirely
+        if self._error_limit_time <= 0 or self._error_limit_duration <= 0:
             return
 
         now = time.time()
-        self._errors[server].append(time.time())
-        if len(self._errors[server]) >= ERROR_LIMIT_COUNT:
+        self._errors[server].append(now)
+        if len(self._errors[server]) > self._error_limit_count:
             self._errors[server] = [err for err in self._errors[server]
-                                    if err > now - ERROR_LIMIT_TIME]
-            remaining_servers = sum(
-                1 for _server, value in self._error_limited.items()
-                if value <= now)
-            if len(self._errors[server]) >= ERROR_LIMIT_COUNT and \
-                    remaining_servers > 1:
-                self._error_limited[server] = now + ERROR_LIMIT_DURATION
+                                    if err > now - self._error_limit_time]
+            if len(self._errors[server]) > self._error_limit_count:
+                self._error_limited[server] = now + self._error_limit_duration
                 self.logger.error('Error limiting server %s', server)
 
     def _get_conns(self, key):
