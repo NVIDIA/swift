@@ -774,7 +774,6 @@ class ContainerSharder(ContainerReplicator):
         return True
 
     def _audit_shard_container(self, broker):
-        # Get the root view of the world.
         self._increment_stat('audit_shard', 'attempted')
         warnings = []
         errors = []
@@ -784,8 +783,10 @@ class ContainerSharder(ContainerReplicator):
 
         own_shard_range = broker.get_own_shard_range(no_default=True)
 
-        own_shard_range_from_root = None
+        shard_ranges = own_shard_range_from_root = None
         if own_shard_range:
+            # Get the root view of the world, at least that part of the world
+            # that overlaps with this shard's namespace
             shard_ranges = self._fetch_shard_ranges(
                 broker, newest=True,
                 params={'marker': str_to_wsgi(own_shard_range.lower_str),
@@ -793,6 +794,11 @@ class ContainerSharder(ContainerReplicator):
                 include_deleted=True)
             if shard_ranges:
                 for shard_range in shard_ranges:
+                    # look for this shard range in the list of shard ranges
+                    # received from root; the root may have different lower and
+                    # upper bounds for this shard (e.g. if this shard has been
+                    # expanded in the root to accept a shrinking shard) so we
+                    # only match on name.
                     if shard_range.name == own_shard_range.name:
                         own_shard_range_from_root = shard_range
                         break
@@ -819,6 +825,10 @@ class ContainerSharder(ContainerReplicator):
             return False
 
         if own_shard_range_from_root:
+            # iff we find our own shard range in the root response, save off
+            # *all* shards returned (including own_shard_range_from_root)
+            # because, for example, these may contain shards into which this
+            # shard is to shard itself
             self.logger.debug('Updating %s shard_range(s) from root',
                               len(shard_ranges))
             broker.merge_shard_ranges(shard_ranges)
@@ -1422,6 +1432,12 @@ class ContainerSharder(ContainerReplicator):
         ranges_done = []
         for shard_range in ranges_todo:
             if shard_range.state == ShardRange.SHRINKING:
+                # Ignore shrinking shard ranges: we never want to cleave
+                # objects to a shrinking shard. Shrinking shard ranges are to
+                # be expected in a root; shrinking shard ranges (other than own
+                # shard range) are not normally expected in a shard but can
+                # occur if there is an overlapping shard range that has been
+                # discovered from the root.
                 continue
             elif shard_range.state in (ShardRange.CREATED,
                                        ShardRange.CLEAVED,

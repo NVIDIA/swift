@@ -64,7 +64,9 @@ class TestReceiver(unittest.TestCase):
             'replication_concurrency_per_device': '0',
             'log_requests': 'false'}
         utils.mkdirs(os.path.join(self.testdir, 'device', 'partition'))
-        self.controller = server.ObjectController(self.conf)
+        self.logger = debug_logger()
+        self.controller = server.ObjectController(
+            self.conf, logger=self.logger)
         self.controller.bytes_per_sync = 1
 
         self.account1 = 'a'
@@ -417,15 +419,12 @@ class TestReceiver(unittest.TestCase):
             req = swob.Request.blank(
                 '/device/partition', environ={'REQUEST_METHOD': 'SSYNC'})
             resp = req.get_response(self.controller)
-            if six.PY2:
-                got = b"''"
-            else:
-                got = b"b''"
-            self.assertEqual(self.body_lines(resp.body), [
-                b':ERROR: 0 "Looking for :MISSING_CHECK: START got %s"' % got])
+            self.assertEqual(resp.body, b'\r\n')
             self.assertEqual(resp.status_int, 200)
             mocked_replication_semaphore.acquire.assert_called_once_with(0)
             mocked_replication_semaphore.release.assert_called_once_with()
+            error_lines = self.logger.get_lines_for_level('error')
+            self.assertEqual(['ssync client disconnected'], error_lines)
 
         with mock.patch.object(
                 self.controller, 'replication_semaphore') as \
@@ -441,7 +440,7 @@ class TestReceiver(unittest.TestCase):
             self.assertFalse(mocked_replication_semaphore.acquire.called)
             self.assertFalse(mocked_replication_semaphore.release.called)
 
-    def test_SSYNC_mount_check(self):
+    def test_SSYNC_mount_check_isdir(self):
         with mock.patch.object(self.controller, 'replication_semaphore'), \
                 mock.patch.object(
                     self.controller._diskfile_router[POLICIES.legacy],
@@ -450,15 +449,13 @@ class TestReceiver(unittest.TestCase):
             req = swob.Request.blank(
                 '/device/partition', environ={'REQUEST_METHOD': 'SSYNC'})
             resp = req.get_response(self.controller)
-            if six.PY2:
-                got = b"''"
-            else:
-                got = b"b''"
-            self.assertEqual(self.body_lines(resp.body), [
-                b':ERROR: 0 "Looking for :MISSING_CHECK: START got %s"' % got])
+            self.assertEqual(resp.body, b'\r\n')
             self.assertEqual(resp.status_int, 200)
             self.assertEqual([], mocks['ismount'].call_args_list)
+            error_lines = self.logger.get_lines_for_level('error')
+            self.assertEqual(['ssync client disconnected'], error_lines)
 
+    def test_SSYNC_mount_check(self):
         with mock.patch.object(self.controller, 'replication_semaphore'), \
                 mock.patch.object(
                     self.controller._diskfile_router[POLICIES.legacy],
@@ -482,16 +479,13 @@ class TestReceiver(unittest.TestCase):
             req = swob.Request.blank(
                 '/device/partition', environ={'REQUEST_METHOD': 'SSYNC'})
             resp = req.get_response(self.controller)
-            if six.PY2:
-                got = b"''"
-            else:
-                got = b"b''"
-            self.assertEqual(self.body_lines(resp.body), [
-                b':ERROR: 0 "Looking for :MISSING_CHECK: START got %s"' % got])
+            self.assertEqual(resp.body, b'\r\n')
             self.assertEqual(resp.status_int, 200)
             self.assertEqual([mock.call(os.path.join(
                 self.controller._diskfile_router[POLICIES.legacy].devices,
                 'device'))] * 2, mocks['ismount'].call_args_list)
+            error_lines = self.logger.get_lines_for_level('error')
+            self.assertEqual(['ssync client disconnected'], error_lines)
 
     def test_SSYNC_Exception(self):
 
@@ -1037,6 +1031,24 @@ class TestReceiver(unittest.TestCase):
         self.assertFalse(self.controller.logger.error.called)
         self.assertFalse(self.controller.logger.exception.called)
 
+    def test_UPDATES_no_start(self):
+        # verify behavior when the sender disconnects and does not send
+        # ':UPDATES: START' e.g. if a sender timeout pops while waiting for
+        # receiver response to missing checks
+        self.controller.logger = mock.MagicMock()
+        req = swob.Request.blank(
+            '/device/partition',
+            environ={'REQUEST_METHOD': 'SSYNC'},
+            body=':MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n')
+        req.remote_addr = '2.3.4.5'
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            self.body_lines(resp.body),
+            [b':MISSING_CHECK: START', b':MISSING_CHECK: END'])
+        self.assertEqual(resp.status_int, 200)
+        self.controller.logger.error.assert_called_once_with(
+            'ssync client disconnected')
+
     def test_UPDATES_timeout(self):
 
         class _Wrapper(io.BytesIO):
@@ -1324,11 +1336,11 @@ class TestReceiver(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(
             self.body_lines(resp.body),
-            [b':MISSING_CHECK: START', b':MISSING_CHECK: END',
-             b":ERROR: 0 'Early termination for PUT /a/c/o'"])
+            [b':MISSING_CHECK: START', b':MISSING_CHECK: END'])
         self.assertEqual(resp.status_int, 200)
-        self.controller.logger.exception.assert_called_once_with(
-            'None/device/partition EXCEPTION in ssync.Receiver')
+        self.controller.logger.error.assert_called_once_with(
+            'None/device/partition read failed in ssync.Receiver: '
+            'Early termination for PUT /a/c/o')
 
     def test_UPDATES_failures(self):
 
@@ -2069,6 +2081,7 @@ class TestSsyncRxServer(unittest.TestCase):
 
         self.conf = {
             'devices': self.devices,
+            'mount_check': 'false',
             'swift_dir': self.tempdir,
         }
         self.rx_logger = debug_logger('test-object-server')
@@ -2134,6 +2147,69 @@ class TestSsyncRxServer(unittest.TestCase):
         resp.close()
         # sanity check that the receiver did not proceed to missing_check
         self.assertFalse(mock_missing_check.called)
+
+    def test_SSYNC_read_error(self):
+        # verify that read errors from wsgi reader are caught and reported
+        def do_send(data):
+            self.rx_logger.clear()
+            self.connection = bufferedhttp.BufferedHTTPConnection(
+                '127.0.0.1:%s' % self.rx_port)
+            self.connection.putrequest('SSYNC', '/sda1/0')
+            self.connection.putheader('Transfer-Encoding', 'chunked')
+            self.connection.putheader('X-Backend-Storage-Policy-Index',
+                                      int(POLICIES[0]))
+            self.connection.endheaders()
+            resp = self.connection.getresponse()
+            self.assertEqual(200, resp.status)
+            resp.close()
+            self.connection.send(data)
+            self.connection.close()
+            for sleep_time in (0, 0.1, 1):
+                lines = self.rx_logger.get_lines_for_level('error')
+                if lines:
+                    return lines
+                eventlet.sleep(sleep_time)
+            return []
+
+        # check read errors during missing_check phase
+        error_lines = do_send(b'')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('missing_check start: invalid literal', error_lines[0])
+
+        error_lines = do_send(b'1\r\n')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('missing_check start: unexpected end of file',
+                      error_lines[0])
+
+        error_lines = do_send(b'17\r\n:MISSING_CHECK: START\r\n\r\nx\r\n')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('missing_check line: invalid literal', error_lines[0])
+
+        error_lines = do_send(b'17\r\n:MISSING_CHECK: START\r\n\r\n12\r\n')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('missing_check line: unexpected end of file',
+                      error_lines[0])
+
+        # check read errors during updates phase
+        with mock.patch('swift.obj.ssync_receiver.Receiver.missing_check'):
+            error_lines = do_send(b'')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('updates start: invalid literal', error_lines[0])
+
+        with mock.patch('swift.obj.ssync_receiver.Receiver.missing_check'):
+            error_lines = do_send(b'1\r\n')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('updates start: unexpected end of file', error_lines[0])
+
+        with mock.patch('swift.obj.ssync_receiver.Receiver.missing_check'):
+            error_lines = do_send(b'11\r\n:UPDATES: START\r\n\r\nx\r\n')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('updates line: invalid literal', error_lines[0])
+
+        with mock.patch('swift.obj.ssync_receiver.Receiver.missing_check'):
+            error_lines = do_send(b'11\r\n:UPDATES: START\r\n\r\n12\r\n')
+        self.assertEqual(1, len(error_lines))
+        self.assertIn('updates line: unexpected end of file', error_lines[0])
 
     def test_SSYNC_invalid_policy(self):
         valid_indices = sorted([int(policy) for policy in POLICIES])

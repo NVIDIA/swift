@@ -2693,8 +2693,8 @@ class ECFragGetter(object):
                         if end - begin + 1 == self.bytes_used_from_backend:
                             warn = False
             if not req.environ.get('swift.non_client_disconnect') and warn:
-                self.app.logger.warning('Client disconnected on read of %r',
-                                        self.path)
+                self.app.logger.warning(
+                    'Client disconnected on read of EC frag %r', self.path)
             raise
         except Exception:
             self.app.logger.exception(_('Trying to send to client'))
@@ -2751,8 +2751,8 @@ class ECFragGetter(object):
                 not Timestamp(src_headers.get('x-backend-timestamp', 0)):
             # throw out 5XX and 404s from handoff nodes unless the data is
             # really on disk and had been DELETEd
-            self.app.logger.info(
-                'Ignoring %s from handoff' % possible_source.status)
+            self.app.logger.debug('Ignoring %s from handoff' %
+                                  possible_source.status)
             conn.close()
             return None
 
@@ -2775,7 +2775,7 @@ class ECFragGetter(object):
                     {'status': possible_source.status,
                      'body': self.body[:1024]})
             else:
-                self.app.logger.info(
+                self.app.logger.debug(
                     'Ignoring %s from primary' % possible_source.status)
 
             return None

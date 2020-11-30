@@ -30,9 +30,9 @@ from swift.common.constraints import CONTAINER_LISTING_LIMIT
 from swift.common.exceptions import LockTimeout
 from swift.common.utils import Timestamp, encode_timestamps, \
     decode_timestamps, extract_swift_bytes, storage_directory, hash_path, \
-    ShardRange, renamer, find_shard_range, MD5_OF_EMPTY_STRING, mkdirs, \
-    get_db_files, parse_db_filename, make_db_file_path, split_path, \
-    RESERVED_BYTE
+    ShardRange, renamer, MD5_OF_EMPTY_STRING, mkdirs, get_db_files, \
+    parse_db_filename, make_db_file_path, split_path, RESERVED_BYTE, \
+    filter_shard_ranges
 from swift.common.db import DatabaseBroker, utf8encode, BROKER_TIMEOUT, \
     zero_like, DatabaseAlreadyExists, SQLITE_ARG_LIMIT
 
@@ -1756,14 +1756,6 @@ class ContainerBroker(DatabaseBroker):
             at the tail of other shard ranges.
         :return: a list of instances of :class:`swift.common.utils.ShardRange`
         """
-        def shard_range_filter(sr):
-            end = start = True
-            if end_marker:
-                end = end_marker > sr.lower
-            if marker:
-                start = marker < sr.upper
-            return start and end
-
         if reverse:
             marker, end_marker = end_marker, marker
         if marker and end_marker and marker >= end_marker:
@@ -1778,14 +1770,12 @@ class ContainerBroker(DatabaseBroker):
         # note if this ever changes to *not* sort by upper first then it breaks
         # a key assumption for bisect, which is used by utils.find_shard_ranges
         shard_ranges.sort(key=lambda sr: (
-            sr.upper, sr.lower, sr.state, sr.name))
-        if includes:
-            shard_range = find_shard_range(includes, shard_ranges)
-            return [shard_range] if shard_range else []
+            sr.upper, sr.state, sr.lower, sr.name))
 
-        if marker or end_marker:
-            shard_ranges = list(filter(shard_range_filter, shard_ranges))
-        if fill_gaps:
+        shard_ranges = filter_shard_ranges(shard_ranges, includes,
+                                           marker, end_marker)
+
+        if not includes and fill_gaps:
             if shard_ranges:
                 last_upper = shard_ranges[-1].upper
             else:

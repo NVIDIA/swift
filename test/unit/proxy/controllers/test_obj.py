@@ -182,6 +182,7 @@ class BaseObjectControllerMixin(object):
         self.app = PatchedObjControllerApp(
             conf, account_ring=FakeRing(),
             container_ring=FakeRing(), logger=self.logger)
+        self.logger.clear()  # startup/loading debug msgs not helpful
 
         # you can over-ride the container_info just by setting it on the app
         # (see PatchedObjControllerApp for details)
@@ -4754,18 +4755,18 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         for line in self.logger.logger.records['ERROR']:
             self.assertIn(req.headers['x-trans-id'], line)
 
-        info_lines = self.logger.get_lines_for_level('info')
+        debug_lines = self.logger.get_lines_for_level('debug')
         nparity = self.policy.ec_nparity
         nhandoffs = self.policy.object_ring.max_more_nodes
         ignore_404 = ignore_404_handoff = 0
-        for line in info_lines:
+        for line in debug_lines:
             if 'Ignoring 404 from primary' in line:
                 ignore_404 += 1
             if 'Ignoring 404 from handoff' in line:
                 ignore_404_handoff += 1
-        self.assertEqual(nparity - 2, ignore_404, info_lines)
-        self.assertEqual(nhandoffs, ignore_404_handoff, info_lines)
-        self.assertEqual(len(info_lines), ignore_404_handoff + ignore_404)
+        self.assertEqual(nparity - 2, ignore_404, debug_lines)
+        self.assertEqual(nhandoffs, ignore_404_handoff, debug_lines)
+        self.assertEqual(len(debug_lines), ignore_404_handoff + ignore_404)
         self.assertEqual(self.logger.get_lines_for_level('warning'), [
             'Skipping source (etag mismatch: got other_etag, '
             'expected %s)' % etag] * 2)
