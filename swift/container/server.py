@@ -43,7 +43,6 @@ from swift.common.utils import get_logger, hash_path, public, \
     ShardRange
 from swift.common.constraints import valid_timestamp, check_utf8, \
     check_drive, AUTO_CREATE_ACCOUNT_PREFIX
-from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout
 from swift.common.http import HTTP_NO_CONTENT, HTTP_NOT_FOUND, is_success
@@ -649,12 +648,12 @@ class ContainerController(BaseStorageServer):
 
         * Both shard range and object listings may be filtered according to
           the constraints described below. However, the
-          ``X-Backend-Ignore-Shard-Name-Filter`` header may be used with a
-          value in :attr:`swift.common.utils.TRUE_VALUES` to override the
-          application of the ``marker``, ``end_marker``, ``includes`` and
-          ``reverse`` parameters to shard range listings. Note that this
-          headers does not override the ``states`` constraint on shard range
-          listings.
+          ``X-Backend-Ignore-Shard-Name-Filter`` header may be used to override
+          the application of the ``marker``, ``end_marker``, ``includes`` and
+          ``reverse`` parameters to shard range listings. These parameters will
+          be ignored if the header has the value 'sharded' and the current db
+          sharding state is also 'sharded'. Note that this header does not
+          override the ``states`` constraint on shard range listings.
 
         * The order of both shard range and object listings may be reversed by
           using a ``reverse`` query string parameter with a
@@ -717,7 +716,7 @@ class ContainerController(BaseStorageServer):
         delimiter = params.get('delimiter')
         marker = params.get('marker', '')
         end_marker = params.get('end_marker')
-        limit = params.get('limit', constraints.CONTAINER_LISTING_LIMIT)
+        limit = params['limit']
         reverse = config_true_value(params.get('reverse'))
         out_content_type = listing_formats.get_listing_content_type(req)
         try:
@@ -729,8 +728,8 @@ class ContainerController(BaseStorageServer):
                                             stale_reads_ok=True)
         info, is_deleted = broker.get_info_is_deleted()
         record_type = req.headers.get('x-backend-record-type', '').lower()
-        sharding_state = info.get('db_state')
-        if record_type == 'auto' and sharding_state in (SHARDING, SHARDED):
+        db_state = info.get('db_state')
+        if record_type == 'auto' and db_state in (SHARDING, SHARDED):
             record_type = 'shard'
         if record_type == 'shard':
             override_deleted = info and config_true_value(
@@ -742,10 +741,11 @@ class ContainerController(BaseStorageServer):
             resp_headers['X-Backend-Record-Type'] = 'shard'
             includes = params.get('includes')
             override_filter_hdr = req.headers.get(
-                'x-backend-override-shard-name-filter', 'false').lower()
-            if (config_true_value(override_filter_hdr) or
-                    override_filter_hdr == sharding_state):
-                resp_headers['x-backend-override-shard-name-filter'] = 'true'
+                'x-backend-override-shard-name-filter', '').lower()
+            if override_filter_hdr == db_state == 'sharded':
+                # respect the request to send back *all* ranges if the db is in
+                # sharded state
+                resp_headers['X-Backend-Override-Shard-Name-Filter'] = 'true'
                 marker = end_marker = includes = None
                 reverse = False
             states = params.get('states')

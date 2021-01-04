@@ -6,7 +6,7 @@
 
       It sets TMPDIR to an XFS mount point created via
       tools/test-setup.sh.
-    timeout: 3600
+    timeout: 5400
     vars:
       tox_environment:
         TMPDIR: '{{ ansible_env.HOME }}/xfstmp'
@@ -187,11 +187,11 @@
       - opendev.org/openstack/requirements
       - opendev.org/openstack/swift
       - opendev.org/openstack/keystone
-    timeout: 3600
+    timeout: 5400
     vars:
       tox_constraints_file: '{{ ansible_user_dir }}/src/opendev.org/openstack/requirements/upper-constraints.txt'
       # This tox env get run twice; once for Keystone and once for tempauth
-      tox_envlist: func
+      tox_envlist: func-py3
       devstack_localrc:
         SWIFT_HASH: changeme
         # We don't need multiple replicas to run purely functional tests.
@@ -227,7 +227,7 @@
     nodeset: centos-7
     description: |
       Setup a SAIO dev environment and run ceph-s3tests
-    timeout: 3600
+    timeout: 5400
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
@@ -244,13 +244,26 @@
     nodeset: centos-7
     description: |
       Setup a SAIO dev environment and run Swift's probe tests
-    timeout: 5400
+      under Python 2.
+    timeout: 7200
+    vars:
+      bindep_profile: test py27
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
       - tools/playbooks/saio_single_node_setup/make_rings.yaml
     run: tools/playbooks/probetests/run.yaml
     post-run: tools/playbooks/probetests/post.yaml
+
+- job:
+    name: swift-probetests-centos-8
+    parent: swift-probetests-centos-7
+    nodeset: centos-8
+    description: |
+      Setup a SAIO dev environment and run Swift's probe tests
+      under Python 3.
+    vars:
+      bindep_profile: test py36
 
 - nodeset:
     name: swift-five-nodes
@@ -299,7 +312,7 @@
     nodeset: swift-five-nodes
     description: |
       Build a 4 node swift cluster and run functional tests
-    timeout: 3600
+    timeout: 5400
     pre-run:
       - tools/playbooks/multinode_setup/pre.yaml
       - tools/playbooks/common/install_dependencies.yaml
@@ -524,6 +537,13 @@
               - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
               - ^test/(unit|functional)/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+        - swift-probetests-centos-8:
+            irrelevant-files:
+              - ^(api-ref|releasenotes)/.*$
+              # Keep doc/saio -- we use those sample configs in the saio playbooks
+              - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
+              - ^test/(unit|functional)/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
         - swift-dsvm-functional:
             irrelevant-files:
               - ^(api-ref|doc|releasenotes)/.*$
@@ -548,6 +568,7 @@
               - ^(api-ref|doc|releasenotes)/.*$
               - ^test/probe/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+            voting: false
         - tempest-integrated-object-storage:
             irrelevant-files:
               - ^(api-ref|doc|releasenotes)/.*$
@@ -582,6 +603,13 @@
         - swift-tox-func-encryption-py37
         - swift-tox-func-ec-py37
         - swift-probetests-centos-7:
+            irrelevant-files:
+              - ^(api-ref|releasenotes)/.*$
+              # Keep doc/saio -- we use those sample configs in the saio playbooks
+              - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
+              - ^test/(unit|functional)/.*$
+              - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
+        - swift-probetests-centos-8:
             irrelevant-files:
               - ^(api-ref|releasenotes)/.*$
               # Keep doc/saio -- we use those sample configs in the saio playbooks

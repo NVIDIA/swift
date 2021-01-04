@@ -19,7 +19,7 @@ from __future__ import print_function
 import hashlib
 
 from test.unit import temptree, debug_logger, make_timestamp_iter, \
-    with_tempdir, mock_timestamp_now
+    with_tempdir, mock_timestamp_now, FakeIterable
 
 import ctypes
 import contextlib
@@ -74,7 +74,7 @@ from swift.common.exceptions import Timeout, MessageTimeout, \
     MimeInvalid
 from swift.common import utils
 from swift.common.utils import is_valid_ip, is_valid_ipv4, is_valid_ipv6, \
-    set_swift_dir
+    set_swift_dir, md5
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import POLICIES, reload_storage_policies
@@ -993,6 +993,13 @@ class TestUtils(unittest.TestCase):
     def setUp(self):
         utils.HASH_PATH_SUFFIX = b'endcap'
         utils.HASH_PATH_PREFIX = b'startcap'
+        self.md5_test_data = "Openstack forever".encode('utf-8')
+        try:
+            self.md5_digest = hashlib.md5(self.md5_test_data).hexdigest()
+            self.fips_enabled = False
+        except ValueError:
+            self.md5_digest = '0d6dc3c588ae71a04ce9a6beebbbba06'
+            self.fips_enabled = True
 
     def test_get_zero_indexed_base_string(self):
         self.assertEqual(utils.get_zero_indexed_base_string('something', 0),
@@ -4469,6 +4476,79 @@ cluster_dfw1 = http://dfw1.host/v1/
         sock.close()
         self.assertEqual(msg, b'READY=1')
         self.assertNotIn('NOTIFY_SOCKET', os.environ)
+
+    def test_md5_with_data(self):
+        if not self.fips_enabled:
+            digest = md5(self.md5_test_data).hexdigest()
+            self.assertEqual(digest, self.md5_digest)
+        else:
+            # on a FIPS enabled system, this throws a ValueError:
+            # [digital envelope routines: EVP_DigestInit_ex] disabled for FIPS
+            self.assertRaises(ValueError, md5, self.md5_test_data)
+
+        if not self.fips_enabled:
+            digest = md5(self.md5_test_data, usedforsecurity=True).hexdigest()
+            self.assertEqual(digest, self.md5_digest)
+        else:
+            self.assertRaises(
+                ValueError, md5, self.md5_test_data, usedforsecurity=True)
+
+        digest = md5(self.md5_test_data, usedforsecurity=False).hexdigest()
+        self.assertEqual(digest, self.md5_digest)
+
+    def test_md5_without_data(self):
+        if not self.fips_enabled:
+            test_md5 = md5()
+            test_md5.update(self.md5_test_data)
+            digest = test_md5.hexdigest()
+            self.assertEqual(digest, self.md5_digest)
+        else:
+            self.assertRaises(ValueError, md5)
+
+        if not self.fips_enabled:
+            test_md5 = md5(usedforsecurity=True)
+            test_md5.update(self.md5_test_data)
+            digest = test_md5.hexdigest()
+            self.assertEqual(digest, self.md5_digest)
+        else:
+            self.assertRaises(ValueError, md5, usedforsecurity=True)
+
+        test_md5 = md5(usedforsecurity=False)
+        test_md5.update(self.md5_test_data)
+        digest = test_md5.hexdigest()
+        self.assertEqual(digest, self.md5_digest)
+
+    @unittest.skipIf(sys.version_info.major == 2,
+                     "hashlib.md5 does not raise TypeError here in py2")
+    def test_string_data_raises_type_error(self):
+        if not self.fips_enabled:
+            self.assertRaises(TypeError, hashlib.md5, u'foo')
+            self.assertRaises(TypeError, md5, u'foo')
+            self.assertRaises(
+                TypeError, md5, u'foo', usedforsecurity=True)
+        else:
+            self.assertRaises(ValueError, hashlib.md5, u'foo')
+            self.assertRaises(ValueError, md5, u'foo')
+            self.assertRaises(
+                ValueError, md5, u'foo', usedforsecurity=True)
+
+        self.assertRaises(
+            TypeError, md5, u'foo', usedforsecurity=False)
+
+    def test_none_data_raises_type_error(self):
+        if not self.fips_enabled:
+            self.assertRaises(TypeError, hashlib.md5, None)
+            self.assertRaises(TypeError, md5, None)
+            self.assertRaises(
+                TypeError, md5, None, usedforsecurity=True)
+        else:
+            self.assertRaises(ValueError, hashlib.md5, None)
+            self.assertRaises(ValueError, md5, None)
+            self.assertRaises(
+                ValueError, md5, None, usedforsecurity=True)
+
+        self.assertRaises(
+            TypeError, md5, None, usedforsecurity=False)
 
 
 class ResellerConfReader(unittest.TestCase):
@@ -8149,7 +8229,7 @@ class TestShardRange(unittest.TestCase):
     def test_make_path(self):
         ts = utils.Timestamp.now()
         actual = utils.ShardRange.make_path('a', 'root', 'parent', ts, 0)
-        parent_hash = hashlib.md5(b'parent').hexdigest()
+        parent_hash = md5(b'parent', usedforsecurity=False).hexdigest()
         self.assertEqual('a/root-%s-%s-0' % (parent_hash, ts.internal), actual)
         actual = utils.ShardRange.make_path('a', 'root', 'parent', ts, 3)
         self.assertEqual('a/root-%s-%s-3' % (parent_hash, ts.internal), actual)
@@ -8660,3 +8740,68 @@ class TestWatchdog(unittest.TestCase):
                 self.assertEqual(exc.seconds, 5.0)
                 self.assertEqual(None, w._next_expiration)
                 w._evt.wait.assert_called_once_with(None)
+
+
+class TestReiterate(unittest.TestCase):
+    def test_reiterate_consumes_first(self):
+        test_iter = FakeIterable([1, 2, 3])
+        reiterated = utils.reiterate(test_iter)
+        self.assertEqual(1, test_iter.next_call_count)
+        self.assertEqual(1, next(reiterated))
+        self.assertEqual(1, test_iter.next_call_count)
+        self.assertEqual(2, next(reiterated))
+        self.assertEqual(2, test_iter.next_call_count)
+        self.assertEqual(3, next(reiterated))
+        self.assertEqual(3, test_iter.next_call_count)
+
+    def test_reiterate_closes(self):
+        test_iter = FakeIterable([1, 2, 3])
+        self.assertEqual(0, test_iter.close_call_count)
+        reiterated = utils.reiterate(test_iter)
+        self.assertEqual(0, test_iter.close_call_count)
+        self.assertTrue(hasattr(reiterated, 'close'))
+        self.assertTrue(callable(reiterated.close))
+        reiterated.close()
+        self.assertEqual(1, test_iter.close_call_count)
+
+        # empty iter gets closed when reiterated
+        test_iter = FakeIterable([])
+        self.assertEqual(0, test_iter.close_call_count)
+        reiterated = utils.reiterate(test_iter)
+        self.assertFalse(hasattr(reiterated, 'close'))
+        self.assertEqual(1, test_iter.close_call_count)
+
+    def test_reiterate_list_or_tuple(self):
+        test_list = [1, 2]
+        reiterated = utils.reiterate(test_list)
+        self.assertIs(test_list, reiterated)
+        test_tuple = (1, 2)
+        reiterated = utils.reiterate(test_tuple)
+        self.assertIs(test_tuple, reiterated)
+
+
+class TestCloseableChain(unittest.TestCase):
+    def test_closeable_chain_iterates(self):
+        test_iter1 = FakeIterable([1])
+        test_iter2 = FakeIterable([2, 3])
+        chain = utils.CloseableChain(test_iter1, test_iter2)
+        self.assertEqual([1, 2, 3], [x for x in chain])
+
+        chain = utils.CloseableChain([1, 2], [3])
+        self.assertEqual([1, 2, 3], [x for x in chain])
+
+    def test_closeable_chain_closes(self):
+        test_iter1 = FakeIterable([1])
+        test_iter2 = FakeIterable([2, 3])
+        chain = utils.CloseableChain(test_iter1, test_iter2)
+        self.assertEqual(0, test_iter1.close_call_count)
+        self.assertEqual(0, test_iter2.close_call_count)
+        chain.close()
+        self.assertEqual(1, test_iter1.close_call_count)
+        self.assertEqual(1, test_iter2.close_call_count)
+
+        # check that close is safe to call even when component iters have no
+        # close
+        chain = utils.CloseableChain([1, 2], [3])
+        chain.close()
+        self.assertEqual([1, 2, 3], [x for x in chain])

@@ -126,9 +126,9 @@ class ContainerController(Controller):
 
     def _GET_using_cache(self, req):
         # It may be possible to fulfil the request from cache: we only reach
-        # here if record_type is 'shard' or 'auto', so if the container state
-        # is 'sharded' then look for cached shard ranges. However, if X-Newest
-        # is true then we always fetch from the backend servers.
+        # here if request record_type is 'shard' or 'auto', so if the container
+        # state is 'sharded' then look for cached shard ranges. However, if
+        # X-Newest is true then we always fetch from the backend servers.
         get_newest = config_true_value(req.headers.get('x-newest', False))
         if get_newest:
             self.app.logger.debug(
@@ -153,17 +153,18 @@ class ContainerController(Controller):
                 if cached_ranges is None and memcache:
                     cached_ranges = memcache.get(cache_key)
                 if cached_ranges is not None:
+                    infocache[cache_key] = tuple(cached_ranges)
                     # shard ranges can be returned from cache
                     self.app.logger.debug('Found %d shards in cache for %s',
                                           len(cached_ranges), req.path_qs)
                     headers.update({'x-backend-record-type': 'shard',
                                     'x-backend-cached-results': 'true'})
-                    shard_ranges = self._filter_resp_shard_ranges(
+                    shard_range_body = self._filter_resp_shard_ranges(
                         req, cached_ranges)
                     # mimic GetOrHeadHandler.get_working_response...
                     # note: server sets charset with content_type but proxy
                     # GETorHEAD_base does not, so don't set it here either
-                    resp = Response(request=req, body=shard_ranges)
+                    resp = Response(request=req, body=shard_range_body)
                     update_headers(resp, headers)
                     resp.last_modified = math.ceil(
                         float(headers['x-put-timestamp']))
@@ -205,12 +206,7 @@ class ContainerController(Controller):
                                       shard='listing')
             data = self._parse_listing_response(req, resp)
             backend_shard_ranges = self._parse_shard_ranges(req, data, resp)
-            if backend_shard_ranges is None:
-                # unexpected case: error parsing shard ranges; we have to
-                # return something, but backend response body has been
-                # consumed, so return empty list without caching it
-                cached_ranges = []
-            else:
+            if backend_shard_ranges is not None:
                 cached_ranges = [dict(sr) for sr in backend_shard_ranges]
                 if resp.headers.get('x-backend-sharding-state') == 'sharded':
                     # cache in infocache even if no shard ranges returned; this
@@ -226,8 +222,8 @@ class ContainerController(Controller):
                             cache_key, cached_ranges,
                             time=self.app.recheck_listing_shard_ranges)
 
-            # filter returned shard ranges according to request constraints
-            resp.body = self._filter_resp_shard_ranges(req, cached_ranges)
+                # filter returned shard ranges according to request constraints
+                resp.body = self._filter_resp_shard_ranges(req, cached_ranges)
 
         return resp
 
@@ -266,8 +262,8 @@ class ContainerController(Controller):
                 record_type != 'object' and
                 self.app.recheck_listing_shard_ranges > 0 and
                 memcache and
-                get_param(req, 'states') == 'listing' and not
-                config_true_value(
+                get_param(req, 'states') == 'listing' and
+                not config_true_value(
                     req.headers.get('x-backend-include-deleted', False))):
             # This GET might be served from cache or might populate cache.
             # 'x-backend-include-deleted' is not usually expected in requests

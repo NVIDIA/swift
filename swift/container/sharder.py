@@ -362,6 +362,12 @@ class CleavingContext(object):
         self.cleaving_done = False
         self.cleave_to_row = self.max_row
 
+    def range_done(self, new_cursor):
+        self.ranges_done += 1
+        self.ranges_todo -= 1
+        if new_cursor is not None:
+            self.cursor = new_cursor
+
     def done(self):
         return all((self.misplaced_done, self.cleaving_done,
                     self.max_row == self.cleave_to_row))
@@ -825,17 +831,38 @@ class ContainerSharder(ContainerReplicator):
             return False
 
         if own_shard_range_from_root:
-            # iff we find our own shard range in the root response, save off
-            # *all* shards returned (including own_shard_range_from_root)
-            # because, for example, these may contain shards into which this
-            # shard is to shard itself
-            self.logger.debug('Updating %s shard_range(s) from root',
-                              len(shard_ranges))
-            broker.merge_shard_ranges(shard_ranges)
+            # iff we find our own shard range in the root response, merge it
+            # and reload own shard range (note: own_range_from_root may not
+            # necessarily be 'newer' than the own shard range we already have,
+            # but merging will get us to the 'newest' state)
+            self.logger.debug('Updating own shard range from root')
+            broker.merge_shard_ranges(own_shard_range_from_root)
+            orig_own_shard_range = own_shard_range
             own_shard_range = broker.get_own_shard_range()
+            if (orig_own_shard_range != own_shard_range or
+                    orig_own_shard_range.state != own_shard_range.state):
+                self.logger.debug(
+                    'Updated own shard range from %s to %s',
+                    orig_own_shard_range, own_shard_range)
+            if own_shard_range.state in (ShardRange.SHRINKING,
+                                         ShardRange.SHRUNK):
+                # If the up-to-date state is shrinking, save off *all* shards
+                # returned because these may contain shards into which this
+                # shard is to shrink itself; shrinking is the only case when we
+                # want to learn about *other* shard ranges from the root.
+                # We need to include shrunk state too, because one replica of a
+                # shard may already have moved the own_shard_range state to
+                # shrunk while another replica may still be in the process of
+                # shrinking.
+                other_shard_ranges = [sr for sr in shard_ranges
+                                      if sr is not own_shard_range_from_root]
+                self.logger.debug('Updating %s other shard range(s) from root',
+                                  len(other_shard_ranges))
+                broker.merge_shard_ranges(other_shard_ranges)
 
         delete_age = time.time() - self.reclaim_age
-        if (own_shard_range.state == ShardRange.SHARDED and
+        deletable_states = (ShardRange.SHARDED, ShardRange.SHRUNK)
+        if (own_shard_range.state in deletable_states and
                 own_shard_range.deleted and
                 own_shard_range.timestamp < delete_age and
                 broker.empty()):
@@ -1165,7 +1192,7 @@ class ContainerSharder(ContainerReplicator):
         own_shard_range = broker.get_own_shard_range()
         shard_ranges = broker.get_shard_ranges()
         if shard_ranges and shard_ranges[-1].upper >= own_shard_range.upper:
-            self.logger.debug('Scan already completed for %s',
+            self.logger.debug('Scan for shard ranges already completed for %s',
                               quote(broker.path))
             return 0
 
@@ -1299,9 +1326,7 @@ class ContainerSharder(ContainerReplicator):
                     # SR because there was nothing there. So cleanup and
                     # remove the shard_broker from its hand off location.
                     self.delete_db(shard_broker)
-                    cleaving_context.cursor = shard_range.upper_str
-                    cleaving_context.ranges_done += 1
-                    cleaving_context.ranges_todo -= 1
+                    cleaving_context.range_done(shard_range.upper_str)
                     if shard_range.upper >= own_shard_range.upper:
                         # cleaving complete
                         cleaving_context.cleaving_done = True
@@ -1334,7 +1359,7 @@ class ContainerSharder(ContainerReplicator):
             # will atomically update its namespace *and* delete the donor.
             # Don't do this when sharding a shard because the donor
             # namespace should not be deleted until all shards are cleaved.
-            if own_shard_range.update_state(ShardRange.SHARDED):
+            if own_shard_range.update_state(ShardRange.SHRUNK):
                 own_shard_range.set_deleted()
                 broker.merge_shard_ranges(own_shard_range)
             shard_broker.merge_shard_ranges(own_shard_range)
@@ -1374,9 +1399,7 @@ class ContainerSharder(ContainerReplicator):
         self._min_stat('cleaved', 'min_time', elapsed)
         self._max_stat('cleaved', 'max_time', elapsed)
         broker.merge_shard_ranges(shard_range)
-        cleaving_context.cursor = shard_range.upper_str
-        cleaving_context.ranges_done += 1
-        cleaving_context.ranges_todo -= 1
+        cleaving_context.range_done(shard_range.upper_str)
         if shard_range.upper >= own_shard_range.upper:
             # cleaving complete
             cleaving_context.cleaving_done = True
@@ -1438,6 +1461,7 @@ class ContainerSharder(ContainerReplicator):
                 # shard range) are not normally expected in a shard but can
                 # occur if there is an overlapping shard range that has been
                 # discovered from the root.
+                cleaving_context.range_done(None)  # don't move the cursor
                 continue
             elif shard_range.state in (ShardRange.CREATED,
                                        ShardRange.CLEAVED,
@@ -1477,7 +1501,12 @@ class ContainerSharder(ContainerReplicator):
             for sr in modified_shard_ranges:
                 sr.update_state(ShardRange.ACTIVE)
             own_shard_range = broker.get_own_shard_range()
-            own_shard_range.update_state(ShardRange.SHARDED)
+            if own_shard_range.state in (ShardRange.SHRINKING,
+                                         ShardRange.SHRUNK):
+                next_state = ShardRange.SHRUNK
+            else:
+                next_state = ShardRange.SHARDED
+            own_shard_range.update_state(next_state)
             own_shard_range.update_meta(0, 0)
             if (not broker.is_root_container() and not
                     own_shard_range.deleted):
@@ -1588,7 +1617,8 @@ class ContainerSharder(ContainerReplicator):
             own_shard_range = broker.get_own_shard_range()
             if own_shard_range.state in (ShardRange.SHARDING,
                                          ShardRange.SHRINKING,
-                                         ShardRange.SHARDED):
+                                         ShardRange.SHARDED,
+                                         ShardRange.SHRUNK):
                 if broker.get_shard_ranges():
                     # container has been given shard ranges rather than
                     # found them e.g. via replication or a shrink event
@@ -1663,6 +1693,7 @@ class ContainerSharder(ContainerReplicator):
             - if not a root container, reports shard range stats to the root
               container
         """
+
         self.logger.info('Container sharder cycle starting, auto-sharding %s',
                          self.auto_shard)
         if isinstance(devices_to_shard, (list, tuple)):
@@ -1729,8 +1760,14 @@ class ContainerSharder(ContainerReplicator):
 
         self._report_stats()
 
+    def _set_auto_shard_from_command_line(self, **kwargs):
+        auto_shard = kwargs.get('auto_shard', None)
+        if auto_shard is not None:
+            self.auto_shard = config_true_value(auto_shard)
+
     def run_forever(self, *args, **kwargs):
         """Run the container sharder until stopped."""
+        self._set_auto_shard_from_command_line(**kwargs)
         self.reported = time.time()
         time.sleep(random() * self.interval)
         while True:
@@ -1753,6 +1790,7 @@ class ContainerSharder(ContainerReplicator):
         override_options = parse_override_options(once=True, **kwargs)
         devices_to_shard = override_options.devices or Everything()
         partitions_to_shard = override_options.partitions or Everything()
+        self._set_auto_shard_from_command_line(**kwargs)
         begin = self.reported = time.time()
         self._one_shard_cycle(devices_to_shard=devices_to_shard,
                               partitions_to_shard=partitions_to_shard)

@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import base64
-import hashlib
 import json
 import time
 import unittest
@@ -32,7 +31,7 @@ from swift.common.swob import Request, HTTPException, str_to_wsgi, \
     bytes_to_wsgi
 from swift.common.utils import quote, closing_if_possible, close_if_possible, \
     parse_content_type, iter_multipart_mime_documents, parse_mime_headers, \
-    Timestamp, get_expirer_container
+    Timestamp, get_expirer_container, md5
 from test.unit.common.middleware.helpers import FakeSwift
 
 
@@ -57,7 +56,7 @@ def fake_start_response(*args, **kwargs):
 def md5hex(s):
     if not isinstance(s, bytes):
         s = s.encode('ascii')
-    return hashlib.md5(s).hexdigest()
+    return md5(s, usedforsecurity=False).hexdigest()
 
 
 class SloTestCase(unittest.TestCase):
@@ -3004,7 +3003,7 @@ class TestSloGetManifest(SloTestCase):
 
     def test_get_segment_with_non_ascii_path(self):
         segment_body = u"a møøse once bit my sister".encode("utf-8")
-        segment_etag = hashlib.md5(segment_body).hexdigest()
+        segment_etag = md5(segment_body, usedforsecurity=False).hexdigest()
         if six.PY2:
             path = u'/v1/AUTH_test/ünicode/öbject-segment'.encode('utf-8')
         else:
@@ -3258,7 +3257,7 @@ class TestSloGetManifest(SloTestCase):
         self.assertEqual(headers['X-Object-Meta-Fish'], 'Bass')
         self.assertEqual(body, b'')
 
-    def test_generator_closure(self):
+    def _do_test_generator_closure(self, leaks):
         # Test that the SLO WSGI iterable closes its internal .app_iter when
         # it receives a close() message.
         #
@@ -3271,8 +3270,6 @@ class TestSloGetManifest(SloTestCase):
         # well; calling .close() on the generator is sufficient, but not
         # necessary. However, having this test is better than nothing for
         # preventing regressions.
-        leaks = [0]
-
         class LeakTracker(object):
             def __init__(self, inner_iter):
                 leaks[0] += 1
@@ -3314,11 +3311,29 @@ class TestSloGetManifest(SloTestCase):
                           LeakTrackingSegmentedIterable):
             app_resp = self.slo(req.environ, start_response)
         self.assertEqual(status[0], '200 OK')  # sanity check
+        return app_resp
+
+    def test_generator_closure(self):
+        leaks = [0]
+        app_resp = self._do_test_generator_closure(leaks)
         body_iter = iter(app_resp)
         chunk = next(body_iter)
         self.assertEqual(chunk, b'aaaaa')  # sanity check
-
         app_resp.close()
+        self.assertEqual(0, leaks[0])
+
+    def test_generator_closure_iter_app_resp(self):
+        # verify that the result of iter(app_resp) has a close method that
+        # closes app_resp
+        leaks = [0]
+        app_resp = self._do_test_generator_closure(leaks)
+        body_iter = iter(app_resp)
+        chunk = next(body_iter)
+        self.assertEqual(chunk, b'aaaaa')  # sanity check
+        close_method = getattr(body_iter, 'close', None)
+        self.assertIsNotNone(close_method)
+        self.assertTrue(callable(close_method))
+        close_method()
         self.assertEqual(0, leaks[0])
 
     def test_head_manifest_is_efficient(self):

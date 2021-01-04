@@ -19,7 +19,6 @@ import os
 import time
 import mock
 import unittest
-from hashlib import md5
 import six
 from six.moves import urllib
 from swift.common import swob, utils
@@ -33,6 +32,7 @@ from swift.common.middleware.versioned_writes.object_versioning import \
     SYSMETA_VERSIONS_SYMLINK, DELETE_MARKER_CONTENT_TYPE
 from swift.common.request_helpers import get_reserved_name
 from swift.common.storage_policy import StoragePolicy
+from swift.common.utils import md5
 from swift.proxy.controllers.base import get_cache_key
 from test.unit import patch_policies, FakeMemcache, make_timestamp_iter
 from test.unit.common.middleware.helpers import FakeSwift
@@ -569,7 +569,8 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             '/v1/a/c/o', method='PUT', body=put_body,
             headers={'Content-Type': 'text/plain',
                      'ETag': md5(
-                         put_body.encode('utf8')).hexdigest(),
+                         put_body.encode('utf8'),
+                         usedforsecurity=False).hexdigest(),
                      'Content-Length': len(put_body)},
             environ={'swift.cache': self.cache_version_on,
                      'swift.trans_id': 'fake_trans_id'})
@@ -596,7 +597,7 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             TGT_OBJ_SYSMETA_SYMLINK_HDR:
             self.build_symlink_path('c', 'o', '9999998765.99999'),
             'x-object-sysmeta-symlink-target-etag': md5(
-                put_body.encode('utf8')).hexdigest(),
+                put_body.encode('utf8'), usedforsecurity=False).hexdigest(),
             'x-object-sysmeta-symlink-target-bytes': str(len(put_body)),
         }
         symlink_put_headers = self.app._calls[-1].headers
@@ -687,7 +688,9 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         req = Request.blank(
             '/v1/a/c/o', method='PUT', body=put_body,
             headers={'Content-Type': 'text/plain',
-                     'ETag': md5(put_body.encode('utf8')).hexdigest(),
+                     'ETag': md5(
+                         put_body.encode('utf8'),
+                         usedforsecurity=False).hexdigest(),
                      'Content-Length': len(put_body)},
             environ={'swift.cache': self.cache_version_on,
                      'swift.trans_id': 'fake_trans_id'})
@@ -714,7 +717,7 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             TGT_OBJ_SYSMETA_SYMLINK_HDR:
             self.build_symlink_path('c', 'o', '9999998765.99999'),
             'x-object-sysmeta-symlink-target-etag': md5(
-                put_body.encode('utf8')).hexdigest(),
+                put_body.encode('utf8'), usedforsecurity=False).hexdigest(),
             'x-object-sysmeta-symlink-target-bytes': str(len(put_body)),
         }
         symlink_put_headers = self.app._calls[-1].headers
@@ -772,7 +775,7 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             TGT_OBJ_SYSMETA_SYMLINK_HDR:
             self.build_symlink_path('c', 'o', '9999998765.99999'),
             'x-object-sysmeta-symlink-target-etag': md5(
-                put_body.encode('utf8')).hexdigest(),
+                put_body.encode('utf8'), usedforsecurity=False).hexdigest(),
             'x-object-sysmeta-symlink-target-bytes': str(len(put_body)),
         }
         for k, v in expected_headers.items():
@@ -834,7 +837,7 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             TGT_OBJ_SYSMETA_SYMLINK_HDR:
             self.build_symlink_path('c', 'o', '9999998765.99999'),
             'x-object-sysmeta-symlink-target-etag': md5(
-                put_body.encode('utf8')).hexdigest(),
+                put_body.encode('utf8'), usedforsecurity=False).hexdigest(),
             'x-object-sysmeta-symlink-target-bytes': str(len(put_body)),
         }
         for k, v in expected_headers.items():
@@ -914,7 +917,7 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             TGT_OBJ_SYSMETA_SYMLINK_HDR:
             self.build_symlink_path('c', 'o', '9999998765.99999'),
             'x-object-sysmeta-symlink-target-etag': md5(
-                put_body.encode('utf8')).hexdigest(),
+                put_body.encode('utf8'), usedforsecurity=False).hexdigest(),
             'x-object-sysmeta-symlink-target-bytes': str(len(put_body)),
         }
         for k, v in expected_headers.items():
@@ -943,7 +946,8 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             '/v1/a/c/o', method='PUT', body=put_body,
             headers={'Content-Type': 'text/plain',
                      'ETag': md5(
-                         put_body.encode('utf8')).hexdigest(),
+                         put_body.encode('utf8'),
+                         usedforsecurity=False).hexdigest(),
                      'Content-Length': len(put_body)},
             environ={'swift.cache': self.cache_version_on,
                      'swift.trans_id': 'fake_trans_id'})
@@ -972,7 +976,7 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             TGT_OBJ_SYSMETA_SYMLINK_HDR:
             self.build_symlink_path('c', 'o', '9999998765.99999'),
             'x-object-sysmeta-symlink-target-etag': md5(
-                put_body.encode('utf8')).hexdigest(),
+                put_body.encode('utf8'), usedforsecurity=False).hexdigest(),
             'x-object-sysmeta-symlink-target-bytes': str(len(put_body)),
         }
         symlink_put_headers = self.app._calls[-1].headers
@@ -1111,7 +1115,9 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
         req = Request.blank(
             '/v1/a/c/o', method='PUT', body=put_body,
             headers={'Content-Type': 'text/plain',
-                     'ETag': md5(put_body.encode('utf8')).hexdigest(),
+                     'ETag': md5(
+                         put_body.encode('utf8'),
+                         usedforsecurity=False).hexdigest(),
                      'Content-Length': len(put_body)},
             environ={'swift.cache': self.cache_version_off,
                      'swift.trans_id': 'fake_trans_id'})
@@ -1198,7 +1204,9 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
         req = Request.blank(
             '/v1/a/c/o', method='PUT', body=put_body,
             headers={'Content-Type': 'text/plain',
-                     'ETag': md5(put_body.encode('utf8')).hexdigest(),
+                     'ETag': md5(
+                         put_body.encode('utf8'),
+                         usedforsecurity=False).hexdigest(),
                      'Content-Length': len(put_body)},
             environ={'swift.cache': self.cache_version_off,
                      'swift.trans_id': 'fake_trans_id'})
@@ -1462,7 +1470,7 @@ class ObjectVersioningTestCopy(ObjectVersioningBaseTestCase):
             TGT_OBJ_SYSMETA_SYMLINK_HDR:
             self.build_symlink_path('c', 'o', '9999998765.99999'),
             'x-object-sysmeta-symlink-target-etag': md5(
-                src_body.encode('utf8')).hexdigest(),
+                src_body.encode('utf8'), usedforsecurity=False).hexdigest(),
             'x-object-sysmeta-symlink-target-bytes': str(len(src_body)),
         }
         symlink_put_headers = self.app._calls[-1].headers
@@ -1515,7 +1523,7 @@ class ObjectVersioningTestCopy(ObjectVersioningBaseTestCase):
             TGT_OBJ_SYSMETA_SYMLINK_HDR:
             self.build_symlink_path('c', 'o', '9999998765.99999'),
             'x-object-sysmeta-symlink-target-etag': md5(
-                src_body.encode('utf8')).hexdigest(),
+                src_body.encode('utf8'), usedforsecurity=False).hexdigest(),
             'x-object-sysmeta-symlink-target-bytes': str(len(src_body)),
         }
         symlink_put_headers = self.app._calls[-1].headers
@@ -1562,7 +1570,7 @@ class ObjectVersioningTestCopy(ObjectVersioningBaseTestCase):
             TGT_OBJ_SYSMETA_SYMLINK_HDR:
             self.build_symlink_path('c', 'o', '9999998765.99999'),
             'x-object-sysmeta-symlink-target-etag': md5(
-                src_body.encode('utf8')).hexdigest(),
+                src_body.encode('utf8'), usedforsecurity=False).hexdigest(),
             'x-object-sysmeta-symlink-target-bytes': str(len(src_body)),
         }
         symlink_put_headers = self.app._calls[-1].headers
@@ -1612,7 +1620,7 @@ class ObjectVersioningTestCopy(ObjectVersioningBaseTestCase):
             TGT_OBJ_SYSMETA_SYMLINK_HDR:
             self.build_symlink_path('c', 'o', '9999998765.99999'),
             'x-object-sysmeta-symlink-target-etag': md5(
-                src_body.encode('utf8')).hexdigest(),
+                src_body.encode('utf8'), usedforsecurity=False).hexdigest(),
             'x-object-sysmeta-symlink-target-bytes': str(len(src_body)),
         }
         symlink_put_headers = self.app._calls[-1].headers
@@ -1663,7 +1671,7 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         timestamp = next(self.ts)
         version_path = '%s?symlink=get' % self.build_versions_path(
             obj='o', version=(~timestamp).normal)
-        etag = md5(b'old-version-etag').hexdigest()
+        etag = md5(b'old-version-etag', usedforsecurity=False).hexdigest()
         self.app.register('HEAD', version_path, swob.HTTPNoContent, {
             'Content-Length': 10,
             'Content-Type': 'application/old-version',
@@ -1924,7 +1932,7 @@ class ObjectVersioningVersionAPIWhileDisabled(ObjectVersioningBaseTestCase):
         timestamp = next(self.ts)
         version_path = '%s?symlink=get' % self.build_versions_path(
             obj='o', version=(~timestamp).normal)
-        etag = md5(b'old-version-etag').hexdigest()
+        etag = md5(b'old-version-etag', usedforsecurity=False).hexdigest()
         self.app.register('HEAD', version_path, swob.HTTPNoContent, {
             'Content-Length': 10,
             'Content-Type': 'application/old-version',

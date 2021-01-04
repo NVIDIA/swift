@@ -211,9 +211,12 @@ def headers_from_container_info(info):
     Construct a HeaderKeyDict from a container info dict.
 
     :param info: a dict of container metadata
-    :returns: a HeaderKeyDict or None if any required headers could not be
-        constructed
+    :returns: a HeaderKeyDict or None if info is None or any required headers
+        could not be constructed
     """
+    if not info:
+        return None
+
     required = (
         ('x-backend-timestamp', 'created_at'),
         ('x-backend-put-timestamp', 'put_timestamp'),
@@ -242,7 +245,7 @@ def headers_from_container_info(info):
     )
 
     def lookup(info, key):
-        # raises TypeError, KeyError or ValueError
+        # raises KeyError or ValueError
         val = info[key]
         if val is None:
             raise ValueError
@@ -254,24 +257,23 @@ def headers_from_container_info(info):
     for hdr, key in required:
         try:
             headers[hdr] = lookup(info, key)
-        except (TypeError, KeyError, ValueError):
+        except (KeyError, ValueError):
             return None
 
     for hdr, key in required_normal_format_timestamps:
         try:
             headers[hdr] = Timestamp(lookup(info, key)).normal
-        except (TypeError, KeyError, ValueError):
+        except (KeyError, ValueError):
             return None
 
     for hdr, key in optional:
         try:
             headers[hdr] = lookup(info, key)
-        except (TypeError, KeyError, ValueError):
+        except (KeyError, ValueError):
             pass
 
     policy_index = info.get('storage_policy')
-    if policy_index is not None:
-        headers['x-storage-policy'] = POLICIES[int(policy_index)].name
+    headers['x-storage-policy'] = POLICIES[int(policy_index)].name
     prefix = get_user_meta_prefix('container')
     headers.update(
         (prefix + k, v)
@@ -279,7 +281,7 @@ def headers_from_container_info(info):
     for hdr, key in cors_optional:
         try:
             headers[prefix + hdr] = lookup(info.get('cors'), key)
-        except (TypeError, KeyError, ValueError):
+        except (KeyError, ValueError):
             pass
     prefix = get_sys_meta_prefix('container')
     headers.update(

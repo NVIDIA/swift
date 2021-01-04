@@ -40,7 +40,7 @@ import uuid
 import functools
 import platform
 import email.parser
-from hashlib import md5, sha1
+from hashlib import sha1
 from random import random, shuffle
 from contextlib import contextmanager, closing
 import ctypes
@@ -674,7 +674,10 @@ class StrAnonymizer(str):
         if not self:
             return self
         else:
-            h = getattr(hashlib, self.method)()
+            if self.method == 'md5':
+                h = md5(usedforsecurity=False)
+            else:
+                h = getattr(hashlib, self.method)()
             if self.salt:
                 h.update(six.b(self.salt))
             h.update(six.b(self))
@@ -2735,10 +2738,10 @@ def hash_path(account, container=None, object=None, raw_digest=False):
                      else object.encode('utf8'))
     if raw_digest:
         return md5(HASH_PATH_PREFIX + b'/' + b'/'.join(paths)
-                   + HASH_PATH_SUFFIX).digest()
+                   + HASH_PATH_SUFFIX, usedforsecurity=False).digest()
     else:
         return md5(HASH_PATH_PREFIX + b'/' + b'/'.join(paths)
-                   + HASH_PATH_SUFFIX).hexdigest()
+                   + HASH_PATH_SUFFIX, usedforsecurity=False).hexdigest()
 
 
 def get_zero_indexed_base_string(base, index):
@@ -4858,6 +4861,27 @@ def get_md5_socket():
     return md5_sockfd
 
 
+try:
+    _test_md5 = hashlib.md5(usedforsecurity=False)  # nosec
+
+    def md5(string=b'', usedforsecurity=True):
+        """Return an md5 hashlib object using usedforsecurity parameter
+
+        For python distributions that support the usedforsecurity keyword
+        parameter, this passes the parameter through as expected.
+        See https://bugs.python.org/issue9216
+        """
+        return hashlib.md5(string, usedforsecurity=usedforsecurity)  # nosec
+except TypeError:
+    def md5(string=b'', usedforsecurity=True):
+        """Return an md5 hashlib object without usedforsecurity parameter
+
+        For python distributions that do not yet support this keyword
+        parameter, we drop the parameter
+        """
+        return hashlib.md5(string)  # nosec
+
+
 class ShardRange(object):
     """
     A ShardRange encapsulates sharding state related to a container including
@@ -4911,13 +4935,15 @@ class ShardRange(object):
     SHRINKING = 50
     SHARDING = 60
     SHARDED = 70
+    SHRUNK = 80
     STATES = {FOUND: 'found',
               CREATED: 'created',
               CLEAVED: 'cleaved',
               ACTIVE: 'active',
               SHRINKING: 'shrinking',
               SHARDING: 'sharding',
-              SHARDED: 'sharded'}
+              SHARDED: 'sharded',
+              SHRUNK: 'shrunk'}
     STATES_BY_NAME = dict((v, k) for k, v in STATES.items())
 
     class OuterBound(object):
@@ -4976,6 +5002,13 @@ class ShardRange(object):
         self.reported = reported
 
     @classmethod
+    def sort_key(cls, sr):
+        # defines the sort order for shard ranges
+        # note if this ever changes to *not* sort by upper first then it breaks
+        # a key assumption for bisect, which is used by utils.find_shard_range
+        return sr.upper, sr.state, sr.lower, sr.name
+
+    @classmethod
     def _encode(cls, value):
         if six.PY2 and isinstance(value, six.text_type):
             return value.encode('utf-8')
@@ -4999,7 +5032,8 @@ class ShardRange(object):
         if not isinstance(parent_container, bytes):
             parent_container = parent_container.encode('utf-8')
         return "%s-%s-%s-%s" % (root_container,
-                                hashlib.md5(parent_container).hexdigest(),
+                                md5(parent_container,
+                                    usedforsecurity=False).hexdigest(),
                                 cls._to_timestamp(timestamp).internal,
                                 index)
 
@@ -5536,7 +5570,7 @@ def o_tmpfile_in_path_supported(dirpath):
             return False
         else:
             raise Exception("Error on '%(path)s' while checking "
-                            "O_TMPFILE: '%(ex)s'",
+                            "O_TMPFILE: '%(ex)s'" %
                             {'path': dirpath, 'ex': e})
     finally:
         if fd is not None:
@@ -5602,7 +5636,7 @@ def md5_hash_for_file(fname):
     :returns: MD5 checksum, hex encoded
     """
     with open(fname, 'rb') as f:
-        md5sum = md5()
+        md5sum = md5(usedforsecurity=False)
         for block in iter(lambda: f.read(MD5_BLOCK_READ_BYTES), b''):
             md5sum.update(block)
     return md5sum.hexdigest()

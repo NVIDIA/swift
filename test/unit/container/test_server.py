@@ -2715,9 +2715,9 @@ class TestContainerController(unittest.TestCase):
             self.assertEqual('shard', resp.headers['X-Backend-Record-Type'])
 
         def check_shard_GET_override_filter(
-                expected_shard_ranges, path, params=''):
+                expected_shard_ranges, path, state, params=''):
             req_headers = {'X-Backend-Record-Type': 'shard',
-                           'X-Backend-Override-Shard-Name-Filter': 'sharded'}
+                           'X-Backend-Override-Shard-Name-Filter': state}
             req = Request.blank('/sda1/p/%s?format=json%s' %
                                 (path, params), method='GET',
                                 headers=req_headers)
@@ -2890,7 +2890,11 @@ class TestContainerController(unittest.TestCase):
             reversed(shard_ranges[:2]), 'a/c',
             params='&states=listing&reverse=true&marker=egg')
         resp = check_shard_GET_override_filter(
-            reversed(shard_ranges[:2]), 'a/c',
+            reversed(shard_ranges[:2]), 'a/c', state='unsharded',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='sharded',
             params='&states=listing&reverse=true&marker=egg')
         self.assertIsNone(
             resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
@@ -2901,12 +2905,17 @@ class TestContainerController(unittest.TestCase):
             reversed(shard_ranges[:2]), 'a/c',
             params='&states=listing&reverse=true&marker=egg')
         resp = check_shard_GET_override_filter(
-            reversed(shard_ranges[:2]), 'a/c',
+            reversed(shard_ranges[:2]), 'a/c', state='sharding',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='sharded',
             params='&states=listing&reverse=true&marker=egg')
         self.assertIsNone(
             resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
         # in sharded state the server *will* override the marker and reverse
-        # params and return listing shard ranges for entire namespace
+        # params and return listing shard ranges for entire namespace if
+        # X-Backend-Override-Shard-Name-Filter == 'sharded'
         self.assertTrue(broker.set_sharded_state())
         ts_now = next(ts_iter)
         with mock_timestamp_now(ts_now):
@@ -2918,7 +2927,11 @@ class TestContainerController(unittest.TestCase):
             params='&states=listing&reverse=true&marker=egg')
         expected = shard_ranges[:3] + [extra_shard_range]
         resp = check_shard_GET_override_filter(
-            expected, 'a/c',
+            reversed(shard_ranges[:2]), 'a/c', state='sharding',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = check_shard_GET_override_filter(
+            expected, 'a/c', state='sharded',
             params='&states=listing&reverse=true&marker=egg')
         self.assertEqual(
             'true', resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
@@ -2930,7 +2943,7 @@ class TestContainerController(unittest.TestCase):
             params='&states=updating&includes=egg')
         expected = shard_ranges[1:4] + [extra_shard_range]
         resp = check_shard_GET_override_filter(
-            expected, 'a/c',
+            expected, 'a/c', state='sharded',
             params='&states=updating&includes=egg')
         self.assertEqual(
             'true', resp.headers.get('X-Backend-Override-Shard-Name-Filter'))

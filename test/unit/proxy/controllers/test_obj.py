@@ -23,7 +23,6 @@ import unittest
 from collections import defaultdict
 from contextlib import contextmanager
 import json
-from hashlib import md5
 
 import mock
 from eventlet import Timeout, sleep
@@ -41,7 +40,7 @@ else:
 import swift
 from swift.common import utils, swob, exceptions
 from swift.common.exceptions import ChunkWriteTimeout
-from swift.common.utils import Timestamp, list_from_csv
+from swift.common.utils import Timestamp, list_from_csv, md5
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers import obj
 from swift.proxy.controllers.base import \
@@ -143,7 +142,8 @@ def make_footers_callback(body=None):
     crypto_etag = '20242af0cd21dd7195a10483eb7472c9'
     etag_crypto_meta = \
         '{"cipher": "AES_CTR_256", "iv": "sD+PSw/DfqYwpsVGSo0GEw=="}'
-    etag = md5(body).hexdigest() if body is not None else None
+    etag = md5(body,
+               usedforsecurity=False).hexdigest() if body is not None else None
     footers_to_add = {
         'X-Object-Sysmeta-Container-Update-Override-Etag': cont_etag,
         'X-Object-Sysmeta-Crypto-Etag': crypto_etag,
@@ -1079,7 +1079,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                                               body=test_body)
         if chunked:
             req.headers['Transfer-Encoding'] = 'chunked'
-        etag = md5(test_body).hexdigest()
+        etag = md5(test_body, usedforsecurity=False).hexdigest()
         req.headers['Etag'] = etag
 
         put_requests = defaultdict(
@@ -2189,7 +2189,8 @@ class ECObjectControllerMixin(CommonObjectControllerMixin):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         # expect a request to all primaries plus one handoff
         self.assertEqual(self.replicas() + 1, len(log))
@@ -2525,7 +2526,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_with_slow_primaries(self):
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-743]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
         ts = self.ts()
         headers = []
@@ -2563,7 +2564,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_with_some_slow_primaries(self):
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-289]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
         ts = self.ts()
         headers = []
@@ -2650,7 +2651,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_with_slow_nodes_and_failures(self):
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-289]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
         ts = self.ts()
         headers = []
@@ -2704,7 +2705,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_with_one_slow_frag_lane(self):
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-454]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
         ts = self.ts()
         headers = []
@@ -2749,7 +2750,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_with_concurrent_ec_extra_requests(self):
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-454]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
         ts = self.ts()
         headers = []
@@ -2826,7 +2827,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_with_frags_swapped_around(self):
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-657]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
 
         _part, primary_nodes = self.obj_ring.get_nodes('a', 'c', 'o')
@@ -2910,7 +2911,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         collected_responses = defaultdict(list)
         for conn in log:
@@ -2965,7 +2967,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             obj1['etag']: {True},
             obj2['etag']: {False},
         }, closed_conn)
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj2['etag'])
         self.assertEqual({True}, {conn.closed for conn in log})
 
         collected_responses = defaultdict(set)
@@ -3012,7 +3015,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj2['etag'])
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -3076,7 +3080,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj2['etag'])
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -3196,7 +3201,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         # Expect a maximum of one request to each primary plus one extra
         # request to node 1. Actual value could be less if the extra request
@@ -3490,7 +3496,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         self.assertGreaterEqual(len(log), self.policy.ec_ndata)
         collected_durables = []
@@ -3535,7 +3542,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         collected_durables = []
         for conn in log:
@@ -3626,7 +3634,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         # Quorum of non-durables for a different object won't
         # prevent us hunting down the durable object
@@ -3671,7 +3680,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
     def test_GET_with_missing_durables_and_older_durables(self):
         # scenario: non-durable frags of newer obj1 obscure all durable frags
@@ -3726,7 +3736,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj2['etag'])
         # max: proxy will GET all non-durable obj1 frags and then 10 obj frags
         self.assertLessEqual(len(log), self.replicas() + self.policy.ec_ndata)
         # min: proxy will GET 10 non-durable obj1 frags and then 10 obj frags
@@ -3771,7 +3782,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj3['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj3['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj3['etag'])
         self.assertGreaterEqual(len(log), self.policy.ec_ndata + 1)
         self.assertLessEqual(len(log), (self.policy.ec_ndata * 2) + 1)
 
@@ -3818,7 +3830,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj2['etag'])
         # max: proxy will GET all non-durable obj1 frags and then 10 obj2 frags
         self.assertLessEqual(len(log), self.replicas() + self.policy.ec_ndata)
         # min: proxy will GET 10 non-durable obj1 frags and then 10 obj2 frags
@@ -4532,10 +4545,10 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         segment_size = self.policy.ec_segment_size
         frag_size = self.policy.fragment_size
         new_data = (b'test' * segment_size)[:-492]
-        new_etag = md5(new_data).hexdigest()
+        new_etag = md5(new_data, usedforsecurity=False).hexdigest()
         new_archives = self._make_ec_archive_bodies(new_data)
         old_data = (b'junk' * segment_size)[:-492]
-        old_etag = md5(old_data).hexdigest()
+        old_etag = md5(old_data, usedforsecurity=False).hexdigest()
         old_archives = self._make_ec_archive_bodies(old_data)
         frag_archive_size = len(new_archives[0])
 
@@ -4612,8 +4625,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         # N.B. the object data *length* here is different
         test_data2 = (b'blah1' * segment_size)[:-333]
 
-        etag1 = md5(test_data1).hexdigest()
-        etag2 = md5(test_data2).hexdigest()
+        etag1 = md5(test_data1, usedforsecurity=False).hexdigest()
+        etag2 = md5(test_data2, usedforsecurity=False).hexdigest()
 
         ec_archive_bodies1 = self._make_ec_archive_bodies(test_data1)
         ec_archive_bodies2 = self._make_ec_archive_bodies(test_data2)
@@ -4638,7 +4651,9 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                               headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(md5(resp.body).hexdigest(), etag1)
+        self.assertEqual(
+            md5(resp.body, usedforsecurity=False).hexdigest(),
+            etag1)
 
         # sanity check responses2
         responses = responses2[:self.policy.ec_ndata]
@@ -4647,7 +4662,9 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                               headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(md5(resp.body).hexdigest(), etag2)
+        self.assertEqual(
+            md5(resp.body, usedforsecurity=False).hexdigest(),
+            etag2)
 
         # now mix the responses a bit
         mix_index = random.randint(0, self.policy.ec_ndata - 1)
@@ -4678,7 +4695,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         # remaining primary nodes also time out and handoffs return 404
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-333]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
         headers = {'X-Object-Sysmeta-Ec-Etag': etag}
         self.app.recoverable_node_timeout = 0.01
@@ -4698,7 +4715,9 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             self.assertEqual(resp.status_int, 200)
             # do this inside the fake http context manager, it'll try to
             # resume but won't be able to give us all the right bytes
-            self.assertNotEqual(md5(resp.body).hexdigest(), etag)
+            self.assertNotEqual(
+                md5(resp.body, usedforsecurity=False).hexdigest(),
+                etag)
         error_lines = self.logger.get_lines_for_level('error')
         nparity = self.policy.ec_nparity
         self.assertGreater(len(error_lines), nparity)
@@ -4774,7 +4793,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_read_timeout_resume(self):
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-333]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
         headers = {
             'X-Object-Sysmeta-Ec-Etag': etag,
@@ -4796,7 +4815,9 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                               headers=headers):
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 200)
-            self.assertEqual(md5(resp.body).hexdigest(), etag)
+            self.assertEqual(
+                md5(resp.body, usedforsecurity=False).hexdigest(),
+                etag)
         error_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(1, len(error_lines))
         self.assertIn('retrying', error_lines[0])
@@ -4845,8 +4866,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         segment_size = self.policy.ec_segment_size
         test_data2 = (b'blah1' * segment_size)[:-333]
         test_data1 = (b'test' * segment_size)[:-333]
-        etag2 = md5(test_data2).hexdigest()
-        etag1 = md5(test_data1).hexdigest()
+        etag2 = md5(test_data2, usedforsecurity=False).hexdigest()
+        etag1 = md5(test_data1, usedforsecurity=False).hexdigest()
         ec_archive_bodies2 = self._make_ec_archive_bodies(test_data2)
         ec_archive_bodies1 = self._make_ec_archive_bodies(test_data1)
         headers2 = {'X-Object-Sysmeta-Ec-Etag': etag2,
@@ -4924,7 +4945,9 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                               headers=headers) as log:
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 200)
-            self.assertEqual(md5(resp.body).hexdigest(), etag1)
+            self.assertEqual(
+                md5(resp.body, usedforsecurity=False).hexdigest(),
+                etag1)
         error_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(2, len(error_lines))
         for line in error_lines:
@@ -4981,7 +5004,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
     def _test_invalid_ranges(self, method, real_body, segment_size, req_range):
         # make a request with range starts from more than real size.
-        body_etag = md5(real_body).hexdigest()
+        body_etag = md5(real_body, usedforsecurity=False).hexdigest()
         req = swift.common.swob.Request.blank(
             '/v1/a/c/o', method=method,
             headers={'Destination': 'c1/o',
@@ -5185,7 +5208,9 @@ class TestECDuplicationObjController(
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj['etag'])
+        self.assertEqual(
+            md5(resp.body, usedforsecurity=False).hexdigest(),
+            obj['etag'])
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -5361,7 +5386,9 @@ class TestECDuplicationObjController(
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(
+            md5(resp.body, usedforsecurity=False).hexdigest(),
+            obj2['etag'])
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -5433,7 +5460,9 @@ class TestECDuplicationObjController(
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(
+            md5(resp.body, usedforsecurity=False).hexdigest(),
+            obj2['etag'])
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -5956,7 +5985,7 @@ class TestECObjControllerMimePutter(BaseObjectControllerMixin,
         env = {'swift.callback.update_footers': footers_callback}
         req = swift.common.swob.Request.blank(
             '/v1/a/c/o', method='PUT', environ=env)
-        etag = md5(test_body).hexdigest()
+        etag = md5(test_body, usedforsecurity=False).hexdigest()
         size = len(test_body)
         req.body = test_body
         if chunked:
@@ -6057,7 +6086,7 @@ class TestECObjControllerMimePutter(BaseObjectControllerMixin,
                 'X-Object-Sysmeta-Ec-Etag': etag,
                 'X-Backend-Container-Update-Override-Etag': etag,
                 'X-Object-Sysmeta-Ec-Segment-Size': str(segment_size),
-                'Etag': md5(obj_payload).hexdigest()})
+                'Etag': md5(obj_payload, usedforsecurity=False).hexdigest()})
             for header, value in expected.items():
                 self.assertEqual(footer_metadata[header], value)
 
@@ -6089,7 +6118,7 @@ class TestECObjControllerMimePutter(BaseObjectControllerMixin,
         # trailing metadata
         segment_size = self.policy.ec_segment_size
         test_body = (b'asdf' * segment_size)[:-10]
-        etag = md5(test_body).hexdigest()
+        etag = md5(test_body, usedforsecurity=False).hexdigest()
         size = len(test_body)
         codes = [201] * self.replicas()
         resp_headers = {
@@ -6165,7 +6194,9 @@ class TestECObjControllerMimePutter(BaseObjectControllerMixin,
                     'X-Object-Sysmeta-Ec-Content-Length': str(size),
                     'X-Object-Sysmeta-Ec-Etag': etag,
                     'X-Object-Sysmeta-Ec-Segment-Size': str(segment_size),
-                    'Etag': md5(obj_part.get_payload(decode=True)).hexdigest()}
+                    'Etag': md5(
+                        obj_part.get_payload(decode=True),
+                        usedforsecurity=False).hexdigest()}
                 expected.update(expect_added)
                 for header, value in expected.items():
                     self.assertIn(header, footer_metadata)

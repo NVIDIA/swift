@@ -20,7 +20,6 @@ Why not swift.common.utils, you ask? Because this way we can import things
 from swob in here without creating circular imports.
 """
 
-import hashlib
 import itertools
 import sys
 import time
@@ -41,7 +40,7 @@ from swift.common.utils import split_path, validate_device_partition, \
     close_if_possible, maybe_multipart_byteranges_to_document_iters, \
     multipart_byteranges_to_document_iters, parse_content_type, \
     parse_content_range, csv_append, list_from_csv, Spliterator, quote, \
-    RESERVED, config_true_value
+    RESERVED, config_true_value, md5, CloseableChain
 from swift.common.wsgi import make_subrequest
 
 
@@ -634,7 +633,7 @@ class SegmentedIterable(object):
             seg_hash = None
             if seg_resp.etag and not seg_req.headers.get('Range'):
                 # Only calculate the MD5 if it we can use it to validate
-                seg_hash = hashlib.md5()
+                seg_hash = md5(usedforsecurity=False)
 
             document_iters = maybe_multipart_byteranges_to_document_iters(
                 seg_resp.app_iter,
@@ -767,7 +766,7 @@ class SegmentedIterable(object):
         if self.peeked_chunk is not None:
             pc = self.peeked_chunk
             self.peeked_chunk = None
-            return itertools.chain([pc], self.app_iter)
+            return CloseableChain([pc], self.app_iter)
         else:
             return self.app_iter
 

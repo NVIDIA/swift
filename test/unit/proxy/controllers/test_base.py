@@ -739,6 +739,9 @@ class TestFuncs(BaseTest):
             headers_to_container_info(headers.items(), 200))
 
     def test_headers_from_container_info(self):
+        self.assertIsNone(headers_from_container_info(None))
+        self.assertIsNone(headers_from_container_info({}))
+
         meta = {'fruit': 'cake'}
         sysmeta = {'green': 'land'}
         info = {

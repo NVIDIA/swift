@@ -409,7 +409,8 @@ class ContainerBroker(DatabaseBroker):
         own_shard_range = self.get_own_shard_range()
         if own_shard_range.state in (ShardRange.SHARDING,
                                      ShardRange.SHRINKING,
-                                     ShardRange.SHARDED):
+                                     ShardRange.SHARDED,
+                                     ShardRange.SHRUNK):
             return bool(self.get_shard_ranges())
         return False
 
@@ -1767,10 +1768,8 @@ class ContainerBroker(DatabaseBroker):
                 include_deleted=include_deleted, states=states,
                 include_own=include_own,
                 exclude_others=exclude_others)]
-        # note if this ever changes to *not* sort by upper first then it breaks
-        # a key assumption for bisect, which is used by utils.find_shard_ranges
-        shard_ranges.sort(key=lambda sr: (
-            sr.upper, sr.state, sr.lower, sr.name))
+
+        shard_ranges.sort(key=ShardRange.sort_key)
 
         shard_ranges = filter_shard_ranges(shard_ranges, includes,
                                            marker, end_marker)
