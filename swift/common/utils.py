@@ -2058,8 +2058,12 @@ class PrefixLoggerAdapter(SwiftLoggerAdapter):
     def set_prefix(self, prefix):
         self.extra['prefix'] = prefix
 
-    def exception(self, *a, **kw):
-        self.logger.exception(*a, **kw)
+    def exception(self, msg, *a, **kw):
+        if 'prefix' in self.extra:
+            msg = self.extra['prefix'] + msg
+        # We up-call to exception() where stdlib uses error() so we can get
+        # some of the traceback suppression from LogAdapter, below
+        self.logger.exception(msg, *a, **kw)
 
     def process(self, msg, kwargs):
         msg, kwargs = super(PrefixLoggerAdapter, self).process(msg, kwargs)
@@ -3069,6 +3073,27 @@ def readconf(conf_path, section_name=None, log_name=None, defaults=None,
             conf['log_name'] = log_name
     conf['__file__'] = conf_path
     return conf
+
+
+def parse_prefixed_conf(conf_file, prefix):
+    """
+    Search the config file for any common-prefix sections and load those
+    sections to a dict mapping the after-prefix reference to options.
+
+    :param conf_file: the file name of the config to parse
+    :param prefix: the common prefix of the sections
+    :return: a dict mapping policy reference -> dict of policy options
+    :raises ValueError: if a policy config section has an invalid name
+    """
+
+    ret_config = {}
+    all_conf = readconf(conf_file)
+    for section, options in all_conf.items():
+        if not section.startswith(prefix):
+            continue
+        target_ref = section[len(prefix):]
+        ret_config[target_ref] = options
+    return ret_config
 
 
 def write_pickle(obj, dest, tmp=None, pickle_protocol=0):
