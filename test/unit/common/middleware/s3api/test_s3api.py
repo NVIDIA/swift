@@ -235,7 +235,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                        'S3Request._validate_headers'), \
                     patch('swift.common.middleware.s3api.s3request.'
                           'S3Request._validate_dates'):
-                req = S3Request(env, Config())
+                req = S3Request(env)
             return req.environ['s3api.auth_details']['string_to_sign']
 
         def verify(hash, path, headers):
@@ -1049,7 +1049,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                        'S3Request._validate_headers'), \
                     patch('swift.common.middleware.s3api.utils.time.time',
                           return_value=fake_time):
-                req = SigV4Request(env, self.conf, app=None)
+                req = SigV4Request(env, app=None)
             return req
 
         def canonical_string(path, environ):
