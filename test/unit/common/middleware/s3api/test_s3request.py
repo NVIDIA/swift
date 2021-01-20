@@ -21,8 +21,9 @@ import unittest
 from io import BytesIO
 
 from swift.common import swob
+from swift.common.middleware.s3api import s3response, controllers
 from swift.common.swob import Request, HTTPNoContent
-from swift.common.middleware.s3api.utils import mktime
+from swift.common.middleware.s3api.utils import mktime, Config
 from swift.common.middleware.s3api.acl_handlers import get_acl_handler
 from swift.common.middleware.s3api.subresource import ACL, User, Owner, \
     Grant, encode_acl
@@ -31,7 +32,7 @@ from swift.common.middleware.s3api.s3request import S3Request, \
     S3AclRequest, SigV4Request, SIGV4_X_AMZ_DATE_FORMAT, HashingInput
 from swift.common.middleware.s3api.s3response import InvalidArgument, \
     NoSuchBucket, InternalError, \
-    AccessDenied, SignatureDoesNotMatch, RequestTimeTooSkewed
+    AccessDenied, SignatureDoesNotMatch, RequestTimeTooSkewed, BadDigest
 from swift.common.utils import md5
 
 from test.unit import DebugLogger
@@ -107,20 +108,7 @@ class TestRequest(S3ApiTestCase):
                             environ={'REQUEST_METHOD': method},
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
-        if issubclass(req_klass, S3AclRequest):
-            s3_req = req_klass(
-                req.environ, MagicMock(),
-                True, self.conf.storage_domain,
-                self.conf.location, self.conf.force_swift_request_proxy_log,
-                self.conf.dns_compliant_bucket_names,
-                self.conf.allow_multipart_uploads, self.conf.allow_no_owner)
-        else:
-            s3_req = req_klass(
-                req.environ, MagicMock(),
-                True, self.conf.storage_domain,
-                self.conf.location, self.conf.force_swift_request_proxy_log,
-                self.conf.dns_compliant_bucket_names,
-                self.conf.allow_multipart_uploads, self.conf.allow_no_owner)
+        s3_req = req_klass(req.environ, conf=self.conf)
         s3_req.set_acl_handler(
             get_acl_handler(s3_req.controller_name)(s3_req, DebugLogger()))
         with patch('swift.common.middleware.s3api.s3request.S3Request.'
@@ -249,7 +237,7 @@ class TestRequest(S3ApiTestCase):
                 patch.object(Request, 'remote_user', 'authorized'):
 
             m_swift_resp.return_value = FakeSwiftResponse()
-            s3_req = S3AclRequest(req.environ, MagicMock())
+            s3_req = S3AclRequest(req.environ, self.conf, None)
             self.assertNotIn('s3api.auth_details', s3_req.environ)
 
     def test_to_swift_req_Authorization_not_exist_in_swreq(self):
@@ -267,7 +255,7 @@ class TestRequest(S3ApiTestCase):
                 patch.object(Request, 'remote_user', 'authorized'):
 
             m_swift_resp.return_value = FakeSwiftResponse()
-            s3_req = S3AclRequest(req.environ, MagicMock())
+            s3_req = S3AclRequest(req.environ)
             # Yes, we *want* to assert this
             sw_req = s3_req.to_swift_req(method, container, obj)
             # So since the result of S3AclRequest init tests and with this
@@ -290,7 +278,8 @@ class TestRequest(S3ApiTestCase):
                 patch.object(Request, 'remote_user', 'authorized'):
             m_swift_resp.return_value = FakeSwiftResponse()
             s3_req = S3AclRequest(
-                req.environ, MagicMock(), force_request_log=True)
+                req.environ,
+                conf=Config({'force_swift_request_proxy_log': True}))
             sw_req = s3_req.to_swift_req(method, container, obj)
             self.assertFalse(sw_req.environ['swift.proxy_access_log_made'])
 
@@ -304,7 +293,8 @@ class TestRequest(S3ApiTestCase):
                 patch.object(Request, 'remote_user', 'authorized'):
             m_swift_resp.return_value = FakeSwiftResponse()
             s3_req = S3AclRequest(
-                req.environ, MagicMock(), force_request_log=False)
+                req.environ,
+                conf=Config({'force_swift_request_proxy_log': False}))
             sw_req = s3_req.to_swift_req(method, container, obj)
             self.assertTrue(sw_req.environ['swift.proxy_access_log_made'])
 
@@ -423,7 +413,7 @@ class TestRequest(S3ApiTestCase):
 
         headers.update(date_header)
         req = Request.blank('/', environ=environ, headers=headers)
-        sigv4_req = SigV4Request(req.environ)
+        sigv4_req = SigV4Request(req.environ, conf=self.s3api.conf)
 
         if 'X-Amz-Date' in date_header:
             timestamp = mktime(
@@ -477,7 +467,32 @@ class TestRequest(S3ApiTestCase):
         self.assertEqual('403 Forbidden', cm.exception.args[0])
         self.assertIn(access_denied_message, cm.exception.body)
 
-        # near-future X-Amz-Date header
+        # near-past X-Amz-Date headers
+        date_header = {'X-Amz-Date': self.get_v4_amz_date_header(
+            datetime.utcnow() - timedelta(minutes=10)
+        )}
+        self._test_request_timestamp_sigv4(date_header)
+
+        date_header = {'X-Amz-Date': self.get_v4_amz_date_header(
+            datetime.utcnow() - timedelta(minutes=10)
+        )}
+        with self.assertRaises(RequestTimeTooSkewed) as cm, \
+                patch.object(self.s3api.conf, 'allowable_clock_skew', 300):
+            self._test_request_timestamp_sigv4(date_header)
+
+        # near-future X-Amz-Date headers
+        date_header = {'X-Amz-Date': self.get_v4_amz_date_header(
+            datetime.utcnow() + timedelta(minutes=10)
+        )}
+        self._test_request_timestamp_sigv4(date_header)
+
+        date_header = {'X-Amz-Date': self.get_v4_amz_date_header(
+            datetime.utcnow() + timedelta(minutes=10)
+        )}
+        with self.assertRaises(RequestTimeTooSkewed) as cm, \
+                patch.object(self.s3api.conf, 'allowable_clock_skew', 300):
+            self._test_request_timestamp_sigv4(date_header)
+
         date_header = {'X-Amz-Date': self.get_v4_amz_date_header(
             datetime.utcnow() + timedelta(days=1)
         )}
@@ -634,14 +649,14 @@ class TestRequest(S3ApiTestCase):
         # Virtual hosted-style
         req = Request.blank('/', environ=environ, headers=headers)
         sigv2_req = S3Request(
-            req.environ, storage_domain='s3.test.com')
+            req.environ, conf=Config({'storage_domain': 's3.test.com'}))
         uri = sigv2_req._canonical_uri()
         self.assertEqual(uri, '/bucket1/')
         self.assertEqual(req.environ['PATH_INFO'], '/')
 
         req = Request.blank('/obj1', environ=environ, headers=headers)
         sigv2_req = S3Request(
-            req.environ, storage_domain='s3.test.com')
+            req.environ, conf=Config({'storage_domain': 's3.test.com'}))
         uri = sigv2_req._canonical_uri()
         self.assertEqual(uri, '/bucket1/obj1')
         self.assertEqual(req.environ['PATH_INFO'], '/obj1')
@@ -652,7 +667,7 @@ class TestRequest(S3ApiTestCase):
 
         # Path-style
         req = Request.blank('/', environ=environ, headers=headers)
-        sigv2_req = S3Request(req.environ, storage_domain='')
+        sigv2_req = S3Request(req.environ)
         uri = sigv2_req._canonical_uri()
 
         self.assertEqual(uri, '/')
@@ -661,7 +676,7 @@ class TestRequest(S3ApiTestCase):
         req = Request.blank('/bucket1/obj1',
                             environ=environ,
                             headers=headers)
-        sigv2_req = S3Request(req.environ, storage_domain='')
+        sigv2_req = S3Request(req.environ)
         uri = sigv2_req._canonical_uri()
         self.assertEqual(uri, '/bucket1/obj1')
         self.assertEqual(req.environ['PATH_INFO'], '/bucket1/obj1')
@@ -731,7 +746,8 @@ class TestRequest(S3ApiTestCase):
             'Authorization': ('AWS AKIAIOSFODNN7EXAMPLE:'
                               'bWq2s1WEIj+Ydj0vQ697zp+IXMU='),
         })
-        sigv2_req = S3Request(req.environ, storage_domain='s3.amazonaws.com')
+        sigv2_req = S3Request(req.environ, conf=Config({
+            'storage_domain': 's3.amazonaws.com'}))
         expected_sts = b'\n'.join([
             b'GET',
             b'',
@@ -750,7 +766,8 @@ class TestRequest(S3ApiTestCase):
             'Authorization': ('AWS AKIAIOSFODNN7EXAMPLE:'
                               'MyyxeRY7whkBe+bq8fHCL/2kKUg='),
         })
-        sigv2_req = S3Request(req.environ, storage_domain='s3.amazonaws.com')
+        sigv2_req = S3Request(req.environ, conf=Config({
+            'storage_domain': 's3.amazonaws.com'}))
         expected_sts = b'\n'.join([
             b'PUT',
             b'',
@@ -770,7 +787,8 @@ class TestRequest(S3ApiTestCase):
                 'Authorization': ('AWS AKIAIOSFODNN7EXAMPLE:'
                                   'htDYFYduRNen8P9ZfE/s9SuKy0U='),
             })
-        sigv2_req = S3Request(req.environ, storage_domain='s3.amazonaws.com')
+        sigv2_req = S3Request(req.environ, conf=Config({
+            'storage_domain': 's3.amazonaws.com'}))
         expected_sts = b'\n'.join([
             b'GET',
             b'',
@@ -798,7 +816,8 @@ class TestRequest(S3ApiTestCase):
             'Authorization': ('AWS AKIAIOSFODNN7EXAMPLE:'
                               'bWq2s1WEIj+Ydj0vQ697zp+IXMU='),
         })
-        sigv2_req = S3Request(req.environ, storage_domain='s3.amazonaws.com')
+        sigv2_req = S3Request(req.environ, Config({
+            'storage_domain': 's3.amazonaws.com'}))
         # This is a failure case with utf-8 non-ascii multi-bytes charactor
         # but we expect to return just False instead of exceptions
         self.assertFalse(sigv2_req.check_signature(
@@ -816,9 +835,334 @@ class TestRequest(S3ApiTestCase):
             'X-Amz-Date': amz_date_header
         })
         sigv4_req = SigV4Request(
-            req.environ, storage_domain='s3.amazonaws.com')
+            req.environ, Config({'storage_domain': 's3.amazonaws.com'}))
         self.assertFalse(sigv4_req.check_signature(
             u'\u30c9\u30e9\u30b4\u30f3'))
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_check_signature_sigv4_unsigned_payload(self):
+        environ = {
+            'HTTP_HOST': 'bucket.s3.test.com',
+            'REQUEST_METHOD': 'GET'}
+        headers = {
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/20210104/us-east-1/s3/aws4_request, '
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=f721a7941d5b7710344bc62cc45f87e66f4bb1dd00d9075ee61'
+                '5b1a5c72b0f8c',
+            'X-Amz-Content-SHA256': 'UNSIGNED-PAYLOAD',
+            'Date': 'Mon, 04 Jan 2021 10:26:23 -0000',
+            'X-Amz-Date': '20210104T102623Z'}
+
+        # Virtual hosted-style
+        self.conf.storage_domain = 's3.test.com'
+        req = Request.blank('/', environ=environ, headers=headers)
+        sigv4_req = SigV4Request(req.environ)
+        self.assertTrue(
+            sigv4_req._canonical_request().endswith(b'UNSIGNED-PAYLOAD'))
+        self.assertTrue(sigv4_req.check_signature('secret'))
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_check_sigv4_req_zero_content_length_sha256(self):
+        # Virtual hosted-style
+        self.conf.storage_domain = 's3.test.com'
+
+        # bad sha256
+        environ = {
+            'HTTP_HOST': 'bucket.s3.test.com',
+            'REQUEST_METHOD': 'GET'}
+        headers = {
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/20210104/us-east-1/s3/aws4_request, '
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=f721a7941d5b7710344bc62cc45f87e66f4bb1dd00d9075ee61'
+                '5b1a5c72b0f8c',
+            'X-Amz-Content-SHA256': 'bad',
+            'Date': 'Mon, 04 Jan 2021 10:26:23 -0000',
+            'X-Amz-Date': '20210104T102623Z',
+            'Content-Length': 0,
+        }
+
+        # lowercase sha256
+        req = Request.blank('/', environ=environ, headers=headers)
+        self.assertRaises(BadDigest, SigV4Request, req.environ)
+        sha256_of_nothing = hashlib.sha256().hexdigest().encode('ascii')
+        headers = {
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/20210104/us-east-1/s3/aws4_request, '
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=d90542e8b4c0d2f803162040a948e8e51db00b62a59ffb16682'
+                'ef433718fde12',
+            'X-Amz-Content-SHA256': sha256_of_nothing,
+            'Date': 'Mon, 04 Jan 2021 10:26:23 -0000',
+            'X-Amz-Date': '20210104T102623Z',
+            'Content-Length': 0,
+        }
+        req = Request.blank('/', environ=environ, headers=headers)
+        sigv4_req = SigV4Request(req.environ)
+        self.assertTrue(
+            sigv4_req._canonical_request().endswith(sha256_of_nothing))
+        self.assertTrue(sigv4_req.check_signature('secret'))
+
+        # uppercase sha256
+        headers = {
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/20210104/us-east-1/s3/aws4_request, '
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=4aab5102e58e9e40f331417d322465c24cac68a7ce77260e9bf'
+                '5ce9a6200862b',
+            'X-Amz-Content-SHA256': sha256_of_nothing.upper(),
+            'Date': 'Mon, 04 Jan 2021 10:26:23 -0000',
+            'X-Amz-Date': '20210104T102623Z',
+            'Content-Length': 0,
+        }
+        req = Request.blank('/', environ=environ, headers=headers)
+        sigv4_req = SigV4Request(req.environ)
+        self.assertTrue(
+            sigv4_req._canonical_request().endswith(sha256_of_nothing.upper()))
+        self.assertTrue(sigv4_req.check_signature('secret'))
+
+
+class TestSigV4Request(S3ApiTestCase):
+    def setUp(self):
+        super(TestSigV4Request, self).setUp()
+        self.s3api.conf.s3_acl = True
+        self.swift.s3_acl = True
+
+    def test_init_header_authorization(self):
+        environ = {
+            'HTTP_HOST': 'bucket.s3.test.com',
+            'REQUEST_METHOD': 'GET'}
+
+        def do_check_ok(conf, auth):
+            x_amz_date = self.get_v4_amz_date_header()
+            headers = {
+                'Authorization': auth,
+                'X-Amz-Content-SHA256': '0123456789',
+                'Date': self.get_date_header(),
+                'X-Amz-Date': x_amz_date}
+            req = Request.blank('/', environ=environ, headers=headers)
+            sigv4_req = SigV4Request(req.environ, conf=conf)
+            self.assertEqual('X', sigv4_req.signature)
+            self.assertEqual('test', sigv4_req.access_key)
+            return sigv4_req
+
+        auth = ('AWS4-HMAC-SHA256 '
+                'Credential=test/%s/us-east-1/s3/aws4_request,'
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0])
+        # location lowercase matches
+        sigv4_req = do_check_ok(Config({'location': 'us-east-1'}), auth)
+        self.assertEqual('us-east-1', sigv4_req.location)
+        # location case mis-matches
+        sigv4_req = do_check_ok(Config({'location': 'US-East-1'}), auth)
+        self.assertEqual('us-east-1', sigv4_req.location)
+        # location uppercase matches
+        auth = ('AWS4-HMAC-SHA256 '
+                'Credential=test/%s/US-East-1/s3/aws4_request,'
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0])
+        sigv4_req = do_check_ok(Config({'location': 'US-East-1'}), auth)
+        self.assertEqual('US-East-1', sigv4_req.location)
+
+        def do_check_bad(conf, auth, exc):
+            x_amz_date = self.get_v4_amz_date_header()
+            headers = {
+                'Authorization': auth,
+                'X-Amz-Content-SHA256': '0123456789',
+                'Date': self.get_date_header(),
+                'X-Amz-Date': x_amz_date}
+            req = Request.blank('/', environ=environ, headers=headers)
+            self.assertRaises(exc, SigV4Request, req.environ, conf)
+
+        # location case mismatch
+        auth = ('AWS4-HMAC-SHA256 '
+                'Credential=test/%s/US-East-1/s3/aws4_request,'
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0])
+        do_check_bad(Config({'location': 'us-east-1'}), auth,
+                     s3response.AuthorizationHeaderMalformed)
+        # bad location
+        auth = ('AWS4-HMAC-SHA256 '
+                'Credential=test/%s/us-west-1/s3/aws4_request,'
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0])
+        do_check_bad(Config({'location': 'us-east-1'}), auth,
+                     s3response.AuthorizationHeaderMalformed)
+        # bad service name
+        auth = ('AWS4-HMAC-SHA256 '
+                'Credential=test/%s/us-east-1/S3/aws4_request,'
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0])
+        do_check_bad(Config({'location': 'us-east-1'}), auth,
+                     s3response.AuthorizationHeaderMalformed)
+        # bad terminal name
+        auth = ('AWS4-HMAC-SHA256 '
+                'Credential=test/%s/us-east-1/s3/AWS4_request,'
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0])
+        do_check_bad(Config({'location': 'us-east-1'}), auth,
+                     s3response.AuthorizationHeaderMalformed)
+        # bad Signature
+        auth = ('AWS4-HMAC-SHA256 '
+                'Credential=test/%s/us-east-1/s3/aws4_request,'
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=' % self.get_v4_amz_date_header().split('T', 1)[0])
+        do_check_bad(Config({'location': 'us-east-1'}), auth,
+                     s3response.AccessDenied)
+        # bad SignedHeaders
+        auth = ('AWS4-HMAC-SHA256 '
+                'Credential=test/%s/us-east-1/s3/aws4_request,'
+                'SignedHeaders=,'
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0])
+        do_check_bad(Config({'location': 'us-east-1'}), auth,
+                     s3response.AuthorizationHeaderMalformed)
+
+    def test_init_query_authorization(self):
+        environ = {
+            'HTTP_HOST': 'bucket.s3.test.com',
+            'REQUEST_METHOD': 'GET'}
+
+        def do_check_ok(conf, params):
+            x_amz_date = self.get_v4_amz_date_header()
+            params['X-Amz-Date'] = x_amz_date
+            signed_headers = {
+                'X-Amz-Content-SHA256': '0123456789',
+                'Date': self.get_date_header(),
+                'X-Amz-Date': x_amz_date}
+            req = Request.blank('/', environ=environ, headers=signed_headers,
+                                params=params)
+            sigv4_req = SigV4Request(req.environ, conf=conf)
+            self.assertEqual('X', sigv4_req.signature)
+            self.assertEqual('test', sigv4_req.access_key)
+            return sigv4_req
+
+        ok_params = {
+            'AWSAccessKeyId': 'test',
+            'X-Amz-Expires': '3600',
+            'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+            'X-Amz-Credential': 'test/%s/us-east-1/s3/aws4_request' %
+            self.get_v4_amz_date_header().split('T', 1)[0],
+            'X-Amz-SignedHeaders': 'host;x-amz-content-sha256;x-amz-date',
+            'X-Amz-Signature': 'X'}
+        # location lowercase matches
+        sigv4_req = do_check_ok(Config({'location': 'us-east-1'}), ok_params)
+        self.assertEqual('us-east-1', sigv4_req.location)
+        # location case mis-matches
+        sigv4_req = do_check_ok(Config({'location': 'US-East-1'}), ok_params)
+        self.assertEqual('us-east-1', sigv4_req.location)
+        # location uppercase matches
+        ok_params['X-Amz-Credential'] = (
+            'test/%s/US-East-1/s3/aws4_request' %
+            self.get_v4_amz_date_header().split('T', 1)[0])
+        sigv4_req = do_check_ok(Config({'location': 'US-East-1'}), ok_params)
+        self.assertEqual('US-East-1', sigv4_req.location)
+
+        def do_check_bad(conf, params, exc):
+            x_amz_date = self.get_v4_amz_date_header()
+            params['X-Amz-Date'] = x_amz_date
+            signed_headers = {
+                'X-Amz-Content-SHA256': '0123456789',
+                'Date': self.get_date_header(),
+                'X-Amz-Date': x_amz_date}
+            req = Request.blank('/', environ=environ, headers=signed_headers,
+                                params=params)
+            self.assertRaises(exc, SigV4Request, req.environ, conf)
+
+        # location case mismatch
+        bad_params = dict(ok_params)
+        bad_params['X-Amz-Credential'] = (
+            'test/%s/US-East-1/s3/aws4_request' %
+            self.get_v4_amz_date_header().split('T', 1)[0])
+        do_check_bad(Config({'location': 'us-east-1'}), bad_params,
+                     s3response.AuthorizationQueryParametersError)
+        # bad location
+        bad_params = dict(ok_params)
+        bad_params['X-Amz-Credential'] = (
+            'test/%s/us-west-1/s3/aws4_request' %
+            self.get_v4_amz_date_header().split('T', 1)[0])
+        do_check_bad(Config({'location': 'us-east-1'}), bad_params,
+                     s3response.AuthorizationQueryParametersError)
+        # bad service name
+        bad_params = dict(ok_params)
+        bad_params['X-Amz-Credential'] = (
+            'test/%s/us-east-1/S3/aws4_request' %
+            self.get_v4_amz_date_header().split('T', 1)[0])
+        do_check_bad(Config({'location': 'us-east-1'}), bad_params,
+                     s3response.AuthorizationQueryParametersError)
+        # bad terminal name
+        bad_params = dict(ok_params)
+        bad_params['X-Amz-Credential'] = (
+            'test/%s/us-east-1/s3/AWS4_request' %
+            self.get_v4_amz_date_header().split('T', 1)[0])
+        do_check_bad(Config({'location': 'us-east-1'}), bad_params,
+                     s3response.AuthorizationQueryParametersError)
+        # bad Signature
+        bad_params = dict(ok_params)
+        bad_params['X-Amz-Signature'] = ''
+        do_check_bad(Config({'location': 'us-east-1'}), bad_params,
+                     s3response.AccessDenied)
+        # bad SignedHeaders
+        bad_params = dict(ok_params)
+        bad_params['X-Amz-SignedHeaders'] = ''
+        do_check_bad(Config({'location': 'us-east-1'}), bad_params,
+                     s3response.AuthorizationQueryParametersError)
+
+    def test_controller_allow_multipart_uploads(self):
+        environ = {
+            'HTTP_HOST': 'bucket.s3.test.com',
+            'REQUEST_METHOD': 'GET'}
+        x_amz_date = self.get_v4_amz_date_header()
+        auth = ('AWS4-HMAC-SHA256 '
+                'Credential=test/%s/us-east-1/s3/aws4_request,'
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0])
+        headers = {
+            'Authorization': auth,
+            'X-Amz-Content-SHA256': '0123456789',
+            'Date': self.get_date_header(),
+            'X-Amz-Date': x_amz_date}
+
+        def make_s3req(config, path, params):
+            req = Request.blank(path, environ=environ, headers=headers,
+                                params=params)
+            return SigV4Request(req.environ, None, config)
+
+        s3req = make_s3req(Config(), '/bkt', {'partNumber': '3'})
+        self.assertEqual(controllers.multi_upload.PartController,
+                         s3req.controller)
+
+        s3req = make_s3req(Config(), '/bkt', {'uploadId': '4'})
+        self.assertEqual(controllers.multi_upload.UploadController,
+                         s3req.controller)
+
+        s3req = make_s3req(Config(), '/bkt', {'uploads': '99'})
+        self.assertEqual(controllers.multi_upload.UploadsController,
+                         s3req.controller)
+
+        # multi part requests require allow_multipart_uploads
+        def do_check_slo_not_enabled(params):
+            s3req = make_s3req(Config({
+                'allow_multipart_uploads': False}), '/bkt', params)
+            self.assertRaises(s3response.S3NotImplemented,
+                              lambda: s3req.controller)
+
+        do_check_slo_not_enabled({'partNumber': '3'})
+        do_check_slo_not_enabled({'uploadId': '4'})
+        do_check_slo_not_enabled({'uploads': '99'})
+
+        # service requests not dependent on allow_multipart_uploads
+        s3req = make_s3req(Config(), '/', {'partNumber': '3'})
+        self.assertEqual(controllers.ServiceController,
+                         s3req.controller)
+        s3req = make_s3req(Config({'allow_multipart_uploads': False}), '/',
+                           {'partNumber': '3'})
+        self.assertEqual(controllers.ServiceController,
+                         s3req.controller)
 
 
 class TestHashingInput(S3ApiTestCase):

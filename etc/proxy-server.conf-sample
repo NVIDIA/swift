@@ -614,6 +614,10 @@ use = egg:swift#s3api
 # upload, except the last part.
 # min_segment_size = 5242880
 #
+# AWS allows clock skew up to 15 mins; note that older versions of swift/swift3
+# allowed at most 5 mins.
+# allowable_clock_skew = 900
+#
 # Multi-delete requests can take a long time to complete when writing out
 # tombstones for every object, which may trip client timeouts. Enable this
 # option to bulk-insert object-expirer jobs to delete objects in the

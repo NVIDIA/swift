@@ -275,12 +275,13 @@ class S3ApiMiddleware(object):
             conf.get('allow_multipart_uploads', True))
         self.conf.min_segment_size = config_positive_int_value(
             conf.get('min_segment_size', 5242880))
+        self.conf.allowable_clock_skew = config_positive_int_value(
+            conf.get('allowable_clock_skew', 15 * 60))
         self.conf.use_async_delete = config_true_value(
             conf.get('use_async_delete', False))
 
         self.logger = get_logger(
             conf, log_route=conf.get('log_name', 's3api'))
-        self.slo_enabled = self.conf.allow_multipart_uploads
         self.check_pipeline(self.conf)
 
         if self.conf.use_async_delete and (self.conf.s3_acl or
@@ -295,11 +296,7 @@ class S3ApiMiddleware(object):
     def __call__(self, env, start_response):
         try:
             req_class = get_request_class(env, self.conf.s3_acl)
-            req = req_class(
-                env, self.app, self.slo_enabled, self.conf.storage_domain,
-                self.conf.location, self.conf.force_swift_request_proxy_log,
-                self.conf.dns_compliant_bucket_names,
-                self.conf.allow_multipart_uploads, self.conf.allow_no_owner)
+            req = req_class(env, self.app, self.conf)
             resp = self.handle_request(req)
         except NotS3Request:
             resp = self.app
@@ -362,8 +359,8 @@ class S3ApiMiddleware(object):
                                  pipeline.index('proxy-server')]
 
         # Check SLO middleware
-        if self.slo_enabled and 'slo' not in auth_pipeline:
-            self.slo_enabled = False
+        if self.conf.allow_multipart_uploads and 'slo' not in auth_pipeline:
+            self.conf.allow_multipart_uploads = False
             self.logger.warning('s3api middleware requires SLO middleware '
                                 'to support multi-part upload, please add it '
                                 'in pipeline')
