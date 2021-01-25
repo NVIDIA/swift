@@ -24,7 +24,7 @@ from swift.common.storage_policy import POLICIES
 from swift.common.exceptions import DiskFileDeleted, DiskFileNotExist, \
     DiskFileQuarantined
 from swift.common.utils import replace_partition_in_path, \
-    audit_location_generator, get_logger
+    audit_location_generator, get_logger, drop_privileges
 from swift.obj import diskfile
 
 
@@ -323,6 +323,8 @@ def cleanup(swift_dir='/etc/swift',
 
 
 def main(args):
+    if args.swift_user:
+        drop_privileges(args.swift_user)
     logging.basicConfig(
         format='%(message)s',
         level=logging.DEBUG if args.debug else logging.INFO,

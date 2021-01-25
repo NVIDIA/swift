@@ -33,6 +33,8 @@ if __name__ == '__main__':
     parser.add_argument('--skip-mount-check', default=False,
                         help='Don\'t test if disk is mounted',
                         action="store_true", dest='skip_mount_check')
+    parser.add_argument('--swift-user', default=None, dest='swift_user',
+                        help='Drop privileges to this user before relinking')
     parser.add_argument('--logfile', default=None,
                         dest='logfile', help='Set log file name')
     parser.add_argument('--debug', default=False, action='store_true',
