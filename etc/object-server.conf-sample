@@ -604,3 +604,7 @@ use = egg:swift#xprofile
 # unwind = false
 
 [object-relinker]
+# Target this many relinks/cleanups per second, to reduce the
+# likelihood that the added I/O from a partition-power increase impacts
+# client traffic.
+# objects_per_second = 0.0
