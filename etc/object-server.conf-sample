@@ -602,3 +602,5 @@ use = egg:swift#xprofile
 #
 # unwind the iterator of applications
 # unwind = false
+
+[object-relinker]
