@@ -82,6 +82,7 @@ from six.moves.configparser import (ConfigParser, NoSectionError,
 from six.moves import range, http_client
 from six.moves.urllib.parse import quote as _quote, unquote
 from six.moves.urllib.parse import urlparse
+from six.moves import UserList
 
 from swift import gettext_ as _
 import swift.common.exceptions
@@ -3215,7 +3216,8 @@ def audit_location_generator(devices, datadir, suffix='',
                              hook_pre_device=None, hook_post_device=None,
                              hook_pre_partition=None, hook_post_partition=None,
                              hook_pre_suffix=None, hook_post_suffix=None,
-                             hook_pre_hash=None, hook_post_hash=None):
+                             hook_pre_hash=None, hook_post_hash=None,
+                             error_counter=None):
     """
     Given a devices path and a data directory, yield (path, device,
     partition) for all files in that directory
@@ -3237,22 +3239,24 @@ def audit_location_generator(devices, datadir, suffix='',
     :param mount_check: Flag to check if a mount check should be performed
                     on devices
     :param logger: a logger object
-    :devices_filter: a callable taking (devices, [list of devices]) as
-                     parameters and returning a [list of devices]
-    :partitions_filter: a callable taking (datadir_path, [list of parts]) as
-                        parameters and returning a [list of parts]
-    :suffixes_filter: a callable taking (part_path, [list of suffixes]) as
-                      parameters and returning a [list of suffixes]
-    :hashes_filter: a callable taking (suff_path, [list of hashes]) as
-                    parameters and returning a [list of hashes]
-    :hook_pre_device: a callable taking device_path as parameter
-    :hook_post_device: a callable taking device_path as parameter
-    :hook_pre_partition: a callable taking part_path as parameter
-    :hook_post_partition: a callable taking part_path as parameter
-    :hook_pre_suffix: a callable taking suff_path as parameter
-    :hook_post_suffix: a callable taking suff_path as parameter
-    :hook_pre_hash: a callable taking hash_path as parameter
-    :hook_post_hash: a callable taking hash_path as parameter
+    :param devices_filter: a callable taking (devices, [list of devices]) as
+                           parameters and returning a [list of devices]
+    :param partitions_filter: a callable taking (datadir_path, [list of parts])
+                              as parameters and returning a [list of parts]
+    :param suffixes_filter: a callable taking (part_path, [list of suffixes])
+                            as parameters and returning a [list of suffixes]
+    :param hashes_filter: a callable taking (suff_path, [list of hashes]) as
+                          parameters and returning a [list of hashes]
+    :param hook_pre_device: a callable taking device_path as parameter
+    :param hook_post_device: a callable taking device_path as parameter
+    :param hook_pre_partition: a callable taking part_path as parameter
+    :param hook_post_partition: a callable taking part_path as parameter
+    :param hook_pre_suffix: a callable taking suff_path as parameter
+    :param hook_post_suffix: a callable taking suff_path as parameter
+    :param hook_pre_hash: a callable taking hash_path as parameter
+    :param hook_post_hash: a callable taking hash_path as parameter
+    :param error_counter: a dictionary used to accumulate error counts; may
+                          add keys 'unmounted' and 'unlistable_partitions'
     """
     device_dir = listdir(devices)
     # randomize devices in case of process restart before sweep completed
@@ -3260,17 +3264,24 @@ def audit_location_generator(devices, datadir, suffix='',
     if devices_filter:
         device_dir = devices_filter(devices, device_dir)
     for device in device_dir:
-        if hook_pre_device:
-            hook_pre_device(os.path.join(devices, device))
         if mount_check and not ismount(os.path.join(devices, device)):
+            if error_counter is not None:
+                error_counter.setdefault('unmounted', 0)
+                error_counter['unmounted'] += 1
             if logger:
                 logger.warning(
                     _('Skipping %s as it is not mounted'), device)
             continue
+        if hook_pre_device:
+            hook_pre_device(os.path.join(devices, device))
         datadir_path = os.path.join(devices, device, datadir)
         try:
             partitions = listdir(datadir_path)
         except OSError as e:
+            # NB: listdir ignores non-existent datadir_path
+            if error_counter is not None:
+                error_counter.setdefault('unlistable_partitions', 0)
+                error_counter['unlistable_partitions'] += 1
             if logger:
                 logger.warning(_('Skipping %(datadir)s because %(err)s'),
                                {'datadir': datadir_path, 'err': e})
@@ -5485,6 +5496,105 @@ class ShardRange(object):
             params['meta_timestamp'], params['deleted'], params['state'],
             params['state_timestamp'], params['epoch'],
             params.get('reported', 0))
+
+    def expand(self, donors):
+        """
+        Expands the bounds as necessary to match the minimum and maximum bounds
+        of the given donors.
+
+        :param donors: A list of :class:`~swift.common.utils.ShardRange`
+        :return: True if the bounds have been modified, False otherwise.
+        """
+        modified = False
+        new_lower = self.lower
+        new_upper = self.upper
+        for donor in donors:
+            new_lower = min(new_lower, donor.lower)
+            new_upper = max(new_upper, donor.upper)
+        if self.lower > new_lower or self.upper < new_upper:
+            self.lower = new_lower
+            self.upper = new_upper
+            modified = True
+        return modified
+
+
+class ShardRangeList(UserList):
+    """
+    This class provides some convenience functions for working with lists of
+    :class:`~swift.common.utils.ShardRange`.
+
+    This class does not enforce ordering or continuity of the list items:
+    callers should ensure that items are added in order as appropriate.
+    """
+    def __getitem__(self, index):
+        # workaround for py3 - not needed for py2.7,py3.8
+        result = self.data[index]
+        return ShardRangeList(result) if type(result) == list else result
+
+    @property
+    def lower(self):
+        """
+        Returns the lower bound of the first item in the list. Note: this will
+        only be equal to the lowest bound of all items in the list if the list
+        contents has been sorted.
+
+        :return: lower bound of first item in the list, or ShardRange.MIN
+                 if the list is empty.
+        """
+        if not self:
+            # empty list has range MIN->MIN
+            return ShardRange.MIN
+        return self[0].lower
+
+    @property
+    def upper(self):
+        """
+        Returns the upper bound of the first item in the list. Note: this will
+        only be equal to the uppermost bound of all items in the list if the
+        list has previously been sorted.
+
+        :return: upper bound of first item in the list, or ShardRange.MIN
+                 if the list is empty.
+        """
+        if not self:
+            # empty list has range MIN->MIN
+            return ShardRange.MIN
+        return self[-1].upper
+
+    @property
+    def object_count(self):
+        """
+        Returns the total number of objects of all items in the list.
+
+        :return: total object count
+        """
+        return sum(sr.object_count for sr in self)
+
+    @property
+    def bytes_used(self):
+        """
+        Returns the total number of bytes in all items in the list.
+
+        :return: total bytes used
+        """
+        return sum(sr.bytes_used for sr in self)
+
+    def includes(self, other):
+        """
+        Check if another ShardRange namespace is enclosed between the list's
+        ``lower`` and ``upper`` properties. Note: the list's ``lower`` and
+        ``upper`` properties will only equal the outermost bounds of all items
+        in the list if the list has previously been sorted.
+
+        Note: the list does not need to contain an item matching ``other`` for
+        this method to return True, although if the list has been sorted and
+        does contain an item matching ``other`` then the method will return
+        True.
+
+        :param other: an instance of :class:`~swift.common.utils.ShardRange`
+        :return: True if other's namespace is enclosed, False otherwise.
+        """
+        return self.lower <= other.lower and self.upper >= other.upper
 
 
 def find_shard_range(item, ranges):

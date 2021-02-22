@@ -74,7 +74,7 @@ from swift.common.exceptions import Timeout, MessageTimeout, \
     MimeInvalid
 from swift.common import utils
 from swift.common.utils import is_valid_ip, is_valid_ipv4, is_valid_ipv6, \
-    set_swift_dir, md5
+    set_swift_dir, md5, ShardRangeList
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import POLICIES, reload_storage_policies
@@ -6374,6 +6374,91 @@ class TestAuditLocationGenerator(unittest.TestCase):
                 hashes_filter.assert_called_once_with(suffix, ["hash1"])
                 self.assertNotIn(((hash_path,),), m_listdir.call_args_list)
 
+    @with_tempdir
+    def test_error_counter(self, tmpdir):
+        def assert_no_errors(devices, mount_check=False):
+            logger = debug_logger()
+            error_counter = {}
+            locations = utils.audit_location_generator(
+                devices, "data", mount_check=mount_check, logger=logger,
+                error_counter=error_counter
+            )
+            self.assertEqual([], list(locations))
+            self.assertEqual([], logger.get_lines_for_level('warning'))
+            self.assertEqual([], logger.get_lines_for_level('error'))
+            self.assertEqual({}, error_counter)
+
+        # no devices, no problem
+        devices = os.path.join(tmpdir, 'devices1')
+        os.makedirs(devices)
+        assert_no_errors(devices)
+
+        # empty dir under devices/
+        devices = os.path.join(tmpdir, 'devices2')
+        os.makedirs(devices)
+        dev_dir = os.path.join(devices, 'device_is_empty_dir')
+        os.makedirs(dev_dir)
+
+        def assert_listdir_error(devices):
+            logger = debug_logger()
+            error_counter = {}
+            locations = utils.audit_location_generator(
+                devices, "data", mount_check=False, logger=logger,
+                error_counter=error_counter
+            )
+            self.assertEqual([], list(locations))
+            self.assertEqual(1, len(logger.get_lines_for_level('warning')))
+            self.assertEqual({'unlistable_partitions': 1}, error_counter)
+
+        # file under devices/
+        devices = os.path.join(tmpdir, 'devices3')
+        os.makedirs(devices)
+        with open(os.path.join(devices, 'device_is_file'), 'w'):
+            pass
+        assert_listdir_error(devices)
+
+        # dir under devices/
+        devices = os.path.join(tmpdir, 'devices4')
+        device = os.path.join(devices, 'device')
+        os.makedirs(device)
+        assert_no_errors(devices)
+
+        # error for dir under devices/
+        orig_listdir = utils.listdir
+
+        def mocked(path):
+            if path.endswith('data'):
+                raise OSError
+            return orig_listdir(path)
+
+        with mock.patch('swift.common.utils.listdir', mocked):
+            assert_listdir_error(devices)
+
+        # mount check error
+        devices = os.path.join(tmpdir, 'devices5')
+        device = os.path.join(devices, 'device')
+        os.makedirs(device)
+
+        # no check
+        with mock.patch('swift.common.utils.ismount', return_value=False):
+            assert_no_errors(devices, mount_check=False)
+
+        # check passes
+        with mock.patch('swift.common.utils.ismount', return_value=True):
+            assert_no_errors(devices, mount_check=True)
+
+        # check fails
+        logger = debug_logger()
+        error_counter = {}
+        with mock.patch('swift.common.utils.ismount', return_value=False):
+            locations = utils.audit_location_generator(
+                devices, "data", mount_check=True, logger=logger,
+                error_counter=error_counter
+            )
+        self.assertEqual([], list(locations))
+        self.assertEqual(1, len(logger.get_lines_for_level('warning')))
+        self.assertEqual({'unmounted': 1}, error_counter)
+
 
 class TestGreenAsyncPile(unittest.TestCase):
 
@@ -8291,6 +8376,135 @@ class TestShardRange(unittest.TestCase):
         actual = utils.ShardRange.make_path('a', 'root', 'parent', ts, 'foo')
         self.assertEqual('a/root-%s-%s-foo' % (parent_hash, ts.internal),
                          actual)
+
+    def test_expand(self):
+        bounds = (('', 'd'), ('d', 'k'), ('k', 't'), ('t', ''))
+        donors = [
+            utils.ShardRange('a/c-%d' % i, utils.Timestamp.now(), b[0], b[1])
+            for i, b in enumerate(bounds)
+        ]
+        acceptor = utils.ShardRange('a/c-acc', utils.Timestamp.now(), 'f', 's')
+        self.assertTrue(acceptor.expand(donors[:1]))
+        self.assertEqual((utils.ShardRange.MIN, 's'),
+                         (acceptor.lower, acceptor.upper))
+
+        acceptor = utils.ShardRange('a/c-acc', utils.Timestamp.now(), 'f', 's')
+        self.assertTrue(acceptor.expand(donors[:2]))
+        self.assertEqual((utils.ShardRange.MIN, 's'),
+                         (acceptor.lower, acceptor.upper))
+
+        acceptor = utils.ShardRange('a/c-acc', utils.Timestamp.now(), 'f', 's')
+        self.assertTrue(acceptor.expand(donors[1:3]))
+        self.assertEqual(('d', 't'),
+                         (acceptor.lower, acceptor.upper))
+
+        acceptor = utils.ShardRange('a/c-acc', utils.Timestamp.now(), 'f', 's')
+        self.assertTrue(acceptor.expand(donors))
+        self.assertEqual((utils.ShardRange.MIN, utils.ShardRange.MAX),
+                         (acceptor.lower, acceptor.upper))
+
+        acceptor = utils.ShardRange('a/c-acc', utils.Timestamp.now(), 'f', 's')
+        self.assertTrue(acceptor.expand(donors[1:2] + donors[3:]))
+        self.assertEqual(('d', utils.ShardRange.MAX),
+                         (acceptor.lower, acceptor.upper))
+
+        acceptor = utils.ShardRange('a/c-acc', utils.Timestamp.now(), '', 'd')
+        self.assertFalse(acceptor.expand(donors[:1]))
+        self.assertEqual((utils.ShardRange.MIN, 'd'),
+                         (acceptor.lower, acceptor.upper))
+
+        acceptor = utils.ShardRange('a/c-acc', utils.Timestamp.now(), 'b', 'v')
+        self.assertFalse(acceptor.expand(donors[1:3]))
+        self.assertEqual(('b', 'v'),
+                         (acceptor.lower, acceptor.upper))
+
+
+class TestShardRangeList(unittest.TestCase):
+    def setUp(self):
+        self.shard_ranges = [
+            utils.ShardRange('a/b', utils.Timestamp.now(), 'a', 'b',
+                             object_count=2, bytes_used=22),
+            utils.ShardRange('b/c', utils.Timestamp.now(), 'b', 'c',
+                             object_count=4, bytes_used=44),
+            utils.ShardRange('x/y', utils.Timestamp.now(), 'x', 'y',
+                             object_count=6, bytes_used=66),
+        ]
+
+    def test_init(self):
+        srl = ShardRangeList()
+        self.assertEqual(0, len(srl))
+        self.assertEqual(utils.ShardRange.MIN, srl.lower)
+        self.assertEqual(utils.ShardRange.MIN, srl.upper)
+        self.assertEqual(0, srl.object_count)
+        self.assertEqual(0, srl.bytes_used)
+
+    def test_init_with_list(self):
+        srl = ShardRangeList(self.shard_ranges[:2])
+        self.assertEqual(2, len(srl))
+        self.assertEqual('a', srl.lower)
+        self.assertEqual('c', srl.upper)
+        self.assertEqual(6, srl.object_count)
+        self.assertEqual(66, srl.bytes_used)
+
+        srl.append(self.shard_ranges[2])
+        self.assertEqual(3, len(srl))
+        self.assertEqual('a', srl.lower)
+        self.assertEqual('y', srl.upper)
+        self.assertEqual(12, srl.object_count)
+        self.assertEqual(132, srl.bytes_used)
+
+    def test_pop(self):
+        srl = ShardRangeList(self.shard_ranges[:2])
+        srl.pop()
+        self.assertEqual(1, len(srl))
+        self.assertEqual('a', srl.lower)
+        self.assertEqual('b', srl.upper)
+        self.assertEqual(2, srl.object_count)
+        self.assertEqual(22, srl.bytes_used)
+
+    def test_slice(self):
+        srl = ShardRangeList(self.shard_ranges)
+        sublist = srl[:1]
+        self.assertIsInstance(sublist, ShardRangeList)
+        self.assertEqual(1, len(sublist))
+        self.assertEqual('a', sublist.lower)
+        self.assertEqual('b', sublist.upper)
+        self.assertEqual(2, sublist.object_count)
+        self.assertEqual(22, sublist.bytes_used)
+
+        sublist = srl[1:]
+        self.assertIsInstance(sublist, ShardRangeList)
+        self.assertEqual(2, len(sublist))
+        self.assertEqual('b', sublist.lower)
+        self.assertEqual('y', sublist.upper)
+        self.assertEqual(10, sublist.object_count)
+        self.assertEqual(110, sublist.bytes_used)
+
+    def test_includes(self):
+        srl = ShardRangeList(self.shard_ranges)
+
+        for sr in self.shard_ranges:
+            self.assertTrue(srl.includes(sr))
+
+        self.assertTrue(srl.includes(srl))
+
+        sr = utils.ShardRange('a/a', utils.Timestamp.now(), '', 'a')
+        self.assertFalse(srl.includes(sr))
+        sr = utils.ShardRange('a/a', utils.Timestamp.now(), '', 'b')
+        self.assertFalse(srl.includes(sr))
+        sr = utils.ShardRange('a/z', utils.Timestamp.now(), 'x', 'z')
+        self.assertFalse(srl.includes(sr))
+        sr = utils.ShardRange('a/z', utils.Timestamp.now(), 'y', 'z')
+        self.assertFalse(srl.includes(sr))
+        sr = utils.ShardRange('a/entire', utils.Timestamp.now(), '', '')
+        self.assertFalse(srl.includes(sr))
+
+        # entire range
+        srl_entire = ShardRangeList([sr])
+        self.assertFalse(srl.includes(srl_entire))
+        # make a fresh instance
+        sr = utils.ShardRange('a/entire', utils.Timestamp.now(), '', '')
+        self.assertTrue(srl_entire.includes(sr))
 
 
 @patch('ctypes.get_errno')

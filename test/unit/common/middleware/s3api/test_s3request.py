@@ -108,7 +108,7 @@ class TestRequest(S3ApiTestCase):
                             environ={'REQUEST_METHOD': method},
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
-        s3_req = req_klass(req.environ, conf=self.conf)
+        s3_req = req_klass(req.environ, conf=self.s3api.conf)
         s3_req.set_acl_handler(
             get_acl_handler(s3_req.controller_name)(s3_req, DebugLogger()))
         with patch('swift.common.middleware.s3api.s3request.S3Request.'
@@ -116,7 +116,7 @@ class TestRequest(S3ApiTestCase):
                 patch('swift.common.middleware.s3api.subresource.ACL.'
                       'check_permission') as m_check_permission:
             mock_get_resp.return_value = fake_swift_resp \
-                or FakeResponse(self.conf.s3_acl)
+                or FakeResponse(self.s3api.conf.s3_acl)
             return mock_get_resp, m_check_permission,\
                 s3_req.get_response(self.s3api)
 
@@ -237,7 +237,7 @@ class TestRequest(S3ApiTestCase):
                 patch.object(Request, 'remote_user', 'authorized'):
 
             m_swift_resp.return_value = FakeSwiftResponse()
-            s3_req = S3AclRequest(req.environ, self.conf, None)
+            s3_req = S3AclRequest(req.environ, self.s3api.conf, None)
             self.assertNotIn('s3api.auth_details', s3_req.environ)
 
     def test_to_swift_req_Authorization_not_exist_in_swreq(self):
@@ -396,8 +396,10 @@ class TestRequest(S3ApiTestCase):
 
         if 'X-Amz-Date' in date_header:
             included_header = 'x-amz-date'
+            scope_date = date_header['X-Amz-Date'].split('T', 1)[0]
         elif 'Date' in date_header:
             included_header = 'date'
+            scope_date = self.get_v4_amz_date_header().split('T', 1)[0]
         else:
             self.fail('Invalid date header specified as test')
 
@@ -407,7 +409,7 @@ class TestRequest(S3ApiTestCase):
                 'Credential=test/%s/us-east-1/s3/aws4_request, '
                 'SignedHeaders=%s,'
                 'Signature=X' % (
-                    self.get_v4_amz_date_header().split('T', 1)[0],
+                    scope_date,
                     ';'.join(sorted(['host', included_header]))),
             'X-Amz-Content-SHA256': '0123456789'}
 
@@ -699,7 +701,7 @@ class TestRequest(S3ApiTestCase):
             'X-Amz-Date': x_amz_date}
 
         # Virtual hosted-style
-        self.conf.storage_domain = 's3.test.com'
+        self.s3api.conf.storage_domain = 's3.test.com'
         req = Request.blank('/', environ=environ, headers=headers)
         sigv4_req = SigV4Request(req.environ)
         uri = sigv4_req._canonical_uri()
@@ -719,7 +721,7 @@ class TestRequest(S3ApiTestCase):
             'REQUEST_METHOD': 'GET'}
 
         # Path-style
-        self.conf.storage_domain = ''
+        self.s3api.conf.storage_domain = ''
         req = Request.blank('/', environ=environ, headers=headers)
         sigv4_req = SigV4Request(req.environ)
         uri = sigv4_req._canonical_uri()
@@ -856,7 +858,7 @@ class TestRequest(S3ApiTestCase):
             'X-Amz-Date': '20210104T102623Z'}
 
         # Virtual hosted-style
-        self.conf.storage_domain = 's3.test.com'
+        self.s3api.conf.storage_domain = 's3.test.com'
         req = Request.blank('/', environ=environ, headers=headers)
         sigv4_req = SigV4Request(req.environ)
         self.assertTrue(
@@ -866,7 +868,7 @@ class TestRequest(S3ApiTestCase):
     @patch.object(S3Request, '_validate_dates', lambda *a: None)
     def test_check_sigv4_req_zero_content_length_sha256(self):
         # Virtual hosted-style
-        self.conf.storage_domain = 's3.test.com'
+        self.s3api.conf.storage_domain = 's3.test.com'
 
         # bad sha256
         environ = {

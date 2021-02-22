@@ -362,14 +362,16 @@ class TestReconstructorRevert(ECProbeTest):
         self.assertEqual('meta-bar', headers.get('x-object-meta-bar'))
 
         # PUT object at t2; make all frags non-durable so that the previous
-        # durable frags at t1 remain on object server
+        # durable frags at t1 remain on object server; use InternalClient so
+        # that x-backend-no-commit is passed through
         internal_client = self.make_internal_client()
         contents2 = Body(total=2.5 * 2 ** 20)  # different content
         self.assertNotEqual(contents2.etag, older_obj_etag)  # sanity check
         headers = {'x-backend-no-commit': 'True',
                    'x-object-meta-bar': 'meta-bar-new'}
         internal_client.upload_object(contents2, self.account,
-                                      self.container_name, self.object_name,
+                                      self.container_name.decode('utf8'),
+                                      self.object_name.decode('utf8'),
                                       headers)
         # GET should still return the older durable object
         headers, obj_etag = self.proxy_get()

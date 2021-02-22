@@ -54,7 +54,13 @@ SHARD_STATS_STATES = [ShardRange.ACTIVE, ShardRange.SHARDING,
 SHARD_LISTING_STATES = SHARD_STATS_STATES + [ShardRange.CLEAVED]
 SHARD_UPDATE_STATES = [ShardRange.CREATED, ShardRange.CLEAVED,
                        ShardRange.ACTIVE, ShardRange.SHARDING]
-
+# when auditing a shard gets its own shard range, which could be in any state
+# except FOUND, and any potential acceptors excluding FOUND ranges that may be
+# unwanted overlaps
+SHARD_AUDITING_STATES = [ShardRange.CREATED, ShardRange.CLEAVED,
+                         ShardRange.ACTIVE, ShardRange.SHARDING,
+                         ShardRange.SHARDED, ShardRange.SHRINKING,
+                         ShardRange.SHRUNK]
 
 # attribute names in order used when transforming shard ranges from dicts to
 # tuples and vice-versa
@@ -332,6 +338,8 @@ class ContainerBroker(DatabaseBroker):
     db_type = 'container'
     db_contains_type = 'object'
     db_reclaim_timestamp = 'created_at'
+    delete_meta_whitelist = ['x-container-sysmeta-shard-quoted-root',
+                             'x-container-sysmeta-shard-root']
 
     def __init__(self, db_file, timeout=BROKER_TIMEOUT, logger=None,
                  account=None, container=None, pending_timeout=None,
@@ -812,16 +820,24 @@ class ContainerBroker(DatabaseBroker):
         info.update(self._get_alternate_object_stats()[1])
         return self._is_deleted_info(**info)
 
-    def is_reclaimable(self, now, reclaim_age):
+    def is_old_enough_to_reclaim(self, now, reclaim_age):
         with self.get() as conn:
             info = conn.execute('''
                 SELECT put_timestamp, delete_timestamp
                 FROM container_stat''').fetchone()
-        if (Timestamp(now - reclaim_age) >
-            Timestamp(info['delete_timestamp']) >
-                Timestamp(info['put_timestamp'])):
-            return self.empty()
-        return False
+        return (Timestamp(now - reclaim_age) >
+                Timestamp(info['delete_timestamp']) >
+                Timestamp(info['put_timestamp']))
+
+    def is_empty_enough_to_reclaim(self):
+        if self.is_root_container() and (self.get_shard_ranges() or
+                                         self.get_db_state() == SHARDING):
+            return False
+        return self.empty()
+
+    def is_reclaimable(self, now, reclaim_age):
+        return self.is_old_enough_to_reclaim(now, reclaim_age) and \
+            self.is_empty_enough_to_reclaim()
 
     def get_info_is_deleted(self):
         """
@@ -1706,7 +1722,10 @@ class ContainerBroker(DatabaseBroker):
 
         The following alias values are supported: 'listing' maps to all states
         that are considered valid when listing objects; 'updating' maps to all
-        states that are considered valid for redirecting an object update.
+        states that are considered valid for redirecting an object update;
+        'auditing' maps to all states that are considered valid for a shard
+        container that is updating its own shard range table from a root (this
+        currently maps to all states except FOUND).
 
         :param states: a list of values each of which may be the name of a
             state, the number of a state, or an alias
@@ -1721,6 +1740,8 @@ class ContainerBroker(DatabaseBroker):
                     resolved_states.update(SHARD_LISTING_STATES)
                 elif state == 'updating':
                     resolved_states.update(SHARD_UPDATE_STATES)
+                elif state == 'auditing':
+                    resolved_states.update(SHARD_AUDITING_STATES)
                 else:
                     resolved_states.add(ShardRange.resolve_state(state)[0])
             return resolved_states
@@ -2119,10 +2140,13 @@ class ContainerBroker(DatabaseBroker):
         """
         _, path = self._get_root_meta()
         if path is not None:
-            # We have metadata telling us where the root is; it's authoritative
+            # We have metadata telling us where the root is; it's
+            # authoritative; shards should always have this metadata even when
+            # deleted
             return self.path == path
 
-        # Else, we're either a root or a deleted shard.
+        # Else, we're either a root or a legacy deleted shard whose sharding
+        # sysmeta was deleted
 
         # Use internal method so we don't try to update stats.
         own_shard_range = self._own_shard_range(no_default=True)

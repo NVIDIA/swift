@@ -602,3 +602,15 @@ use = egg:swift#xprofile
 #
 # unwind the iterator of applications
 # unwind = false
+
+[object-relinker]
+# You can override the default log routing for this app here (don't use set!):
+# log_name = object-relinker
+# log_facility = LOG_LOCAL0
+# log_level = INFO
+# log_address = /dev/log
+#
+# Target this many relinks/cleanups per second, to reduce the
+# likelihood that the added I/O from a partition-power increase impacts
+# client traffic. Use zero for unlimited.
+# files_per_second = 0.0

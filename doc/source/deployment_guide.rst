@@ -489,6 +489,38 @@ that have available RAM and CPU.  Typically Memcached is run on the proxy
 servers.  The ``memcache_servers`` config option in the ``proxy-server.conf``
 should contain all memcached servers.
 
+*************************
+Shard Range Listing Cache
+*************************
+
+When a container gets :ref:`sharded<sharding_doc>` the root container will still be the
+primary entry point to many container requests, as it provides the list of shards.
+To take load off the root container Swift by default caches the list of shards returned.
+
+As the number of shards for a root container grows to more than 3k the memcache default max
+size of 1MB can be reached.
+
+If you over-run your max configured memcache size you'll see messages like::
+
+  Error setting value in memcached: 127.0.0.1:11211: SERVER_ERROR object too large for cache
+
+When you see these messages your root containers are getting hammered and
+probably returning 503 reponses to clients.  Override the default 1MB limit to
+5MB with something like::
+
+  /usr/bin/memcached -I 5000000 ...
+
+Memcache has a ``stats sizes`` option that can point out the current size usage. As this
+reaches the current max an increase might be in order::
+
+  # telnet <memcache server> 11211
+  > stats sizes
+  STAT 160 2
+  STAT 448 1
+  STAT 576 1
+  END
+
+
 -----------
 System Time
 -----------
