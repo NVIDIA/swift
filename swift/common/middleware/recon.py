@@ -24,8 +24,7 @@ from swift import gettext_ as _
 from swift.common.constraints import check_mount
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import Request, Response
-from swift.common.utils import get_logger, config_true_value, \
-    SWIFT_CONF_FILE, md5_hash_for_file
+from swift.common.utils import get_logger, SWIFT_CONF_FILE, md5_hash_for_file
 
 
 class ReconMiddleware(object):
@@ -35,7 +34,7 @@ class ReconMiddleware(object):
     /recon/load|mem|async... will return various system metrics.
 
     Needs to be added to the pipeline and requires a filter
-    declaration in the object-server.conf:
+    declaration in the [account|container|object]-server conf file:
 
     [filter:recon]
     use = egg:swift#recon
@@ -65,8 +64,6 @@ class ReconMiddleware(object):
         for policy in POLICIES:
             self.rings.append(os.path.join(swift_dir,
                                            policy.ring_name + '.ring.gz'))
-
-        self.mount_check = config_true_value(conf.get('mount_check', 'true'))
 
     def _from_recon_cache(self, cache_keys, cache_file, openr=open):
         """retrieve values from a recon cache file
@@ -134,6 +131,12 @@ class ReconMiddleware(object):
         """get # of drive audit errors"""
         return self._from_recon_cache(['drive_audit_errors'],
                                       self.drive_recon_cache)
+
+    def get_sharding_info(self):
+        """get sharding info"""
+        return self._from_recon_cache(["sharding_stats",
+                                       "sharding_last"],
+                                      self.container_recon_cache)
 
     def get_replication_info(self, recon_type):
         """get replication info"""
@@ -372,6 +375,8 @@ class ReconMiddleware(object):
             content = self.get_driveaudit_error()
         elif rcheck == "time":
             content = self.get_time()
+        elif rcheck == "sharding":
+            content = self.get_sharding_info()
         else:
             content = "Invalid path: %s" % req.path
             return Response(request=req, status="404 Not Found",
