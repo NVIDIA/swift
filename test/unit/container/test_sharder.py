@@ -38,8 +38,7 @@ from swift.container import replicator
 from swift.container.backend import ContainerBroker, UNSHARDED, SHARDING, \
     SHARDED, DATADIR
 from swift.container.sharder import ContainerSharder, sharding_enabled, \
-    CleavingContext, DEFAULT_SHARD_SHRINK_POINT, \
-    DEFAULT_SHARD_CONTAINER_THRESHOLD, finalize_shrinking, \
+    CleavingContext, DEFAULT_SHARDER_CONF, finalize_shrinking, \
     find_shrinking_candidates, process_compactible_shard_sequences, \
     find_compactible_shard_sequences, is_shrinking_candidate, \
     is_sharding_candidate, find_paths, rank_paths
@@ -152,6 +151,7 @@ class TestSharder(BaseTestSharder):
                                  (k, v, getattr(sharder, k)))
             return sharder, mock_ic
 
+        # defaults
         expected = {
             'mount_check': True, 'bind_ip': '0.0.0.0', 'port': 6201,
             'per_diff': 1000, 'max_diffs': 100, 'interval': 30,
@@ -161,12 +161,12 @@ class TestSharder(BaseTestSharder):
             'rsync_compress': False,
             'rsync_module': '{replication_ip}::container',
             'reclaim_age': 86400 * 7,
-            'shard_shrink_point': 0.10,
-            'shrink_merge_point': 0.75,
             'shard_container_threshold': 1000000,
-            'split_size': 500000,
+            'rows_per_shard': 500000,
+            'shrink_threshold': 100000,
+            'expansion_limit': 750000,
             'cleave_batch_size': 2,
-            'scanner_batch_size': 10,
+            'shard_scanner_batch_size': 10,
             'rcache': '/var/cache/swift/container.recon',
             'shards_account_prefix': '.shards_',
             'auto_shard': False,
@@ -185,6 +185,7 @@ class TestSharder(BaseTestSharder):
             allow_modify_pipeline=False,
             use_replication_network=True)
 
+        # non-default
         conf = {
             'mount_check': False, 'bind_ip': '10.11.12.13', 'bind_port': 62010,
             'per_diff': 2000, 'max_diffs': 200, 'interval': 60,
@@ -220,12 +221,12 @@ class TestSharder(BaseTestSharder):
             'rsync_compress': True,
             'rsync_module': '{replication_ip}::container_sda',
             'reclaim_age': 86400 * 14,
-            'shard_shrink_point': 0.35,
-            'shrink_merge_point': 0.85,
             'shard_container_threshold': 20000000,
-            'split_size': 10000000,
+            'rows_per_shard': 10000000,
+            'shrink_threshold': 7000000,
+            'expansion_limit': 17000000,
             'cleave_batch_size': 4,
-            'scanner_batch_size': 8,
+            'shard_scanner_batch_size': 8,
             'rcache': '/var/cache/swift-alt/container.recon',
             'shards_account_prefix': '...shards_',
             'auto_shard': True,
@@ -4090,7 +4091,7 @@ class TestSharder(BaseTestSharder):
     def _check_old_style_find_shard_ranges_none_found(self, broker, objects):
         with self._mock_sharder() as sharder:
             num_found = sharder._find_shard_ranges(broker)
-        self.assertGreater(sharder.split_size, len(objects))
+        self.assertGreater(sharder.rows_per_shard, len(objects))
         self.assertEqual(0, num_found)
         self.assertFalse(broker.get_shard_ranges())
         expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
@@ -4102,7 +4103,7 @@ class TestSharder(BaseTestSharder):
         with self._mock_sharder(
                 conf={'shard_container_threshold': 200}) as sharder:
             num_found = sharder._find_shard_ranges(broker)
-        self.assertEqual(sharder.split_size, len(objects))
+        self.assertEqual(sharder.rows_per_shard, len(objects))
         self.assertEqual(0, num_found)
         self.assertFalse(broker.get_shard_ranges())
         expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
@@ -4143,7 +4144,7 @@ class TestSharder(BaseTestSharder):
                                 ) as sharder:
             with mock_timestamp_now() as now:
                 num_found = sharder._find_shard_ranges(broker)
-        self.assertEqual(99, sharder.split_size)
+        self.assertEqual(99, sharder.rows_per_shard)
         self.assertEqual(2, num_found)
         check_ranges()
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
@@ -4190,7 +4191,7 @@ class TestSharder(BaseTestSharder):
     def _check_find_shard_ranges_none_found(self, broker, objects):
         with self._mock_sharder() as sharder:
             num_found = sharder._find_shard_ranges(broker)
-        self.assertGreater(sharder.split_size, len(objects))
+        self.assertGreater(sharder.rows_per_shard, len(objects))
         self.assertEqual(0, num_found)
         self.assertFalse(broker.get_shard_ranges())
         expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
@@ -4202,7 +4203,7 @@ class TestSharder(BaseTestSharder):
         with self._mock_sharder(
                 conf={'shard_container_threshold': 200}) as sharder:
             num_found = sharder._find_shard_ranges(broker)
-        self.assertEqual(sharder.split_size, len(objects))
+        self.assertEqual(sharder.rows_per_shard, len(objects))
         self.assertEqual(0, num_found)
         self.assertFalse(broker.get_shard_ranges())
         expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
@@ -4242,7 +4243,7 @@ class TestSharder(BaseTestSharder):
                                 ) as sharder:
             with mock_timestamp_now() as now:
                 num_found = sharder._find_shard_ranges(broker)
-        self.assertEqual(99, sharder.split_size)
+        self.assertEqual(99, sharder.rows_per_shard)
         self.assertEqual(2, num_found)
         check_ranges()
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
@@ -4293,7 +4294,7 @@ class TestSharder(BaseTestSharder):
                       'shard_scanner_batch_size': 2}) as sharder:
             with mock_timestamp_now(now):
                 num_found = sharder._find_shard_ranges(broker)
-        self.assertEqual(45, sharder.split_size)
+        self.assertEqual(45, sharder.rows_per_shard)
         self.assertEqual(2, num_found)
         self.assertEqual(2, len(broker.get_shard_ranges()))
         self._assert_shard_ranges_equal(expected_ranges[:2],
@@ -5508,8 +5509,8 @@ class TestSharder(BaseTestSharder):
         broker = self._make_broker()
         broker.enable_sharding(next(self.ts_iter))
         shard_bounds = (('', 'here'), ('here', 'there'), ('there', ''))
-        size = (DEFAULT_SHARD_SHRINK_POINT *
-                DEFAULT_SHARD_CONTAINER_THRESHOLD / 100)
+        size = (DEFAULT_SHARDER_CONF['shard_shrink_point'] *
+                DEFAULT_SHARDER_CONF['shard_container_threshold'] / 100)
 
         # all shard ranges too big to shrink
         shard_ranges = self._make_shard_ranges(
@@ -5615,8 +5616,8 @@ class TestSharder(BaseTestSharder):
         broker.enable_sharding(next(self.ts_iter))
         shard_bounds = (('', 'a'), ('a', 'b'), ('b', 'c'),
                         ('c', 'd'), ('d', 'e'), ('e', ''))
-        size = (DEFAULT_SHARD_SHRINK_POINT *
-                DEFAULT_SHARD_CONTAINER_THRESHOLD / 100)
+        size = (DEFAULT_SHARDER_CONF['shard_shrink_point'] *
+                DEFAULT_SHARDER_CONF['shard_container_threshold'] / 100)
         shard_ranges = self._make_shard_ranges(
             shard_bounds, state=ShardRange.ACTIVE, object_count=size)
         own_sr = broker.get_own_shard_range()
@@ -5834,7 +5835,8 @@ class TestSharder(BaseTestSharder):
                 brokers.append(broker)
                 shard_ranges.append(self._make_shard_ranges(
                     shard_bounds, state=ShardRange.ACTIVE,
-                    object_count=(DEFAULT_SHARD_CONTAINER_THRESHOLD / 2),
+                    object_count=(
+                        DEFAULT_SHARDER_CONF['shard_container_threshold'] / 2),
                     timestamp=next(self.ts_iter)))
 
             # we want c2 to have 2 shrink pairs
@@ -5847,7 +5849,7 @@ class TestSharder(BaseTestSharder):
             # we want c1 to have the same, but one can't be shrunk
             shard_ranges[C1][1].object_count = 0
             shard_ranges[C1][2].object_count = \
-                DEFAULT_SHARD_CONTAINER_THRESHOLD - 1
+                DEFAULT_SHARDER_CONF['shard_container_threshold'] - 1
             shard_ranges[C1][3].object_count = 0
             brokers[C1].merge_shard_ranges(shard_ranges[C1])
             brokers[C1].set_sharding_state()
@@ -5925,7 +5927,8 @@ class TestSharder(BaseTestSharder):
             # and no longer appears in stats
             def shrink_actionable_ranges(broker):
                 compactible = find_compactible_shard_sequences(
-                    broker, sharder.shrink_size, sharder.merge_size, 1, -1)
+                    broker, sharder.rows_per_shard, sharder.expansion_limit,
+                    1, -1)
                 self.assertNotEqual([], compactible)
                 with mock_timestamp_now(next(self.ts_iter)):
                     process_compactible_shard_sequences(broker, compactible)
@@ -6494,8 +6497,8 @@ class TestSharderFunctions(BaseTestSharder):
     def test_find_shrinking_candidates(self):
         broker = self._make_broker()
         shard_bounds = (('', 'a'), ('a', 'b'), ('b', 'c'), ('c', 'd'))
-        threshold = (DEFAULT_SHARD_SHRINK_POINT *
-                     DEFAULT_SHARD_CONTAINER_THRESHOLD / 100)
+        threshold = (DEFAULT_SHARDER_CONF['shard_shrink_point'] *
+                     DEFAULT_SHARDER_CONF['shard_container_threshold'] / 100)
         shard_ranges = self._make_shard_ranges(
             shard_bounds, state=ShardRange.ACTIVE, object_count=threshold,
             timestamp=next(self.ts_iter))
