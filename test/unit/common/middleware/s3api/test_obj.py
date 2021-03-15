@@ -1748,21 +1748,28 @@ class TestS3ApiObj(S3ApiTestCase):
         })
 
     def test_cors_headers(self):
+        # note: Access-Control-Allow-Methods would normally be expected in
+        # response to an OPTIONS request but its included here in GET/PUT tests
+        # to check that it is always passed back in S3Response
         cors_headers = {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': ('GET, PUT, POST, COPY, '
                                              'DELETE, PUT, OPTIONS'),
-            'Access-Control-Expose-Headers': 'x-object-meta-test, etag',
+            'Access-Control-Expose-Headers':
+                'x-object-meta-test, x-object-meta-test=5funderscore, etag',
         }
+        get_resp_headers = self.response_headers
+        get_resp_headers['x-object-meta-test=5funderscore'] = 'underscored'
         self.swift.register(
             'GET', '/v1/AUTH_test/bucket/cors-object', swob.HTTPOk,
-            dict(self.response_headers, **cors_headers),
+            dict(get_resp_headers, **cors_headers),
             self.object_body)
         self.swift.register(
             'PUT', '/v1/AUTH_test/bucket/cors-object', swob.HTTPCreated,
             dict({'etag': self.etag,
                   'last-modified': self.last_modified,
-                  'x-object-meta-something': 'oh hai'},
+                  'x-object-meta-something': 'oh hai',
+                  'x-object-meta-test=5funderscore': 'underscored'},
                  **cors_headers),
             None)
 
@@ -1781,11 +1788,14 @@ class TestS3ApiObj(S3ApiTestCase):
         self.assertIn('Access-Control-Expose-Headers', headers)
         self.assertEqual(
             headers['Access-Control-Expose-Headers'],
-            'x-amz-meta-test, etag, x-amz-request-id, x-amz-id-2')
+            'x-amz-meta-test, x-amz-meta-test_underscore, etag, '
+            'x-amz-request-id, x-amz-id-2')
         self.assertIn('Access-Control-Allow-Methods', headers)
         self.assertEqual(
             headers['Access-Control-Allow-Methods'],
             'GET, PUT, POST, DELETE, PUT, OPTIONS')
+        self.assertIn('x-amz-meta-test_underscore', headers)
+        self.assertEqual('underscored', headers['x-amz-meta-test_underscore'])
 
         req = Request.blank(
             '/bucket/cors-object',
@@ -1802,11 +1812,13 @@ class TestS3ApiObj(S3ApiTestCase):
         self.assertIn('Access-Control-Expose-Headers', headers)
         self.assertEqual(
             headers['Access-Control-Expose-Headers'],
-            'x-amz-meta-test, etag, x-amz-request-id, x-amz-id-2')
+            'x-amz-meta-test, x-amz-meta-test_underscore, etag, '
+            'x-amz-request-id, x-amz-id-2')
         self.assertIn('Access-Control-Allow-Methods', headers)
         self.assertEqual(
             headers['Access-Control-Allow-Methods'],
             'GET, PUT, POST, DELETE, PUT, OPTIONS')
+        self.assertEqual('underscored', headers['x-amz-meta-test_underscore'])
 
 
 class TestS3ApiObjNonUTC(TestS3ApiObj):

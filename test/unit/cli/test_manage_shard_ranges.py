@@ -13,6 +13,8 @@
 import json
 import os
 import unittest
+from argparse import Namespace
+from textwrap import dedent
 
 import mock
 from shutil import rmtree
@@ -92,6 +94,168 @@ class TestManageShardRanges(unittest.TestCase):
         own_sr.update_state(ShardRange.SHARDED, epoch)
         broker.merge_shard_ranges([own_sr])
         return epoch
+
+    def test_conf_file_options(self):
+        db_file = os.path.join(self.testdir, 'hash.db')
+        broker = ContainerBroker(db_file, account='a', container='c')
+        broker.initialize()
+
+        conf = """
+        [container-sharder]
+        shard_shrink_point = 15
+        shard_shrink_merge_point = 65
+        shard_container_threshold = 1000
+        max_shrinking = 33
+        max_expanding = 31
+        """
+
+        conf_file = os.path.join(self.testdir, 'sharder.conf')
+        with open(conf_file, 'w') as fd:
+            fd.write(dedent(conf))
+
+        # default values
+        with mock.patch('swift.cli.manage_shard_ranges.find_ranges') as mocked:
+            main([db_file, 'find'])
+        expected = Namespace(conf_file=None,
+                             container_db=mock.ANY,
+                             func=mock.ANY,
+                             rows_per_shard=500000,
+                             subcommand='find',
+                             verbose=0)
+        mocked.assert_called_once_with(mock.ANY, expected)
+
+        # conf file
+        with mock.patch('swift.cli.manage_shard_ranges.find_ranges') as mocked:
+            main([db_file, '--config', conf_file, 'find'])
+        expected = Namespace(conf_file=conf_file,
+                             container_db=mock.ANY,
+                             func=mock.ANY,
+                             rows_per_shard=500,
+                             subcommand='find',
+                             verbose=0)
+        mocked.assert_called_once_with(mock.ANY, expected)
+
+        # cli options override conf file
+        with mock.patch('swift.cli.manage_shard_ranges.find_ranges') as mocked:
+            main([db_file, '--config', conf_file, 'find', '12345'])
+        expected = Namespace(conf_file=conf_file,
+                             container_db=mock.ANY,
+                             func=mock.ANY,
+                             rows_per_shard=12345,
+                             subcommand='find',
+                             verbose=0)
+        mocked.assert_called_once_with(mock.ANY, expected)
+
+        # default values
+        with mock.patch('swift.cli.manage_shard_ranges.compact_shard_ranges') \
+                as mocked:
+            main([db_file, 'compact'])
+        expected = Namespace(conf_file=None,
+                             container_db=mock.ANY,
+                             func=mock.ANY,
+                             subcommand='compact',
+                             verbose=0,
+                             max_expanding=-1,
+                             max_shrinking=1,
+                             shrink_threshold=100000,
+                             expansion_limit=500000,
+                             yes=False)
+        mocked.assert_called_once_with(mock.ANY, expected)
+
+        # conf file
+        with mock.patch('swift.cli.manage_shard_ranges.compact_shard_ranges') \
+                as mocked:
+            main([db_file, '--config', conf_file, 'compact'])
+        expected = Namespace(conf_file=conf_file,
+                             container_db=mock.ANY,
+                             func=mock.ANY,
+                             subcommand='compact',
+                             verbose=0,
+                             max_expanding=31,
+                             max_shrinking=33,
+                             shrink_threshold=150,
+                             expansion_limit=650,
+                             yes=False)
+        mocked.assert_called_once_with(mock.ANY, expected)
+
+        # conf file - small percentages resulting in zero absolute values
+        # should be respected rather than falling back to defaults, to avoid
+        # nasty surprises
+        conf = """
+        [container-sharder]
+        shard_shrink_point = 1
+        shard_shrink_merge_point = 2
+        shard_container_threshold = 10
+        max_shrinking = 33
+        max_expanding = 31
+        """
+        conf_file = os.path.join(self.testdir, 'sharder.conf')
+        with open(conf_file, 'w') as fd:
+            fd.write(dedent(conf))
+
+        with mock.patch('swift.cli.manage_shard_ranges.compact_shard_ranges') \
+                as mocked:
+            main([db_file, '--config', conf_file, 'compact'])
+        expected = Namespace(conf_file=conf_file,
+                             container_db=mock.ANY,
+                             func=mock.ANY,
+                             subcommand='compact',
+                             verbose=0,
+                             max_expanding=31,
+                             max_shrinking=33,
+                             shrink_threshold=0,
+                             expansion_limit=0,
+                             yes=False)
+        mocked.assert_called_once_with(mock.ANY, expected)
+
+        # cli options
+        with mock.patch('swift.cli.manage_shard_ranges.compact_shard_ranges') \
+                as mocked:
+            main([db_file, '--config', conf_file, 'compact',
+                  '--max-shrinking', '22',
+                  '--max-expanding', '11',
+                  '--expansion-limit', '3456',
+                  '--shrink-threshold', '1234'])
+        expected = Namespace(conf_file=conf_file,
+                             container_db=mock.ANY,
+                             func=mock.ANY,
+                             subcommand='compact',
+                             verbose=0,
+                             max_expanding=11,
+                             max_shrinking=22,
+                             shrink_threshold=1234,
+                             expansion_limit=3456,
+                             yes=False)
+        mocked.assert_called_once_with(mock.ANY, expected)
+
+        # conf file - invalid value for shard_container_threshold
+        conf = """
+        [container-sharder]
+        shard_shrink_point = 1
+        shard_shrink_merge_point = 2
+        shard_container_threshold = 0
+        max_shrinking = 33
+        max_expanding = 31
+        """
+        conf_file = os.path.join(self.testdir, 'sharder.conf')
+        with open(conf_file, 'w') as fd:
+            fd.write(dedent(conf))
+
+        out = StringIO()
+        err = StringIO()
+        with mock.patch('sys.stdout', out), mock.patch('sys.stderr', err):
+            main([db_file, '--config', conf_file, 'compact'])
+        err_lines = err.getvalue().split('\n')
+        self.assert_starts_with(err_lines[0], 'Error opening config file')
+
+        # conf file - cannot open conf file
+        conf_file = os.path.join(self.testdir, 'missing_sharder.conf')
+        out = StringIO()
+        err = StringIO()
+        with mock.patch('sys.stdout', out), mock.patch('sys.stderr', err):
+            main([db_file, '--config', conf_file, 'compact'])
+        err_lines = err.getvalue().split('\n')
+        self.assert_starts_with(err_lines[0], 'Error opening config file')
 
     def test_find_shard_ranges(self):
         db_file = os.path.join(self.testdir, 'hash.db')
@@ -529,16 +693,44 @@ class TestManageShardRanges(unittest.TestCase):
             err_lines = err.getvalue().split('\n')
             self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
             out_lines = out.getvalue().split('\n')
-            self.assertIn('total of 20 objects', out_lines[0])
-            self.assertIn('objects: 10', out_lines[1])
-            self.assertIn('state: active', out_lines[2])
-            self.assertIn('objects: 10', out_lines[3])
-            self.assertIn('state: active', out_lines[4])
-            self.assertIn('can be compacted into', out_lines[5])
-            self.assertIn('objects: 10', out_lines[6])
-            self.assertIn('state: active', out_lines[7])
-            broker_ranges = broker.get_shard_ranges()
-            return broker_ranges
+            expected = [
+                'Donor shard range(s) with total of 20 objects:',
+                "  '.shards_a",
+                "    objects:        10  lower: 'obj29'",
+                "      state:    active  upper: 'obj39'",
+                "  '.shards_a",
+                "    objects:        10  lower: 'obj39'",
+                "      state:    active  upper: 'obj49'",
+                'can be compacted into acceptor shard range:',
+                "  '.shards_a",
+                "    objects:    100001  lower: 'obj49'",
+                "      state:    active  upper: 'obj59'",
+                'Donor shard range(s) with total of 10 objects:',
+                "  '.shards_a",
+                "    objects:        10  lower: 'obj69'",
+                "      state:    active  upper: 'obj79'",
+                'can be compacted into acceptor shard range:',
+                "  '.shards_a",
+                "    objects:    100001  lower: 'obj79'",
+                "      state:    active  upper: 'obj89'",
+                'Once applied to the broker these changes will result in '
+                'shard range compaction the next time the sharder runs.',
+            ]
+            if user_input == 'y':
+                expected.extend([
+                    'Updated 2 shard sequences for compaction.',
+                    'Run container-replicator to replicate the changes to '
+                    'other nodes.',
+                    'Run container-sharder on all nodes to compact shards.',
+                    '',
+                ])
+            else:
+                expected.extend([
+                    'No changes applied',
+                    '',
+                ])
+            self.assertEqual(expected, [l.split('/', 1)[0] for l in out_lines])
+            return broker.get_shard_ranges()
 
         broker_ranges = do_compact('n')
         # expect no changes to shard ranges

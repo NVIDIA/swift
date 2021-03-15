@@ -49,11 +49,18 @@ class HeaderKeyDict(header_key_dict.HeaderKeyDict):
 def translate_swift_to_s3(key, val):
     _key = swob.bytes_to_wsgi(swob.wsgi_to_bytes(key).lower())
 
+    def translate_meta_key(_key):
+        if not _key.startswith('x-object-meta-'):
+            return _key
+        # Note that AWS allows user-defined metadata with underscores in the
+        # header, while WSGI (and other protocols derived from CGI) does not
+        # differentiate between an underscore and a dash. Fortunately,
+        # eventlet exposes the raw headers from the client, so we could
+        # translate '_' to '=5F' on the way in. Now, we translate back.
+        return 'x-amz-meta-' + _key[14:].replace('=5f', '_')
+
     if _key.startswith('x-object-meta-'):
-        # Note that AWS ignores user-defined headers with '=' in the
-        # header name. We translated underscores to '=5F' on the way
-        # in, though.
-        return 'x-amz-meta-' + _key[14:].replace('=5f', '_'), val
+        return translate_meta_key(_key), val
     elif _key in ('content-length', 'content-type',
                   'content-range', 'content-encoding',
                   'content-disposition', 'content-language',
@@ -74,9 +81,7 @@ def translate_swift_to_s3(key, val):
             'x-amz-id-2',
         ])
         return 'access-control-expose-headers', ', '.join(
-            'x-amz-meta-' + h[14:] if h.startswith('x-object-meta-') else h
-            for h in exposed_headers)
-
+            translate_meta_key(h) for h in exposed_headers)
     elif _key == 'access-control-allow-methods':
         methods = val.split(', ')
         try:
@@ -86,6 +91,7 @@ def translate_swift_to_s3(key, val):
         return key, ', '.join(methods)
     elif _key.startswith('access-control-'):
         return key, val
+    # else, drop the header
     return None
 
 

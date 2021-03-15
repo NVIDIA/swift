@@ -47,6 +47,10 @@ There are additional environment variables to exercise the S3 API:
 * ``S3_USER``
 * ``S3_KEY``
 
+.. note::
+   It is necessary to set `s3_acl = False` in the `[filter:s3api]` section of
+   your `proxy-server.conf` for all the s3 object tests to pass.
+
 ..
    TODO: verify that this works with Keystone
 
@@ -114,5 +118,5 @@ covers the S3 service. The current version used is 2.829.0, built on
 * clearing all services,
 * explicitly adding AWS.S3,
 * clicking "Build" to download,
-* saving in the ``test/cors/vendored`` directory, and finally
+* saving in the ``test/cors/vendor`` directory, and finally
 * updating the version number in ``test/cors/test-s3*.js``.

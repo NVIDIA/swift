@@ -31,13 +31,14 @@ import uuid
 from six.moves import cStringIO as StringIO
 
 from swift.cli import relinker
-from swift.common import exceptions, ring, utils
+from swift.common import ring, utils
 from swift.common import storage_policy
 from swift.common.exceptions import PathNotDir
 from swift.common.storage_policy import (
     StoragePolicy, StoragePolicyCollection, POLICIES, ECStoragePolicy)
 
-from swift.obj.diskfile import write_metadata, DiskFileRouter, DiskFileManager
+from swift.obj.diskfile import write_metadata, DiskFileRouter, \
+    DiskFileManager, relink_paths
 
 from test.unit import FakeLogger, skip_if_no_xattrs, DEFAULT_TEST_EC_TYPE, \
     patch_policies
@@ -80,7 +81,7 @@ class TestRelinker(unittest.TestCase):
             digest = binascii.unhexlify(self._hash)
             self.part = struct.unpack_from('>I', digest)[0] >> 24
             self.next_part = struct.unpack_from('>I', digest)[0] >> 23
-            path = os.path.join(os.path.sep, account, container, obj)
+            self.obj_path = os.path.join(os.path.sep, account, container, obj)
             # There's 1/512 chance that both old and new parts will be 0;
             # that's not a terribly interesting case, as there's nothing to do
             attempts.append((self.part, self.next_part, 2**PART_POWER))
@@ -96,21 +97,23 @@ class TestRelinker(unittest.TestCase):
         self.objdir = os.path.join(
             self.objects, str(self.part), self._hash[-3:], self._hash)
         os.makedirs(self.objdir)
-        self.object_fname = utils.Timestamp.now().internal + ".data"
+        self.obj_ts = utils.Timestamp.now()
+        self.object_fname = self.obj_ts.internal + ".data"
 
         self.objname = os.path.join(self.objdir, self.object_fname)
         with open(self.objname, "wb") as dummy:
             dummy.write(b"Hello World!")
-            write_metadata(dummy, {'name': path, 'Content-Length': '12'})
+            write_metadata(dummy,
+                           {'name': self.obj_path, 'Content-Length': '12'})
 
         self.policy = StoragePolicy(0, 'platinum', True)
         storage_policy._POLICIES = StoragePolicyCollection([self.policy])
 
         self.part_dir = os.path.join(self.objects, str(self.part))
-        self.suffix_dir = os.path.join(self.part_dir, self._hash[-3:])
+        self.suffix = self._hash[-3:]
+        self.suffix_dir = os.path.join(self.part_dir, self.suffix)
         self.next_part_dir = os.path.join(self.objects, str(self.next_part))
-        self.next_suffix_dir = os.path.join(
-            self.next_part_dir, self._hash[-3:])
+        self.next_suffix_dir = os.path.join(self.next_part_dir, self.suffix)
         self.expected_dir = os.path.join(self.next_suffix_dir, self._hash)
         self.expected_file = os.path.join(self.expected_dir, self.object_fname)
 
@@ -424,6 +427,58 @@ class TestRelinker(unittest.TestCase):
         self.assertFalse(os.path.exists(
             os.path.join(self.part_dir, 'hashes.invalid')))
 
+    def test_relink_link_already_exists(self):
+        self.rb.prepare_increase_partition_power()
+        self._save_ring()
+        orig_relink_paths = relink_paths
+
+        def mock_relink_paths(target_path, new_target_path):
+            # pretend another process has created the link before this one
+            os.makedirs(self.expected_dir)
+            os.link(target_path, new_target_path)
+            orig_relink_paths(target_path, new_target_path)
+
+        with mock.patch('swift.cli.relinker.diskfile.relink_paths',
+                        mock_relink_paths):
+            self.assertEqual(0, relinker.main([
+                'relink',
+                '--swift-dir', self.testdir,
+                '--devices', self.devices,
+                '--skip-mount',
+            ]))
+
+        self.assertTrue(os.path.isdir(self.expected_dir))
+        self.assertTrue(os.path.isfile(self.expected_file))
+        stat_old = os.stat(os.path.join(self.objdir, self.object_fname))
+        stat_new = os.stat(self.expected_file)
+        self.assertEqual(stat_old.st_ino, stat_new.st_ino)
+
+    def test_relink_link_target_disappears(self):
+        # we need object name in lower half of current part so that there is no
+        # rehash of the new partition which wold erase the empty new partition
+        # - we want to assert it was created
+        self._setup_object(lambda part: part < 2 ** (PART_POWER - 1))
+        self.rb.prepare_increase_partition_power()
+        self._save_ring()
+        orig_relink_paths = relink_paths
+
+        def mock_relink_paths(target_path, new_target_path):
+            # pretend another process has cleaned up the target path
+            os.unlink(target_path)
+            orig_relink_paths(target_path, new_target_path)
+
+        with mock.patch('swift.cli.relinker.diskfile.relink_paths',
+                        mock_relink_paths):
+            self.assertEqual(0, relinker.main([
+                'relink',
+                '--swift-dir', self.testdir,
+                '--devices', self.devices,
+                '--skip-mount',
+            ]))
+
+        self.assertTrue(os.path.isdir(self.expected_dir))
+        self.assertFalse(os.path.isfile(self.expected_file))
+
     def test_relink_no_applicable_policy(self):
         # NB do not prepare part power increase
         self._save_ring()
@@ -546,7 +601,7 @@ class TestRelinker(unittest.TestCase):
         # partition!
         self._setup_object(lambda part: part < 2 ** (PART_POWER - 1))
         with mock.patch('swift.cli.relinker.replace_partition_in_path',
-                        lambda *args: args[0]):
+                        lambda *args, **kwargs: args[0]):
             self.assertEqual(0, relinker.main([
                 'cleanup',
                 '--swift-dir', self.testdir,
@@ -558,11 +613,11 @@ class TestRelinker(unittest.TestCase):
     def test_cleanup_second_quartile_no_rehash(self):
         # we need a part in upper half of current part power
         self._setup_object(lambda part: part >= 2 ** (PART_POWER - 1))
-        self.assertGreater(self.part, 2 ** (PART_POWER - 1))
+        self.assertGreaterEqual(self.part, 2 ** (PART_POWER - 1))
         self._common_test_cleanup()
 
         def fake_hash_suffix(suffix_dir, policy):
-            # check that the suffix dir is empty and remove it just like the
+            # check that the hash dir is empty and remove it just like the
             # real _hash_suffix
             self.assertEqual([self._hash], os.listdir(suffix_dir))
             hash_dir = os.path.join(suffix_dir, self._hash)
@@ -794,9 +849,12 @@ class TestRelinker(unittest.TestCase):
                               'mount_check': False}, self.logger)[pol]
 
         # Ack partition 96
-        relinker.hook_post_partition(states, relinker.STEP_RELINK, pol, mgr,
+        relinker.hook_post_partition(self.logger, states,
+                                     relinker.STEP_RELINK, pol, mgr,
                                      os.path.join(datadir_path, '96'))
         self.assertEqual(states["state"], {'96': True, '227': False})
+        self.assertIn("Device: sda1 Step: relink Partitions: 1/2",
+                      self.logger.get_lines_for_level("info"))
         with open(state_file, 'rt') as f:
             self.assertEqual(json.load(f), {
                 "part_power": PART_POWER,
@@ -810,8 +868,11 @@ class TestRelinker(unittest.TestCase):
         self.assertEqual(states["state"], {'96': True, '227': False})
 
         # Ack partition 227
-        relinker.hook_post_partition(states, relinker.STEP_RELINK, pol, mgr,
-                                     os.path.join(datadir_path, '227'))
+        relinker.hook_post_partition(
+            self.logger, states, relinker.STEP_RELINK, pol,
+            mgr, os.path.join(datadir_path, '227'))
+        self.assertIn("Device: sda1 Step: relink Partitions: 2/2",
+                      self.logger.get_lines_for_level("info"))
         self.assertEqual(states["state"], {'96': True, '227': True})
         with open(state_file, 'rt') as f:
             self.assertEqual(json.load(f), {
@@ -852,8 +913,11 @@ class TestRelinker(unittest.TestCase):
                          call_partition_filter(PART_POWER + 1, PART_POWER + 1,
                                                ['96', '227', '312']))
         # Ack partition 227
-        relinker.hook_post_partition(states, relinker.STEP_CLEANUP, pol, mgr,
-                                     os.path.join(datadir_path, '227'))
+        relinker.hook_post_partition(
+            self.logger, states, relinker.STEP_CLEANUP, pol, mgr,
+            os.path.join(datadir_path, '227'))
+        self.assertIn("Device: sda1 Step: cleanup Partitions: 1/2",
+                      self.logger.get_lines_for_level("info"))
         self.assertEqual(states["state"],
                          {'96': False, '227': True})
         with open(state_file, 'rt') as f:
@@ -871,8 +935,11 @@ class TestRelinker(unittest.TestCase):
                          {'96': False, '227': True})
 
         # Ack partition 96
-        relinker.hook_post_partition(states, relinker.STEP_CLEANUP, pol, mgr,
+        relinker.hook_post_partition(self.logger, states,
+                                     relinker.STEP_CLEANUP, pol, mgr,
                                      os.path.join(datadir_path, '96'))
+        self.assertIn("Device: sda1 Step: cleanup Partitions: 2/2",
+                      self.logger.get_lines_for_level("info"))
         self.assertEqual(states["state"],
                          {'96': True, '227': True})
         with open(state_file, 'rt') as f:
@@ -918,22 +985,134 @@ class TestRelinker(unittest.TestCase):
         self.assertFalse(os.path.exists(state_file))
         os.close(locks[0])  # Release the lock
 
-    def test_cleanup_not_yet_relinked(self):
-        self._common_test_cleanup(relink=False)
-        self.assertEqual(1, relinker.main([
-            'cleanup',
-            '--swift-dir', self.testdir,
-            '--devices', self.devices,
-            '--skip-mount',
-        ]))
+    def test_cleanup_relinked_ok(self):
+        self._common_test_cleanup()
+        with mock.patch.object(relinker.logging, 'getLogger',
+                               return_value=self.logger):
+            self.assertEqual(0, relinker.main([
+                'cleanup',
+                '--swift-dir', self.testdir,
+                '--devices', self.devices,
+                '--skip-mount',
+            ]))
 
-        self.assertTrue(os.path.isfile(
-            os.path.join(self.objdir, self.object_fname)))
+        self.assertTrue(os.path.isfile(self.expected_file))  # link intact
+        self.assertEqual([], self.logger.get_lines_for_level('warning'))
+        # old partition should be cleaned up
+        self.assertFalse(os.path.exists(self.part_dir))
+
+    def test_cleanup_not_yet_relinked(self):
+        # force rehash of new partition to not happen during cleanup
+        self._setup_object(lambda part: part >= 2 ** (PART_POWER - 1))
+        self._common_test_cleanup(relink=False)
+        with mock.patch.object(relinker.logging, 'getLogger',
+                               return_value=self.logger):
+            self.assertEqual(0, relinker.main([
+                'cleanup',
+                '--swift-dir', self.testdir,
+                '--devices', self.devices,
+                '--skip-mount',
+            ]))
+
+        self.assertTrue(os.path.isfile(self.expected_file))  # link created
+        # old partition should be cleaned up
+        self.assertFalse(os.path.exists(self.part_dir))
+        self.assertEqual([], self.logger.get_lines_for_level('warning'))
+        self.assertIn(
+            'Relinking (cleanup) created link: %s to %s'
+            % (self.objname, self.expected_file),
+            self.logger.get_lines_for_level('debug'))
+        # suffix should be invalidated in new partition
+        hashes_invalid = os.path.join(self.next_part_dir, 'hashes.invalid')
+        self.assertTrue(os.path.exists(hashes_invalid))
+        with open(hashes_invalid, 'r') as fd:
+            self.assertEqual(str(self.suffix), fd.read().strip())
+
+    def test_cleanup_same_object_different_inode_in_new_partition(self):
+        # force rehash of new partition to not happen during cleanup
+        self._setup_object(lambda part: part >= 2 ** (PART_POWER - 1))
+        self._common_test_cleanup(relink=False)
+        # new file in the new partition but different inode
+        os.makedirs(self.expected_dir)
+        with open(self.expected_file, 'w') as fd:
+            fd.write('same but different')
+
+        with mock.patch.object(relinker.logging, 'getLogger',
+                               return_value=self.logger):
+            res = relinker.main([
+                'cleanup',
+                '--swift-dir', self.testdir,
+                '--devices', self.devices,
+                '--skip-mount',
+            ])
+
+        self.assertEqual(1, res)
+        self.assertTrue(os.path.isfile(self.objname))
+        with open(self.objname, 'r') as fd:
+            self.assertEqual('Hello World!', fd.read())
+        self.assertTrue(os.path.isfile(self.expected_file))
+        with open(self.expected_file, 'r') as fd:
+            self.assertEqual('same but different', fd.read())
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warning_lines), warning_lines)
+        self.assertIn('Error relinking (cleanup): failed to relink %s to %s'
+                      % (self.objname, self.expected_file), warning_lines[0])
+        # suffix should not be invalidated in new partition
+        hashes_invalid = os.path.join(self.next_part_dir, 'hashes.invalid')
+        self.assertFalse(os.path.exists(hashes_invalid))
+
+    def test_cleanup_older_object_in_new_partition(self):
+        # relink of the current object failed, but there is an older version of
+        # same object in the new partition
+        # force rehash of new partition to not happen during cleanup
+        self._setup_object(lambda part: part >= 2 ** (PART_POWER - 1))
+        self._common_test_cleanup(relink=False)
+        os.makedirs(self.expected_dir)
+        older_obj_file = os.path.join(
+            self.expected_dir,
+            utils.Timestamp(int(self.obj_ts) - 1).internal + '.data')
+        with open(older_obj_file, "wb") as fd:
+            fd.write(b"Hello Olde Worlde!")
+            write_metadata(fd, {'name': self.obj_path, 'Content-Length': '18'})
+
+        with mock.patch.object(relinker.logging, 'getLogger',
+                               return_value=self.logger):
+            res = relinker.main([
+                'cleanup',
+                '--swift-dir', self.testdir,
+                '--devices', self.devices,
+                '--skip-mount',
+            ])
+
+        self.assertEqual(0, res)
+        # old partition should be cleaned up
+        self.assertFalse(os.path.exists(self.part_dir))
+        self.assertTrue(os.path.isfile(older_obj_file))  # older file intact
+        self.assertTrue(os.path.isfile(self.expected_file))  # link created
+        self.assertIn(
+            'Relinking (cleanup) created link: %s to %s'
+            % (self.objname, self.expected_file),
+            self.logger.get_lines_for_level('debug'))
+        self.assertEqual([], self.logger.get_lines_for_level('warning'))
+        # suffix should be invalidated in new partition
+        hashes_invalid = os.path.join(self.next_part_dir, 'hashes.invalid')
+        self.assertTrue(os.path.exists(hashes_invalid))
+        with open(hashes_invalid, 'r') as fd:
+            self.assertEqual(str(self.suffix), fd.read().strip())
 
     def test_cleanup_deleted(self):
+        # force rehash of new partition to not happen during cleanup
+        self._setup_object(lambda part: part >= 2 ** (PART_POWER - 1))
         self._common_test_cleanup()
+        # rehash during relink creates hashes.invalid...
+        hashes_invalid = os.path.join(self.next_part_dir, 'hashes.invalid')
+        self.assertTrue(os.path.exists(hashes_invalid))
 
-        # Pretend the object got deleted inbetween and there is a tombstone
+        # Pretend the object got deleted in between and there is a tombstone
+        # note: the tombstone would normally be at a newer timestamp but here
+        # we make the tombstone at same timestamp - it  is treated as the
+        # 'required' file in the new partition, so the .data is deleted in the
+        # old partition
         fname_ts = self.expected_file[:-4] + "ts"
         os.rename(self.expected_file, fname_ts)
 
@@ -943,24 +1122,159 @@ class TestRelinker(unittest.TestCase):
             '--devices', self.devices,
             '--skip-mount',
         ]))
+        self.assertTrue(os.path.isfile(fname_ts))
+        # old partition should be cleaned up
+        self.assertFalse(os.path.exists(self.part_dir))
+        # suffix should not be invalidated in new partition
+        self.assertTrue(os.path.exists(hashes_invalid))
+        with open(hashes_invalid, 'r') as fd:
+            self.assertEqual('', fd.read().strip())
 
-    def test_cleanup_doesnotexist(self):
+    def test_cleanup_reapable(self):
+        # relink a tombstone
+        fname_ts = self.objname[:-4] + "ts"
+        os.rename(self.objname, fname_ts)
+        self.objname = fname_ts
+        self.expected_file = self.expected_file[:-4] + "ts"
         self._common_test_cleanup()
-
-        # Pretend the file in the new place got deleted inbetween
-        os.remove(self.expected_file)
+        self.assertTrue(os.path.exists(self.expected_file))  # sanity check
 
         with mock.patch.object(relinker.logging, 'getLogger',
-                               return_value=self.logger):
-            self.assertEqual(1, relinker.main([
+                               return_value=self.logger), \
+                mock.patch('time.time', return_value=1e11):  # far, far future
+            self.assertEqual(0, relinker.main([
                 'cleanup',
                 '--swift-dir', self.testdir,
                 '--devices', self.devices,
                 '--skip-mount',
             ]))
-        self.assertEqual(self.logger.get_lines_for_level('warning'),
-                         ['Error cleaning up %s: %s' % (self.objname,
-                          repr(exceptions.DiskFileNotExist()))])
+        self.assertEqual(self.logger.get_lines_for_level('error'), [])
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+        # reclaimed during relinker cleanup...
+        self.assertFalse(os.path.exists(self.objname))
+        # reclaimed during relinker relink or relinker cleanup, depending on
+        # which quartile the partition is in ...
+        self.assertFalse(os.path.exists(self.expected_file))
+
+    def test_cleanup_new_does_not_exist(self):
+        self._common_test_cleanup()
+        # Pretend the file in the new place got deleted in between relink and
+        # cleanup: cleanup should re-create the link
+        os.remove(self.expected_file)
+
+        with mock.patch.object(relinker.logging, 'getLogger',
+                               return_value=self.logger):
+            self.assertEqual(0, relinker.main([
+                'cleanup',
+                '--swift-dir', self.testdir,
+                '--devices', self.devices,
+                '--skip-mount',
+            ]))
+        self.assertTrue(os.path.isfile(self.expected_file))  # link created
+        # old partition should be cleaned up
+        self.assertFalse(os.path.exists(self.part_dir))
+        self.assertIn(
+            'Relinking (cleanup) created link: %s to %s'
+            % (self.objname, self.expected_file),
+            self.logger.get_lines_for_level('debug'))
+        self.assertEqual([], self.logger.get_lines_for_level('warning'))
+
+    def test_cleanup_new_does_not_exist_and_relink_fails(self):
+        # force rehash of new partition to not happen during cleanup
+        self._setup_object(lambda part: part >= 2 ** (PART_POWER - 1))
+        self._common_test_cleanup()
+        # rehash during relink creates hashes.invalid...
+        hashes_invalid = os.path.join(self.next_part_dir, 'hashes.invalid')
+        self.assertTrue(os.path.exists(hashes_invalid))
+        # Pretend the file in the new place got deleted in between relink and
+        # cleanup: cleanup attempts to re-create the link but fails
+        os.remove(self.expected_file)
+
+        with mock.patch('swift.obj.diskfile.os.link', side_effect=OSError):
+            with mock.patch.object(relinker.logging, 'getLogger',
+                                   return_value=self.logger):
+                self.assertEqual(1, relinker.main([
+                    'cleanup',
+                    '--swift-dir', self.testdir,
+                    '--devices', self.devices,
+                    '--skip-mount',
+                ]))
+        self.assertFalse(os.path.isfile(self.expected_file))
+        self.assertTrue(os.path.isfile(self.objname))  # old file intact
+        self.assertEqual(
+            ['Error relinking (cleanup): failed to relink %s to %s: '
+             % (self.objname, self.expected_file)],
+            self.logger.get_lines_for_level('warning'),
+        )
+        # suffix should not be invalidated in new partition
+        self.assertTrue(os.path.exists(hashes_invalid))
+        with open(hashes_invalid, 'r') as fd:
+            self.assertEqual('', fd.read().strip())
+        # nor in the old partition
+        old_hashes_invalid = os.path.join(self.part_dir, 'hashes.invalid')
+        self.assertFalse(os.path.exists(old_hashes_invalid))
+
+    def test_cleanup_remove_fails(self):
+        meta_file = utils.Timestamp(int(self.obj_ts) + 1).internal + '.meta'
+        old_meta_path = os.path.join(self.objdir, meta_file)
+        new_meta_path = os.path.join(self.expected_dir, meta_file)
+
+        with open(old_meta_path, 'w') as fd:
+            fd.write('unexpected file in old partition')
+        self._common_test_cleanup()
+
+        calls = []
+        orig_remove = os.remove
+
+        def mock_remove(path, *args, **kwargs):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError
+            return orig_remove(path)
+
+        with mock.patch('swift.obj.diskfile.os.remove', mock_remove):
+            with mock.patch.object(relinker.logging, 'getLogger',
+                                   return_value=self.logger):
+                self.assertEqual(1, relinker.main([
+                    'cleanup',
+                    '--swift-dir', self.testdir,
+                    '--devices', self.devices,
+                    '--skip-mount',
+                ]))
+        self.assertEqual([old_meta_path, self.objname], calls)
+        self.assertTrue(os.path.isfile(self.expected_file))  # new file intact
+        self.assertTrue(os.path.isfile(new_meta_path))  # new file intact
+        self.assertFalse(os.path.isfile(self.objname))  # old file removed
+        self.assertTrue(os.path.isfile(old_meta_path))  # meta file remove fail
+        self.assertEqual(
+            ['Error cleaning up %s: OSError()' % old_meta_path],
+            self.logger.get_lines_for_level('warning'),
+        )
+
+    def test_cleanup_two_files_need_linking(self):
+        meta_file = utils.Timestamp(int(self.obj_ts) + 1).internal + '.meta'
+        old_meta_path = os.path.join(self.objdir, meta_file)
+        new_meta_path = os.path.join(self.expected_dir, meta_file)
+
+        with open(old_meta_path, 'w') as fd:
+            fd.write('unexpected file in old partition')
+        self._common_test_cleanup(relink=False)
+        self.assertFalse(os.path.isfile(self.expected_file))  # link missing
+        self.assertFalse(os.path.isfile(new_meta_path))  # link missing
+
+        with mock.patch.object(relinker.logging, 'getLogger',
+                               return_value=self.logger):
+            self.assertEqual(0, relinker.main([
+                'cleanup',
+                '--swift-dir', self.testdir,
+                '--devices', self.devices,
+                '--skip-mount',
+            ]))
+        self.assertTrue(os.path.isfile(self.expected_file))  # new file created
+        self.assertTrue(os.path.isfile(new_meta_path))  # new file created
+        self.assertFalse(os.path.isfile(self.objname))  # old file removed
+        self.assertFalse(os.path.isfile(old_meta_path))  # meta file removed
+        self.assertEqual([], self.logger.get_lines_for_level('warning'))
 
     @patch_policies(
         [ECStoragePolicy(
@@ -968,8 +1282,9 @@ class TestRelinker(unittest.TestCase):
          ec_ndata=4, ec_nparity=2)])
     def test_cleanup_diskfile_error(self):
         self._common_test_cleanup()
-
-        # Switch the policy type so all fragments raise DiskFileError.
+        # Switch the policy type so all fragments raise DiskFileError: they
+        # are included in the diskfile data as 'unexpected' files and cleanup
+        # should include them
         with mock.patch.object(relinker.logging, 'getLogger',
                                return_value=self.logger):
             self.assertEqual(0, relinker.main([
@@ -979,34 +1294,49 @@ class TestRelinker(unittest.TestCase):
                 '--skip-mount',
             ]))
         log_lines = self.logger.get_lines_for_level('warning')
-        self.assertEqual(2, len(log_lines),
-                         'Expected 2 log lines, got %r' % log_lines)
-        # Once for the cleanup...
-        self.assertIn('Bad fragment index: None', log_lines[0])
-        # ... then again for the rehash
-        self.assertIn('Bad fragment index: None', log_lines[1])
+        # once for cleanup_ondisk_files in old and new location, once for
+        # get_ondisk_files of union of files, once for the rehash of the new
+        # partition
+        self.assertEqual(4, len(log_lines),
+                         'Expected 4 log lines, got %r' % log_lines)
+        for line in log_lines:
+            self.assertIn('Bad fragment index: None', line, log_lines)
+        self.assertTrue(os.path.isfile(self.expected_file))  # new file intact
+        # old partition should be cleaned up
+        self.assertFalse(os.path.exists(self.part_dir))
 
-    def test_cleanup_quarantined(self):
-        self._common_test_cleanup()
-        # Pretend the object in the new place got corrupted
-        with open(self.expected_file, "wb") as obj:
-            obj.write(b'trash')
-
+    @patch_policies(
+        [ECStoragePolicy(
+            0, name='platinum', is_default=True, ec_type=DEFAULT_TEST_EC_TYPE,
+            ec_ndata=4, ec_nparity=2)])
+    def test_cleanup_diskfile_error_new_file_missing(self):
+        self._common_test_cleanup(relink=False)
+        # Switch the policy type so all fragments raise DiskFileError: they
+        # are included in the diskfile data as 'unexpected' files and cleanup
+        # should include them
         with mock.patch.object(relinker.logging, 'getLogger',
                                return_value=self.logger):
-            self.assertEqual(1, relinker.main([
+            self.assertEqual(0, relinker.main([
                 'cleanup',
                 '--swift-dir', self.testdir,
                 '--devices', self.devices,
                 '--skip-mount',
             ]))
-
-        log_lines = self.logger.get_lines_for_level('warning')
-        self.assertEqual(2, len(log_lines),
-                         'Expected 2 log lines, got %r' % log_lines)
-        self.assertIn('metadata content-length 12 does not match '
-                      'actual object size 5', log_lines[0])
-        self.assertIn('failed audit and was quarantined', log_lines[1])
+        warning_lines = self.logger.get_lines_for_level('warning')
+        # once for cleanup_ondisk_files in old and once once for the
+        # get_ondisk_files of union of files; the new partition did not exist
+        # at start of cleanup so is not rehashed
+        self.assertEqual(2, len(warning_lines),
+                         'Expected 2 log lines, got %r' % warning_lines)
+        for line in warning_lines:
+            self.assertIn('Bad fragment index: None', line, warning_lines)
+        self.assertIn(
+            'Relinking (cleanup) created link: %s to %s'
+            % (self.objname, self.expected_file),
+            self.logger.get_lines_for_level('debug'))
+        self.assertTrue(os.path.isfile(self.expected_file))  # new file intact
+        # old partition should be cleaned up
+        self.assertFalse(os.path.exists(self.part_dir))
 
     def test_rehashing(self):
         calls = []

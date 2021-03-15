@@ -160,7 +160,7 @@ class TestSharder(BaseTestSharder):
             'rsync_compress': False,
             'rsync_module': '{replication_ip}::container',
             'reclaim_age': 86400 * 7,
-            'shard_shrink_point': 0.25,
+            'shard_shrink_point': 0.10,
             'shrink_merge_point': 0.75,
             'shard_container_threshold': 1000000,
             'split_size': 500000,
@@ -172,7 +172,9 @@ class TestSharder(BaseTestSharder):
             'recon_candidates_limit': 5,
             'recon_sharded_timeout': 43200,
             'shard_replication_quorum': 2,
-            'existing_shard_replication_quorum': 2
+            'existing_shard_replication_quorum': 2,
+            'max_shrinking': 1,
+            'max_expanding': -1
         }
         sharder, mock_ic = do_test({}, expected, logger=None)
         self.assertEqual(
@@ -204,7 +206,9 @@ class TestSharder(BaseTestSharder):
             'recon_candidates_limit': 10,
             'recon_sharded_timeout': 7200,
             'shard_replication_quorum': 1,
-            'existing_shard_replication_quorum': 0
+            'existing_shard_replication_quorum': 0,
+            'max_shrinking': 5,
+            'max_expanding': 4
         }
         expected = {
             'mount_check': False, 'bind_ip': '10.11.12.13', 'port': 62010,
@@ -227,7 +231,9 @@ class TestSharder(BaseTestSharder):
             'recon_candidates_limit': 10,
             'recon_sharded_timeout': 7200,
             'shard_replication_quorum': 1,
-            'existing_shard_replication_quorum': 0
+            'existing_shard_replication_quorum': 0,
+            'max_shrinking': 5,
+            'max_expanding': 4
         }
         sharder, mock_ic = do_test(conf, expected)
         mock_ic.assert_called_once_with(
@@ -262,13 +268,11 @@ class TestSharder(BaseTestSharder):
             do_test({'shard_shrink_point': 101}, {})
         self.assertIn(
             'greater than 0, less than 100, not "101"', str(cm.exception))
-        self.assertIn('shard_shrink_point', str(cm.exception))
 
         with self.assertRaises(ValueError) as cm:
             do_test({'shard_shrink_merge_point': 101}, {})
         self.assertIn(
             'greater than 0, less than 100, not "101"', str(cm.exception))
-        self.assertIn('shard_shrink_merge_point', str(cm.exception))
 
     def test_init_internal_client_conf_loading_error(self):
         with mock.patch('swift.common.db_replicator.ring.Ring') \
@@ -804,6 +808,29 @@ class TestSharder(BaseTestSharder):
                          'error': None}]}
             self._assert_stats(
                 expected_in_progress_stats, sharder, 'sharding_in_progress')
+
+    def test_one_shard_cycle_no_containers(self):
+        conf = {'recon_cache_path': self.tempdir,
+                'devices': self.tempdir,
+                'mount_check': False}
+
+        with self._mock_sharder(conf) as sharder:
+            for dev in sharder.ring.devs:
+                os.mkdir(os.path.join(self.tempdir, dev['device']))
+            with mock.patch('swift.container.sharder.is_local_device',
+                            return_value=True):
+                sharder._one_shard_cycle(Everything(), Everything())
+        self.assertEqual([], sharder.logger.get_lines_for_level('warning'))
+        self.assertIn('Found no containers directories',
+                      sharder.logger.get_lines_for_level('info'))
+        with self._mock_sharder(conf) as sharder:
+            os.mkdir(os.path.join(self.tempdir, dev['device'], 'containers'))
+            with mock.patch('swift.container.sharder.is_local_device',
+                            return_value=True):
+                sharder._one_shard_cycle(Everything(), Everything())
+        self.assertEqual([], sharder.logger.get_lines_for_level('warning'))
+        self.assertNotIn('Found no containers directories',
+                         sharder.logger.get_lines_for_level('info'))
 
     def test_ratelimited_roundrobin(self):
         n_databases = 100

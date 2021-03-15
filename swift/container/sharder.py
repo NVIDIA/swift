@@ -35,9 +35,8 @@ from swift.common.ring.utils import is_local_device
 from swift.common.swob import str_to_wsgi
 from swift.common.utils import get_logger, config_true_value, \
     dump_recon_cache, whataremyips, Timestamp, ShardRange, GreenAsyncPile, \
-    config_float_value, config_positive_int_value, \
-    quorum_size, parse_override_options, Everything, config_auto_int_value, \
-    ShardRangeList
+    config_positive_int_value, quorum_size, parse_override_options, \
+    Everything, config_auto_int_value, ShardRangeList, config_percent_value
 from swift.container.backend import ContainerBroker, \
     RECORD_TYPE_SHARD, UNSHARDED, SHARDING, SHARDED, COLLAPSED, \
     SHARD_UPDATE_STATES
@@ -517,8 +516,10 @@ class CleavingContext(object):
 
 
 DEFAULT_SHARD_CONTAINER_THRESHOLD = 1000000
-DEFAULT_SHARD_SHRINK_POINT = 25
+DEFAULT_SHARD_SHRINK_POINT = 10
 DEFAULT_SHARD_MERGE_POINT = 75
+DEFAULT_MAX_SHRINKING = 1
+DEFAULT_MAX_EXPANDING = -1
 
 
 class ContainerSharder(ContainerReplicator):
@@ -539,18 +540,10 @@ class ContainerSharder(ContainerReplicator):
         else:
             auto_create_account_prefix = AUTO_CREATE_ACCOUNT_PREFIX
         self.shards_account_prefix = (auto_create_account_prefix + 'shards_')
-
-        def percent_value(key, default):
-            try:
-                value = conf.get(key, default)
-                return config_float_value(value, 0, 100) / 100.0
-            except ValueError as err:
-                raise ValueError("%s: %s" % (str(err), key))
-
-        self.shard_shrink_point = percent_value('shard_shrink_point',
-                                                DEFAULT_SHARD_SHRINK_POINT)
-        self.shrink_merge_point = percent_value('shard_shrink_merge_point',
-                                                DEFAULT_SHARD_MERGE_POINT)
+        self.shard_shrink_point = config_percent_value(
+            conf.get('shard_shrink_point', DEFAULT_SHARD_SHRINK_POINT))
+        self.shrink_merge_point = config_percent_value(
+            conf.get('shard_shrink_merge_point', DEFAULT_SHARD_MERGE_POINT))
         self.shard_container_threshold = config_positive_int_value(
             conf.get('shard_container_threshold',
                      DEFAULT_SHARD_CONTAINER_THRESHOLD))
@@ -565,6 +558,10 @@ class ContainerSharder(ContainerReplicator):
             conf.get('cleave_batch_size', 2))
         self.cleave_row_batch_size = config_positive_int_value(
             conf.get('cleave_row_batch_size', 10000))
+        self.max_shrinking = int(conf.get('max_shrinking',
+                                          DEFAULT_MAX_SHRINKING))
+        self.max_expanding = int(conf.get('max_expanding',
+                                          DEFAULT_MAX_EXPANDING))
         self.auto_shard = config_true_value(conf.get('auto_shard', False))
         self.sharding_candidates = []
         self.shrinking_candidates = []
@@ -675,7 +672,7 @@ class ContainerSharder(ContainerReplicator):
     def _identify_shrinking_candidate(self, broker, node):
         sequences = find_compactible_shard_sequences(
             broker, self.shrink_size, self.merge_size,
-            1, -1)
+            self.max_shrinking, self.max_expanding)
         # compactible_ranges are all apart from final acceptor in each sequence
         compactible_ranges = sum(len(seq) - 1 for seq in sequences)
 
@@ -1742,8 +1739,8 @@ class ContainerSharder(ContainerReplicator):
             return
 
         compactible_sequences = find_compactible_shard_sequences(
-            broker, self.shrink_size, self.merge_size, 1, -1,
-            include_shrinking=True)
+            broker, self.shrink_size, self.merge_size, self.max_shrinking,
+            self.max_expanding, include_shrinking=True)
         self.logger.debug('Found %s compactible sequences of length(s) %s' %
                           (len(compactible_sequences),
                            [len(s) for s in compactible_sequences]))
@@ -1924,7 +1921,7 @@ class ContainerSharder(ContainerReplicator):
                     partitions_to_shard)
                 dirs.append((datadir, node, part_filt))
         if not dirs:
-            self.logger.warning('Found no data dirs!')
+            self.logger.info('Found no containers directories')
         for part, path, node in self.roundrobin_datadirs(dirs):
             # NB: get_part_nodes always provides an 'index' key;
             # this will be used in leader selection

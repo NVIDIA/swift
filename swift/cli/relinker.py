@@ -22,8 +22,6 @@ import logging
 import os
 from functools import partial
 from swift.common.storage_policy import POLICIES
-from swift.common.exceptions import DiskFileDeleted, DiskFileNotExist, \
-    DiskFileQuarantined
 from swift.common.utils import replace_partition_in_path, config_true_value, \
     audit_location_generator, get_logger, readconf, drop_privileges, \
     RateLimitedIterator, lock_path
@@ -136,7 +134,7 @@ def partitions_filter(states, part_power, next_part_power,
 
 
 # Save states when a partition is done
-def hook_post_partition(states, step, policy, diskfile_manager,
+def hook_post_partition(logger, states, step, policy, diskfile_manager,
                         partition_path):
     datadir_path, part = os.path.split(os.path.abspath(partition_path))
     device_path, datadir_name = os.path.split(datadir_path)
@@ -207,13 +205,17 @@ def hook_post_partition(states, step, policy, diskfile_manager,
         json.dump(states, f)
         os.fsync(f.fileno())
     os.rename(state_tmp_file, state_file)
+    num_parts_done = sum(1 for part in states["state"].values() if part)
+    logger.info("Device: %s Step: %s Partitions: %d/%d" % (
+        device, step, num_parts_done, len(states["state"])))
 
 
 def hashes_filter(next_part_power, suff_path, hashes):
     hashes = list(hashes)
     for hsh in hashes:
-        fname = os.path.join(suff_path, hsh, 'fake-file-name')
-        if replace_partition_in_path(fname, next_part_power) == fname:
+        fname = os.path.join(suff_path, hsh)
+        if fname == replace_partition_in_path(
+                fname, next_part_power, is_hash_dir=True):
             hashes.remove(hsh)
     return hashes
 
@@ -275,8 +277,9 @@ def relink(conf, logger, device):
         relink_hook_post_device = partial(hook_post_device, locks)
         relink_partition_filter = partial(partitions_filter,
                                           states, part_power, next_part_power)
-        relink_hook_post_partition = partial(
-            hook_post_partition, states, STEP_RELINK, policy, diskfile_mgr)
+        relink_hook_post_partition = partial(hook_post_partition, logger,
+                                             states, STEP_RELINK, policy,
+                                             diskfile_mgr)
         relink_hashes_filter = partial(hashes_filter, next_part_power)
 
         locations = audit_location_generator(
@@ -296,7 +299,8 @@ def relink(conf, logger, device):
         for fname, _, _ in locations:
             newfname = replace_partition_in_path(fname, next_part_power)
             try:
-                diskfile.relink_paths(fname, newfname, check_existing=True)
+                logger.debug('Relinking %s to %s', fname, newfname)
+                diskfile.relink_paths(fname, newfname)
                 relinked += 1
                 suffix_dir = os.path.dirname(os.path.dirname(newfname))
                 diskfile.invalidate_hash(suffix_dir)
@@ -343,8 +347,9 @@ def cleanup(conf, logger, device):
         cleanup_hook_post_device = partial(hook_post_device, locks)
         cleanup_partition_filter = partial(partitions_filter,
                                            states, part_power, next_part_power)
-        cleanup_hook_post_partition = partial(
-            hook_post_partition, states, STEP_CLEANUP, policy, diskfile_mgr)
+        cleanup_hook_post_partition = partial(hook_post_partition, logger,
+                                              states, STEP_CLEANUP, policy,
+                                              diskfile_mgr)
         cleanup_hashes_filter = partial(hashes_filter, next_part_power)
 
         locations = audit_location_generator(
@@ -357,56 +362,113 @@ def cleanup(conf, logger, device):
             partitions_filter=cleanup_partition_filter,
             hook_post_partition=cleanup_hook_post_partition,
             hashes_filter=cleanup_hashes_filter,
-            logger=logger, error_counter=error_counter)
+            logger=logger,
+            error_counter=error_counter,
+            yield_hash_dirs=True)
         if conf['files_per_second'] > 0:
             locations = RateLimitedIterator(
                 locations, conf['files_per_second'])
-        for fname, device, partition in locations:
-            expected_fname = replace_partition_in_path(fname, part_power)
-            if fname == expected_fname:
+
+        for hash_path, device, partition in locations:
+            # Compare the contents of each hash dir with contents of same hash
+            # dir in its new partition to verify that the new location has the
+            # most up to date set of files. The new location may have newer
+            # files if it has been updated since relinked.
+            new_hash_path = replace_partition_in_path(
+                hash_path, part_power, is_hash_dir=True)
+
+            if new_hash_path == hash_path:
                 continue
-            # Make sure there is a valid object file in the expected new
-            # location. Note that this could be newer than the original one
-            # (which happens if there is another PUT after partition power
-            # has been increased, but cleanup did not yet run)
-            loc = diskfile.AuditLocation(
-                os.path.dirname(expected_fname), device, partition, policy)
-            df = diskfile_mgr.get_diskfile_from_audit_location(loc)
-            try:
-                with df.open():
-                    pass
-            except DiskFileQuarantined as exc:
-                logger.warning('ERROR Object %(obj)s failed audit and was'
-                               ' quarantined: %(err)r',
-                               {'obj': loc, 'err': exc})
-                errors += 1
-                continue
-            except DiskFileDeleted:
-                pass
-            except DiskFileNotExist as exc:
-                err = False
-                if policy.policy_type == 'erasure_coding':
-                    # Might be a non-durable fragment - check that there is
-                    # a fragment in the new path. Will be fixed by the
-                    # reconstructor then
-                    if not os.path.isfile(expected_fname):
-                        err = True
-                else:
-                    err = True
-                if err:
+
+            # Get on disk data for new and old locations, cleaning up any
+            # reclaimable or obsolete files in each. The new location is
+            # cleaned up *before* the old location to prevent false negatives
+            # where the old still has a file that has been cleaned up in the
+            # new; cleaning up the new location first ensures that the old will
+            # always be 'cleaner' than the new.
+            new_df_data = diskfile_mgr.cleanup_ondisk_files(new_hash_path)
+            old_df_data = diskfile_mgr.cleanup_ondisk_files(hash_path)
+            # Now determine the most up to date set of on disk files would be
+            # given the content of old and new locations...
+            new_files = set(new_df_data['files'])
+            old_files = set(old_df_data['files'])
+            union_files = new_files.union(old_files)
+            union_data = diskfile_mgr.get_ondisk_files(
+                union_files, '', verify=False)
+            obsolete_files = set(info['filename']
+                                 for info in union_data.get('obsolete', []))
+            # drop 'obsolete' files but retain 'unexpected' files which might
+            # be misplaced diskfiles from another policy
+            required_files = union_files.difference(obsolete_files)
+            required_links = required_files.intersection(old_files)
+
+            missing_links = 0
+            created_links = 0
+            for filename in required_links:
+                # Before removing old files, be sure that the corresponding
+                # required new files exist by calling relink_paths again. There
+                # are several possible outcomes:
+                #  - The common case is that the new file exists, in which case
+                #    relink_paths checks that the new file has the same inode
+                #    as the old file. An exception is raised if the inode of
+                #    the new file is not the same as the old file.
+                #  - The new file may not exist because the relinker failed to
+                #    create the link to the old file and has erroneously moved
+                #    on to cleanup. In this case the relink_paths will create
+                #    the link now or raise an exception if that fails.
+                #  - The new file may not exist because some other process,
+                #    such as an object server handling a request, has cleaned
+                #    it up since we called cleanup_ondisk_files(new_hash_path).
+                #    In this case a new link will be created to the old file.
+                #    This is unnecessary but simpler than repeating the
+                #    evaluation of what links are now required and safer than
+                #    assuming that a non-existent file that *was* required is
+                #    no longer required. The new file will eventually be
+                #    cleaned up again.
+                old_file = os.path.join(hash_path, filename)
+                new_file = os.path.join(new_hash_path, filename)
+                try:
+                    if diskfile.relink_paths(old_file, new_file):
+                        logger.debug(
+                            "Relinking (cleanup) created link: %s to %s",
+                            old_file, new_file)
+                        created_links += 1
+                except OSError as exc:
                     logger.warning(
-                        'Error cleaning up %s: %r', fname, exc)
+                        "Error relinking (cleanup): failed to relink %s to "
+                        "%s: %s", old_file, new_file, exc)
                     errors += 1
-                    continue
-            try:
-                os.remove(fname)
-                cleaned_up += 1
-                logger.debug("Removed %s", fname)
-                suffix_dir = os.path.dirname(os.path.dirname(fname))
-                diskfile.invalidate_hash(suffix_dir)
-            except OSError as exc:
-                logger.warning('Error cleaning up %s: %r', fname, exc)
-                errors += 1
+                    missing_links += 1
+            if created_links:
+                diskfile.invalidate_hash(os.path.dirname(new_hash_path))
+            if missing_links:
+                continue
+
+            # the new partition hash dir has the most up to date set of on
+            # disk files so it is safe to delete the old location...
+            rehash = False
+            # use the sorted list to help unit testing
+            for filename in old_df_data['files']:
+                old_file = os.path.join(hash_path, filename)
+                try:
+                    os.remove(old_file)
+                except OSError as exc:
+                    logger.warning('Error cleaning up %s: %r', old_file, exc)
+                    errors += 1
+                else:
+                    rehash = True
+                    cleaned_up += 1
+                    logger.debug("Removed %s", old_file)
+
+            if rehash:
+                try:
+                    diskfile.invalidate_hash(os.path.dirname(hash_path))
+                except Exception as exc:
+                    # note: not counted as an error
+                    logger.warning(
+                        'Error invalidating suffix for %s: %r',
+                        hash_path, exc)
+
     return determine_exit_code(
         logger=logger,
         found_policy=found_policy,

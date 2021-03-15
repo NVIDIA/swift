@@ -3017,6 +3017,30 @@ cluster_dfw1 = http://dfw1.host/v1/
             self.assertIn('greater than %s' % minimum, cm.exception.args[0])
             self.assertIn('less than %s' % maximum, cm.exception.args[0])
 
+    def test_config_percent_value(self):
+        for arg, expected in (
+                (99, 0.99),
+                (25.5, 0.255),
+                ('99', 0.99),
+                ('25.5', 0.255),
+                (0, 0.0),
+                ('0', 0.0),
+                ('100', 1.0),
+                (100, 1.0),
+                (1, 0.01),
+                ('1', 0.01),
+                (25, 0.25)):
+            actual = utils.config_percent_value(arg)
+            self.assertEqual(expected, actual)
+
+        # bad values
+        for val in (-1, '-1', 101, '101'):
+            with self.assertRaises(ValueError) as cm:
+                utils.config_percent_value(val)
+            self.assertIn('Config option must be a number, greater than 0, '
+                          'less than 100, not "{}"'.format(val),
+                          cm.exception.args[0])
+
     def test_config_auto_int_value(self):
         expectations = {
             # (value, default) : expected,
@@ -4297,6 +4321,14 @@ cluster_dfw1 = http://dfw1.host/v1/
             self.fail('Invalid results from pure function:\n%s' %
                       '\n'.join(failures))
 
+    def test_get_partition_for_hash(self):
+        hex_hash = 'af088baea4806dcaba30bf07d9e64c77'
+        self.assertEqual(43, utils.get_partition_for_hash(hex_hash, 6))
+        self.assertEqual(87, utils.get_partition_for_hash(hex_hash, 7))
+        self.assertEqual(350, utils.get_partition_for_hash(hex_hash, 9))
+        self.assertEqual(700, utils.get_partition_for_hash(hex_hash, 10))
+        self.assertEqual(1400, utils.get_partition_for_hash(hex_hash, 11))
+
     def test_replace_partition_in_path(self):
         # Check for new part = part * 2
         old = '/s/n/d/o/700/c77/af088baea4806dcaba30bf07d9e64c77/f'
@@ -4318,6 +4350,14 @@ cluster_dfw1 = http://dfw1.host/v1/
         # Make sure there is no change if the part power didn't change
         self.assertEqual(utils.replace_partition_in_path(old, 10), old)
         self.assertEqual(utils.replace_partition_in_path(new, 11), new)
+
+        # check hash_dir option
+        old = '/s/n/d/o/700/c77/af088baea4806dcaba30bf07d9e64c77'
+        exp = '/s/n/d/o/1400/c77/af088baea4806dcaba30bf07d9e64c77'
+        actual = utils.replace_partition_in_path(old, 11, is_hash_dir=True)
+        self.assertEqual(exp, actual)
+        actual = utils.replace_partition_in_path(exp, 11, is_hash_dir=True)
+        self.assertEqual(exp, actual)
 
     def test_round_robin_iter(self):
         it1 = iter([1, 2, 3])
