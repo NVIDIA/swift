@@ -29,7 +29,7 @@ from swift.common.utils import replace_partition_in_path, config_true_value, \
     audit_location_generator, get_logger, readconf, drop_privileges, \
     RateLimitedIterator, lock_path, PrefixLoggerAdapter, distribute_evenly, \
     non_negative_float, non_negative_int, config_auto_int_value, \
-    dump_recon_cache
+    dump_recon_cache, get_partition_from_path
 from swift.obj import diskfile
 
 
@@ -118,6 +118,7 @@ class Relinker(object):
         self.devices_data = recursive_defaultdict()
         self.policy_count = 0
         self.pid = os.getpid()
+        self.dirty_partitions = set()
 
     def _aggregate_dev_policy_stats(self):
         for dev_data in self.devices_data.values():
@@ -315,15 +316,16 @@ class Relinker(object):
         # shift to the new partition space and rehash
         #   |0                             2N|
         #   |                IIJJKKLLMMNNOOPP|
-        partition = int(part)
-        if not self.do_cleanup and partition >= 2 ** (
-                self.states['part_power'] - 1):
-            for new_part in (2 * partition, 2 * partition + 1):
+        for partition in self.dirty_partitions:
+            if self.do_cleanup or partition >= 2 ** (
+                    self.states['next_part_power'] - 1):
                 self.diskfile_mgr.get_hashes(
-                    device, new_part, [], self.policy)
-        elif self.do_cleanup:
+                    device, partition, [], self.policy)
+        self.dirty_partitions = set()
+
+        if self.do_cleanup:
             hashes = self.diskfile_mgr.get_hashes(
-                device, partition, [], self.policy)
+                device, int(part), [], self.policy)
             # In any reasonably-large cluster, we'd expect all old
             # partitions P to be empty after cleanup (i.e., it's unlikely
             # that there's another partition Q := P//2 that also has data
@@ -507,6 +509,8 @@ class Relinker(object):
                     self.stats['errors'] += 1
                     missing_links += 1
         if created_links:
+            self.dirty_partitions.add(get_partition_from_path(
+                self.conf['devices'], new_hash_path))
             diskfile.invalidate_hash(os.path.dirname(new_hash_path))
 
         if self.do_cleanup and not missing_links:
@@ -529,6 +533,9 @@ class Relinker(object):
                 self.logger.debug("Removed %s", old_file)
 
         if rehash:
+            # Even though we're invalidating the suffix, don't update
+            # self.dirty_hashes -- we only care about them for relinking
+            # into the new part-power space
             try:
                 diskfile.invalidate_hash(os.path.dirname(hash_path))
             except Exception as exc:

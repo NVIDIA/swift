@@ -2120,7 +2120,7 @@ class TestRelinker(unittest.TestCase):
                            (('meta', 1),),
                            None,
                            None,
-                           (('data', 0), ('meta', 1), ('meta', 2)))
+                           (('data', 0), ('meta', 2)))
         info_lines = self.logger.get_lines_for_level('info')
         self.assertIn('1 hash dirs processed (cleanup=True) '
                       '(2 files, 2 linked, 2 removed, 0 errors)',
@@ -2131,7 +2131,7 @@ class TestRelinker(unittest.TestCase):
                            (('data', 0),),
                            None,
                            None,
-                           (('data', 0), ('ts', 2),))
+                           (('ts', 2),))
         info_lines = self.logger.get_lines_for_level('info')
         self.assertIn('1 hash dirs processed (cleanup=True) '
                       '(1 files, 1 linked, 1 removed, 0 errors)',
@@ -2142,7 +2142,7 @@ class TestRelinker(unittest.TestCase):
                            (('ts', 0),),
                            None,
                            None,
-                           (('ts', 0), ('data', 1), ('meta', 2)))
+                           (('data', 1), ('meta', 2)))
         info_lines = self.logger.get_lines_for_level('info')
         self.assertIn('1 hash dirs processed (cleanup=True) '
                       '(2 files, 2 linked, 2 removed, 0 errors)',
@@ -3234,11 +3234,11 @@ class TestRelinker(unittest.TestCase):
         info_lines = self.logger.get_lines_for_level('info')
         self.assertIn('1 hash dirs processed (cleanup=True) '
                       '(1 files, 1 linked, 1 removed, 0 errors)', info_lines)
-        # suffix should be invalidated in new partition
+        # suffix should be invalidated and rehashed in new partition
         hashes_invalid = os.path.join(self.next_part_dir, 'hashes.invalid')
         self.assertTrue(os.path.exists(hashes_invalid))
         with open(hashes_invalid, 'r') as fd:
-            self.assertEqual(str(self.suffix), fd.read().strip())
+            self.assertEqual('', fd.read().strip())
         self.assertEqual([], self.logger.get_lines_for_level('error'))
 
     def test_cleanup_same_object_different_inode_in_new_partition(self):
@@ -3302,7 +3302,8 @@ class TestRelinker(unittest.TestCase):
         self.assertEqual(0, res)
         # old partition should be cleaned up
         self.assertFalse(os.path.exists(self.part_dir))
-        self.assertTrue(os.path.isfile(older_obj_file))  # older file intact
+        # which is also going to clean up the older file
+        self.assertFalse(os.path.isfile(older_obj_file))
         self.assertTrue(os.path.isfile(self.expected_file))  # link created
         self.assertIn(
             'Relinking (cleanup) created link: %s to %s'
@@ -3312,11 +3313,11 @@ class TestRelinker(unittest.TestCase):
         info_lines = self.logger.get_lines_for_level('info')
         self.assertIn('1 hash dirs processed (cleanup=True) '
                       '(1 files, 1 linked, 1 removed, 0 errors)', info_lines)
-        # suffix should be invalidated in new partition
+        # suffix should be invalidated and rehashed in new partition
         hashes_invalid = os.path.join(self.next_part_dir, 'hashes.invalid')
         self.assertTrue(os.path.exists(hashes_invalid))
         with open(hashes_invalid, 'r') as fd:
-            self.assertEqual(str(self.suffix), fd.read().strip())
+            self.assertEqual('', fd.read().strip())
         self.assertEqual([], self.logger.get_lines_for_level('error'))
 
     def test_cleanup_deleted(self):
@@ -3613,11 +3614,11 @@ class TestRelinker(unittest.TestCase):
                 '--skip-mount',
             ]))
         warning_lines = self.logger.get_lines_for_level('warning')
-        # once for cleanup_ondisk_files in old and once once for the
-        # get_ondisk_files of union of files; the new partition did not exist
-        # at start of cleanup so is not rehashed
-        self.assertEqual(2, len(warning_lines),
-                         'Expected 2 log lines, got %r' % warning_lines)
+        # once for cleanup_ondisk_files in old, again for the get_ondisk_files
+        # of union of files, and one last time when the new partition gets
+        # rehashed at the end of processing the old one
+        self.assertEqual(3, len(warning_lines),
+                         'Expected 3 log lines, got %r' % warning_lines)
         for line in warning_lines:
             self.assertIn('Bad fragment index: None', line, warning_lines)
         self.assertIn(
@@ -3666,12 +3667,8 @@ class TestRelinker(unittest.TestCase):
             ]))
             expected = [('invalidate', self.next_suffix_dir)]
             if self.part >= 2 ** (PART_POWER - 1):
-                expected.extend([
-                    ('get_hashes', self.existing_device, self.next_part & ~1,
-                     [], POLICIES[0]),
-                    ('get_hashes', self.existing_device, self.next_part | 1,
-                     [], POLICIES[0]),
-                ])
+                expected.append(('get_hashes', self.existing_device,
+                                 self.next_part, [], POLICIES[0]))
 
             self.assertEqual(calls, expected)
             # Depending on partition, there may or may not be a get_hashes here
