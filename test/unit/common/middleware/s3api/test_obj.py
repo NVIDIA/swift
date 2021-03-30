@@ -1739,6 +1739,20 @@ class TestS3ApiObj(S3ApiTestCase):
             'Vary': 'Origin, Access-Control-Request-Headers',
         })
 
+        # test more allow_origins
+        self.s3api.conf.cors_preflight_allow_origin = ['http://example.com',
+                                                       'http://other.com']
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status, '200 OK')
+        self.assertDictEqual(headers, {
+            'Allow': 'GET, HEAD, PUT, POST, DELETE, OPTIONS',
+            'Access-Control-Allow-Origin': 'http://example.com',
+            'Access-Control-Allow-Methods': ('GET, HEAD, PUT, POST, DELETE, '
+                                             'OPTIONS'),
+            'Access-Control-Allow-Headers': 'authorization',
+            'Vary': 'Origin, Access-Control-Request-Headers',
+        })
+
         # Wrong protocol
         self.s3api.conf.cors_preflight_allow_origin = ['https://example.com']
         status, headers, body = self.call_s3api(req)

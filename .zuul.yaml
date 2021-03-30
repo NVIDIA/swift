@@ -413,6 +413,12 @@
       previous_swift_version: origin/stable/victoria
 
 - job:
+    name: swift-multinode-rolling-upgrade-wallaby
+    parent: swift-multinode-rolling-upgrade
+    vars:
+      previous_swift_version: origin/stable/wallaby
+
+- job:
     name: swift-multinode-rolling-upgrade-master
     parent: swift-multinode-rolling-upgrade
     vars:
@@ -598,7 +604,6 @@
               - ^doc/(requirements.txt|(saio|s3api|source)/.*)$
         - swift-multinode-rolling-upgrade:
             irrelevant-files: *functest-irrelevant-files
-            voting: false
         - tempest-integrated-object-storage:
             irrelevant-files: &tempest-irrelevant-files
               - ^(api-ref|doc|releasenotes)/.*$
@@ -642,6 +647,8 @@
             irrelevant-files: *unittest-irrelevant-files
         - openstack-tox-pep8:
             irrelevant-files: *pep8-irrelevant-files
+        - swift-multinode-rolling-upgrade:
+            irrelevant-files: *functest-irrelevant-files
         - tempest-integrated-object-storage:
             irrelevant-files: *tempest-irrelevant-files
         - tempest-ipv6-only:
@@ -663,6 +670,7 @@
         - swift-multinode-rolling-upgrade-train
         - swift-multinode-rolling-upgrade-ussuri
         - swift-multinode-rolling-upgrade-victoria
+        - swift-multinode-rolling-upgrade-wallaby
         - swift-multinode-rolling-upgrade-master:
             branches: master
 

@@ -424,6 +424,35 @@ def backward(f, blocksize=4096):
 TRUE_VALUES = set(('true', '1', 'yes', 'on', 't', 'y'))
 
 
+def non_negative_float(value):
+    """
+    Check that the value casts to a float and is non-negative.
+
+    :param value: value to check
+    :raises ValueError: if the value cannot be cast to a float or is negative.
+    :return: a float
+    """
+    value = float(value)
+    if value < 0:
+        raise ValueError
+    return value
+
+
+def non_negative_int(value):
+    """
+    Check that the value casts to an int and is a whole number.
+
+    :param value: value to check
+    :raises ValueError: if the value cannot be cast to an int or does not
+        represent a whole number.
+    :return: an int
+    """
+    int_value = int(value)
+    if int_value != non_negative_float(value):
+        raise ValueError
+    return int_value
+
+
 def config_true_value(value):
     """
     Returns True if the value is either True or a string in TRUE_VALUES.
@@ -2373,13 +2402,19 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
                                           facility=facility)
     else:
         log_address = conf.get('log_address', '/dev/log')
+        handler = None
         try:
-            handler = ThreadSafeSysLogHandler(address=log_address,
-                                              facility=facility)
-        except socket.error as e:
-            # Either /dev/log isn't a UNIX socket or it does not exist at all
+            mode = os.stat(log_address).st_mode
+            if stat.S_ISSOCK(mode):
+                handler = ThreadSafeSysLogHandler(address=log_address,
+                                                  facility=facility)
+        except (OSError, socket.error) as e:
+            # If either /dev/log isn't a UNIX socket or it does not exist at
+            # all then py2 would raise an error
             if e.errno not in [errno.ENOTSOCK, errno.ENOENT]:
                 raise
+        if handler is None:
+            # fallback to default UDP
             handler = ThreadSafeSysLogHandler(facility=facility)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -4935,6 +4970,33 @@ except TypeError:
         return hashlib.md5(string)  # nosec
 
 
+class ShardRangeOuterBound(object):
+    """
+    A custom singleton type to be subclassed for the outer bounds of
+    ShardRanges.
+    """
+    _singleton = None
+
+    def __new__(cls):
+        if cls is ShardRangeOuterBound:
+            raise TypeError('ShardRangeOuterBound is an abstract class; '
+                            'only subclasses should be instantiated')
+        if cls._singleton is None:
+            cls._singleton = super(ShardRangeOuterBound, cls).__new__(cls)
+        return cls._singleton
+
+    def __str__(self):
+        return ''
+
+    def __repr__(self):
+        return type(self).__name__
+
+    def __bool__(self):
+        return False
+
+    __nonzero__ = __bool__
+
+
 class ShardRange(object):
     """
     A ShardRange encapsulates sharding state related to a container including
@@ -4999,31 +5061,15 @@ class ShardRange(object):
               SHRUNK: 'shrunk'}
     STATES_BY_NAME = dict((v, k) for k, v in STATES.items())
 
-    class OuterBound(object):
-        def __eq__(self, other):
-            return isinstance(other, type(self))
-
-        def __ne__(self, other):
-            return not self.__eq__(other)
-
-        def __str__(self):
-            return ''
-
-        def __repr__(self):
-            return type(self).__name__
-
-        def __bool__(self):
-            return False
-
-        __nonzero__ = __bool__
-
     @functools.total_ordering
-    class MaxBound(OuterBound):
+    class MaxBound(ShardRangeOuterBound):
+        # singleton for maximum bound
         def __ge__(self, other):
             return True
 
     @functools.total_ordering
-    class MinBound(OuterBound):
+    class MinBound(ShardRangeOuterBound):
+        # singleton for minimum bound
         def __le__(self, other):
             return True
 
@@ -5072,7 +5118,7 @@ class ShardRange(object):
         return value
 
     def _encode_bound(self, bound):
-        if isinstance(bound, ShardRange.OuterBound):
+        if isinstance(bound, ShardRangeOuterBound):
             return bound
         if not (isinstance(bound, six.text_type) or
                 isinstance(bound, six.binary_type)):
@@ -5279,17 +5325,19 @@ class ShardRange(object):
             valid state number.
         """
         try:
-            state = state.lower()
-            state_num = cls.STATES_BY_NAME[state]
-        except (KeyError, AttributeError):
             try:
-                state_name = cls.STATES[state]
-            except KeyError:
-                raise ValueError('Invalid state %r' % state)
-            else:
-                state_num = state
-        else:
-            state_name = state
+                # maybe it's a number
+                float_state = float(state)
+                state_num = int(float_state)
+                if state_num != float_state:
+                    raise ValueError('Invalid state %r' % state)
+                state_name = cls.STATES[state_num]
+            except (ValueError, TypeError):
+                # maybe it's a state name
+                state_name = state.lower()
+                state_num = cls.STATES_BY_NAME[state_name]
+        except (KeyError, AttributeError):
+            raise ValueError('Invalid state %r' % state)
         return state_num, state_name
 
     @property
@@ -5298,14 +5346,7 @@ class ShardRange(object):
 
     @state.setter
     def state(self, state):
-        try:
-            float_state = float(state)
-            int_state = int(float_state)
-        except (ValueError, TypeError):
-            raise ValueError('Invalid state %r' % state)
-        if int_state != float_state or int_state not in self.STATES:
-            raise ValueError('Invalid state %r' % state)
-        self._state = int_state
+        self._state = self.resolve_state(state)[0]
 
     @property
     def state_text(self):
@@ -5593,6 +5634,14 @@ class ShardRangeList(UserList):
         """
         return sum(sr.bytes_used for sr in self)
 
+    @property
+    def timestamps(self):
+        return set(sr.timestamp for sr in self)
+
+    @property
+    def states(self):
+        return set(sr.state for sr in self)
+
     def includes(self, other):
         """
         Check if another ShardRange namespace is enclosed between the list's
@@ -5609,6 +5658,44 @@ class ShardRangeList(UserList):
         :return: True if other's namespace is enclosed, False otherwise.
         """
         return self.lower <= other.lower and self.upper >= other.upper
+
+    def filter(self, includes=None, marker=None, end_marker=None):
+        """
+        Filter the list for those shard ranges whose namespace includes the
+        ``includes`` name or any part of the namespace between ``marker`` and
+        ``end_marker``. If none of ``includes``, ``marker`` or ``end_marker``
+        are specified then all shard ranges will be returned.
+
+        :param includes: a string; if not empty then only the shard range, if
+            any, whose namespace includes this string will be returned, and
+            ``marker`` and ``end_marker`` will be ignored.
+        :param marker: if specified then only shard ranges whose upper bound is
+            greater than this value will be returned.
+        :param end_marker: if specified then only shard ranges whose lower
+            bound is less than this value will be returned.
+        :return: A new instance of :class:`~swift.common.utils.ShardRangeList`
+            containing the filtered shard ranges.
+        """
+        return ShardRangeList(
+            filter_shard_ranges(self, includes, marker, end_marker))
+
+    def find_lower(self, condition):
+        """
+        Finds the first shard range satisfies the given condition and returns
+        its lower bound.
+
+        :param condition: A function that must accept a single argument of type
+            :class:`~swift.common.utils.ShardRange` and return True if the
+            shard range satisfies the condition or False otherwise.
+        :return: The lower bound of the first shard range to satisfy the
+            condition, or the ``upper`` value of this list if no such shard
+            range is found.
+
+        """
+        for sr in self:
+            if condition(sr):
+                return sr.lower
+        return self.upper
 
 
 def find_shard_range(item, ranges):
@@ -5628,6 +5715,22 @@ def find_shard_range(item, ranges):
 
 
 def filter_shard_ranges(shard_ranges, includes, marker, end_marker):
+    """
+    Filter the given shard ranges to those whose namespace includes the
+    ``includes`` name or any part of the namespace between ``marker`` and
+    ``end_marker``. If none of ``includes``, ``marker`` or ``end_marker`` are
+    specified then all shard ranges will be returned.
+
+    :param shard_ranges: A list of :class:`~swift.common.utils.ShardRange`.
+    :param includes: a string; if not empty then only the shard range, if any,
+        whose namespace includes this string will be returned, and ``marker``
+        and ``end_marker`` will be ignored.
+    :param marker: if specified then only shard ranges whose upper bound is
+        greater than this value will be returned.
+    :param end_marker: if specified then only shard ranges whose lower bound is
+        less than this value will be returned.
+    :return: A filtered list of :class:`~swift.common.utils.ShardRange`.
+    """
     if includes:
         shard_range = find_shard_range(includes, shard_ranges)
         return [shard_range] if shard_range else []
@@ -5642,6 +5745,10 @@ def filter_shard_ranges(shard_ranges, includes, marker, end_marker):
 
     if marker or end_marker:
         return list(filter(shard_range_filter, shard_ranges))
+
+    if marker == ShardRange.MAX or end_marker == ShardRange.MIN:
+        # MIN and MAX are both Falsy so not handled by shard_range_filter
+        return []
 
     return shard_ranges
 
@@ -5806,21 +5913,27 @@ def get_partition_for_hash(hex_hash, part_power):
     return struct.unpack_from('>I', raw_hash)[0] >> part_shift
 
 
-def replace_partition_in_path(path, part_power, is_hash_dir=False):
+def replace_partition_in_path(devices, path, part_power):
     """
     Takes a path and a partition power and returns the same path, but with the
     correct partition number. Most useful when increasing the partition power.
 
-    :param path: full path to a file, for example object .data file
+    :param devices: directory where devices are mounted (e.g. /srv/node)
+    :param path: full path to a object file or hashdir
     :param part_power: partition power to compute correct partition number
     :param is_hash_dir: if True then ``path`` is the path to a hash dir,
         otherwise ``path`` is the path to a file in a hash dir.
     :returns: Path with re-computed partition power
     """
+    offset_parts = devices.rstrip(os.sep).split(os.sep)
     path_components = path.split(os.sep)
-    part = get_partition_for_hash(path_components[-1 if is_hash_dir else -2],
-                                  part_power)
-    path_components[-3 if is_hash_dir else -4] = "%d" % part
+    if offset_parts == path_components[:len(offset_parts)]:
+        offset = len(offset_parts)
+    else:
+        raise ValueError('Path %r is not under device dir %r' % (
+            path, devices))
+    part = get_partition_for_hash(path_components[offset + 4], part_power)
+    path_components[offset + 2] = "%d" % part
     return os.sep.join(path_components)
 
 

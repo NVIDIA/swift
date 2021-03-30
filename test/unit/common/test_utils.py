@@ -1721,7 +1721,8 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(sio.getvalue(),
                          'test1\ntest3\ntest4\ntest6\n')
 
-    def test_get_logger_sysloghandler_plumbing(self):
+    @with_tempdir
+    def test_get_logger_sysloghandler_plumbing(self, tempdir):
         orig_sysloghandler = utils.ThreadSafeSysLogHandler
         syslog_handler_args = []
 
@@ -1742,6 +1743,7 @@ class TestUtils(unittest.TestCase):
         with mock.patch.object(utils, 'ThreadSafeSysLogHandler',
                                syslog_handler_catcher), \
                 mock.patch.object(socket, 'getaddrinfo', fake_getaddrinfo):
+            # default log_address
             utils.get_logger({
                 'log_facility': 'LOG_LOCAL3',
             }, 'server', log_route='server')
@@ -1752,19 +1754,51 @@ class TestUtils(unittest.TestCase):
                     os.path.isdir('/dev/log'):
                 # Since socket on OSX is in /var/run/syslog, there will be
                 # a fallback to UDP.
-                expected_args.append(
-                    ((), {'facility': orig_sysloghandler.LOG_LOCAL3}))
+                expected_args = [
+                    ((), {'facility': orig_sysloghandler.LOG_LOCAL3})]
             self.assertEqual(expected_args, syslog_handler_args)
 
+            # custom log_address - file doesn't exist: fallback to UDP
+            log_address = os.path.join(tempdir, 'foo')
             syslog_handler_args = []
             utils.get_logger({
                 'log_facility': 'LOG_LOCAL3',
-                'log_address': '/foo/bar',
+                'log_address': log_address,
             }, 'server', log_route='server')
+            expected_args = [
+                ((), {'facility': orig_sysloghandler.LOG_LOCAL3})]
             self.assertEqual(
-                ((), {'address': '/foo/bar',
-                      'facility': orig_sysloghandler.LOG_LOCAL3}),
-                syslog_handler_args[0])
+                expected_args, syslog_handler_args)
+
+            # custom log_address - file exists, not a socket: fallback to UDP
+            with open(log_address, 'w'):
+                pass
+            syslog_handler_args = []
+            utils.get_logger({
+                'log_facility': 'LOG_LOCAL3',
+                'log_address': log_address,
+            }, 'server', log_route='server')
+            expected_args = [
+                ((), {'facility': orig_sysloghandler.LOG_LOCAL3})]
+            self.assertEqual(
+                expected_args, syslog_handler_args)
+
+            # custom log_address - file exists, is a socket: use it
+            os.unlink(log_address)
+            with contextlib.closing(
+                    socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)) as sock:
+                sock.settimeout(5)
+                sock.bind(log_address)
+                syslog_handler_args = []
+                utils.get_logger({
+                    'log_facility': 'LOG_LOCAL3',
+                    'log_address': log_address,
+                }, 'server', log_route='server')
+            expected_args = [
+                ((), {'address': log_address,
+                      'facility': orig_sysloghandler.LOG_LOCAL3})]
+            self.assertEqual(
+                expected_args, syslog_handler_args)
 
             # Using UDP with default port
             syslog_handler_args = []
@@ -1787,6 +1821,15 @@ class TestUtils(unittest.TestCase):
                 ((), {'address': ('syslog.funtimes.com', 2123),
                       'facility': orig_sysloghandler.LOG_LOCAL0})],
                 syslog_handler_args)
+
+        with mock.patch.object(utils, 'ThreadSafeSysLogHandler',
+                               side_effect=OSError(errno.EPERM, 'oops')):
+            with self.assertRaises(OSError) as cm:
+                utils.get_logger({
+                    'log_facility': 'LOG_LOCAL3',
+                    'log_address': 'log_address',
+                }, 'server', log_route='server')
+        self.assertEqual(errno.EPERM, cm.exception.errno)
 
     @reset_logger_state
     def test_clean_logger_exception(self):
@@ -2932,6 +2975,43 @@ cluster_dfw1 = http://dfw1.host/v1/
             self.assertTrue(utils.config_true_value(False) is False)
         finally:
             utils.TRUE_VALUES = orig_trues
+
+    def test_non_negative_float(self):
+        self.assertEqual(0, utils.non_negative_float('0.0'))
+        self.assertEqual(0, utils.non_negative_float(0.0))
+        self.assertEqual(1.1, utils.non_negative_float(1.1))
+        self.assertEqual(1.1, utils.non_negative_float('1.1'))
+        self.assertEqual(1.0, utils.non_negative_float('1'))
+        self.assertEqual(1, utils.non_negative_float(True))
+        self.assertEqual(0, utils.non_negative_float(False))
+
+        with self.assertRaises(ValueError):
+            utils.non_negative_float(-1.1)
+        with self.assertRaises(ValueError):
+            utils.non_negative_float('-1.1')
+        with self.assertRaises(ValueError):
+            utils.non_negative_float('one')
+
+    def test_non_negative_int(self):
+        self.assertEqual(0, utils.non_negative_int('0'))
+        self.assertEqual(0, utils.non_negative_int(0.0))
+        self.assertEqual(1, utils.non_negative_int(1))
+        self.assertEqual(1, utils.non_negative_int('1'))
+        self.assertEqual(1, utils.non_negative_int(True))
+        self.assertEqual(0, utils.non_negative_int(False))
+
+        with self.assertRaises(ValueError):
+            utils.non_negative_int(-1)
+        with self.assertRaises(ValueError):
+            utils.non_negative_int('-1')
+        with self.assertRaises(ValueError):
+            utils.non_negative_int('-1.1')
+        with self.assertRaises(ValueError):
+            utils.non_negative_int('1.1')
+        with self.assertRaises(ValueError):
+            utils.non_negative_int('1.0')
+        with self.assertRaises(ValueError):
+            utils.non_negative_int('one')
 
     def test_config_positive_int_value(self):
         expectations = {
@@ -4334,30 +4414,65 @@ cluster_dfw1 = http://dfw1.host/v1/
         old = '/s/n/d/o/700/c77/af088baea4806dcaba30bf07d9e64c77/f'
         new = '/s/n/d/o/1400/c77/af088baea4806dcaba30bf07d9e64c77/f'
         # Expected outcome
-        self.assertEqual(utils.replace_partition_in_path(old, 11), new)
+        self.assertEqual(utils.replace_partition_in_path('/s/n/', old, 11),
+                         new)
 
         # Make sure there is no change if the part power didn't change
-        self.assertEqual(utils.replace_partition_in_path(old, 10), old)
-        self.assertEqual(utils.replace_partition_in_path(new, 11), new)
+        self.assertEqual(utils.replace_partition_in_path('/s/n', old, 10), old)
+        self.assertEqual(utils.replace_partition_in_path('/s/n/', new, 11),
+                         new)
 
         # Check for new part = part * 2 + 1
         old = '/s/n/d/o/693/c77/ad708baea4806dcaba30bf07d9e64c77/f'
         new = '/s/n/d/o/1387/c77/ad708baea4806dcaba30bf07d9e64c77/f'
 
         # Expected outcome
-        self.assertEqual(utils.replace_partition_in_path(old, 11), new)
+        self.assertEqual(utils.replace_partition_in_path('/s/n', old, 11), new)
 
         # Make sure there is no change if the part power didn't change
-        self.assertEqual(utils.replace_partition_in_path(old, 10), old)
-        self.assertEqual(utils.replace_partition_in_path(new, 11), new)
+        self.assertEqual(utils.replace_partition_in_path('/s/n', old, 10), old)
+        self.assertEqual(utils.replace_partition_in_path('/s/n/', new, 11),
+                         new)
 
-        # check hash_dir option
+        # check hash_dir
         old = '/s/n/d/o/700/c77/af088baea4806dcaba30bf07d9e64c77'
         exp = '/s/n/d/o/1400/c77/af088baea4806dcaba30bf07d9e64c77'
-        actual = utils.replace_partition_in_path(old, 11, is_hash_dir=True)
+        actual = utils.replace_partition_in_path('/s/n', old, 11)
         self.assertEqual(exp, actual)
-        actual = utils.replace_partition_in_path(exp, 11, is_hash_dir=True)
+        actual = utils.replace_partition_in_path('/s/n', exp, 11)
         self.assertEqual(exp, actual)
+
+        # check longer devices path
+        old = '/s/n/1/2/d/o/700/c77/af088baea4806dcaba30bf07d9e64c77'
+        exp = '/s/n/1/2/d/o/1400/c77/af088baea4806dcaba30bf07d9e64c77'
+        actual = utils.replace_partition_in_path('/s/n/1/2', old, 11)
+        self.assertEqual(exp, actual)
+        actual = utils.replace_partition_in_path('/s/n/1/2', exp, 11)
+        self.assertEqual(exp, actual)
+
+        # check empty devices path
+        old = '/d/o/700/c77/af088baea4806dcaba30bf07d9e64c77'
+        exp = '/d/o/1400/c77/af088baea4806dcaba30bf07d9e64c77'
+        actual = utils.replace_partition_in_path('', old, 11)
+        self.assertEqual(exp, actual)
+        actual = utils.replace_partition_in_path('', exp, 11)
+        self.assertEqual(exp, actual)
+
+        # check path validation
+        path = '/s/n/d/o/693/c77/ad708baea4806dcaba30bf07d9e64c77/f'
+        with self.assertRaises(ValueError) as cm:
+            utils.replace_partition_in_path('/s/n1', path, 11)
+        self.assertEqual(
+            "Path '/s/n/d/o/693/c77/ad708baea4806dcaba30bf07d9e64c77/f' "
+            "is not under device dir '/s/n1'", str(cm.exception))
+
+        # check path validation - path lacks leading /
+        path = 's/n/d/o/693/c77/ad708baea4806dcaba30bf07d9e64c77/f'
+        with self.assertRaises(ValueError) as cm:
+            utils.replace_partition_in_path('/s/n', path, 11)
+        self.assertEqual(
+            "Path 's/n/d/o/693/c77/ad708baea4806dcaba30bf07d9e64c77/f' "
+            "is not under device dir '/s/n'", str(cm.exception))
 
     def test_round_robin_iter(self):
         it1 = iter([1, 2, 3])
@@ -4504,7 +4619,8 @@ cluster_dfw1 = http://dfw1.host/v1/
             utils.load_pkg_resource(*args)
         self.assertEqual("Unhandled URI scheme: 'nog'", str(cm.exception))
 
-    def test_systemd_notify(self):
+    @with_tempdir
+    def test_systemd_notify(self, tempdir):
         m_sock = mock.Mock(connect=mock.Mock(), sendall=mock.Mock())
         with mock.patch('swift.common.utils.socket.socket',
                         return_value=m_sock) as m_socket:
@@ -4557,15 +4673,23 @@ cluster_dfw1 = http://dfw1.host/v1/
                 "Systemd notification failed", exc_info=True)
 
         # Test it for real
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        sock.settimeout(5)
-        sock.bind('\0foobar')
-        os.environ['NOTIFY_SOCKET'] = '@foobar'
-        utils.systemd_notify()
-        msg = sock.recv(512)
-        sock.close()
-        self.assertEqual(msg, b'READY=1')
-        self.assertNotIn('NOTIFY_SOCKET', os.environ)
+        def do_test_real_socket(socket_address, notify_socket):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            sock.settimeout(5)
+            sock.bind(socket_address)
+            os.environ['NOTIFY_SOCKET'] = notify_socket
+            utils.systemd_notify()
+            msg = sock.recv(512)
+            sock.close()
+            self.assertEqual(msg, b'READY=1')
+            self.assertNotIn('NOTIFY_SOCKET', os.environ)
+
+        # test file socket address
+        socket_path = os.path.join(tempdir, 'foobar')
+        do_test_real_socket(socket_path, socket_path)
+        if sys.platform.startswith('linux'):
+            # test abstract socket address
+            do_test_real_socket('\0foobar', '@foobar')
 
     def test_md5_with_data(self):
         if not self.fips_enabled:
@@ -6228,6 +6352,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
     def test_find_objects(self):
         with temptree([]) as tmpdir:
             expected_objs = list()
+            expected_dirs = list()
             logger = FakeLogger()
             data = os.path.join(tmpdir, "drive", "data")
             os.makedirs(data)
@@ -6239,6 +6364,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
             os.makedirs(suffix)
             hash_path = os.path.join(suffix, "hash")
             os.makedirs(hash_path)
+            expected_dirs.append((hash_path, 'drive', 'partition1'))
             obj_path = os.path.join(hash_path, "obj1.db")
             with open(obj_path, "w"):
                 pass
@@ -6249,6 +6375,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
             os.makedirs(suffix)
             hash_path = os.path.join(suffix, "hash2")
             os.makedirs(hash_path)
+            expected_dirs.append((hash_path, 'drive', 'partition2'))
             obj_path = os.path.join(hash_path, "obj2.db")
             with open(obj_path, "w"):
                 pass
@@ -6260,6 +6387,14 @@ class TestAuditLocationGenerator(unittest.TestCase):
             self.assertEqual(len(got_objs), len(expected_objs))
             self.assertEqual(sorted(got_objs), sorted(expected_objs))
             self.assertEqual(1, len(logger.get_lines_for_level('warning')))
+
+            # check yield_hash_dirs option
+            locations = utils.audit_location_generator(
+                tmpdir, "data", mount_check=False, logger=logger,
+                yield_hash_dirs=True,
+            )
+            got_dirs = list(locations)
+            self.assertEqual(sorted(got_dirs), sorted(expected_dirs))
 
     def test_ignore_metadata(self):
         with temptree([]) as tmpdir:
@@ -7566,6 +7701,9 @@ class TestShardRange(unittest.TestCase):
         self.ts_iter = make_timestamp_iter()
 
     def test_min_max_bounds(self):
+        with self.assertRaises(TypeError):
+            utils.ShardRangeOuterBound()
+
         # max
         self.assertEqual(utils.ShardRange.MAX, utils.ShardRange.MAX)
         self.assertFalse(utils.ShardRange.MAX > utils.ShardRange.MAX)
@@ -7584,6 +7722,10 @@ class TestShardRange(unittest.TestCase):
         self.assertFalse(utils.ShardRange.MAX != utils.ShardRange.MAX)
         self.assertTrue(
             utils.ShardRange.MaxBound() == utils.ShardRange.MaxBound())
+        self.assertTrue(
+            utils.ShardRange.MaxBound() is utils.ShardRange.MaxBound())
+        self.assertTrue(
+            utils.ShardRange.MaxBound() is utils.ShardRange.MAX)
         self.assertFalse(
             utils.ShardRange.MaxBound() != utils.ShardRange.MaxBound())
 
@@ -7606,6 +7748,10 @@ class TestShardRange(unittest.TestCase):
         self.assertFalse(utils.ShardRange.MIN != utils.ShardRange.MIN)
         self.assertTrue(
             utils.ShardRange.MinBound() == utils.ShardRange.MinBound())
+        self.assertTrue(
+            utils.ShardRange.MinBound() is utils.ShardRange.MinBound())
+        self.assertTrue(
+            utils.ShardRange.MinBound() is utils.ShardRange.MIN)
         self.assertFalse(
             utils.ShardRange.MinBound() != utils.ShardRange.MinBound())
 
@@ -7613,11 +7759,20 @@ class TestShardRange(unittest.TestCase):
         self.assertFalse(utils.ShardRange.MIN == utils.ShardRange.MAX)
         self.assertTrue(utils.ShardRange.MAX != utils.ShardRange.MIN)
         self.assertTrue(utils.ShardRange.MIN != utils.ShardRange.MAX)
+        self.assertFalse(utils.ShardRange.MAX is utils.ShardRange.MIN)
 
         self.assertEqual(utils.ShardRange.MAX,
                          max(utils.ShardRange.MIN, utils.ShardRange.MAX))
         self.assertEqual(utils.ShardRange.MIN,
                          min(utils.ShardRange.MIN, utils.ShardRange.MAX))
+
+        # check the outer bounds are hashable
+        hashmap = {utils.ShardRange.MIN: 'min',
+                   utils.ShardRange.MAX: 'max'}
+        self.assertEqual(hashmap[utils.ShardRange.MIN], 'min')
+        self.assertEqual(hashmap[utils.ShardRange.MinBound()], 'min')
+        self.assertEqual(hashmap[utils.ShardRange.MAX], 'max')
+        self.assertEqual(hashmap[utils.ShardRange.MaxBound()], 'max')
 
     def test_shard_range_initialisation(self):
         def assert_initialisation_ok(params, expected):
@@ -7891,8 +8046,9 @@ class TestShardRange(unittest.TestCase):
         self.assertEqual(utils.Timestamp(0), sr.state_timestamp)
 
     def test_state_setter(self):
-        for state in utils.ShardRange.STATES:
-            for test_value in (state, str(state)):
+        for state, state_name in utils.ShardRange.STATES.items():
+            for test_value in (
+                    state, str(state), state_name, state_name.upper()):
                 sr = utils.ShardRange('a/test', next(self.ts_iter), 'l', 'u')
                 sr.state = test_value
                 actual = sr.state
@@ -7941,6 +8097,8 @@ class TestShardRange(unittest.TestCase):
                 (number, name), utils.ShardRange.resolve_state(name.title()))
             self.assertEqual(
                 (number, name), utils.ShardRange.resolve_state(number))
+            self.assertEqual(
+                (number, name), utils.ShardRange.resolve_state(str(number)))
 
         def check_bad_value(value):
             with self.assertRaises(ValueError) as cm:
@@ -8461,12 +8619,16 @@ class TestShardRange(unittest.TestCase):
 
 class TestShardRangeList(unittest.TestCase):
     def setUp(self):
+        self.ts_iter = make_timestamp_iter()
+        self.t1 = next(self.ts_iter)
+        self.t2 = next(self.ts_iter)
+        self.ts_iter = make_timestamp_iter()
         self.shard_ranges = [
-            utils.ShardRange('a/b', utils.Timestamp.now(), 'a', 'b',
+            utils.ShardRange('a/b', self.t1, 'a', 'b',
                              object_count=2, bytes_used=22),
-            utils.ShardRange('b/c', utils.Timestamp.now(), 'b', 'c',
+            utils.ShardRange('b/c', self.t2, 'b', 'c',
                              object_count=4, bytes_used=44),
-            utils.ShardRange('x/y', utils.Timestamp.now(), 'x', 'y',
+            utils.ShardRange('c/y', self.t1, 'c', 'y',
                              object_count=6, bytes_used=66),
         ]
 
@@ -8545,6 +8707,86 @@ class TestShardRangeList(unittest.TestCase):
         # make a fresh instance
         sr = utils.ShardRange('a/entire', utils.Timestamp.now(), '', '')
         self.assertTrue(srl_entire.includes(sr))
+
+    def test_timestamps(self):
+        srl = ShardRangeList(self.shard_ranges)
+        self.assertEqual({self.t1, self.t2}, srl.timestamps)
+        t3 = next(self.ts_iter)
+        self.shard_ranges[2].timestamp = t3
+        self.assertEqual({self.t1, self.t2, t3}, srl.timestamps)
+        srl.pop(0)
+        self.assertEqual({self.t2, t3}, srl.timestamps)
+
+    def test_states(self):
+        srl = ShardRangeList()
+        self.assertEqual(set(), srl.states)
+
+        srl = ShardRangeList(self.shard_ranges)
+        self.shard_ranges[0].update_state(
+            utils.ShardRange.CREATED, next(self.ts_iter))
+        self.shard_ranges[1].update_state(
+            utils.ShardRange.CLEAVED, next(self.ts_iter))
+        self.shard_ranges[2].update_state(
+            utils.ShardRange.ACTIVE, next(self.ts_iter))
+
+        self.assertEqual({utils.ShardRange.CREATED,
+                          utils.ShardRange.CLEAVED,
+                          utils.ShardRange.ACTIVE},
+                         srl.states)
+
+    def test_filter(self):
+        srl = ShardRangeList(self.shard_ranges)
+        self.assertEqual(self.shard_ranges, srl.filter())
+        self.assertEqual(self.shard_ranges,
+                         srl.filter(marker='', end_marker=''))
+        self.assertEqual(self.shard_ranges,
+                         srl.filter(marker=utils.ShardRange.MIN,
+                                    end_marker=utils.ShardRange.MAX))
+        self.assertEqual([], srl.filter(marker=utils.ShardRange.MAX,
+                                        end_marker=utils.ShardRange.MIN))
+        self.assertEqual([], srl.filter(marker=utils.ShardRange.MIN,
+                                        end_marker=utils.ShardRange.MIN))
+        self.assertEqual([], srl.filter(marker=utils.ShardRange.MAX,
+                                        end_marker=utils.ShardRange.MAX))
+        self.assertEqual(self.shard_ranges[:1],
+                         srl.filter(marker='', end_marker='b'))
+        self.assertEqual(self.shard_ranges[1:3],
+                         srl.filter(marker='b', end_marker='y'))
+        self.assertEqual([],
+                         srl.filter(marker='y', end_marker='y'))
+        self.assertEqual([],
+                         srl.filter(marker='y', end_marker='x'))
+        # includes trumps marker & end_marker
+        self.assertEqual(self.shard_ranges[0:1],
+                         srl.filter(includes='b', marker='c', end_marker='y'))
+        self.assertEqual(self.shard_ranges[0:1],
+                         srl.filter(includes='b', marker='', end_marker=''))
+        self.assertEqual([], srl.filter(includes='z'))
+
+    def test_find_lower(self):
+        srl = ShardRangeList(self.shard_ranges)
+        self.shard_ranges[0].update_state(
+            utils.ShardRange.CREATED, next(self.ts_iter))
+        self.shard_ranges[1].update_state(
+            utils.ShardRange.CLEAVED, next(self.ts_iter))
+        self.shard_ranges[2].update_state(
+            utils.ShardRange.ACTIVE, next(self.ts_iter))
+
+        def do_test(states):
+            return srl.find_lower(lambda sr: sr.state in states)
+
+        self.assertEqual(srl.upper,
+                         do_test([utils.ShardRange.FOUND]))
+        self.assertEqual(self.shard_ranges[0].lower,
+                         do_test([utils.ShardRange.CREATED]))
+        self.assertEqual(self.shard_ranges[0].lower,
+                         do_test((utils.ShardRange.CREATED,
+                                  utils.ShardRange.CLEAVED)))
+        self.assertEqual(self.shard_ranges[1].lower,
+                         do_test((utils.ShardRange.ACTIVE,
+                                  utils.ShardRange.CLEAVED)))
+        self.assertEqual(self.shard_ranges[2].lower,
+                         do_test([utils.ShardRange.ACTIVE]))
 
 
 @patch('ctypes.get_errno')
