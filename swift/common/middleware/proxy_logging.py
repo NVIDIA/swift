@@ -387,6 +387,8 @@ class ProxyLoggingMiddleware(object):
             start_response_args[0] = (status, list(headers), exc_info)
 
         def status_int_for_logging(start_status, client_disconnect=False):
+            if 'swift.proxy_logging_status' in env:
+                return env['swift.proxy_logging_status']
             # log disconnected clients as '499' status code
             if client_disconnect or input_proxy.client_disconnect:
                 return 499
