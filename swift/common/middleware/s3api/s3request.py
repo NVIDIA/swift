@@ -1405,6 +1405,10 @@ class S3Request(swob.Request):
             raise AccessDenied()
         if status == HTTP_SERVICE_UNAVAILABLE:
             raise ServiceUnavailable()
+        if status in (HTTP_RATE_LIMITED, HTTP_TOO_MANY_REQUESTS):
+            if self.conf.ratelimit_as_client_error:
+                raise SlowDown(status='429 Slow Down')
+            raise SlowDown()
 
         raise InternalError('unexpected status code %d' % status)
 
@@ -1551,6 +1555,8 @@ class S3AclRequest(S3Request):
 
         sw_req.environ.get('swift.authorize', lambda req: None)(sw_req)
         self.environ['swift_owner'] = sw_req.environ.get('swift_owner', False)
+        if 'REMOTE_USER' in sw_req.environ:
+            self.environ['REMOTE_USER'] = sw_req.environ['REMOTE_USER']
 
         # Need to skip S3 authorization on subsequent requests to prevent
         # overwriting the account in PATH_INFO

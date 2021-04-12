@@ -283,6 +283,8 @@ class S3ApiMiddleware(object):
                 len(self.conf.cors_preflight_allow_origin) > 1:
             raise ValueError('if cors_preflight_allow_origin should include '
                              'all domains, * must be the only entry')
+        self.conf.ratelimit_as_client_error = config_true_value(
+            wsgi_conf.get('ratelimit_as_client_error', False))
         self.conf.use_async_delete = config_true_value(
             wsgi_conf.get('use_async_delete', False))
 

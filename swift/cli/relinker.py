@@ -15,15 +15,19 @@
 
 
 import argparse
+import datetime
 import errno
 import fcntl
 import json
 import logging
 import os
+import time
+
 from swift.common.storage_policy import POLICIES
 from swift.common.utils import replace_partition_in_path, config_true_value, \
     audit_location_generator, get_logger, readconf, drop_privileges, \
-    RateLimitedIterator, lock_path, non_negative_float, non_negative_int
+    RateLimitedIterator, lock_path, PrefixLoggerAdapter, distribute_evenly, \
+    non_negative_float, non_negative_int, config_auto_int_value
 from swift.obj import diskfile
 
 
@@ -45,14 +49,14 @@ def policy(policy_name_or_index):
 
 
 class Relinker(object):
-    def __init__(self, conf, logger, device, do_cleanup=False):
+    def __init__(self, conf, logger, device_list=None, do_cleanup=False):
         self.conf = conf
         self.logger = logger
-        self.device = device
+        self.device_list = device_list or []
         self.do_cleanup = do_cleanup
         self.root = self.conf['devices']
-        if self.device is not None:
-            self.root = os.path.join(self.root, self.device)
+        if len(self.device_list) == 1:
+            self.root = os.path.join(self.root, list(self.device_list)[0])
         self.part_power = self.next_part_power = None
         self.diskfile_mgr = None
         self.dev_lock = None
@@ -70,8 +74,8 @@ class Relinker(object):
         }
 
     def devices_filter(self, _, devices):
-        if self.device:
-            devices = [d for d in devices if d == self.device]
+        if self.device_list:
+            devices = [d for d in devices if d in self.device_list]
 
         return set(devices)
 
@@ -222,7 +226,11 @@ class Relinker(object):
                     # get_hashes
                     try:
                         for f in ('hashes.pkl', 'hashes.invalid', '.lock'):
-                            os.unlink(os.path.join(partition_path, f))
+                            try:
+                                os.unlink(os.path.join(partition_path, f))
+                            except OSError as e:
+                                if e.errno != errno.ENOENT:
+                                    raise
                     except OSError:
                         pass
                 try:
@@ -257,6 +265,29 @@ class Relinker(object):
                 hashes.remove(hsh)
         return hashes
 
+    def check_existing(self, new_file):
+        existing_link = None
+        link_created = False
+        start = self.next_part_power - 1
+        stop = max(start - self.conf['link_check_limit'], -1)
+        for check_part_power in range(start, stop, -1):
+            # Try to create the link from each of several previous part power
+            # locations. If an attempt succeeds then either a link was made or
+            # an existing link with the same inode as the next part power
+            # location was found: either is acceptable. The part power location
+            # that previously failed with EEXIST is included in the further
+            # attempts here for simplicity.
+            target_file = replace_partition_in_path(
+                self.conf['devices'], new_file, check_part_power)
+            try:
+                link_created = diskfile.relink_paths(target_file, new_file,
+                                                     ignore_missing=False)
+                existing_link = target_file
+                break
+            except OSError:
+                pass
+        return existing_link, link_created
+
     def process_location(self, hash_path, new_hash_path):
         # Compare the contents of each hash dir with contents of same hash
         # dir in its new partition to verify that the new location has the
@@ -288,6 +319,7 @@ class Relinker(object):
 
         missing_links = 0
         created_links = 0
+        unwanted_files = []
         for filename in required_links:
             # Before removing old files, be sure that the corresponding
             # required new files exist by calling relink_paths again. There
@@ -321,22 +353,52 @@ class Relinker(object):
                     created_links += 1
                     self.stats['linked'] += 1
             except OSError as exc:
-                self.logger.warning(
-                    "Error relinking%s: failed to relink %s to "
-                    "%s: %s", ' (cleanup)' if self.do_cleanup else '',
-                    old_file, new_file, exc)
-                self.stats['errors'] += 1
-                missing_links += 1
+                existing_link = None
+                link_created = False
+                if exc.errno == errno.EEXIST and filename.endswith('.ts'):
+                    # special case for duplicate tombstones in older partition
+                    # power locations
+                    # (https://bugs.launchpad.net/swift/+bug/1921718)
+                    existing_link, link_created = self.check_existing(new_file)
+                if existing_link:
+                    self.logger.debug(
+                        "Relinking%s: link not needed: %s to %s due to "
+                        "existing %s", ' (cleanup)' if self.do_cleanup else '',
+                        old_file, new_file, existing_link)
+                    if link_created:
+                        # uncommon case: the retry succeeded in creating a link
+                        created_links += 1
+                        self.stats['linked'] += 1
+                    wanted_file = replace_partition_in_path(
+                        self.conf['devices'], old_file, self.part_power)
+                    if old_file not in (existing_link, wanted_file):
+                        # A link exists to a different file and this file
+                        # is not the current target for client requests. If
+                        # this file is visited again it is possible that
+                        # the existing_link will have been cleaned up and
+                        # the check will fail, so clean it up now.
+                        self.logger.info(
+                            "Relinking%s: cleaning up unwanted file: %s",
+                            ' (cleanup)' if self.do_cleanup else '', old_file)
+                        unwanted_files.append(filename)
+                else:
+                    self.logger.warning(
+                        "Error relinking%s: failed to relink %s to %s: %s",
+                        ' (cleanup)' if self.do_cleanup else '',
+                        old_file, new_file, exc)
+                    self.stats['errors'] += 1
+                    missing_links += 1
         if created_links:
             diskfile.invalidate_hash(os.path.dirname(new_hash_path))
-        if missing_links or not self.do_cleanup:
-            return
+
+        if self.do_cleanup and not missing_links:
+            # use the sorted list to help unit testing
+            unwanted_files = old_df_data['files']
 
         # the new partition hash dir has the most up to date set of on
         # disk files so it is safe to delete the old location...
         rehash = False
-        # use the sorted list to help unit testing
-        for filename in old_df_data['files']:
+        for filename in unwanted_files:
             old_file = os.path.join(hash_path, filename)
             try:
                 os.remove(old_file)
@@ -436,23 +498,95 @@ class Relinker(object):
                 'There were unexpected errors while enumerating disk '
                 'files: %r', self.stats)
 
-        self.logger.info(
+        if action_errors + listdir_errors + unmounted > 0:
+            log_method = self.logger.warning
+            # NB: audit_location_generator logs unmounted disks as warnings,
+            # but we want to treat them as errors
+            status = EXIT_ERROR
+        else:
+            log_method = self.logger.info
+            status = EXIT_SUCCESS
+
+        log_method(
             '%d hash dirs processed (cleanup=%s) (%d files, %d linked, '
             '%d removed, %d errors)', hash_dirs, self.do_cleanup, files,
             linked, removed, action_errors + listdir_errors)
-        if action_errors + listdir_errors + unmounted > 0:
-            # NB: audit_location_generator logs unmounted disks as warnings,
-            # but we want to treat them as errors
-            return EXIT_ERROR
-        return EXIT_SUCCESS
+        return status
 
 
-def relink(conf, logger, device):
-    return Relinker(conf, logger, device, do_cleanup=False).run()
+def parallel_process(do_cleanup, conf, logger=None, device_list=None):
+    logger = logger or logging.getLogger()
+    device_list = sorted(set(device_list or os.listdir(conf['devices'])))
+    workers = conf['workers']
+    if workers == 'auto':
+        workers = len(device_list)
+    else:
+        workers = min(workers, len(device_list))
 
+    start = time.time()
+    logger.info('Starting relinker (cleanup=%s) using %d workers: %s' %
+                (do_cleanup, workers,
+                 time.strftime('%X %x %Z', time.gmtime(start))))
+    if workers == 0 or len(device_list) in (0, 1):
+        ret = Relinker(
+            conf, logger, device_list, do_cleanup=do_cleanup).run()
+        logger.info('Finished relinker (cleanup=%s): %s (%s elapsed)' %
+                    (do_cleanup, time.strftime('%X %x %Z', time.gmtime()),
+                     datetime.timedelta(seconds=time.time() - start)))
+        return ret
 
-def cleanup(conf, logger, device):
-    return Relinker(conf, logger, device, do_cleanup=True).run()
+    children = {}
+    for worker_devs in distribute_evenly(device_list, workers):
+        pid = os.fork()
+        if pid == 0:
+            dev_logger = PrefixLoggerAdapter(logger, {})
+            dev_logger.set_prefix('[pid=%s, devs=%s] ' % (
+                os.getpid(), ','.join(worker_devs)))
+            os._exit(Relinker(
+                conf, dev_logger, worker_devs, do_cleanup=do_cleanup).run())
+        else:
+            children[pid] = worker_devs
+
+    final_status = EXIT_SUCCESS
+    final_messages = []
+    while children:
+        pid, status = os.wait()
+        sig = status & 0xff
+        status = status >> 8
+        time_delta = time.time() - start
+        devs = children.pop(pid, ['unknown device'])
+        worker_desc = '(pid=%s, devs=%s)' % (pid, ','.join(devs))
+        if sig != 0:
+            final_status = EXIT_ERROR
+            final_messages.append(
+                'Worker %s exited in %.1fs after receiving signal: %s'
+                % (worker_desc, time_delta, sig))
+            continue
+
+        if status == EXIT_SUCCESS:
+            continue
+
+        if status == EXIT_NO_APPLICABLE_POLICY:
+            if final_status == EXIT_SUCCESS:
+                final_status = status
+            continue
+
+        final_status = EXIT_ERROR
+        if status == EXIT_ERROR:
+            final_messages.append(
+                'Worker %s completed in %.1fs with errors'
+                % (worker_desc, time_delta))
+        else:
+            final_messages.append(
+                'Worker %s exited in %.1fs with unexpected status %s'
+                % (worker_desc, time_delta, status))
+
+    for msg in final_messages:
+        logger.warning(msg)
+    logger.info('Finished relinker (cleanup=%s): %s (%s elapsed)' %
+                (do_cleanup, time.strftime('%X %x %Z', time.gmtime()),
+                 datetime.timedelta(seconds=time.time() - start)))
+    return final_status
 
 
 def main(args):
@@ -471,7 +605,8 @@ def main(args):
                         dest='devices', help='Path to swift device directory')
     parser.add_argument('--user', default=None, dest='user',
                         help='Drop privileges to this user before relinking')
-    parser.add_argument('--device', default=None, dest='device',
+    parser.add_argument('--device',
+                        default=[], dest='device_list', action='append',
                         help='Device name to relink (default: all)')
     parser.add_argument('--partition', '-p', default=[], dest='partitions',
                         type=non_negative_int, action='append',
@@ -483,10 +618,21 @@ def main(args):
                         type=non_negative_float, dest='files_per_second',
                         help='Used to limit I/O. Zero implies no limit '
                              '(default: no limit).')
+    parser.add_argument(
+        '--workers', default=None, type=non_negative_int, help=(
+            'Process devices across N workers '
+            '(default: one worker per device)'))
     parser.add_argument('--logfile', default=None, dest='logfile',
                         help='Set log file name. Ignored if using conf_file.')
     parser.add_argument('--debug', default=False, action='store_true',
                         help='Enable debug mode')
+    parser.add_argument('--link-check-limit', type=non_negative_int,
+                        default=None, dest='link_check_limit',
+                        help='Maximum number of partition power locations to '
+                             'check for a valid link target if relink '
+                             'encounters an existing tombstone with different '
+                             'inode in the next partition power location '
+                             '(default: 2).')
 
     args = parser.parse_args(args)
     if args.conf_file:
@@ -519,10 +665,12 @@ def main(args):
             else non_negative_float(conf.get('files_per_second', '0'))),
         'policies': set(args.policies) or POLICIES,
         'partitions': set(args.partitions),
+        'workers': config_auto_int_value(
+            conf.get('workers') if args.workers is None else args.workers,
+            'auto'),
+        'link_check_limit': (
+            args.link_check_limit if args.link_check_limit is not None
+            else non_negative_int(conf.get('link_check_limit', 2))),
     })
-
-    if args.action == 'relink':
-        return relink(conf, logger, device=args.device)
-
-    if args.action == 'cleanup':
-        return cleanup(conf, logger, device=args.device)
+    return parallel_process(
+        args.action == 'cleanup', conf, logger, args.device_list)

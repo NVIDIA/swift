@@ -161,6 +161,7 @@ import json
 import os.path
 import sys
 import time
+from contextlib import contextmanager
 
 from six.moves import input
 
@@ -207,12 +208,22 @@ def _print_shard_range(sr, level=0):
     print(indent + '    state: %9s  upper: %r' % (sr.state_text, sr.upper_str))
 
 
+@contextmanager
+def _open_input(args):
+    if args.input == '-':
+        args.input = '<STDIN>'
+        yield sys.stdin
+    else:
+        with open(args.input, 'r') as fd:
+            yield fd
+
+
 def _load_and_validate_shard_data(args, require_index=True):
     required_keys = ['lower', 'upper', 'object_count']
     if require_index:
         required_keys.append('index')
     try:
-        with open(args.input, 'r') as fd:
+        with _open_input(args) as fd:
             try:
                 data = json.load(fd)
                 if not isinstance(data, list):
@@ -654,6 +665,10 @@ def repair_shard_ranges(broker, args):
 
 def analyze_shard_ranges(args):
     shard_data = _load_and_validate_shard_data(args, require_index=False)
+    for data in shard_data:
+        # allow for incomplete shard range data that may have been scraped from
+        # swift-container-info output
+        data.setdefault('epoch', None)
     shard_ranges = [ShardRange.from_dict(data) for data in shard_data]
     whole_sr = ShardRange('whole/namespace', 0)
     try:

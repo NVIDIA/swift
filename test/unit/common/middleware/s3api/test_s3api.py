@@ -120,6 +120,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             's3_acl': False,
             'use_async_delete': False,
             'cors_preflight_allow_origin': [],
+            'ratelimit_as_client_error': False,
         })
         s3api = S3ApiMiddleware(None, {})
         self.assertEqual(expected, s3api.conf)
@@ -144,6 +145,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             's3_acl': True,
             'use_async_delete': False,
             'cors_preflight_allow_origin': 'foo.example.com,bar.example.com',
+            'ratelimit_as_client_error': True,
         }
         s3api = S3ApiMiddleware(None, conf)
         conf['cors_preflight_allow_origin'] = \
