@@ -18,8 +18,9 @@ from __future__ import print_function
 
 import hashlib
 
-from test.unit import temptree, debug_logger, make_timestamp_iter, \
-    with_tempdir, mock_timestamp_now, FakeIterable
+from test.debug_logger import debug_logger
+from test.unit import temptree, make_timestamp_iter, with_tempdir, \
+    mock_timestamp_now, FakeIterable
 
 import ctypes
 import contextlib
@@ -79,7 +80,7 @@ from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import POLICIES, reload_storage_policies
 from swift.common.swob import Request, Response
-from test.unit import FakeLogger, requires_o_tmpfile_support_in_tmp, \
+from test.unit import requires_o_tmpfile_support_in_tmp, \
     quiet_eventlet_exceptions
 
 threading = eventlet.patcher.original('threading')
@@ -1488,7 +1489,8 @@ class TestUtils(unittest.TestCase):
                     self.handleError(record)
 
         logger = logging.getLogger()
-        logger.addHandler(CrashyLogger())
+        handler = CrashyLogger()
+        logger.addHandler(handler)
 
         # Set up some real file descriptors for stdio. If you run
         # nosetests with "-s", you already have real files there, but
@@ -1515,6 +1517,8 @@ class TestUtils(unittest.TestCase):
                 utils.capture_stdio(logger)
                 logger.info("I like ham")
                 self.assertGreater(crashy_calls[0], 1)
+
+        logger.removeHandler(handler)
 
     def test_parse_options(self):
         # Get a file that is definitely on disk
@@ -2864,7 +2868,7 @@ key = 9ff3b71c849749dbaec4ccdd3cbab62b
 cluster_dfw1 = http://dfw1.host/v1/
 '''
         with temptree([fname], [fcontents]) as tempdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             fpath = os.path.join(tempdir, fname)
             csr = ContainerSyncRealms(fpath, logger)
             for realms_conf in (None, csr):
@@ -3602,7 +3606,7 @@ cluster_dfw1 = http://dfw1.host/v1/
             'bytes': 1234, 'hash': 'asdf', 'name': 'zxcv',
             'content_type': 'text/plain; hello="world"; swift_bytes=15'}
         utils.override_bytes_from_content_type(listing_dict,
-                                               logger=FakeLogger())
+                                               logger=debug_logger())
         self.assertEqual(listing_dict['bytes'], 15)
         self.assertEqual(listing_dict['content_type'],
                          'text/plain;hello="world"')
@@ -3611,7 +3615,7 @@ cluster_dfw1 = http://dfw1.host/v1/
             'bytes': 1234, 'hash': 'asdf', 'name': 'zxcv',
             'content_type': 'text/plain; hello="world"; swift_bytes=hey'}
         utils.override_bytes_from_content_type(listing_dict,
-                                               logger=FakeLogger())
+                                               logger=debug_logger())
         self.assertEqual(listing_dict['bytes'], 1234)
         self.assertEqual(listing_dict['content_type'],
                          'text/plain;hello="world"')
@@ -3910,15 +3914,15 @@ cluster_dfw1 = http://dfw1.host/v1/
     def test_cache_from_env(self):
         # should never get logging when swift.cache is found
         env = {'swift.cache': 42}
-        logger = FakeLogger()
+        logger = debug_logger()
         with mock.patch('swift.common.utils.logging', logger):
             self.assertEqual(42, utils.cache_from_env(env))
             self.assertEqual(0, len(logger.get_lines_for_level('error')))
-        logger = FakeLogger()
+        logger = debug_logger()
         with mock.patch('swift.common.utils.logging', logger):
             self.assertEqual(42, utils.cache_from_env(env, False))
             self.assertEqual(0, len(logger.get_lines_for_level('error')))
-        logger = FakeLogger()
+        logger = debug_logger()
         with mock.patch('swift.common.utils.logging', logger):
             self.assertEqual(42, utils.cache_from_env(env, True))
             self.assertEqual(0, len(logger.get_lines_for_level('error')))
@@ -3926,15 +3930,15 @@ cluster_dfw1 = http://dfw1.host/v1/
         # check allow_none controls logging when swift.cache is not found
         err_msg = 'ERROR: swift.cache could not be found in env!'
         env = {}
-        logger = FakeLogger()
+        logger = debug_logger()
         with mock.patch('swift.common.utils.logging', logger):
             self.assertIsNone(utils.cache_from_env(env))
             self.assertTrue(err_msg in logger.get_lines_for_level('error'))
-        logger = FakeLogger()
+        logger = debug_logger()
         with mock.patch('swift.common.utils.logging', logger):
             self.assertIsNone(utils.cache_from_env(env, False))
             self.assertTrue(err_msg in logger.get_lines_for_level('error'))
-        logger = FakeLogger()
+        logger = debug_logger()
         with mock.patch('swift.common.utils.logging', logger):
             self.assertIsNone(utils.cache_from_env(env, True))
             self.assertEqual(0, len(logger.get_lines_for_level('error')))
@@ -3962,7 +3966,7 @@ cluster_dfw1 = http://dfw1.host/v1/
             # Not a directory - arg is file path
             self.assertRaises(OSError, utils.fsync_dir, temppath)
 
-            logger = FakeLogger()
+            logger = debug_logger()
 
             def _mock_fsync(fd):
                 raise OSError(errno.EBADF, os.strerror(errno.EBADF))
@@ -5535,7 +5539,7 @@ class TestStatsdLogging(unittest.TestCase):
             }, 'some-name', log_route='some-route')
         statsd_client = logger.logger.statsd_client
 
-        fl = FakeLogger()
+        fl = debug_logger()
         statsd_client.logger = fl
         mock_socket = MockUdpSocket()
 
@@ -5548,7 +5552,7 @@ class TestStatsdLogging(unittest.TestCase):
     def test_no_exception_when_cant_send_udp_packet(self):
         logger = utils.get_logger({'log_statsd_host': 'some.host.com'})
         statsd_client = logger.logger.statsd_client
-        fl = FakeLogger()
+        fl = debug_logger()
         statsd_client.logger = fl
         mock_socket = MockUdpSocket(sendto_errno=errno.EPERM)
         statsd_client._open_socket = lambda *_: mock_socket
@@ -6296,7 +6300,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
 
     def test_non_dir_drive(self):
         with temptree([]) as tmpdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             data = os.path.join(tmpdir, "drive", "data")
             os.makedirs(data)
             # Create a file, that represents a non-dir drive
@@ -6314,7 +6318,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
 
     def test_mount_check_drive(self):
         with temptree([]) as tmpdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             data = os.path.join(tmpdir, "drive", "data")
             os.makedirs(data)
             # Create a file, that represents a non-dir drive
@@ -6333,7 +6337,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
 
     def test_non_dir_contents(self):
         with temptree([]) as tmpdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             data = os.path.join(tmpdir, "drive", "data")
             os.makedirs(data)
             with open(os.path.join(data, "partition1"), "w"):
@@ -6355,7 +6359,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
         with temptree([]) as tmpdir:
             expected_objs = list()
             expected_dirs = list()
-            logger = FakeLogger()
+            logger = debug_logger()
             data = os.path.join(tmpdir, "drive", "data")
             os.makedirs(data)
             # Create a file, that represents a non-dir drive
@@ -6400,7 +6404,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
 
     def test_ignore_metadata(self):
         with temptree([]) as tmpdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             data = os.path.join(tmpdir, "drive", "data")
             os.makedirs(data)
             partition = os.path.join(data, "partition2")
@@ -6423,7 +6427,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
 
     def test_hooks(self):
         with temptree([]) as tmpdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             data = os.path.join(tmpdir, "drive", "data")
             os.makedirs(data)
             partition = os.path.join(data, "partition1")
@@ -6471,7 +6475,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
 
     def test_filters(self):
         with temptree([]) as tmpdir:
-            logger = FakeLogger()
+            logger = debug_logger()
             data = os.path.join(tmpdir, "drive", "data")
             os.makedirs(data)
             partition = os.path.join(data, "partition1")
@@ -6576,7 +6580,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
         dev_dir = os.path.join(devices, 'device_is_empty_dir')
         os.makedirs(dev_dir)
 
-        def assert_listdir_error(devices):
+        def assert_listdir_error(devices, expected):
             logger = debug_logger()
             error_counter = {}
             locations = utils.audit_location_generator(
@@ -6585,19 +6589,23 @@ class TestAuditLocationGenerator(unittest.TestCase):
             )
             self.assertEqual([], list(locations))
             self.assertEqual(1, len(logger.get_lines_for_level('warning')))
-            self.assertEqual({'unlistable_partitions': 1}, error_counter)
+            self.assertEqual({'unlistable_partitions': expected},
+                             error_counter)
 
         # file under devices/
         devices = os.path.join(tmpdir, 'devices3')
         os.makedirs(devices)
         with open(os.path.join(devices, 'device_is_file'), 'w'):
             pass
-        assert_listdir_error(devices)
+        listdir_error_data_dir = os.path.join(devices, 'device_is_file',
+                                              'data')
+        assert_listdir_error(devices, [listdir_error_data_dir])
 
         # dir under devices/
         devices = os.path.join(tmpdir, 'devices4')
         device = os.path.join(devices, 'device')
         os.makedirs(device)
+        expected_datadir = os.path.join(devices, 'device', 'data')
         assert_no_errors(devices)
 
         # error for dir under devices/
@@ -6609,7 +6617,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
             return orig_listdir(path)
 
         with mock.patch('swift.common.utils.listdir', mocked):
-            assert_listdir_error(devices)
+            assert_listdir_error(devices, [expected_datadir])
 
         # mount check error
         devices = os.path.join(tmpdir, 'devices5')
@@ -6634,7 +6642,7 @@ class TestAuditLocationGenerator(unittest.TestCase):
             )
         self.assertEqual([], list(locations))
         self.assertEqual(1, len(logger.get_lines_for_level('warning')))
-        self.assertEqual({'unmounted': 1}, error_counter)
+        self.assertEqual({'unmounted': ['device']}, error_counter)
 
 
 class TestGreenAsyncPile(unittest.TestCase):
@@ -7212,7 +7220,7 @@ class TestDocumentItersToHTTPResponseBody(unittest.TestCase):
     def test_no_parts(self):
         body = utils.document_iters_to_http_response_body(
             iter([]), 'dontcare',
-            multipart=False, logger=FakeLogger())
+            multipart=False, logger=debug_logger())
         self.assertEqual(body, '')
 
     def test_single_part(self):
@@ -7222,7 +7230,7 @@ class TestDocumentItersToHTTPResponseBody(unittest.TestCase):
         resp_body = b''.join(
             utils.document_iters_to_http_response_body(
                 iter(doc_iters), b'dontcare',
-                multipart=False, logger=FakeLogger()))
+                multipart=False, logger=debug_logger()))
         self.assertEqual(resp_body, body)
 
     def test_multiple_parts(self):
@@ -7246,7 +7254,7 @@ class TestDocumentItersToHTTPResponseBody(unittest.TestCase):
         resp_body = b''.join(
             utils.document_iters_to_http_response_body(
                 iter(doc_iters), b'boundaryboundary',
-                multipart=True, logger=FakeLogger()))
+                multipart=True, logger=debug_logger()))
         self.assertEqual(resp_body, (
             b"--boundaryboundary\r\n" +
             # This is a little too strict; we don't actually care that the
@@ -7269,7 +7277,7 @@ class TestDocumentItersToHTTPResponseBody(unittest.TestCase):
         useful_iter_mock.__iter__.return_value = ['']
         body_iter = utils.document_iters_to_http_response_body(
             iter([{'part_iter': useful_iter_mock}]), 'dontcare',
-            multipart=False, logger=FakeLogger())
+            multipart=False, logger=debug_logger())
         body = ''
         for s in body_iter:
             body += s
@@ -7280,7 +7288,7 @@ class TestDocumentItersToHTTPResponseBody(unittest.TestCase):
         del useful_iter_mock.close
         body_iter = utils.document_iters_to_http_response_body(
             iter([{'part_iter': useful_iter_mock}]), 'dontcare',
-            multipart=False, logger=FakeLogger())
+            multipart=False, logger=debug_logger())
         body = ''
         for s in body_iter:
             body += s

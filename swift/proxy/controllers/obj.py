@@ -1404,8 +1404,14 @@ class ECAppIter(object):
                 pass
             except ChunkReadTimeout:
                 # unable to resume in ECFragGetter
-                self.logger.exception(_("Timeout fetching fragments for %r"),
-                                      quote(self.path))
+                self.logger.exception(
+                    "ChunkReadTimeout fetching fragments for %r",
+                    quote(self.path))
+            except ChunkWriteTimeout:
+                # slow client disconnect
+                self.logger.exception(
+                    "ChunkWriteTimeout fetching fragments for %r",
+                    quote(self.path))
             except:  # noqa
                 self.logger.exception("Exception fetching fragments for %r",
                                       quote(self.path))
@@ -1437,8 +1443,8 @@ class ECAppIter(object):
                 try:
                     segment = self.policy.pyeclib_driver.decode(fragments)
                 except ECDriverError:
-                    self.logger.exception(_("Error decoding fragments for"
-                                            " %r"), quote(self.path))
+                    self.logger.exception("Error decoding fragments for %r",
+                                          quote(self.path))
                     raise
 
                 yield segment
@@ -2522,22 +2528,21 @@ class ECFragGetter(object):
                         return (start_byte, end_byte, length, headers, part)
                     except ChunkReadTimeout:
                         new_source, new_node = self._dig_for_source_and_node()
-                        if new_source:
-                            self.app.error_occurred(
-                                self.node, _('Trying to read object during '
-                                             'GET (retrying)'))
-                            # Close-out the connection as best as possible.
-                            if getattr(self.source, 'swift_conn', None):
-                                close_swift_conn(self.source)
-                            self.source = new_source
-                            self.node = new_node
-                            # This is safe; it sets up a generator but does
-                            # not call next() on it, so no IO is performed.
-                            parts_iter[0] = http_response_to_document_iters(
-                                new_source,
-                                read_chunk_size=self.app.object_chunk_size)
-                        else:
+                        if not new_source:
                             raise
+                        self.app.error_occurred(
+                            self.node, 'Trying to read next part of '
+                            'EC multi-part GET (retrying)')
+                        # Close-out the connection as best as possible.
+                        if getattr(self.source, 'swift_conn', None):
+                            close_swift_conn(self.source)
+                        self.source = new_source
+                        self.node = new_node
+                        # This is safe; it sets up a generator but does
+                        # not call next() on it, so no IO is performed.
+                        parts_iter[0] = http_response_to_document_iters(
+                            new_source,
+                            read_chunk_size=self.app.object_chunk_size)
 
             def iter_bytes_from_response_part(part_file, nbytes):
                 nchunks = 0
@@ -2567,8 +2572,8 @@ class ECFragGetter(object):
                         new_source, new_node = self._dig_for_source_and_node()
                         if new_source:
                             self.app.error_occurred(
-                                self.node, _('Trying to read object during '
-                                             'GET (retrying)'))
+                                self.node, 'Trying to read EC fragment '
+                                'during GET (retrying)')
                             # Close-out the connection as best as possible.
                             if getattr(self.source, 'swift_conn', None):
                                 close_swift_conn(self.source)
@@ -2744,7 +2749,7 @@ class ECFragGetter(object):
         except (Exception, Timeout):
             self.app.exception_occurred(
                 node, 'Object',
-                _('Trying to %(method)s %(path)s') %
+                'Trying to %(method)s %(path)s' %
                 {'method': self.req.method, 'path': self.req.path})
             return None
 
@@ -3101,6 +3106,12 @@ class ECObjectController(BaseObjectController):
         if resp.status_int == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE:
             resp.headers['Content-Range'] = 'bytes */%s' % resp.headers[
                 'X-Object-Sysmeta-Ec-Content-Length']
+        ec_headers = [header for header in resp.headers
+                      if header.lower().startswith('x-object-sysmeta-ec-')]
+        for header in ec_headers:
+            # clients (including middlewares) shouldn't need to care about
+            # this implementation detail
+            del resp.headers[header]
 
     def _fix_ranges(self, req, resp):
         # Has to be called *before* kickoff()!

@@ -22,12 +22,14 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 
 from swift.common.storage_policy import POLICIES
 from swift.common.utils import replace_partition_in_path, config_true_value, \
     audit_location_generator, get_logger, readconf, drop_privileges, \
     RateLimitedIterator, lock_path, PrefixLoggerAdapter, distribute_evenly, \
-    non_negative_float, non_negative_int, config_auto_int_value
+    non_negative_float, non_negative_int, config_auto_int_value, \
+    dump_recon_cache
 from swift.obj import diskfile
 
 
@@ -39,6 +41,12 @@ STEP_CLEANUP = 'cleanup'
 EXIT_SUCCESS = 0
 EXIT_NO_APPLICABLE_POLICY = 2
 EXIT_ERROR = 1
+RECON_FILE = 'relinker.recon'
+DEFAULT_RECON_CACHE_PATH = '/var/cache/swift'
+
+
+def recursive_defaultdict():
+    return defaultdict(recursive_defaultdict)
 
 
 def policy(policy_name_or_index):
@@ -48,9 +56,50 @@ def policy(policy_name_or_index):
     return value
 
 
+def _aggregate_stats(base_stats, update_stats):
+    for key, value in update_stats.items():
+        base_stats.setdefault(key, 0)
+        base_stats[key] += value
+
+    return base_stats
+
+
+def _aggregate_recon_stats(base_stats, updated_stats):
+    for k, v in updated_stats.items():
+        if k == 'stats':
+            base_stats['stats'] = _aggregate_stats(base_stats['stats'], v)
+        elif k == "start_time":
+            base_stats[k] = min(base_stats.get(k, v), v)
+        elif k in ("timestamp", "total_time"):
+            base_stats[k] = max(base_stats.get(k, 0), v)
+        elif k in ('parts_done', 'total_parts'):
+            base_stats[k] += v
+
+    return base_stats
+
+
+def _zero_stats():
+    return {
+        'hash_dirs': 0,
+        'files': 0,
+        'linked': 0,
+        'removed': 0,
+        'errors': 0}
+
+
+def _zero_collated_stats():
+    return {
+        'parts_done': 0,
+        'total_parts': 0,
+        'total_time': 0,
+        'stats': _zero_stats()}
+
+
 class Relinker(object):
     def __init__(self, conf, logger, device_list=None, do_cleanup=False):
         self.conf = conf
+        self.recon_cache = os.path.join(self.conf['recon_cache_path'],
+                                        RECON_FILE)
         self.logger = logger
         self.device_list = device_list or []
         self.do_cleanup = do_cleanup
@@ -60,18 +109,61 @@ class Relinker(object):
         self.part_power = self.next_part_power = None
         self.diskfile_mgr = None
         self.dev_lock = None
+        self._last_recon_update = time.time()
+        self.stats_interval = float(conf.get('stats_interval', 300.0))
         self.diskfile_router = diskfile.DiskFileRouter(self.conf, self.logger)
-        self._zero_stats()
+        self.stats = _zero_stats()
+        self.devices_data = recursive_defaultdict()
+        self.policy_count = 0
+        self.pid = os.getpid()
 
-    def _zero_stats(self):
-        self.stats = {
-            'hash_dirs': 0,
-            'files': 0,
-            'linked': 0,
-            'removed': 0,
-            'errors': 0,
-            'policies': 0,
-        }
+    def _aggregate_dev_policy_stats(self):
+        for dev_data in self.devices_data.values():
+            dev_data.update(_zero_collated_stats())
+            for policy_data in dev_data.get('policies', {}).values():
+                _aggregate_recon_stats(dev_data, policy_data)
+
+    def _update_recon(self, device=None, force_dump=False):
+        if not force_dump and self._last_recon_update + self.stats_interval \
+                > time.time():
+            # not time yet!
+            return
+        if device:
+            # dump recon stats for the device
+            num_parts_done = sum(
+                1 for part_done in self.states["state"].values()
+                if part_done)
+            num_total_parts = len(self.states["state"])
+            step = STEP_CLEANUP if self.do_cleanup else STEP_RELINK
+            policy_dev_progress = {'step': step,
+                                   'parts_done': num_parts_done,
+                                   'total_parts': num_total_parts,
+                                   'timestamp': time.time()}
+            self.devices_data[device]['policies'][self.policy.idx].update(
+                policy_dev_progress)
+
+        # aggregate device policy level values into device level
+        self._aggregate_dev_policy_stats()
+
+        # We want to periodically update the worker recon timestamp so we know
+        # it's still running
+        recon_data = self._update_worker_stats(recon_dump=False)
+
+        recon_data.update({'devices': self.devices_data})
+        self.logger.debug("Updating recon for %s" % device)
+        self._last_recon_update = time.time()
+        dump_recon_cache(recon_data, self.recon_cache, self.logger)
+
+    @property
+    def total_errors(self):
+        # first make sure the policy data is aggregated down to the device
+        # level
+        self._aggregate_dev_policy_stats()
+        return sum([sum([
+            dev.get('stats', {}).get('errors', 0),
+            dev.get('stats', {}).get('unmounted', 0),
+            dev.get('stats', {}).get('unlistable_partitions', 0)])
+            for dev in self.devices_data.values()])
 
     def devices_filter(self, _, devices):
         if self.device_list:
@@ -109,9 +201,24 @@ class Relinker(object):
             if err.errno != errno.ENOENT:
                 raise
 
-    def hook_post_device(self, _):
+        # initialise the device in recon.
+        device = os.path.basename(device_path)
+        self.devices_data[device]['policies'][self.policy.idx] = {
+            'start_time': time.time(), 'stats': _zero_stats(),
+            'part_power': self.states["part_power"],
+            'next_part_power': self.states["next_part_power"]}
+        self.stats = \
+            self.devices_data[device]['policies'][self.policy.idx]['stats']
+        self._update_recon(device)
+
+    def hook_post_device(self, device_path):
         os.close(self.dev_lock)
         self.dev_lock = None
+        device = os.path.basename(device_path)
+        pol_stats = self.devices_data[device]['policies'][self.policy.idx]
+        total_time = time.time() - pol_stats['start_time']
+        pol_stats.update({'total_time': total_time, 'stats': self.stats})
+        self._update_recon(device, force_dump=True)
 
     def partitions_filter(self, datadir_path, partitions):
         # Remove all non partitions first (eg: auditor_status_ALL.json)
@@ -169,7 +276,9 @@ class Relinker(object):
 
         return partitions
 
-    # Save states when a partition is done
+    def hook_pre_partition(self, partition_path):
+        self.pre_partition_errors = self.total_errors
+
     def hook_post_partition(self, partition_path):
         datadir_path, part = os.path.split(os.path.abspath(partition_path))
         device_path, datadir_name = os.path.split(datadir_path)
@@ -241,13 +350,15 @@ class Relinker(object):
                     # a shot.
                     pass
 
-        # Then mark this part as done, in case the process is interrupted and
-        # needs to resume.
-        self.states["state"][part] = True
-        with open(state_tmp_file, 'wt') as f:
-            json.dump(self.states, f)
-            os.fsync(f.fileno())
-        os.rename(state_tmp_file, state_file)
+        # If there were no errors, mark this partition as done. This is handy
+        # in case the process is interrupted and needs to resume, or there
+        # were errors and the relinker needs to run again.
+        if self.pre_partition_errors == self.total_errors:
+            self.states["state"][part] = True
+            with open(state_tmp_file, 'wt') as f:
+                json.dump(self.states, f)
+                os.fsync(f.fileno())
+            os.rename(state_tmp_file, state_file)
         num_parts_done = sum(
             1 for part in self.states["state"].values()
             if part)
@@ -255,6 +366,7 @@ class Relinker(object):
         num_total_parts = len(self.states["state"])
         self.logger.info("Step: %s Device: %s Policy: %s Partitions: %d/%d" % (
             step, device, self.policy.name, num_parts_done, num_total_parts))
+        self._update_recon(device)
 
     def hashes_filter(self, suff_path, hashes):
         hashes = list(hashes)
@@ -419,6 +531,11 @@ class Relinker(object):
                     'Error invalidating suffix for %s: %r',
                     hash_path, exc)
 
+    def place_policy_stat(self, dev, policy, stat, value):
+        stats = self.devices_data[dev]['policies'][policy.idx].setdefault(
+            "stats", _zero_stats())
+        stats[stat] = stats.get(stat, 0) + value
+
     def process_policy(self, policy):
         self.logger.info(
             'Processing files for policy %s under %s (cleanup=%s)',
@@ -432,6 +549,7 @@ class Relinker(object):
             "next_part_power": self.next_part_power,
             "state": {},
         }
+        audit_stats = {}
 
         locations = audit_location_generator(
             self.conf['devices'],
@@ -441,10 +559,11 @@ class Relinker(object):
             hook_pre_device=self.hook_pre_device,
             hook_post_device=self.hook_post_device,
             partitions_filter=self.partitions_filter,
+            hook_pre_partition=self.hook_pre_partition,
             hook_post_partition=self.hook_post_partition,
             hashes_filter=self.hashes_filter,
             logger=self.logger,
-            error_counter=self.stats,
+            error_counter=audit_stats,
             yield_hash_dirs=True
         )
         if self.conf['files_per_second'] > 0:
@@ -458,8 +577,30 @@ class Relinker(object):
                 continue
             self.process_location(hash_path, new_hash_path)
 
+        # any unmounted devices don't trigger the pre_device trigger.
+        # so we'll deal with them here.
+        for dev in audit_stats.get('unmounted', []):
+            self.place_policy_stat(dev, policy, 'unmounted', 1)
+
+        # Further unlistable_partitions doesn't trigger the post_device, so
+        # we also need to deal with them here.
+        for datadir in audit_stats.get('unlistable_partitions', []):
+            device_path, _ = os.path.split(datadir)
+            device = os.path.basename(device_path)
+            self.place_policy_stat(device, policy, 'unlistable_partitions', 1)
+
+    def _update_worker_stats(self, recon_dump=True, return_code=None):
+        worker_stats = {'devices': self.device_list,
+                        'timestamp': time.time(),
+                        'return_code': return_code}
+        worker_data = {"workers": {str(self.pid): worker_stats}}
+        if recon_dump:
+            dump_recon_cache(worker_data, self.recon_cache, self.logger)
+        return worker_data
+
     def run(self):
-        self._zero_stats()
+        num_policies = 0
+        self._update_worker_stats()
         for policy in self.conf['policies']:
             self.policy = policy
             policy.object_ring = None  # Ensure it will be reloaded
@@ -471,34 +612,19 @@ class Relinker(object):
             if self.do_cleanup != part_power_increased:
                 continue
 
-            self.stats['policies'] += 1
+            num_policies += 1
             self.process_policy(policy)
 
-        policies = self.stats.pop('policies')
-        if not policies:
+        # Some stat collation happens during _update_recon and we want to force
+        # this to happen at the end of the run
+        self._update_recon(force_dump=True)
+        if not num_policies:
             self.logger.warning(
                 "No policy found to increase the partition power.")
+            self._update_worker_stats(return_code=EXIT_NO_APPLICABLE_POLICY)
             return EXIT_NO_APPLICABLE_POLICY
 
-        hash_dirs = self.stats.pop('hash_dirs')
-        files = self.stats.pop('files')
-        linked = self.stats.pop('linked')
-        removed = self.stats.pop('removed')
-        action_errors = self.stats.pop('errors')
-        unmounted = self.stats.pop('unmounted', 0)
-        if unmounted:
-            self.logger.warning('%d disks were unmounted', unmounted)
-        listdir_errors = self.stats.pop('unlistable_partitions', 0)
-        if listdir_errors:
-            self.logger.warning(
-                'There were %d errors listing partition directories',
-                listdir_errors)
-        if self.stats:
-            self.logger.warning(
-                'There were unexpected errors while enumerating disk '
-                'files: %r', self.stats)
-
-        if action_errors + listdir_errors + unmounted > 0:
+        if self.total_errors > 0:
             log_method = self.logger.warning
             # NB: audit_location_generator logs unmounted disks as warnings,
             # but we want to treat them as errors
@@ -507,15 +633,49 @@ class Relinker(object):
             log_method = self.logger.info
             status = EXIT_SUCCESS
 
+        stats = _zero_stats()
+        for dev_stats in self.devices_data.values():
+            stats = _aggregate_stats(stats, dev_stats.get('stats', {}))
+        hash_dirs = stats.pop('hash_dirs')
+        files = stats.pop('files')
+        linked = stats.pop('linked')
+        removed = stats.pop('removed')
+        action_errors = stats.pop('errors')
+        unmounted = stats.pop('unmounted', 0)
+        if unmounted:
+            self.logger.warning('%d disks were unmounted', unmounted)
+        listdir_errors = stats.pop('unlistable_partitions', 0)
+        if listdir_errors:
+            self.logger.warning(
+                'There were %d errors listing partition directories',
+                listdir_errors)
+        if stats:
+            self.logger.warning(
+                'There were unexpected errors while enumerating disk '
+                'files: %r', stats)
+
         log_method(
             '%d hash dirs processed (cleanup=%s) (%d files, %d linked, '
             '%d removed, %d errors)', hash_dirs, self.do_cleanup, files,
             linked, removed, action_errors + listdir_errors)
+
+        self._update_worker_stats(return_code=status)
         return status
+
+
+def _reset_recon(recon_cache, logger):
+    device_progress_recon = {'devices': {}, 'workers': {}}
+    dump_recon_cache(device_progress_recon, recon_cache, logger)
 
 
 def parallel_process(do_cleanup, conf, logger=None, device_list=None):
     logger = logger or logging.getLogger()
+
+    # initialise recon dump for collection
+    # Lets start by always deleting last run's stats
+    recon_cache = os.path.join(conf['recon_cache_path'], RECON_FILE)
+    _reset_recon(recon_cache, logger)
+
     device_list = sorted(set(device_list or os.listdir(conf['devices'])))
     workers = conf['workers']
     if workers == 'auto':
@@ -671,6 +831,10 @@ def main(args):
         'link_check_limit': (
             args.link_check_limit if args.link_check_limit is not None
             else non_negative_int(conf.get('link_check_limit', 2))),
+        'recon_cache_path': conf.get('recon_cache_path',
+                                     DEFAULT_RECON_CACHE_PATH),
+        'stats_interval': non_negative_float(conf.get('stats_interval',
+                                                      300.0)),
     })
     return parallel_process(
         args.action == 'cleanup', conf, logger, args.device_list)

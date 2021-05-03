@@ -48,11 +48,12 @@ from swift.proxy.controllers.base import \
 from swift.common.storage_policy import POLICIES, ECDriverError, \
     StoragePolicy, ECStoragePolicy
 
-from test.unit import FakeRing, fake_http_connect, \
-    debug_logger, patch_policies, SlowBody, FakeStatus, \
-    DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub, \
-    fake_ec_node_response, StubResponse, mocked_http_conn, \
-    quiet_eventlet_exceptions
+from test.debug_logger import debug_logger
+from test.unit import (
+    FakeRing, fake_http_connect, patch_policies, SlowBody, FakeStatus,
+    DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub,
+    fake_ec_node_response, StubResponse, mocked_http_conn,
+    quiet_eventlet_exceptions)
 from test.unit.proxy.test_server import node_error_count
 
 
@@ -2308,12 +2309,17 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         get_statuses = [200] * self.policy.ec_ndata
-        get_hdrs = [{'Connection': 'close'}] * self.policy.ec_ndata
+        get_hdrs = [{
+            'Connection': 'close',
+            'X-Object-Sysmeta-Ec-Scheme': self.policy.ec_scheme_description,
+        }] * self.policy.ec_ndata
         with set_http_connect(*get_statuses, headers=get_hdrs):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
         self.assertNotIn('Connection', resp.headers)
+        self.assertFalse([h for h in resp.headers
+                          if h.lower().startswith('x-object-sysmeta-ec-')])
 
     def test_GET_not_found_when_404_newer(self):
         # if proxy receives a 404, it keeps waiting for other connections until
@@ -4314,8 +4320,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.status_int, 206)
         self.assertEqual(len(log), self.policy.ec_n_unique_fragments * 2)
         log_lines = self.app.logger.get_lines_for_level('error')
-        self.assertIn("Trying to read object during GET (retrying)",
-                      log_lines[0])
+        self.assertIn("Trying to read next part of EC multi-part "
+                      "GET (retrying)", log_lines[0])
         # not the most graceful ending
         self.assertIn("Exception fetching fragments for '/a/c/o'",
                       log_lines[-1])
@@ -4754,6 +4760,44 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             self.assertIn('ChunkReadTimeout (0.01s)', line)
         for line in self.logger.logger.records['ERROR']:
             self.assertIn(req.headers['x-trans-id'], line)
+
+    def test_GET_write_timeout(self):
+        # verify EC GET behavior when there's a timeout sending decoded frags
+        # via the queue.
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-333]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        headers = {'X-Object-Sysmeta-Ec-Etag': etag,
+                   'X-Object-Sysmeta-Ec-Content-Length': '333'}
+        ndata = self.policy.ec_ndata
+        responses = [
+            (200, body, self._add_frag_index(i, headers))
+            for i, body in enumerate(ec_archive_bodies[:ndata])
+        ] * self.policy.ec_duplication_factor
+
+        req = swob.Request.blank('/v1/a/c/o')
+
+        status_codes, body_iter, headers = zip(*responses)
+        self.app.client_timeout = 0.01
+        with mocked_http_conn(*status_codes, body_iter=body_iter,
+                              headers=headers):
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            resp_body = next(resp.app_iter)
+            sleep(0.5)  # lazy client
+            # remaining resp truncated
+            resp_body += b''.join(resp.app_iter)
+        # we log errors
+        log_lines = self.app.logger.get_lines_for_level('error')
+        for line in log_lines:
+            self.assertIn('ChunkWriteTimeout fetching fragments', line)
+        # client gets a short read
+        self.assertEqual(16051, len(test_data))
+        self.assertEqual(8192, len(resp_body))
+        self.assertNotEqual(
+            md5(resp_body, usedforsecurity=False).hexdigest(),
+            etag)
 
     def test_GET_read_timeout_retrying_but_no_more_useful_nodes(self):
         # verify EC GET behavior when initial batch of nodes time out then

@@ -49,8 +49,7 @@ from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          VALID_EC_TYPES)
 from swift.common.utils import Timestamp, md5
 from test import get_config
-# import to namespace for backward compat
-from test.debug_logger import debug_logger, DebugLogger, FakeLogger  # noqa
+from test.debug_logger import FakeLogger
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.ring import Ring, RingData, RingBuilder
 from swift.obj import server
@@ -226,6 +225,7 @@ class FakeRing(Ring):
         # 9 total nodes (6 more past the initial 3) is the cap, no matter if
         # this is set higher, or R^2 for R replicas
         self.set_replicas(replicas)
+        self._next_part_power = None
         self._reload()
 
     def has_changed(self):
@@ -1008,6 +1008,13 @@ def mock_timestamp_now(now=None):
     with mocklib.patch('swift.common.utils.Timestamp.now',
                        classmethod(lambda c: now)):
         yield now
+
+
+@contextmanager
+def mock_timestamp_now_with_iter(ts_iter):
+    with mocklib.patch('swift.common.utils.Timestamp.now',
+                       side_effect=ts_iter):
+        yield
 
 
 class Timeout(object):
