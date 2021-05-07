@@ -24,6 +24,7 @@ import os
 import time
 from collections import defaultdict
 
+from swift.common.exceptions import LockTimeout
 from swift.common.storage_policy import POLICIES
 from swift.common.utils import replace_partition_in_path, config_true_value, \
     audit_location_generator, get_logger, readconf, drop_privileges, \
@@ -338,21 +339,22 @@ class Relinker(object):
             # starts and little data is written to handoffs during the
             # increase).
             if not hashes:
-                with lock_path(partition_path):
-                    # Same lock used by invalidate_hashes, consolidate_hashes,
-                    # get_hashes
-                    try:
-                        for f in ('hashes.pkl', 'hashes.invalid', '.lock'):
+                try:
+                    with lock_path(partition_path, name='replication'), \
+                            lock_path(partition_path):
+                        # Order here is somewhat important for crash-tolerance
+                        for f in ('hashes.pkl', 'hashes.invalid', '.lock',
+                                  '.lock-replication'):
                             try:
                                 os.unlink(os.path.join(partition_path, f))
                             except OSError as e:
                                 if e.errno != errno.ENOENT:
                                     raise
-                    except OSError:
-                        pass
-                try:
+                    # Note that as soon as we've deleted the lock files, some
+                    # other process could come along and make new ones -- so
+                    # this may well complain that the directory is not empty
                     os.rmdir(partition_path)
-                except OSError:
+                except (OSError, LockTimeout):
                     # Most likely, some data landed in here or we hit an error
                     # above. Let the replicator deal with things; it was worth
                     # a shot.
