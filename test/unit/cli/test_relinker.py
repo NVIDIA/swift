@@ -3387,6 +3387,10 @@ class TestRelinker(unittest.TestCase):
                                  set(os.listdir(self.part_dir)))
                 # unlink a random file, should be empty
                 os.unlink(os.path.join(self.part_dir, 'hashes.pkl'))
+                # create an extra ssync replication lock
+                with open(os.path.join(self.part_dir,
+                                       '.lock-replication-123'), 'w'):
+                    pass
                 calls.append(True)
             elif part == self.next_part:
                 # sometimes our random obj needs to rehash the next part too

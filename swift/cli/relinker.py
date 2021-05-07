@@ -341,12 +341,25 @@ class Relinker(object):
                     # Same lock used by invalidate_hashes, consolidate_hashes,
                     # get_hashes
                     try:
-                        for f in ('hashes.pkl', 'hashes.invalid', '.lock'):
+                        # Order of hashes.pkl/invalid is somewhat important
+                        for f in ('hashes.pkl', 'hashes.invalid'):
                             try:
                                 os.unlink(os.path.join(partition_path, f))
                             except OSError as e:
                                 if e.errno != errno.ENOENT:
                                     raise
+
+                        # After that, any lock files (replication lock, hashes
+                        # lock, etc.) can be removed. It's important that we
+                        # not touch any directories, though -- those could
+                        # have new writes
+                        for f in os.listdir(partition_path):
+                            if f.startswith('.lock'):
+                                try:
+                                    os.unlink(os.path.join(partition_path, f))
+                                except OSError as e:
+                                    if e.errno != errno.ENOENT:
+                                        raise
                     except OSError:
                         pass
                 try:
