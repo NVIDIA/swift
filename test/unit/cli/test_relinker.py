@@ -206,10 +206,12 @@ class TestRelinker(unittest.TestCase):
     @contextmanager
     def _mock_relinker(self):
         with mock.patch.object(relinker.logging, 'getLogger',
-                               return_value=self.logger):
-            with mock.patch('swift.cli.relinker.DEFAULT_RECON_CACHE_PATH',
-                            self.recon_cache_path):
-                yield
+                               return_value=self.logger), \
+                mock.patch.object(relinker, 'get_logger',
+                                  return_value=self.logger), \
+                mock.patch('swift.cli.relinker.DEFAULT_RECON_CACHE_PATH',
+                           self.recon_cache_path):
+            yield
 
     def test_workers_parent(self):
         os.mkdir(os.path.join(self.devices, 'sda2'))
@@ -3394,7 +3396,7 @@ class TestRelinker(unittest.TestCase):
                       '(0 files, 0 linked, 1 removed, 0 errors)', info_lines)
         self.assertEqual([], self.logger.get_lines_for_level('error'))
 
-    def test_cleanup_old_part_careful(self):
+    def test_cleanup_old_part_careful_file(self):
         self._common_test_cleanup()
         # make some extra junk file in the part
         extra_file = os.path.join(self.part_dir, 'extra')
@@ -3411,6 +3413,82 @@ class TestRelinker(unittest.TestCase):
         self.assertTrue(os.path.exists(self.part_dir))
         self.assertEqual([], self.logger.get_lines_for_level('error'))
 
+    def test_cleanup_old_part_careful_dir(self):
+        self._common_test_cleanup()
+        # make some extra junk directory in the part
+        extra_dir = os.path.join(self.part_dir, 'extra')
+        os.mkdir(extra_dir)
+        self.assertEqual(0, relinker.main([
+            'cleanup',
+            '--swift-dir', self.testdir,
+            '--devices', self.devices,
+            '--skip-mount',
+        ]))
+        # old partition can't be cleaned up
+        self.assertTrue(os.path.exists(self.part_dir))
+        self.assertTrue(os.path.exists(extra_dir))
+
+    def test_cleanup_old_part_replication_lock_taken(self):
+        # verify that relinker must take the replication lock before deleting
+        # it, and handles the LockTimeout when unable to take it
+        self._common_test_cleanup()
+
+        config = """
+        [DEFAULT]
+        swift_dir = %s
+        devices = %s
+        mount_check = false
+        replication_lock_timeout = 1
+
+        [object-relinker]
+        """ % (self.testdir, self.devices)
+        conf_file = os.path.join(self.testdir, 'relinker.conf')
+        with open(conf_file, 'w') as f:
+            f.write(dedent(config))
+
+        with utils.lock_path(self.part_dir, name='replication'):
+            # lock taken so relinker should be unable to remove the lock file
+            with self._mock_relinker():
+                self.assertEqual(0, relinker.main(['cleanup', conf_file]))
+        # old partition can't be cleaned up
+        self.assertTrue(os.path.exists(self.part_dir))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.part_dir, '.lock-replication')))
+        self.assertEqual([], self.logger.get_lines_for_level('error'))
+
+    def test_cleanup_old_part_partition_lock_taken(self):
+        # verify that relinker must take the partition lock before deleting
+        # it, and handles the LockTimeout when unable to take it
+        self._common_test_cleanup()
+
+        config = """
+        [DEFAULT]
+        swift_dir = %s
+        devices = %s
+        mount_check = false
+        replication_lock_timeout = 1
+
+        [object-relinker]
+        """ % (self.testdir, self.devices)
+        conf_file = os.path.join(self.testdir, 'relinker.conf')
+        with open(conf_file, 'w') as f:
+            f.write(dedent(config))
+
+        with utils.lock_path(self.part_dir):
+            # lock taken so relinker should be unable to remove the lock file
+            with self._mock_relinker(), mock.patch(
+                    'swift.common.utils.DEFAULT_LOCK_TIMEOUT', 0.1):
+                self.assertEqual(0, relinker.main(['cleanup', conf_file]))
+        # old partition can't be cleaned up
+        self.assertTrue(os.path.exists(self.part_dir))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.part_dir, '.lock')))
+        self.assertEqual([], self.logger.get_lines_for_level('error'))
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warning_lines))
+        self.assertIn('Error invalidating suffix', warning_lines[0])
+        self.assertIn('LockTimeout', warning_lines[0])
+
     def test_cleanup_old_part_robust(self):
         self._common_test_cleanup()
 
@@ -3425,6 +3503,10 @@ class TestRelinker(unittest.TestCase):
                                  set(os.listdir(self.part_dir)))
                 # unlink a random file, should be empty
                 os.unlink(os.path.join(self.part_dir, 'hashes.pkl'))
+                # create an ssync replication lock, too
+                with open(os.path.join(self.part_dir,
+                                       '.lock-replication'), 'w'):
+                    pass
                 calls.append(True)
             elif part == self.next_part:
                 # sometimes our random obj needs to rehash the next part too
