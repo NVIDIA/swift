@@ -18,6 +18,7 @@ from __future__ import print_function
 
 import hashlib
 
+from test import annotate_failure
 from test.debug_logger import debug_logger
 from test.unit import temptree, make_timestamp_iter, with_tempdir, \
     mock_timestamp_now, FakeIterable
@@ -3125,6 +3126,27 @@ cluster_dfw1 = http://dfw1.host/v1/
                           'less than 100, not "{}"'.format(val),
                           cm.exception.args[0])
 
+    def test_config_request_node_count_value(self):
+        def do_test(value, replicas, expected):
+            self.assertEqual(
+                expected,
+                utils.config_request_node_count_value(value)(replicas))
+
+        do_test('0', 10, 0)
+        do_test('1 * replicas', 3, 3)
+        do_test('1 * replicas', 11, 11)
+        do_test('2 * replicas', 3, 6)
+        do_test('2 * replicas', 11, 22)
+        do_test('11', 11, 11)
+        do_test('10', 11, 10)
+        do_test('12', 11, 12)
+
+        for bad in ('1.1', 1.1, 'auto', 'bad',
+                    '2.5 * replicas', 'two * replicas'):
+            with annotate_failure(bad):
+                with self.assertRaises(ValueError):
+                    utils.config_request_node_count_value(bad)
+
     def test_config_auto_int_value(self):
         expectations = {
             # (value, default) : expected,
@@ -4414,6 +4436,22 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertEqual(1400, utils.get_partition_for_hash(hex_hash, 11))
         self.assertEqual(0, utils.get_partition_for_hash(hex_hash, 0))
         self.assertEqual(0, utils.get_partition_for_hash(hex_hash, -1))
+
+    def test_get_partition_from_path(self):
+        def do_test(path):
+            self.assertEqual(utils.get_partition_from_path('/s/n', path), 70)
+            self.assertEqual(utils.get_partition_from_path('/s/n/', path), 70)
+            path += '/'
+            self.assertEqual(utils.get_partition_from_path('/s/n', path), 70)
+            self.assertEqual(utils.get_partition_from_path('/s/n/', path), 70)
+
+        do_test('/s/n/d/o/70/c77/af088baea4806dcaba30bf07d9e64c77/f')
+        # also works with a hashdir
+        do_test('/s/n/d/o/70/c77/af088baea4806dcaba30bf07d9e64c77')
+        # or suffix dir
+        do_test('/s/n/d/o/70/c77')
+        # or even the part dir itself
+        do_test('/s/n/d/o/70')
 
     def test_replace_partition_in_path(self):
         # Check for new part = part * 2
@@ -7819,7 +7857,7 @@ class TestShardRange(unittest.TestCase):
                       meta_timestamp=ts_1.internal, deleted=0,
                       state=utils.ShardRange.FOUND,
                       state_timestamp=ts_1.internal, epoch=None,
-                      reported=0)
+                      reported=0, tombstones=-1)
         assert_initialisation_ok(dict(empty_run, name='a/c', timestamp=ts_1),
                                  expect)
         assert_initialisation_ok(dict(name='a/c', timestamp=ts_1), expect)
@@ -7829,17 +7867,18 @@ class TestShardRange(unittest.TestCase):
                         meta_timestamp=ts_2, deleted=0,
                         state=utils.ShardRange.CREATED,
                         state_timestamp=ts_3.internal, epoch=ts_4,
-                        reported=0)
+                        reported=0, tombstones=11)
         expect.update({'lower': 'l', 'upper': 'u', 'object_count': 2,
                        'bytes_used': 10, 'meta_timestamp': ts_2.internal,
                        'state': utils.ShardRange.CREATED,
                        'state_timestamp': ts_3.internal, 'epoch': ts_4,
-                       'reported': 0})
+                       'reported': 0, 'tombstones': 11})
         assert_initialisation_ok(good_run.copy(), expect)
 
-        # obj count and bytes used as int strings
+        # obj count, tombstones and bytes used as int strings
         good_str_run = good_run.copy()
-        good_str_run.update({'object_count': '2', 'bytes_used': '10'})
+        good_str_run.update({'object_count': '2', 'bytes_used': '10',
+                             'tombstones': '11'})
         assert_initialisation_ok(good_str_run, expect)
 
         good_no_meta = good_run.copy()
@@ -7895,7 +7934,7 @@ class TestShardRange(unittest.TestCase):
             'upper': upper, 'object_count': 10, 'bytes_used': 100,
             'meta_timestamp': ts_2.internal, 'deleted': 0,
             'state': utils.ShardRange.FOUND, 'state_timestamp': ts_3.internal,
-            'epoch': ts_4, 'reported': 0}
+            'epoch': ts_4, 'reported': 0, 'tombstones': -1}
         self.assertEqual(expected, sr_dict)
         self.assertIsInstance(sr_dict['lower'], six.string_types)
         self.assertIsInstance(sr_dict['upper'], six.string_types)
@@ -7910,9 +7949,9 @@ class TestShardRange(unittest.TestCase):
         for key in sr_dict:
             bad_dict = dict(sr_dict)
             bad_dict.pop(key)
-            if key == 'reported':
-                # This was added after the fact, and we need to be able to eat
-                # data from old servers
+            if key in ('reported', 'tombstones'):
+                # These were added after the fact, and we need to be able to
+                # eat data from old servers
                 utils.ShardRange.from_dict(bad_dict)
                 utils.ShardRange(**bad_dict)
                 continue
@@ -8025,6 +8064,62 @@ class TestShardRange(unittest.TestCase):
                 sr.increment_meta(*args)
         check_bad_args('bad', 10)
         check_bad_args(10, 'bad')
+
+    def test_update_tombstones(self):
+        ts_1 = next(self.ts_iter)
+        sr = utils.ShardRange('a/test', ts_1, 'l', 'u', 0, 0, None)
+        self.assertEqual(-1, sr.tombstones)
+        self.assertFalse(sr.reported)
+
+        with mock_timestamp_now(next(self.ts_iter)) as now:
+            sr.update_tombstones(1)
+        self.assertEqual(1, sr.tombstones)
+        self.assertEqual(now, sr.meta_timestamp)
+        self.assertFalse(sr.reported)
+
+        sr.reported = True
+        with mock_timestamp_now(next(self.ts_iter)) as now:
+            sr.update_tombstones(3, None)
+        self.assertEqual(3, sr.tombstones)
+        self.assertEqual(now, sr.meta_timestamp)
+        self.assertFalse(sr.reported)
+
+        sr.reported = True
+        ts_2 = next(self.ts_iter)
+        sr.update_tombstones(5, ts_2)
+        self.assertEqual(5, sr.tombstones)
+        self.assertEqual(ts_2, sr.meta_timestamp)
+        self.assertFalse(sr.reported)
+
+        # no change in value -> no change in reported
+        sr.reported = True
+        ts_3 = next(self.ts_iter)
+        sr.update_tombstones(5, ts_3)
+        self.assertEqual(5, sr.tombstones)
+        self.assertEqual(ts_3, sr.meta_timestamp)
+        self.assertTrue(sr.reported)
+
+        sr.update_meta('11', '12')
+        self.assertEqual(11, sr.object_count)
+        self.assertEqual(12, sr.bytes_used)
+
+        def check_bad_args(*args):
+            with self.assertRaises(ValueError):
+                sr.update_tombstones(*args)
+        check_bad_args('bad')
+        check_bad_args(10, 'bad')
+
+    def test_row_count(self):
+        ts_1 = next(self.ts_iter)
+        sr = utils.ShardRange('a/test', ts_1, 'l', 'u', 0, 0, None)
+        self.assertEqual(0, sr.row_count)
+
+        sr.update_meta(11, 123)
+        self.assertEqual(11, sr.row_count)
+        sr.update_tombstones(13)
+        self.assertEqual(24, sr.row_count)
+        sr.update_meta(0, 0)
+        self.assertEqual(13, sr.row_count)
 
     def test_state_timestamp_setter(self):
         ts_1 = next(self.ts_iter)
@@ -8635,9 +8730,9 @@ class TestShardRangeList(unittest.TestCase):
         self.ts_iter = make_timestamp_iter()
         self.shard_ranges = [
             utils.ShardRange('a/b', self.t1, 'a', 'b',
-                             object_count=2, bytes_used=22),
+                             object_count=2, bytes_used=22, tombstones=222),
             utils.ShardRange('b/c', self.t2, 'b', 'c',
-                             object_count=4, bytes_used=44),
+                             object_count=4, bytes_used=44, tombstones=444),
             utils.ShardRange('c/y', self.t1, 'c', 'y',
                              object_count=6, bytes_used=66),
         ]
@@ -8649,6 +8744,7 @@ class TestShardRangeList(unittest.TestCase):
         self.assertEqual(utils.ShardRange.MIN, srl.upper)
         self.assertEqual(0, srl.object_count)
         self.assertEqual(0, srl.bytes_used)
+        self.assertEqual(0, srl.row_count)
 
     def test_init_with_list(self):
         srl = ShardRangeList(self.shard_ranges[:2])
@@ -8657,6 +8753,7 @@ class TestShardRangeList(unittest.TestCase):
         self.assertEqual('c', srl.upper)
         self.assertEqual(6, srl.object_count)
         self.assertEqual(66, srl.bytes_used)
+        self.assertEqual(672, srl.row_count)
 
         srl.append(self.shard_ranges[2])
         self.assertEqual(3, len(srl))
@@ -8664,6 +8761,8 @@ class TestShardRangeList(unittest.TestCase):
         self.assertEqual('y', srl.upper)
         self.assertEqual(12, srl.object_count)
         self.assertEqual(132, srl.bytes_used)
+        self.assertEqual(-1, self.shard_ranges[2].tombstones)  # sanity check
+        self.assertEqual(678, srl.row_count)  # NB: tombstones=-1 not counted
 
     def test_pop(self):
         srl = ShardRangeList(self.shard_ranges[:2])
@@ -8673,6 +8772,7 @@ class TestShardRangeList(unittest.TestCase):
         self.assertEqual('b', srl.upper)
         self.assertEqual(2, srl.object_count)
         self.assertEqual(22, srl.bytes_used)
+        self.assertEqual(224, srl.row_count)
 
     def test_slice(self):
         srl = ShardRangeList(self.shard_ranges)
@@ -8683,6 +8783,7 @@ class TestShardRangeList(unittest.TestCase):
         self.assertEqual('b', sublist.upper)
         self.assertEqual(2, sublist.object_count)
         self.assertEqual(22, sublist.bytes_used)
+        self.assertEqual(224, sublist.row_count)
 
         sublist = srl[1:]
         self.assertIsInstance(sublist, ShardRangeList)
@@ -8691,6 +8792,7 @@ class TestShardRangeList(unittest.TestCase):
         self.assertEqual('y', sublist.upper)
         self.assertEqual(10, sublist.object_count)
         self.assertEqual(110, sublist.bytes_used)
+        self.assertEqual(454, sublist.row_count)
 
     def test_includes(self):
         srl = ShardRangeList(self.shard_ranges)

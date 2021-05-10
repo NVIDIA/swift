@@ -30,7 +30,8 @@ from swift.common import ring, utils
 from swift.common.swob import Request
 from swift.common.middleware import recon
 from swift.common.storage_policy import StoragePolicy
-from test.unit import patch_policies, FakeLogger
+from test.debug_logger import debug_logger
+from test.unit import patch_policies
 
 
 def fake_check_mount(a, b):
@@ -241,7 +242,7 @@ class TestReconSuccess(TestCase):
         self.real_from_cache = self.app._from_recon_cache
         self.app._from_recon_cache = self.fakecache.fake_from_recon_cache
         self.frecon = FakeRecon()
-        self.app.logger = FakeLogger()
+        self.app.logger = debug_logger()
 
         # replace hash md5 implementation of the md5_hash_for_file function
         mock_hash_for_file = mock.patch(
@@ -488,7 +489,7 @@ class TestReconSuccess(TestCase):
         rv = self.app._from_recon_cache(['testkey1', 'notpresentkey'],
                                         'test.cache', openr=oart)
         self.assertEqual(rv, {'notpresentkey': None, 'testkey1': None})
-        self.assertIn('Error reading recon cache file',
+        self.assertIn('Error reading recon cache file: ',
                       self.app.logger.get_lines_for_level('error'))
         # Now try with ignore_missing but not ENOENT
         self.app.logger.clear()
@@ -496,7 +497,7 @@ class TestReconSuccess(TestCase):
                                         'test.cache', openr=oart,
                                         ignore_missing=True)
         self.assertEqual(rv, {'notpresentkey': None, 'testkey1': None})
-        self.assertIn('Error reading recon cache file',
+        self.assertIn('Error reading recon cache file: ',
                       self.app.logger.get_lines_for_level('error'))
         # Now try again with ignore_missing with ENOENT
         self.app.logger.clear()
@@ -505,8 +506,7 @@ class TestReconSuccess(TestCase):
                                         'test.cache', openr=oart,
                                         ignore_missing=True)
         self.assertEqual(rv, {'notpresentkey': None, 'testkey1': None})
-        self.assertNotIn('Error reading recon cache file',
-                         self.app.logger.get_lines_for_level('error'))
+        self.assertEqual(self.app.logger.get_lines_for_level('error'), [])
         self.app._from_recon_cache = self.fakecache.fake_from_recon_cache
 
     def test_from_recon_cache_valueerror(self):
@@ -515,7 +515,7 @@ class TestReconSuccess(TestCase):
         rv = self.app._from_recon_cache(['testkey1', 'notpresentkey'],
                                         'test.cache', openr=oart)
         self.assertEqual(rv, {'notpresentkey': None, 'testkey1': None})
-        self.assertIn('Error parsing recon cache file',
+        self.assertIn('Error parsing recon cache file: ',
                       self.app.logger.get_lines_for_level('error'))
         self.app._from_recon_cache = self.fakecache.fake_from_recon_cache
 
@@ -525,7 +525,7 @@ class TestReconSuccess(TestCase):
         rv = self.app._from_recon_cache(['testkey1', 'notpresentkey'],
                                         'test.cache', openr=oart)
         self.assertEqual(rv, {'notpresentkey': None, 'testkey1': None})
-        self.assertIn('Error retrieving recon data',
+        self.assertIn('Error retrieving recon data: ',
                       self.app.logger.get_lines_for_level('error'))
         self.app._from_recon_cache = self.fakecache.fake_from_recon_cache
 

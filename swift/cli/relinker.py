@@ -29,7 +29,7 @@ from swift.common.utils import replace_partition_in_path, config_true_value, \
     audit_location_generator, get_logger, readconf, drop_privileges, \
     RateLimitedIterator, lock_path, PrefixLoggerAdapter, distribute_evenly, \
     non_negative_float, non_negative_int, config_auto_int_value, \
-    dump_recon_cache
+    dump_recon_cache, get_partition_from_path
 from swift.obj import diskfile
 
 
@@ -43,6 +43,7 @@ EXIT_NO_APPLICABLE_POLICY = 2
 EXIT_ERROR = 1
 RECON_FILE = 'relinker.recon'
 DEFAULT_RECON_CACHE_PATH = '/var/cache/swift'
+DEFAULT_STATS_INTERVAL = 300.0
 
 
 def recursive_defaultdict():
@@ -110,12 +111,14 @@ class Relinker(object):
         self.diskfile_mgr = None
         self.dev_lock = None
         self._last_recon_update = time.time()
-        self.stats_interval = float(conf.get('stats_interval', 300.0))
+        self.stats_interval = float(conf.get(
+            'stats_interval', DEFAULT_STATS_INTERVAL))
         self.diskfile_router = diskfile.DiskFileRouter(self.conf, self.logger)
         self.stats = _zero_stats()
         self.devices_data = recursive_defaultdict()
         self.policy_count = 0
         self.pid = os.getpid()
+        self.dirty_partitions = set()
 
     def _aggregate_dev_policy_stats(self):
         for dev_data in self.devices_data.values():
@@ -150,7 +153,10 @@ class Relinker(object):
         recon_data = self._update_worker_stats(recon_dump=False)
 
         recon_data.update({'devices': self.devices_data})
-        self.logger.debug("Updating recon for %s" % device)
+        if device:
+            self.logger.debug("Updating recon for %s", device)
+        else:
+            self.logger.debug("Updating recon")
         self._last_recon_update = time.time()
         dump_recon_cache(recon_data, self.recon_cache, self.logger)
 
@@ -310,15 +316,16 @@ class Relinker(object):
         # shift to the new partition space and rehash
         #   |0                             2N|
         #   |                IIJJKKLLMMNNOOPP|
-        partition = int(part)
-        if not self.do_cleanup and partition >= 2 ** (
-                self.states['part_power'] - 1):
-            for new_part in (2 * partition, 2 * partition + 1):
+        for partition in self.dirty_partitions:
+            if self.do_cleanup or partition >= 2 ** (
+                    self.states['next_part_power'] - 1):
                 self.diskfile_mgr.get_hashes(
-                    device, new_part, [], self.policy)
-        elif self.do_cleanup:
+                    device, partition, [], self.policy)
+        self.dirty_partitions = set()
+
+        if self.do_cleanup:
             hashes = self.diskfile_mgr.get_hashes(
-                device, partition, [], self.policy)
+                device, int(part), [], self.policy)
             # In any reasonably-large cluster, we'd expect all old
             # partitions P to be empty after cleanup (i.e., it's unlikely
             # that there's another partition Q := P//2 that also has data
@@ -334,12 +341,25 @@ class Relinker(object):
                     # Same lock used by invalidate_hashes, consolidate_hashes,
                     # get_hashes
                     try:
-                        for f in ('hashes.pkl', 'hashes.invalid', '.lock'):
+                        # Order of hashes.pkl/invalid is somewhat important
+                        for f in ('hashes.pkl', 'hashes.invalid'):
                             try:
                                 os.unlink(os.path.join(partition_path, f))
                             except OSError as e:
                                 if e.errno != errno.ENOENT:
                                     raise
+
+                        # After that, any lock files (replication lock, hashes
+                        # lock, etc.) can be removed. It's important that we
+                        # not touch any directories, though -- those could
+                        # have new writes
+                        for f in os.listdir(partition_path):
+                            if f.startswith('.lock'):
+                                try:
+                                    os.unlink(os.path.join(partition_path, f))
+                                except OSError as e:
+                                    if e.errno != errno.ENOENT:
+                                        raise
                     except OSError:
                         pass
                 try:
@@ -364,8 +384,9 @@ class Relinker(object):
             if part)
         step = STEP_CLEANUP if self.do_cleanup else STEP_RELINK
         num_total_parts = len(self.states["state"])
-        self.logger.info("Step: %s Device: %s Policy: %s Partitions: %d/%d" % (
-            step, device, self.policy.name, num_parts_done, num_total_parts))
+        self.logger.info(
+            "Step: %s Device: %s Policy: %s Partitions: %d/%d",
+            step, device, self.policy.name, num_parts_done, num_total_parts)
         self._update_recon(device)
 
     def hashes_filter(self, suff_path, hashes):
@@ -501,6 +522,8 @@ class Relinker(object):
                     self.stats['errors'] += 1
                     missing_links += 1
         if created_links:
+            self.dirty_partitions.add(get_partition_from_path(
+                self.conf['devices'], new_hash_path))
             diskfile.invalidate_hash(os.path.dirname(new_hash_path))
 
         if self.do_cleanup and not missing_links:
@@ -523,6 +546,9 @@ class Relinker(object):
                 self.logger.debug("Removed %s", old_file)
 
         if rehash:
+            # Even though we're invalidating the suffix, don't update
+            # self.dirty_hashes -- we only care about them for relinking
+            # into the new part-power space
             try:
                 diskfile.invalidate_hash(os.path.dirname(hash_path))
             except Exception as exc:
@@ -749,6 +775,10 @@ def parallel_process(do_cleanup, conf, logger=None, device_list=None):
     return final_status
 
 
+def auto_or_int(value):
+    return config_auto_int_value(value, default='auto')
+
+
 def main(args):
     parser = argparse.ArgumentParser(
         description='Relink and cleanup objects to increase partition power')
@@ -778,8 +808,12 @@ def main(args):
                         type=non_negative_float, dest='files_per_second',
                         help='Used to limit I/O. Zero implies no limit '
                              '(default: no limit).')
+    parser.add_argument('--stats-interval', default=None,
+                        type=non_negative_float, dest='stats_interval',
+                        help='Emit stats to recon roughly every N seconds. '
+                             '(default: %d).' % DEFAULT_STATS_INTERVAL)
     parser.add_argument(
-        '--workers', default=None, type=non_negative_int, help=(
+        '--workers', default=None, type=auto_or_int, help=(
             'Process devices across N workers '
             '(default: one worker per device)'))
     parser.add_argument('--logfile', default=None, dest='logfile',
@@ -833,8 +867,9 @@ def main(args):
             else non_negative_int(conf.get('link_check_limit', 2))),
         'recon_cache_path': conf.get('recon_cache_path',
                                      DEFAULT_RECON_CACHE_PATH),
-        'stats_interval': non_negative_float(conf.get('stats_interval',
-                                                      300.0)),
+        'stats_interval': non_negative_float(
+            args.stats_interval or conf.get('stats_interval',
+                                            DEFAULT_STATS_INTERVAL)),
     })
     return parallel_process(
         args.action == 'cleanup', conf, logger, args.device_list)

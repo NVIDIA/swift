@@ -40,7 +40,6 @@ from test.probe import PROXY_BASE_URL
 from test.probe.brain import BrainSplitter
 from test.probe.common import ReplProbeTest, get_server_number, \
     wait_for_server_to_hangup
-from test.debug_logger import debug_logger
 import mock
 
 
@@ -415,12 +414,8 @@ class BaseTestContainerSharding(ReplProbeTest):
                                additional_args='--partitions=%s' % part)
 
     def run_custom_sharder(self, conf_index, custom_conf, **kwargs):
-        conf_file = self.configs['container-sharder'][conf_index]
-        conf = utils.readconf(conf_file, 'container-sharder')
-        conf.update(custom_conf)
-        sharder = ContainerSharder(conf, logger=debug_logger('probe'))
-        sharder.run_once(**kwargs)
-        return sharder
+        return self.run_custom_daemon(ContainerSharder, 'container-sharder',
+                                      conf_index, custom_conf, **kwargs)
 
 
 class TestContainerShardingNonUTF8(BaseTestContainerSharding):
@@ -1682,8 +1677,13 @@ class TestContainerSharding(BaseTestContainerSharding):
                     orig_range_data, range_data,
                     excludes=['meta_timestamp', 'state_timestamp'])
 
-            # ...until the sharders run and update root
-            self.run_sharders(orig_shard_ranges[0])
+            # ...until the sharders run and update root; reclaim tombstones so
+            # that the shard is shrinkable
+            shard_0_part = self.get_part_and_node_numbers(
+                orig_shard_ranges[0])[0]
+            for conf_index in self.configs['container-sharder'].keys():
+                self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                        override_partitions=[shard_0_part])
             exp_obj_count = len(second_shard_objects) + 1
             self.assert_container_object_count(exp_obj_count)
             self.assert_container_listing([alpha] + second_shard_objects)
@@ -1748,10 +1748,32 @@ class TestContainerSharding(BaseTestContainerSharding):
 
             self.assert_container_listing([alpha])
 
-            # runs sharders so second range shrinks away, requires up to 3
-            # cycles
-            self.sharders.once()  # shard updates root stats
+            # run sharders: second range should not shrink away yet because it
+            # has tombstones
+            self.sharders.once()  # second shard updates root stats
             self.assert_container_listing([alpha])
+            self.sharders.once()  # root finds shrinkable shard
+            self.assert_container_listing([alpha])
+            self.sharders.once()  # shards shrink themselves
+            self.assert_container_listing([alpha])
+
+            # the acceptor shard is intact...
+            shard_nodes_data = self.direct_get_container_shard_ranges(
+                orig_shard_ranges[1].account, orig_shard_ranges[1].container)
+            obj_count, bytes_used = check_shard_nodes_data(shard_nodes_data)
+            self.assertEqual(1, obj_count)
+
+            # run sharders to reclaim tombstones so that the second shard is
+            # shrinkable
+            shard_1_part = self.get_part_and_node_numbers(
+                orig_shard_ranges[1])[0]
+            for conf_index in self.configs['container-sharder'].keys():
+                self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                        override_partitions=[shard_1_part])
+            self.assert_container_listing([alpha])
+
+            # run sharders so second range shrinks away, requires up to 2
+            # cycles
             self.sharders.once()  # root finds shrinkable shard
             self.assert_container_listing([alpha])
             self.sharders.once()  # shards shrink themselves
@@ -2215,10 +2237,15 @@ class TestContainerSharding(BaseTestContainerSharding):
         self.assert_container_listing([])
         self.assert_container_post_ok('has objects')
 
-        # run sharder on shard containers to update root stats
+        # run sharder on shard containers to update root stats; reclaim
+        # the tombstones so that the shards appear to be shrinkable
         shard_ranges = self.get_container_shard_ranges()
         self.assertLengthEqual(shard_ranges, 2)
-        self.run_sharders(shard_ranges)
+        shard_partitions = [self.get_part_and_node_numbers(sr)[0]
+                            for sr in shard_ranges]
+        for conf_index in self.configs['container-sharder'].keys():
+            self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                    override_partitions=shard_partitions)
         self.assert_container_object_count(0)
 
         # First, test a misplaced object moving from one shard to another.
@@ -2349,8 +2376,12 @@ class TestContainerSharding(BaseTestContainerSharding):
         self.assert_container_listing(shard_1_objects)
         self.assert_container_post_ok('has objects')
 
-        # run sharder on first shard container to update root stats
-        self.run_sharders(shard_ranges[0])
+        # run sharder on first shard container to update root stats; reclaim
+        # the tombstones so that the shard appears to be shrinkable
+        shard_0_part = self.get_part_and_node_numbers(shard_ranges[0])[0]
+        for conf_index in self.configs['container-sharder'].keys():
+            self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                    override_partitions=[shard_0_part])
         self.assert_container_object_count(len(shard_1_objects))
 
         # First, test a misplaced object moving from one shard to another.
@@ -2384,10 +2415,13 @@ class TestContainerSharding(BaseTestContainerSharding):
 
         # Now we have just one active shard, test a misplaced object moving
         # from that shard to the root.
-        # delete most objects from second shard range and run sharder on root
-        # to discover second shrink candidate
+        # delete most objects from second shard range, reclaim the tombstones,
+        # and run sharder on root to discover second shrink candidate
         self.delete_objects(shard_1_objects)
-        self.run_sharders(shard_ranges[1])
+        shard_1_part = self.get_part_and_node_numbers(shard_ranges[1])[0]
+        for conf_index in self.configs['container-sharder'].keys():
+            self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                    override_partitions=[shard_1_part])
         self.sharders.once(additional_args='--partitions=%s' % self.brain.part)
         # then run sharder on the shard node to shrink it to root - note this
         # moves alpha to the root db
@@ -2457,7 +2491,10 @@ class TestContainerSharding(BaseTestContainerSharding):
         self.assert_container_post_ok('has objects')
 
         # run sharder on first shard container to update root stats
-        self.run_sharders(shard_ranges[0])
+        shard_0_part = self.get_part_and_node_numbers(shard_ranges[0])[0]
+        for conf_index in self.configs['container-sharder'].keys():
+            self.run_custom_sharder(conf_index, {'reclaim_age': 0},
+                                    override_partitions=[shard_0_part])
         self.assert_container_object_count(len(shard_1_objects))
 
         # First, test a misplaced object moving from one shard to another.
