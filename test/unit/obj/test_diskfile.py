@@ -4615,7 +4615,8 @@ class DiskFileMixin(BaseDiskFileTestMixin):
             invalid_type='Bad-Content-Length')
 
     def test_quarantine_fstat_oserror(self):
-        with mock.patch('os.fstat', side_effect=OSError()):
+        with mock.patch('os.fstat', side_effect=OSError()), \
+                mock.patch('swift.obj.diskfile.lock_path'):
             self.assertRaises(
                 DiskFileQuarantined,
                 self._get_open_disk_file)
