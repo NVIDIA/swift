@@ -29,6 +29,7 @@ import errno
 import eventlet
 import eventlet.debug
 import eventlet.event
+import eventlet.green.threading
 import eventlet.patcher
 import functools
 import grp
@@ -1084,6 +1085,109 @@ class TestUtils(unittest.TestCase):
                     with utils.lock_path(tmpdir, 0.1):
                         success = True
         self.assertFalse(success)
+
+    @with_tempdir
+    @mock.patch.object(utils, 'STRICT_LOCKS', True)
+    def test_lock_path_deleted(self, tmpdir):
+        # If a thread blocks on a lock but then it gets deleted, the blocked
+        # thread gets a Timeout
+        took_lock = eventlet.green.threading.Event()
+        about_to_block_on_lock = eventlet.green.threading.Event()
+        test_done = eventlet.green.threading.Event()
+        caught = []
+
+        def deleter():
+            with utils.lock_path(tmpdir):
+                took_lock.set()
+                about_to_block_on_lock.wait()
+                # Give the other thread a beat to actually block
+                time.sleep(0.1)
+                os.unlink(os.path.join(tmpdir, '.lock'))
+
+        def blocked():
+            try:
+                took_lock.wait()
+                about_to_block_on_lock.set()
+                with utils.lock_path(tmpdir, timeout=60):
+                    raise RuntimeError("Shouldn't be able to acquire this")
+            except (Exception, Timeout) as e:
+                caught.append(e)
+            finally:
+                test_done.set()
+
+        with Timeout(30):
+            t1 = eventlet.green.threading.Thread(target=deleter)
+            t2 = eventlet.green.threading.Thread(target=blocked)
+            t1.start()
+            t2.start()
+            test_done.wait()
+            t1.join()
+            t2.join()
+        self.assertEqual(len(caught), 1, caught)
+        self.assertIsInstance(caught[0], LockTimeout)
+
+    @with_tempdir
+    @mock.patch.object(utils, 'STRICT_LOCKS', True)
+    def test_lock_path_moved(self, tmpdir):
+        # If a thread blocks on a lock but then it gets deleted and recreated,
+        # the blocked thread gets a Timeout
+        took_lock = eventlet.green.threading.Event()
+        about_to_block_on_lock = eventlet.green.threading.Event()
+        lock_moved = eventlet.green.threading.Event()
+        new_lock_created = eventlet.green.threading.Event()
+        test_done = eventlet.green.threading.Event()
+        caught = []
+
+        def deleter():
+            with utils.lock_path(tmpdir):
+                took_lock.set()
+                about_to_block_on_lock.wait()
+                time.sleep(0.1)
+                os.rename(os.path.join(tmpdir, '.lock'),
+                          os.path.join(tmpdir, '.moved'))
+                lock_moved.set()
+                new_lock_created.wait()
+
+        def blocked():
+            try:
+                took_lock.wait()
+                about_to_block_on_lock.set()
+                with utils.lock_path(tmpdir, timeout=60):
+                    raise RuntimeError("Shouldn't be able to acquire this")
+            except (Exception, Timeout) as e:
+                caught.append(e)
+            finally:
+                test_done.set()
+
+        def new_locker():
+            lock_moved.wait()
+            with utils.lock_path(tmpdir, timeout=0.1):
+                new_lock_created.set()
+                test_done.wait()
+
+        with Timeout(30):
+            t1 = eventlet.green.threading.Thread(target=deleter)
+            t2 = eventlet.green.threading.Thread(target=blocked)
+            t3 = eventlet.green.threading.Thread(target=new_locker)
+            t1.start()
+            t2.start()
+            t3.start()
+            test_done.wait()
+            t1.join()
+            t2.join()
+            t3.join()
+        self.assertEqual(len(caught), 1, caught)
+        self.assertIsInstance(caught[0], LockTimeout)
+
+    @with_tempdir
+    @mock.patch.object(utils, 'STRICT_LOCKS', True)
+    def test_lock_path_error(self, tmpdir):
+        with mock.patch.object(utils.os, 'fstat',
+                               side_effect=OSError(errno.EPERM, 'nope')), \
+                self.assertRaises(OSError) as caught:
+            with utils.lock_path(tmpdir):
+                pass
+        self.assertEqual(caught.exception.errno, errno.EPERM)
 
     @with_tempdir
     def test_lock_path_invalid_limit(self, tmpdir):
