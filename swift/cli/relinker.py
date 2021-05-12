@@ -31,6 +31,7 @@ from swift.common.utils import replace_partition_in_path, config_true_value, \
     RateLimitedIterator, PrefixLoggerAdapter, distribute_evenly, \
     non_negative_float, non_negative_int, config_auto_int_value, \
     dump_recon_cache, get_partition_from_path
+from swift.common import utils
 from swift.obj import diskfile
 
 
@@ -876,5 +877,7 @@ def main(args):
             args.stats_interval or conf.get('stats_interval',
                                             DEFAULT_STATS_INTERVAL)),
     })
+    utils.STRICT_LOCKS = config_true_value(conf.get(
+        'strict_locks', utils.STRICT_LOCKS))
     return parallel_process(
         args.action == 'cleanup', conf, logger, args.device_list)
