@@ -109,6 +109,8 @@ bind_port = 6200
 # Work only with ionice_class.
 # ionice_class =
 # ionice_priority =
+#
+# strict_locks = false
 
 [pipeline:main]
 pipeline = healthcheck recon object-server
