@@ -315,6 +315,9 @@ def run_daemon(klass, conf_file, section_name='', once=False, **kwargs):
     os.environ['TZ'] = 'UTC+0'
     time.tzset()
 
+    utils.STRICT_LOCKS = utils.config_true_value(conf.get(
+        'strict_locks', utils.STRICT_LOCKS))
+
     logger.notice('Starting %s', os.getpid())
     try:
         d = klass(conf)
