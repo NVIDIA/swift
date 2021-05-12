@@ -391,6 +391,9 @@ def run_server(conf, logger, sock, global_conf=None, ready_callback=None,
     os.environ['TZ'] = 'UTC+0'
     time.tzset()
 
+    utils.STRICT_LOCKS = config_true_value(conf.get(
+        'strict_locks', utils.STRICT_LOCKS))
+
     eventlet.hubs.use_hub(get_hub())
     eventlet_debug = config_true_value(conf.get('eventlet_debug', 'no'))
     eventlet.debug.hub_exceptions(eventlet_debug)
