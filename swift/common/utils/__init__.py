@@ -124,6 +124,10 @@ import logging
 
 NOTICE = 25
 
+# Note that this may be overridden by a strict_locks config option
+# (see swift/common/wsgi.py and swift/common/daemon.py)
+STRICT_LOCKS = False
+
 # Used by hash_path to offer a bit more security when generating hashes for
 # paths. It simply appends this value to all paths; guessing the hash a path
 # will end up with would also require knowing this suffix.
@@ -2283,7 +2287,7 @@ def _get_any_lock(fds):
     for fd in fds:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
+            return fd
         except IOError as err:
             if err.errno != errno.EAGAIN:
                 raise
@@ -2328,9 +2332,10 @@ def lock_path(directory, timeout=None, timeout_class=None,
     lockpath = '%s/.lock' % directory
     if name:
         lockpath += '-%s' % str(name)
-    fds = [os.open(get_zero_indexed_base_string(lockpath, i),
-                   os.O_WRONLY | os.O_CREAT)
-           for i in range(limit)]
+    fd_paths = {
+        os.open(p, os.O_WRONLY | os.O_CREAT): p
+        for i in range(limit)
+        for p in [get_zero_indexed_base_string(lockpath, i)]}
     sleep_time = 0.01
     slower_sleep_time = max(timeout * 0.01, sleep_time)
     slowdown_at = timeout * 0.01
@@ -2338,15 +2343,25 @@ def lock_path(directory, timeout=None, timeout_class=None,
     try:
         with timeout_class(timeout, lockpath):
             while True:
-                if _get_any_lock(fds):
+                locked_fd = _get_any_lock(fd_paths)
+                if locked_fd:
                     break
                 if time_slept > slowdown_at:
                     sleep_time = slower_sleep_time
                 sleep(sleep_time)
                 time_slept += sleep_time
+            if STRICT_LOCKS:
+                try:
+                    s = os.stat(fd_paths[locked_fd])
+                    if s.st_ino != os.fstat(locked_fd).st_ino:
+                        raise timeout_class(timeout, lockpath)
+                except OSError as e:
+                    if e.errno == errno.ENOENT:
+                        raise timeout_class(timeout, lockpath)
+                    raise
         yield True
     finally:
-        for fd in fds:
+        for fd in fd_paths:
             os.close(fd)
 
 
