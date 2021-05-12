@@ -84,6 +84,8 @@ bind_port = 6201
 # Work only with ionice_class.
 # ionice_class =
 # ionice_priority =
+#
+# strict_locks = false
 
 [pipeline:main]
 pipeline = healthcheck recon container-server
