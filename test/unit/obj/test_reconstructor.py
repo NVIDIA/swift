@@ -5718,6 +5718,76 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             'Unable to get enough responses (%d x 404 error responses)'
             % num_other_resps, error_lines[2])
 
+    def _do_test_reconstruct_fa_no_quarantine_bad_headers(self, bad_headers):
+        # verify that responses with invalid headers count against the
+        # quarantine_threshold
+        self._configure_reconstructor(reclaim_age=0, quarantine_threshold=1)
+        local_frag_index = 2
+        self._create_fragment(local_frag_index)
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[0]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+
+        def make_header(body):
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            return headers
+
+        responses = []
+        body = ec_archive_bodies[2]
+        headers = make_header(body)
+        responses.append((200, body, headers))
+        body = ec_archive_bodies[3]
+        headers = make_header(body)
+        headers.update(bad_headers)
+        responses.append((200, body, headers))
+        other_responses = ([(404, None, None)] *
+                           (self.policy.object_ring.replicas - 3))
+        codes, body_iter, headers = zip(*(responses + other_responses))
+        resp_timestamps = [self.obj_timestamp] * len(codes)
+        resp_timestamps = [ts.internal for ts in resp_timestamps]
+        with mocked_http_conn(*codes, body_iter=body_iter,
+                              headers=headers,
+                              timestamps=resp_timestamps):
+            with self.assertRaises(DiskFileError) as cm:
+                self.reconstructor.reconstruct_fa(
+                    job, node, self._create_fragment(2))
+        self.assertIsInstance(cm.exception, DiskFileError)
+        self._assert_diskfile_not_quarantined()
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(2, len(error_lines), error_lines)
+        self.assertIn(
+            'Unable to get enough responses (1/%d from 1 ok responses)'
+            % (self.policy.ec_ndata,), error_lines[0])
+        self.assertIn(
+            'Unable to get enough responses '
+            '(1 x unknown, %d x 404 error responses)'
+            % len(other_responses), error_lines[1])
+
+    def test_reconstruct_fa_no_quarantine_invalid_frag_index_header(self):
+        self._do_test_reconstruct_fa_no_quarantine_bad_headers(
+            {'X-Object-Sysmeta-Ec-Frag-Index': 'two'})
+
+    def test_reconstruct_fa_no_quarantine_missing_frag_index_header(self):
+        self._do_test_reconstruct_fa_no_quarantine_bad_headers(
+            {'X-Object-Sysmeta-Ec-Frag-Index': ''})
+
+    def test_reconstruct_fa_no_quarantine_missing_timestamp_header(self):
+        self._do_test_reconstruct_fa_no_quarantine_bad_headers(
+            {'X-Backend-Data-Timestamp': ''})
+
+    def test_reconstruct_fa_no_quarantine_missing_etag_header(self):
+        self._do_test_reconstruct_fa_no_quarantine_bad_headers(
+            {'X-Object-Sysmeta-Ec-Etag': ''})
+
     def test_reconstruct_fa_frags_on_handoffs(self):
         # just a lonely old frag on primaries: this appears to be a quarantine
         # candidate, but unexpectedly the other frags are found on handoffs so

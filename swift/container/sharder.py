@@ -108,12 +108,13 @@ def find_overlapping_ranges(shard_ranges):
         each other.
     """
     result = set()
-    for shard_range in shard_ranges:
-        overlapping = [sr for sr in shard_ranges
-                       if shard_range != sr and shard_range.overlaps(sr)]
+    for i, shard_range in enumerate(shard_ranges):
+        overlapping = [
+            sr for sr in shard_ranges[i + 1:]
+            if shard_range.name != sr.name and shard_range.overlaps(sr)]
         if overlapping:
             overlapping.append(shard_range)
-            overlapping.sort()
+            overlapping.sort(key=ShardRange.sort_key)
             result.add(tuple(overlapping))
 
     return result
@@ -126,7 +127,7 @@ def is_sharding_candidate(shard_range, threshold):
             shard_range.object_count >= threshold)
 
 
-def is_shrinking_candidate(shard_range, shrink_threshold, merge_size,
+def is_shrinking_candidate(shard_range, shrink_threshold, expansion_limit,
                            states=None):
     # typically shrink_threshold < merge_size but check both just in case
     # note: use *row* count (objects plus tombstones) as the condition for
@@ -135,7 +136,7 @@ def is_shrinking_candidate(shard_range, shrink_threshold, merge_size,
     states = states or (ShardRange.ACTIVE,)
     return (shard_range.state in states and
             shard_range.row_count < shrink_threshold and
-            shard_range.row_count <= merge_size)
+            shard_range.row_count <= expansion_limit)
 
 
 def find_sharding_candidates(broker, threshold, shard_ranges=None):
@@ -156,61 +157,13 @@ def find_sharding_candidates(broker, threshold, shard_ranges=None):
     return candidates
 
 
-def find_shrinking_acceptors(donor, shard_ranges):
-    """
-    Find the best list of contiguous shard ranges to accept for a given donor
-    """
-    acceptors = []
-
-    all_but_donor = [sr for sr in shard_ranges if sr.name != donor.name
-                     and sr.state in (ShardRange.ACTIVE, ShardRange.CLEAVED)
-                     and not sr.deleted]
-
-    first_lower = None
-    index = 1
-    for i, sr in enumerate(all_but_donor):
-        if sr.lower <= donor.lower:
-            if not first_lower:
-                index = i
-                first_lower = sr
-            elif sr.lower > first_lower.lower:
-                index = i
-                first_lower = sr
-            # else sr.lower == first_lower.lower i.e. *second* lower :P
-            continue
-        if not first_lower:
-            # because of order this only happens when
-            #   donor.lower == ShardRange.MIN
-            index = 1
-            first_lower = sr
-            break
-
-    acceptors.append(first_lower)
-    if donor.upper <= first_lower.upper:
-        # fully overlapping first_lower range
-        return acceptors
-
-    # extend a contiguous range over donor
-    end = first_lower.upper
-    for sr in all_but_donor[index:]:
-        if end >= donor.upper:
-            break
-        if sr.lower >= donor.upper:
-            continue
-        if sr.lower == end:
-            end = sr.upper
-            acceptors.append(sr)
-
-    return acceptors
-
-
-def find_shrinking_candidates(broker, shrink_threshold, merge_size):
+def find_shrinking_candidates(broker, shrink_threshold, expansion_limit):
     # this is only here to preserve a legacy public function signature;
     # superseded by find_compactible_shard_sequences
     merge_pairs = {}
     # restrict search to sequences with one donor
     results = find_compactible_shard_sequences(broker, shrink_threshold,
-                                               merge_size, 1, -1,
+                                               expansion_limit, 1, -1,
                                                include_shrinking=True)
     for sequence in results:
         # map acceptor -> donor list
@@ -220,7 +173,7 @@ def find_shrinking_candidates(broker, shrink_threshold, merge_size):
 
 def find_compactible_shard_sequences(broker,
                                      shrink_threshold,
-                                     merge_size,
+                                     expansion_limit,
                                      max_shrinking,
                                      max_expanding,
                                      include_shrinking=False):
@@ -233,8 +186,8 @@ def find_compactible_shard_sequences(broker,
     :param broker: A :class:`~swift.container.backend.ContainerBroker`.
     :param shrink_threshold: the number of rows below which a shard may be
         considered for shrinking into another shard
-    :param merge_size: the maximum number of rows that an acceptor shard range
-        should have after other shard ranges have been compacted into it
+    :param expansion_limit: the maximum number of rows that an acceptor shard
+        range should have after other shard ranges have been compacted into it
     :param max_shrinking: the maximum number of shard ranges that should be
         compacted into each acceptor; -1 implies unlimited.
     :param max_expanding: the maximum number of acceptors to be found (i.e. the
@@ -261,13 +214,13 @@ def find_compactible_shard_sequences(broker,
         #  - the max number of shard ranges to be compacted (max_shrinking) has
         #    been reached
         #  - the total number of objects in the sequence has reached the
-        #    merge_size
+        #    expansion_limit
         if (sequence and
                 (not is_shrinking_candidate(
-                    sequence[-1], shrink_threshold, merge_size,
+                    sequence[-1], shrink_threshold, expansion_limit,
                     states=(ShardRange.ACTIVE, ShardRange.SHRINKING)) or
                  0 < max_shrinking < len(sequence) or
-                 sequence.row_count >= merge_size)):
+                 sequence.row_count >= expansion_limit)):
             return True
         return False
 
@@ -277,7 +230,7 @@ def find_compactible_shard_sequences(broker,
     while ((max_expanding < 0 or expanding < max_expanding) and
            index < len(shard_ranges)):
         if not is_shrinking_candidate(
-                shard_ranges[index], shrink_threshold, merge_size,
+                shard_ranges[index], shrink_threshold, expansion_limit,
                 states=(ShardRange.ACTIVE, ShardRange.SHRINKING)):
             # this shard range cannot be the start of a new or existing
             # compactible sequence, move on
@@ -302,7 +255,7 @@ def find_compactible_shard_sequences(broker,
                 # already shrinking: add to sequence unconditionally
                 sequence.append(shard_range)
             elif (sequence.row_count + shard_range.row_count
-                  <= merge_size):
+                  <= expansion_limit):
                 # add to sequence: could be a donor or acceptor
                 sequence.append(shard_range)
                 if sequence_complete(sequence):
@@ -317,7 +270,7 @@ def find_compactible_shard_sequences(broker,
                 sequence.includes(own_shard_range)):
             # special case: only one sequence has been found, which consumes
             # all shard ranges, encompasses the entire namespace, has no more
-            # than merge_size records and whose shard ranges are all
+            # than expansion_limit records and whose shard ranges are all
             # shrinkable; all the shards in the sequence can be shrunk to the
             # root, so append own_shard_range to the sequence to act as an
             # acceptor; note: only shrink to the root when *all* the remaining
@@ -620,11 +573,88 @@ class CleavingContext(object):
         broker.set_sharding_sysmeta('Context-' + self.ref, '')
 
 
-DEFAULT_SHARD_CONTAINER_THRESHOLD = 1000000
-DEFAULT_SHARD_SHRINK_POINT = 10
-DEFAULT_SHARD_MERGE_POINT = 75
-DEFAULT_MAX_SHRINKING = 1
-DEFAULT_MAX_EXPANDING = -1
+DEFAULT_SHARDER_CONF = {
+    'shard_container_threshold': 1000000,
+    'max_shrinking': 1,
+    'max_expanding': -1,
+    'shard_scanner_batch_size': 10,
+    'cleave_batch_size': 2,
+    'cleave_row_batch_size': 10000,
+    'broker_timeout': 60,
+    'recon_candidates_limit': 5,
+    'recon_sharded_timeout': 43200,
+    'conn_timeout': 5,
+    'auto_shard': False,
+    'shard_shrink_point': 10,
+    'shard_shrink_merge_point': 75,
+    # The following are not exposed as configurable options but are precomputed
+    # values derived from options above and included here for convenience. They
+    # are the values resulting from other options having their defaults values.
+    # shrink_threshold = shard_shrink_point * shard_container_threshold
+    'shrink_threshold': 100000,
+    # expansion_limit = shard_shrink_merge_point * shard_container_threshold
+    'expansion_limit': 750000,
+    'rows_per_shard_percent': 50,
+    # rows_per_shard = rows_per_shard_percent * shard_container_threshold
+    'rows_per_shard': 500000,
+}
+
+
+def init_sharding_conf(conf, namespace):
+    """
+    Install options from a ``conf` dict as attributes of the ``namespace``.
+    Options not in the ``conf`` dict will be set with default values.
+
+    :param conf: A dict of config options.
+    :param namespace: An object to which attributes will be added.
+    :return: the ``namespace`` object.
+    """
+    def set_val(key, validator, conf_key=None):
+        """
+        Set an attribute in the namespace with a value from config.
+
+        :param key: Attribute name to be set in namespace.
+        :param validator: A function that will passed the value from the config
+            dict and should return the value to be set. This function should
+            raise a ValueError if the config value if not valid.
+        :param conf_key: key to lookup value in config dict; if None then
+            ``key`` will be used.
+        :raises: ValueError if the value read from config is invalid.
+        """
+        conf_key = conf_key or key
+        try:
+            setattr(namespace, key, validator(conf.get(conf_key)))
+        except ValueError as err:
+            raise ValueError('Error setting %s: %s' % (conf_key, err))
+
+    def percent_of_threshold(val):
+        return int(config_percent_value(val) *
+                   namespace.shard_container_threshold)
+
+    for k in DEFAULT_SHARDER_CONF:
+        conf.setdefault(k, DEFAULT_SHARDER_CONF[k])
+
+    for args in (
+        ('max_shrinking', int),
+        ('max_expanding', int),
+        ('shard_container_threshold', config_positive_int_value),
+        ('shard_scanner_batch_size', config_positive_int_value),
+        ('cleave_batch_size', config_positive_int_value),
+        ('cleave_row_batch_size', config_positive_int_value),
+        ('broker_timeout', config_positive_int_value),
+        ('recon_candidates_limit', int),
+        ('recon_sharded_timeout', int),
+        ('conn_timeout', float),
+        ('auto_shard', config_true_value),
+        # some options are derived from percentage of shard_container_threshold
+        # so must be listed after shard_container_threshold has been set...
+        ('rows_per_shard', percent_of_threshold, 'rows_per_shard_percent'),
+        ('shrink_threshold', percent_of_threshold, 'shard_shrink_point'),
+        ('expansion_limit', percent_of_threshold, 'shard_shrink_merge_point'),
+    ):
+        set_val(*args)
+
+    return namespace
 
 
 class ContainerSharder(ContainerReplicator):
@@ -645,37 +675,11 @@ class ContainerSharder(ContainerReplicator):
         else:
             auto_create_account_prefix = AUTO_CREATE_ACCOUNT_PREFIX
         self.shards_account_prefix = (auto_create_account_prefix + 'shards_')
-        self.shard_shrink_point = config_percent_value(
-            conf.get('shard_shrink_point', DEFAULT_SHARD_SHRINK_POINT))
-        self.shrink_merge_point = config_percent_value(
-            conf.get('shard_shrink_merge_point', DEFAULT_SHARD_MERGE_POINT))
-        self.shard_container_threshold = config_positive_int_value(
-            conf.get('shard_container_threshold',
-                     DEFAULT_SHARD_CONTAINER_THRESHOLD))
-        self.shrink_size = (self.shard_container_threshold *
-                            self.shard_shrink_point)
-        self.merge_size = (self.shard_container_threshold *
-                           self.shrink_merge_point)
-        self.split_size = self.shard_container_threshold // 2
-        self.scanner_batch_size = config_positive_int_value(
-            conf.get('shard_scanner_batch_size', 10))
-        self.cleave_batch_size = config_positive_int_value(
-            conf.get('cleave_batch_size', 2))
-        self.cleave_row_batch_size = config_positive_int_value(
-            conf.get('cleave_row_batch_size', 10000))
-        self.max_shrinking = int(conf.get('max_shrinking',
-                                          DEFAULT_MAX_SHRINKING))
-        self.max_expanding = int(conf.get('max_expanding',
-                                          DEFAULT_MAX_EXPANDING))
-        self.auto_shard = config_true_value(conf.get('auto_shard', False))
+
+        init_sharding_conf(conf, self)
+
         self.sharding_candidates = []
         self.shrinking_candidates = []
-        self.recon_candidates_limit = int(
-            conf.get('recon_candidates_limit', 5))
-        self.recon_sharded_timeout = int(
-            conf.get('recon_sharded_timeout', 43200))
-        self.broker_timeout = config_positive_int_value(
-            conf.get('broker_timeout', 60))
         replica_count = self.ring.replica_count
         quorum = quorum_size(replica_count)
         self.shard_replication_quorum = config_auto_int_value(
@@ -697,7 +701,6 @@ class ContainerSharder(ContainerReplicator):
             self.existing_shard_replication_quorum = replica_count
 
         # internal client
-        self.conn_timeout = float(conf.get('conn_timeout', 5))
         request_tries = config_positive_int_value(
             conf.get('request_tries', 3))
         internal_client_conf_path = conf.get('internal_client_conf_path',
@@ -776,7 +779,7 @@ class ContainerSharder(ContainerReplicator):
 
     def _identify_shrinking_candidate(self, broker, node):
         sequences = find_compactible_shard_sequences(
-            broker, self.shrink_size, self.merge_size,
+            broker, self.shrink_threshold, self.expansion_limit,
             self.max_shrinking, self.max_expanding)
         # compactible_ranges are all apart from final acceptor in each sequence
         compactible_ranges = sum(len(seq) - 1 for seq in sequences)
@@ -1042,12 +1045,14 @@ class ContainerSharder(ContainerReplicator):
                 continue
             shard_ranges = broker.get_shard_ranges(states=state)
             overlaps = find_overlapping_ranges(shard_ranges)
-            for overlapping_ranges in overlaps:
+            if overlaps:
+                all_overlaps = ', '.join(
+                    [' '.join(['%s-%s' % (sr.lower, sr.upper)
+                               for sr in overlapping_ranges])
+                     for overlapping_ranges in sorted(list(overlaps))])
                 warnings.append(
-                    'overlapping ranges in state %s: %s' %
-                    (ShardRange.STATES[state],
-                     ' '.join(['%s-%s' % (sr.lower, sr.upper)
-                               for sr in overlapping_ranges])))
+                    'overlapping ranges in state %r: %s' %
+                    (ShardRange.STATES[state], all_overlaps))
 
         if warnings:
             self.logger.warning(
@@ -1497,7 +1502,7 @@ class ContainerSharder(ContainerReplicator):
 
         start = time.time()
         shard_data, last_found = broker.find_shard_ranges(
-            self.split_size, limit=self.scanner_batch_size,
+            self.rows_per_shard, limit=self.shard_scanner_batch_size,
             existing_ranges=shard_ranges)
         elapsed = time.time() - start
 
@@ -1860,8 +1865,8 @@ class ContainerSharder(ContainerReplicator):
             return
 
         compactible_sequences = find_compactible_shard_sequences(
-            broker, self.shrink_size, self.merge_size, self.max_shrinking,
-            self.max_expanding, include_shrinking=True)
+            broker, self.shrink_threshold, self.expansion_limit,
+            self.max_shrinking, self.max_expanding, include_shrinking=True)
         self.logger.debug('Found %s compactible sequences of length(s) %s' %
                           (len(compactible_sequences),
                            [len(s) for s in compactible_sequences]))

@@ -12,6 +12,7 @@
 
 import json
 import os
+import sys
 import unittest
 from argparse import Namespace
 from textwrap import dedent
@@ -202,8 +203,9 @@ class TestManageShardRanges(unittest.TestCase):
                              max_expanding=-1,
                              max_shrinking=1,
                              shrink_threshold=100000,
-                             expansion_limit=500000,
-                             yes=False)
+                             expansion_limit=750000,
+                             yes=False,
+                             dry_run=False)
         mocked.assert_called_once_with(mock.ANY, expected)
 
         # conf file
@@ -221,7 +223,8 @@ class TestManageShardRanges(unittest.TestCase):
                              max_shrinking=33,
                              shrink_threshold=150,
                              expansion_limit=650,
-                             yes=False)
+                             yes=False,
+                             dry_run=False)
         mocked.assert_called_once_with(mock.ANY, expected)
 
         # conf file - small percentages resulting in zero absolute values
@@ -253,7 +256,8 @@ class TestManageShardRanges(unittest.TestCase):
                              max_shrinking=33,
                              shrink_threshold=0,
                              expansion_limit=0,
-                             yes=False)
+                             yes=False,
+                             dry_run=False)
         mocked.assert_called_once_with(mock.ANY, expected)
 
         # cli options
@@ -275,8 +279,14 @@ class TestManageShardRanges(unittest.TestCase):
                              max_shrinking=22,
                              shrink_threshold=1234,
                              expansion_limit=3456,
-                             yes=False)
+                             yes=False,
+                             dry_run=False)
         mocked.assert_called_once_with(mock.ANY, expected)
+
+    def test_conf_file_invalid(self):
+        db_file = os.path.join(self.testdir, 'hash.db')
+        broker = ContainerBroker(db_file, account='a', container='c')
+        broker.initialize()
 
         # conf file - invalid value for shard_container_threshold
         conf = """
@@ -298,8 +308,12 @@ class TestManageShardRanges(unittest.TestCase):
         self.assertEqual(2, ret)
         err_lines = err.getvalue().split('\n')
         self.assert_starts_with(err_lines[0], 'Error loading config file')
+        self.assertIn('shard_container_threshold', err_lines[0])
 
-        # conf file - cannot open conf file
+    def test_conf_file_does_not_exist(self):
+        db_file = os.path.join(self.testdir, 'hash.db')
+        broker = ContainerBroker(db_file, account='a', container='c')
+        broker.initialize()
         conf_file = os.path.join(self.testdir, 'missing_sharder.conf')
         out = StringIO()
         err = StringIO()
@@ -890,11 +904,12 @@ class TestManageShardRanges(unittest.TestCase):
             "  '.shards_a",
             "    objects:    100001, tombstones:       999, lower: 'obj79'",
             "      state:    active,                        upper: 'obj89'",
+            'Total of 2 shard sequences identified for compaction.',
             'Once applied to the broker these changes will result in '
             'shard range compaction the next time the sharder runs.',
         ]
 
-        def do_compact(user_input, exit_code):
+        def do_compact(user_input, options, exp_changes, exit_code):
             out = StringIO()
             err = StringIO()
             with mock.patch('sys.stdout', out),\
@@ -902,13 +917,13 @@ class TestManageShardRanges(unittest.TestCase):
                     mock.patch('swift.cli.manage_shard_ranges.input',
                                return_value=user_input):
                 ret = main([broker.db_file, 'compact',
-                            '--max-shrinking', '99'])
+                            '--max-shrinking', '99'] + options)
             self.assertEqual(exit_code, ret)
             err_lines = err.getvalue().split('\n')
             self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
             out_lines = out.getvalue().split('\n')
             expected = list(expected_base)
-            if user_input == 'yes':
+            if exp_changes:
                 expected.extend([
                     'Updated 2 shard sequences for compaction.',
                     'Run container-replicator to replicate the changes to '
@@ -924,13 +939,19 @@ class TestManageShardRanges(unittest.TestCase):
             self.assertEqual(expected, [l.split('/', 1)[0] for l in out_lines])
             return broker.get_shard_ranges()
 
-        broker_ranges = do_compact('n', 3)
+        broker_ranges = do_compact('n', [], False, 3)
         # expect no changes to shard ranges
         self.assertEqual(shard_ranges, broker_ranges)
         for i, sr in enumerate(broker_ranges):
             self.assertEqual(ShardRange.ACTIVE, sr.state)
 
-        broker_ranges = do_compact('yes', 0)
+        broker_ranges = do_compact('yes', ['--dry-run'], False, 3)
+        # expect no changes to shard ranges
+        self.assertEqual(shard_ranges, broker_ranges)
+        for i, sr in enumerate(broker_ranges):
+            self.assertEqual(ShardRange.ACTIVE, sr.state)
+
+        broker_ranges = do_compact('yes', [], True, 0)
         # expect updated shard ranges
         shard_ranges[5].lower = shard_ranges[3].lower
         shard_ranges[8].lower = shard_ranges[7].lower
@@ -960,9 +981,7 @@ class TestManageShardRanges(unittest.TestCase):
         err_lines = err.getvalue().split('\n')
         self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
         out_lines = out.getvalue().split('\n')
-        self.assertEqual(
-            ['Updated 2 shard sequences for compaction.'],
-            out_lines[:1])
+        self.assertIn('Updated 2 shard sequences for compaction.', out_lines)
         updated_ranges = broker.get_shard_ranges()
         for i, sr in enumerate(updated_ranges):
             if i in small_ranges:
@@ -1013,9 +1032,7 @@ class TestManageShardRanges(unittest.TestCase):
         err_lines = err.getvalue().split('\n')
         self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
         out_lines = out.getvalue().split('\n')
-        self.assertEqual(
-            ['Updated 1 shard sequences for compaction.'],
-            out_lines[:1])
+        self.assertIn('Updated 1 shard sequences for compaction.', out_lines)
         updated_ranges = broker.get_shard_ranges()
         self.assertEqual(shard_ranges, updated_ranges)
         self.assertEqual([ShardRange.SHRINKING] * 10,
@@ -1052,9 +1069,7 @@ class TestManageShardRanges(unittest.TestCase):
         err_lines = err.getvalue().split('\n')
         self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
         out_lines = out.getvalue().split('\n')
-        self.assertEqual(
-            ['Updated 1 shard sequences for compaction.'],
-            out_lines[:1])
+        self.assertIn('Updated 1 shard sequences for compaction.', out_lines)
         updated_ranges = broker.get_shard_ranges()
         self.assertEqual(shard_ranges, updated_ranges)
         self.assertEqual([ShardRange.SHRINKING],
@@ -1093,9 +1108,7 @@ class TestManageShardRanges(unittest.TestCase):
         err_lines = err.getvalue().split('\n')
         self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
         out_lines = out.getvalue().split('\n')
-        self.assertEqual(
-            ['Updated 1 shard sequences for compaction.'],
-            out_lines[:1])
+        self.assertIn('Updated 1 shard sequences for compaction.', out_lines)
         updated_ranges = broker.get_shard_ranges()
         shard_ranges[9].lower = shard_ranges[4].lower  # expanded acceptor
         self.assertEqual(shard_ranges, updated_ranges)
@@ -1126,9 +1139,7 @@ class TestManageShardRanges(unittest.TestCase):
         err_lines = err.getvalue().split('\n')
         self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
         out_lines = out.getvalue().split('\n')
-        self.assertEqual(
-            ['Updated 2 shard sequences for compaction.'],
-            out_lines[:1])
+        self.assertIn('Updated 2 shard sequences for compaction.', out_lines)
         updated_ranges = broker.get_shard_ranges()
         gapped_ranges[2].lower = gapped_ranges[0].lower
         gapped_ranges[8].lower = gapped_ranges[3].lower
@@ -1155,7 +1166,7 @@ class TestManageShardRanges(unittest.TestCase):
             err_lines = err.getvalue().split('\n')
             self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
             out_lines = out.getvalue().split('\n')
-            self.assertEqual([expect_msg], out_lines[:1])
+            self.assertIn(expect_msg, out_lines)
             return broker.get_shard_ranges()
 
         updated_ranges = do_compact(
@@ -1191,7 +1202,7 @@ class TestManageShardRanges(unittest.TestCase):
             err_lines = err.getvalue().split('\n')
             self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
             out_lines = out.getvalue().split('\n')
-            self.assertEqual([expect_msg], out_lines[:1])
+            self.assertIn(expect_msg, out_lines)
             return broker.get_shard_ranges()
 
         updated_ranges = do_compact(
@@ -1231,7 +1242,7 @@ class TestManageShardRanges(unittest.TestCase):
             err_lines = err.getvalue().split('\n')
             self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
             out_lines = out.getvalue().split('\n')
-            self.assertEqual([expect_msg], out_lines[:1])
+            self.assertIn(expect_msg, out_lines)
             return broker.get_shard_ranges()
 
         updated_ranges = do_compact(
@@ -1267,10 +1278,8 @@ class TestManageShardRanges(unittest.TestCase):
         self.assertEqual(0, ret, out.getvalue())
         err_lines = err.getvalue().split('\n')
         self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
-        out_lines = out.getvalue().split('\n')
-        self.assertEqual(
-            ['Updated 5 shard sequences for compaction.'],
-            out_lines[:1])
+        out_lines = out.getvalue().rstrip('\n').split('\n')
+        self.assertIn('Updated 5 shard sequences for compaction.', out_lines)
         updated_ranges = broker.get_shard_ranges()
         shard_ranges[1].lower = shard_ranges[0].lower
         shard_ranges[3].lower = shard_ranges[2].lower
@@ -1378,9 +1387,7 @@ class TestManageShardRanges(unittest.TestCase):
         err_lines = err.getvalue().split('\n')
         self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
         out_lines = out.getvalue().split('\n')
-        self.assertEqual(
-            ['Updated 1 shard sequences for compaction.'],
-            out_lines[:1])
+        self.assertIn('Updated 1 shard sequences for compaction.', out_lines)
         updated_ranges = broker.get_shard_ranges()
         shard_ranges[8].lower = shard_ranges[0].lower
         self.assertEqual(shard_ranges, updated_ranges)
@@ -1565,7 +1572,8 @@ class TestManageShardRanges(unittest.TestCase):
         broker.merge_shard_ranges(shard_ranges + overlap_shard_ranges_2)
         self.assertTrue(broker.is_root_container())
 
-        def do_repair(user_input, ts_now, exit_code):
+        def do_repair(user_input, ts_now, options, exit_code):
+            options = options if options else []
             out = StringIO()
             err = StringIO()
             with mock.patch('sys.stdout', out), \
@@ -1573,7 +1581,7 @@ class TestManageShardRanges(unittest.TestCase):
                     mock_timestamp_now(ts_now), \
                     mock.patch('swift.cli.manage_shard_ranges.input',
                                return_value=user_input):
-                ret = main([broker.db_file, 'repair'])
+                ret = main([broker.db_file, 'repair'] + options)
             self.assertEqual(exit_code, ret)
             err_lines = err.getvalue().split('\n')
             self.assert_starts_with(err_lines[0], 'Loaded db broker for ')
@@ -1584,7 +1592,25 @@ class TestManageShardRanges(unittest.TestCase):
 
         # user input 'n'
         ts_now = next(self.ts_iter)
-        do_repair('n', ts_now, 3)
+        do_repair('n', ts_now, [], 3)
+        updated_ranges = broker.get_shard_ranges()
+        expected = sorted(
+            shard_ranges + overlap_shard_ranges_2,
+            key=ShardRange.sort_key)
+        self.assert_shard_ranges_equal(expected, updated_ranges)
+
+        # --dry-run
+        ts_now = next(self.ts_iter)
+        do_repair('y', ts_now, ['--dry-run'], 3)
+        updated_ranges = broker.get_shard_ranges()
+        expected = sorted(
+            shard_ranges + overlap_shard_ranges_2,
+            key=ShardRange.sort_key)
+        self.assert_shard_ranges_equal(expected, updated_ranges)
+
+        # --n
+        ts_now = next(self.ts_iter)
+        do_repair('y', ts_now, ['-n'], 3)
         updated_ranges = broker.get_shard_ranges()
         expected = sorted(
             shard_ranges + overlap_shard_ranges_2,
@@ -1593,7 +1619,7 @@ class TestManageShardRanges(unittest.TestCase):
 
         # user input 'yes'
         ts_now = next(self.ts_iter)
-        do_repair('yes', ts_now, 0)
+        do_repair('yes', ts_now, [], 0)
         updated_ranges = broker.get_shard_ranges()
         for sr in overlap_shard_ranges_2:
             sr.update_state(ShardRange.SHRINKING, ts_now)
@@ -1755,3 +1781,20 @@ class TestManageShardRanges(unittest.TestCase):
                 self.assertEqual(2, ret)
                 err_lines = err.getvalue().split('\n')
                 self.assertIn('A sub-command is required.', err_lines)
+
+    def test_dry_run_and_yes_is_invalid(self):
+        out = StringIO()
+        err = StringIO()
+        with mock.patch('sys.stdout', out), \
+                mock.patch('sys.stderr', err), \
+                self.assertRaises(SystemExit) as cm:
+            main(['db file', 'repair', '--dry-run', '--yes'])
+        self.assertEqual(2, cm.exception.code)
+        err_lines = err.getvalue().split('\n')
+        runner = os.path.basename(sys.argv[0])
+        self.assertEqual(
+            'usage: %s path_to_file repair [-h] [--yes | --dry-run]' % runner,
+            err_lines[0])
+        self.assertIn(
+            "argument --yes/-y: not allowed with argument --dry-run/-n",
+            err_lines[1])

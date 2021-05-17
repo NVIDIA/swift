@@ -22,6 +22,7 @@ import time
 import six
 
 from swift.common.direct_client import DirectClientException
+from swift.common.manager import Manager
 from swift.common.utils import md5
 from swift.obj.reconstructor import ObjectReconstructor
 from test.probe.common import ECProbeTest
@@ -402,12 +403,21 @@ class TestReconstructorRebuild(ECProbeTest):
         self.revive_drive(device_path)
         self.assert_direct_get_succeeds(failed_node, self.opart)
 
-        # client GET will fail with 503, or 404 if the failed node is
-        # error-limited
+        # restart proxy to clear error-limiting so that the revived drive
+        # participates again
+        Manager(['proxy-server']).restart()
+
+        # client GET will fail with 503 ...
         with self.assertRaises(ClientException) as cm:
             client.get_object(self.url, self.token, self.container_name,
                               self.object_name)
-        self.assertIn(cm.exception.http_status, (404, 503))
+        self.assertEqual(503, cm.exception.http_status)
+        # ... but client GET succeeds
+        headers = client.head_object(self.url, self.token, self.container_name,
+                                     self.object_name)
+        for key in self.headers_post:
+            self.assertIn(key, headers)
+            self.assertEqual(self.headers_post[key], headers[key])
 
         # run the reconstructor without quarantine_threshold set
         error_lines = []
@@ -517,6 +527,9 @@ class TestReconstructorRebuild(ECProbeTest):
 
 
 if six.PY2:
+    # The non-ASCII chars in metadata cause test hangs in
+    # _assert_all_nodes_have_frag because of https://bugs.python.org/issue37093
+
     class TestReconstructorRebuildUTF8(TestReconstructorRebuild):
 
         def _make_name(self, prefix):

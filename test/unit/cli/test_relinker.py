@@ -3212,9 +3212,47 @@ class TestRelinker(unittest.TestCase):
         self.assertEqual([], self.logger.get_lines_for_level('error'))
 
     def test_cleanup_not_yet_relinked(self):
-        # force rehash of new partition to not happen during cleanup
+        # force new partition to be above range of partitions visited during
+        # cleanup
         self._setup_object(lambda part: part >= 2 ** (PART_POWER - 1))
         self._common_test_cleanup(relink=False)
+        with self._mock_relinker():
+            self.assertEqual(0, relinker.main([
+                'cleanup',
+                '--swift-dir', self.testdir,
+                '--devices', self.devices,
+                '--skip-mount',
+            ]))
+
+        self.assertTrue(os.path.isfile(self.expected_file))  # link created
+        # old partition should be cleaned up
+        self.assertFalse(os.path.exists(self.part_dir))
+        self.assertEqual([], self.logger.get_lines_for_level('warning'))
+        self.assertIn(
+            'Relinking (cleanup) created link: %s to %s'
+            % (self.objname, self.expected_file),
+            self.logger.get_lines_for_level('debug'))
+        info_lines = self.logger.get_lines_for_level('info')
+        self.assertIn('1 hash dirs processed (cleanup=True) '
+                      '(1 files, 1 linked, 1 removed, 0 errors)', info_lines)
+        # suffix should be invalidated and rehashed in new partition
+        hashes_invalid = os.path.join(self.next_part_dir, 'hashes.invalid')
+        self.assertTrue(os.path.exists(hashes_invalid))
+        with open(hashes_invalid, 'r') as fd:
+            self.assertEqual('', fd.read().strip())
+        self.assertEqual([], self.logger.get_lines_for_level('error'))
+
+    def test_cleanup_not_yet_relinked_low(self):
+        # force new partition to be in the range of partitions visited during
+        # cleanup, but not exist until after cleanup would have visited it
+        self._setup_object(lambda part: part < 2 ** (PART_POWER - 1))
+        self._common_test_cleanup(relink=False)
+        self.assertFalse(os.path.isfile(self.expected_file))
+        self.assertFalse(os.path.exists(self.next_part_dir))
+        # Relinker processes partitions in reverse order; as a result, the
+        # "normal" rehash during cleanup won't hit this, since it doesn't
+        # exist yet -- but when we finish processing the old partition,
+        # we'll loop back around.
         with self._mock_relinker():
             self.assertEqual(0, relinker.main([
                 'cleanup',
@@ -3356,7 +3394,7 @@ class TestRelinker(unittest.TestCase):
                       '(0 files, 0 linked, 1 removed, 0 errors)', info_lines)
         self.assertEqual([], self.logger.get_lines_for_level('error'))
 
-    def test_cleanup_old_part_careful(self):
+    def test_cleanup_old_part_careful_file(self):
         self._common_test_cleanup()
         # make some extra junk file in the part
         extra_file = os.path.join(self.part_dir, 'extra')
@@ -3373,6 +3411,21 @@ class TestRelinker(unittest.TestCase):
         self.assertTrue(os.path.exists(self.part_dir))
         self.assertEqual([], self.logger.get_lines_for_level('error'))
 
+    def test_cleanup_old_part_careful_dir(self):
+        self._common_test_cleanup()
+        # make some extra junk directory in the part
+        extra_dir = os.path.join(self.part_dir, 'extra')
+        os.mkdir(extra_dir)
+        self.assertEqual(0, relinker.main([
+            'cleanup',
+            '--swift-dir', self.testdir,
+            '--devices', self.devices,
+            '--skip-mount',
+        ]))
+        # old partition can't be cleaned up
+        self.assertTrue(os.path.exists(self.part_dir))
+        self.assertTrue(os.path.exists(extra_dir))
+
     def test_cleanup_old_part_robust(self):
         self._common_test_cleanup()
 
@@ -3387,9 +3440,9 @@ class TestRelinker(unittest.TestCase):
                                  set(os.listdir(self.part_dir)))
                 # unlink a random file, should be empty
                 os.unlink(os.path.join(self.part_dir, 'hashes.pkl'))
-                # create an extra ssync replication lock
+                # create an ssync replication lock, too
                 with open(os.path.join(self.part_dir,
-                                       '.lock-replication-123'), 'w'):
+                                       '.lock-replication'), 'w'):
                     pass
                 calls.append(True)
             elif part == self.next_part:

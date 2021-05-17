@@ -398,13 +398,17 @@ use = egg:swift#recon
 # stale, in which case the reconstructor will never succeed in reconstructing
 # the apparently missing fragment and will log errors. If the object's
 # tombstones have been reclaimed then the stale fragment will never be deleted
-# (see https://bugs.launchpad.net/swift/+bug/1655608). Setting the
-# quarantine_threshold to a value greater than zero enables the reconstructor
-# to quarantine stale fragments when it fails to fetch more than the
-# quarantine_threshold number of fragments (including the stale fragment)
-# during an attempt to reconstruct. For example, setting the
+# (see https://bugs.launchpad.net/swift/+bug/1655608). If an operator suspects
+# that stale fragments have been re-introduced to the cluster and is seeing
+# error logs similar to those in the bug report, then the quarantine_threshold
+# option may be set to a value greater than zero. This enables the
+# reconstructor to quarantine the stale fragments when it fails to fetch more
+# than the quarantine_threshold number of fragments (including the stale
+# fragment) during an attempt to reconstruct. For example, setting the
 # quarantine_threshold to 1 would cause a fragment to be quarantined if no
-# other fragments can be fetched.
+# other fragments can be fetched. The value may be reset to zero after the
+# reconstructor has run on all affected nodes and the error logs are no longer
+# seen.
 # Note: the quarantine_threshold applies equally to all policies, but for each
 # policy it is effectively capped at (ec_ndata - 1) so that a fragment is never
 # quarantined when sufficient fragments exist to reconstruct the object.

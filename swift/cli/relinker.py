@@ -24,6 +24,7 @@ import os
 import time
 from collections import defaultdict
 
+from swift.common.exceptions import LockTimeout
 from swift.common.storage_policy import POLICIES
 from swift.common.utils import replace_partition_in_path, config_true_value, \
     audit_location_generator, get_logger, readconf, drop_privileges, \
@@ -118,7 +119,7 @@ class Relinker(object):
         self.devices_data = recursive_defaultdict()
         self.policy_count = 0
         self.pid = os.getpid()
-        self.dirty_partitions = set()
+        self.linked_into_partitions = set()
 
     def _aggregate_dev_policy_stats(self):
         for dev_data in self.devices_data.values():
@@ -284,9 +285,11 @@ class Relinker(object):
 
     def hook_pre_partition(self, partition_path):
         self.pre_partition_errors = self.total_errors
+        self.linked_into_partitions = set()
 
     def hook_post_partition(self, partition_path):
-        datadir_path, part = os.path.split(os.path.abspath(partition_path))
+        datadir_path, partition = os.path.split(
+            os.path.abspath(partition_path))
         device_path, datadir_name = os.path.split(datadir_path)
         device = os.path.basename(device_path)
         state_tmp_file = os.path.join(
@@ -316,16 +319,15 @@ class Relinker(object):
         # shift to the new partition space and rehash
         #   |0                             2N|
         #   |                IIJJKKLLMMNNOOPP|
-        for partition in self.dirty_partitions:
-            if self.do_cleanup or partition >= 2 ** (
-                    self.states['next_part_power'] - 1):
+        for dirty_partition in self.linked_into_partitions:
+            if self.do_cleanup or \
+                    dirty_partition >= 2 ** self.states['part_power']:
                 self.diskfile_mgr.get_hashes(
-                    device, partition, [], self.policy)
-        self.dirty_partitions = set()
+                    device, dirty_partition, [], self.policy)
 
         if self.do_cleanup:
             hashes = self.diskfile_mgr.get_hashes(
-                device, int(part), [], self.policy)
+                device, int(partition), [], self.policy)
             # In any reasonably-large cluster, we'd expect all old
             # partitions P to be empty after cleanup (i.e., it's unlikely
             # that there's another partition Q := P//2 that also has data
@@ -337,34 +339,22 @@ class Relinker(object):
             # starts and little data is written to handoffs during the
             # increase).
             if not hashes:
-                with lock_path(partition_path):
-                    # Same lock used by invalidate_hashes, consolidate_hashes,
-                    # get_hashes
-                    try:
-                        # Order of hashes.pkl/invalid is somewhat important
-                        for f in ('hashes.pkl', 'hashes.invalid'):
+                try:
+                    with lock_path(partition_path, name='replication'), \
+                            lock_path(partition_path):
+                        # Order here is somewhat important for crash-tolerance
+                        for f in ('hashes.pkl', 'hashes.invalid', '.lock',
+                                  '.lock-replication'):
                             try:
                                 os.unlink(os.path.join(partition_path, f))
                             except OSError as e:
                                 if e.errno != errno.ENOENT:
                                     raise
-
-                        # After that, any lock files (replication lock, hashes
-                        # lock, etc.) can be removed. It's important that we
-                        # not touch any directories, though -- those could
-                        # have new writes
-                        for f in os.listdir(partition_path):
-                            if f.startswith('.lock'):
-                                try:
-                                    os.unlink(os.path.join(partition_path, f))
-                                except OSError as e:
-                                    if e.errno != errno.ENOENT:
-                                        raise
-                    except OSError:
-                        pass
-                try:
+                    # Note that as soon as we've deleted the lock files, some
+                    # other process could come along and make new ones -- so
+                    # this may well complain that the directory is not empty
                     os.rmdir(partition_path)
-                except OSError:
+                except (OSError, LockTimeout):
                     # Most likely, some data landed in here or we hit an error
                     # above. Let the replicator deal with things; it was worth
                     # a shot.
@@ -374,7 +364,7 @@ class Relinker(object):
         # in case the process is interrupted and needs to resume, or there
         # were errors and the relinker needs to run again.
         if self.pre_partition_errors == self.total_errors:
-            self.states["state"][part] = True
+            self.states["state"][partition] = True
             with open(state_tmp_file, 'wt') as f:
                 json.dump(self.states, f)
                 os.fsync(f.fileno())
@@ -522,7 +512,7 @@ class Relinker(object):
                     self.stats['errors'] += 1
                     missing_links += 1
         if created_links:
-            self.dirty_partitions.add(get_partition_from_path(
+            self.linked_into_partitions.add(get_partition_from_path(
                 self.conf['devices'], new_hash_path))
             diskfile.invalidate_hash(os.path.dirname(new_hash_path))
 
@@ -547,8 +537,8 @@ class Relinker(object):
 
         if rehash:
             # Even though we're invalidating the suffix, don't update
-            # self.dirty_hashes -- we only care about them for relinking
-            # into the new part-power space
+            # self.linked_into_partitions -- we only care about them for
+            # relinking into the new part-power space
             try:
                 diskfile.invalidate_hash(os.path.dirname(hash_path))
             except Exception as exc:
