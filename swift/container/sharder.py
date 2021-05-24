@@ -129,7 +129,7 @@ def is_sharding_candidate(shard_range, threshold):
 
 def is_shrinking_candidate(shard_range, shrink_threshold, expansion_limit,
                            states=None):
-    # typically shrink_threshold < merge_size but check both just in case
+    # typically shrink_threshold < expansion_limit but check both just in case
     # note: use *row* count (objects plus tombstones) as the condition for
     # shrinking to avoid inadvertently moving large numbers of tombstones into
     # an acceptor
@@ -573,96 +573,76 @@ class CleavingContext(object):
         broker.set_sharding_sysmeta('Context-' + self.ref, '')
 
 
-DEFAULT_SHARDER_CONF = {
-    'shard_container_threshold': 1000000,
-    'max_shrinking': 1,
-    'max_expanding': -1,
-    'shard_scanner_batch_size': 10,
-    'cleave_batch_size': 2,
-    'cleave_row_batch_size': 10000,
-    'broker_timeout': 60,
-    'recon_candidates_limit': 5,
-    'recon_sharded_timeout': 43200,
-    'conn_timeout': 5,
-    'auto_shard': False,
-    'shard_shrink_point': 10,
-    'shard_shrink_merge_point': 75,
-    # The following are not exposed as configurable options but are precomputed
-    # values derived from options above and included here for convenience. They
-    # are the values resulting from other options having their defaults values.
-    # shrink_threshold = shard_shrink_point * shard_container_threshold
-    'shrink_threshold': 100000,
-    # expansion_limit = shard_shrink_merge_point * shard_container_threshold
-    'expansion_limit': 750000,
-    'rows_per_shard_percent': 50,
-    # rows_per_shard = rows_per_shard_percent * shard_container_threshold
-    'rows_per_shard': 500000,
-}
+class ContainerSharderConf(object):
+    def __init__(self, conf=None):
+        conf = conf if conf else {}
+
+        def get_val(key, validator, default):
+            """
+            Get a value from conf and validate it.
+
+            :param key: key to lookup value in the ``conf`` dict.
+            :param validator: A function that will passed the value from the
+                ``conf`` dict and should return the value to be set. This
+                function should raise a ValueError if the ``conf`` value if not
+                valid.
+            :param default: value to use if ``key`` is not found in ``conf``.
+            :raises: ValueError if the value read from ``conf`` is invalid.
+            :returns: the configuration value.
+            """
+            try:
+                return validator(conf.get(key, default))
+            except ValueError as err:
+                raise ValueError('Error setting %s: %s' % (key, err))
+
+        self.shard_container_threshold = get_val(
+            'shard_container_threshold', config_positive_int_value, 1000000)
+        self.max_shrinking = get_val(
+            'max_shrinking', int, 1)
+        self.max_expanding = get_val(
+            'max_expanding', int, -1)
+        self.shard_scanner_batch_size = get_val(
+            'shard_scanner_batch_size', config_positive_int_value, 10)
+        self.cleave_batch_size = get_val(
+            'cleave_batch_size', config_positive_int_value, 2)
+        self.cleave_row_batch_size = get_val(
+            'cleave_row_batch_size', config_positive_int_value, 10000)
+        self.broker_timeout = get_val(
+            'broker_timeout', config_positive_int_value, 60)
+        self.recon_candidates_limit = get_val(
+            'recon_candidates_limit', int, 5)
+        self.recon_sharded_timeout = get_val(
+            'recon_sharded_timeout', int, 43200)
+        self.conn_timeout = get_val(
+            'conn_timeout', float, 5)
+        self.auto_shard = get_val(
+            'auto_shard', config_true_value, False)
+        # deprecated percent options still loaded...
+        self.shrink_threshold = get_val(
+            'shard_shrink_point', self.percent_of_threshold, 10)
+        self.expansion_limit = get_val(
+            'shard_shrink_merge_point', self.percent_of_threshold, 75)
+        # ...but superseded by absolute options if present in conf
+        self.shrink_threshold = get_val(
+            'shrink_threshold', int, self.shrink_threshold)
+        self.expansion_limit = get_val(
+            'expansion_limit', int, self.expansion_limit)
+        self.rows_per_shard = self.shard_container_threshold // 2
+
+    def percent_of_threshold(self, val):
+        return int(config_percent_value(val) * self.shard_container_threshold)
 
 
-def init_sharding_conf(conf, namespace):
-    """
-    Install options from a ``conf` dict as attributes of the ``namespace``.
-    Options not in the ``conf`` dict will be set with default values.
-
-    :param conf: A dict of config options.
-    :param namespace: An object to which attributes will be added.
-    :return: the ``namespace`` object.
-    """
-    def set_val(key, validator, conf_key=None):
-        """
-        Set an attribute in the namespace with a value from config.
-
-        :param key: Attribute name to be set in namespace.
-        :param validator: A function that will passed the value from the config
-            dict and should return the value to be set. This function should
-            raise a ValueError if the config value if not valid.
-        :param conf_key: key to lookup value in config dict; if None then
-            ``key`` will be used.
-        :raises: ValueError if the value read from config is invalid.
-        """
-        conf_key = conf_key or key
-        try:
-            setattr(namespace, key, validator(conf.get(conf_key)))
-        except ValueError as err:
-            raise ValueError('Error setting %s: %s' % (conf_key, err))
-
-    def percent_of_threshold(val):
-        return int(config_percent_value(val) *
-                   namespace.shard_container_threshold)
-
-    for k in DEFAULT_SHARDER_CONF:
-        conf.setdefault(k, DEFAULT_SHARDER_CONF[k])
-
-    for args in (
-        ('max_shrinking', int),
-        ('max_expanding', int),
-        ('shard_container_threshold', config_positive_int_value),
-        ('shard_scanner_batch_size', config_positive_int_value),
-        ('cleave_batch_size', config_positive_int_value),
-        ('cleave_row_batch_size', config_positive_int_value),
-        ('broker_timeout', config_positive_int_value),
-        ('recon_candidates_limit', int),
-        ('recon_sharded_timeout', int),
-        ('conn_timeout', float),
-        ('auto_shard', config_true_value),
-        # some options are derived from percentage of shard_container_threshold
-        # so must be listed after shard_container_threshold has been set...
-        ('rows_per_shard', percent_of_threshold, 'rows_per_shard_percent'),
-        ('shrink_threshold', percent_of_threshold, 'shard_shrink_point'),
-        ('expansion_limit', percent_of_threshold, 'shard_shrink_merge_point'),
-    ):
-        set_val(*args)
-
-    return namespace
+DEFAULT_SHARDER_CONF = vars(ContainerSharderConf())
 
 
-class ContainerSharder(ContainerReplicator):
+class ContainerSharder(ContainerSharderConf, ContainerReplicator):
     """Shards containers."""
 
     def __init__(self, conf, logger=None):
         logger = logger or get_logger(conf, log_route='container-sharder')
-        super(ContainerSharder, self).__init__(conf, logger=logger)
+        ContainerReplicator.__init__(self, conf, logger=logger)
+        ContainerSharderConf.__init__(self, conf)
         if conf.get('auto_create_account_prefix'):
             self.logger.warning('Option auto_create_account_prefix is '
                                 'deprecated. Configure '
@@ -675,9 +655,6 @@ class ContainerSharder(ContainerReplicator):
         else:
             auto_create_account_prefix = AUTO_CREATE_ACCOUNT_PREFIX
         self.shards_account_prefix = (auto_create_account_prefix + 'shards_')
-
-        init_sharding_conf(conf, self)
-
         self.sharding_candidates = []
         self.shrinking_candidates = []
         replica_count = self.ring.replica_count

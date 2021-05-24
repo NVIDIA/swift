@@ -172,13 +172,19 @@ from swift.container.backend import ContainerBroker, UNSHARDED
 from swift.container.sharder import make_shard_ranges, sharding_enabled, \
     CleavingContext, process_compactible_shard_sequences, \
     find_compactible_shard_sequences, find_overlapping_ranges, \
-    find_paths, rank_paths, finalize_shrinking, init_sharding_conf, \
-    DEFAULT_SHARDER_CONF
+    find_paths, rank_paths, finalize_shrinking, DEFAULT_SHARDER_CONF, \
+    ContainerSharderConf
 
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 EXIT_INVALID_ARGS = 2  # consistent with argparse exit code for invalid args
 EXIT_USER_QUIT = 3
+
+# Some CLI options derive their default values from DEFAULT_SHARDER_CONF if
+# they have not been set. It is therefore important that the CLI parser
+# provides None as a default so that we can detect that no value was set on the
+# command line. We use this alias to act as a reminder.
+USE_SHARDER_DEFAULT = object()
 
 
 class ManageShardRangesException(Exception):
@@ -698,15 +704,20 @@ def _positive_int(arg):
 
 def _add_find_args(parser):
     parser.add_argument(
-        'rows_per_shard', nargs='?', type=int, default=None,
-        help='Target number of rows for newly created shards.'
-        'Default is %s' % DEFAULT_SHARDER_CONF['rows_per_shard'])
+        'rows_per_shard', nargs='?', type=int, default=USE_SHARDER_DEFAULT,
+        help='Target number of rows for newly created shards. '
+        'Default is half of the shard_container_threshold value if that is '
+        'given in a conf file specified with --config, otherwise %s.'
+        % DEFAULT_SHARDER_CONF['rows_per_shard'])
 
 
 def _add_replace_args(parser):
     parser.add_argument(
         '--shards_account_prefix', metavar='shards_account_prefix', type=str,
-        required=False, help='Prefix for shards account', default='.shards_')
+        required=False, default='.shards_',
+        help="Prefix for shards account. The default is '.shards_'. This "
+             "should only be changed if the auto_create_account_prefix option "
+             "has been similarly changed in swift.conf.")
     parser.add_argument(
         '--replace-timeout', type=int, default=600,
         help='Minimum DB timeout to use when replacing shard ranges.')
@@ -823,12 +834,14 @@ def _make_parser():
              'of rows. This command only works on root containers.')
     _add_prompt_args(compact_parser)
     compact_parser.add_argument(
-        '--shrink-threshold', nargs='?', type=_positive_int, default=None,
+        '--shrink-threshold', nargs='?', type=_positive_int,
+        default=USE_SHARDER_DEFAULT,
         help='The number of rows below which a shard can qualify for '
              'shrinking. '
              'Defaults to %d' % DEFAULT_SHARDER_CONF['shrink_threshold'])
     compact_parser.add_argument(
-        '--expansion-limit', nargs='?', type=_positive_int, default=None,
+        '--expansion-limit', nargs='?', type=_positive_int,
+        default=USE_SHARDER_DEFAULT,
         help='Maximum number of rows for an expanding shard to have after '
              'compaction has completed. '
              'Defaults to %d' % DEFAULT_SHARDER_CONF['expansion_limit'])
@@ -840,7 +853,7 @@ def _make_parser():
     # temporary gap(s) in object listings where the shrunk donors are missing.
     compact_parser.add_argument('--max-shrinking', nargs='?',
                                 type=_positive_int,
-                                default=None,
+                                default=USE_SHARDER_DEFAULT,
                                 help='Maximum number of shards that should be '
                                      'shrunk into each expanding shard. '
                                      'Defaults to 1. Using values greater '
@@ -849,7 +862,7 @@ def _make_parser():
                                      'shards have shrunk.')
     compact_parser.add_argument('--max-expanding', nargs='?',
                                 type=_positive_int,
-                                default=None,
+                                default=USE_SHARDER_DEFAULT,
                                 help='Maximum number of shards that should be '
                                      'expanded. Defaults to unlimited.')
     compact_parser.set_defaults(func=compact_shard_ranges)
@@ -890,7 +903,7 @@ def main(cli_args=None):
         conf = {}
         if args.conf_file:
             conf = readconf(args.conf_file, 'container-sharder')
-        conf_args = init_sharding_conf(conf, argparse.Namespace())
+        conf_args = ContainerSharderConf(conf)
     except (OSError, IOError) as exc:
         print('Error opening config file %s: %s' % (args.conf_file, exc),
               file=sys.stderr)
@@ -900,10 +913,10 @@ def main(cli_args=None):
               file=sys.stderr)
         return EXIT_INVALID_ARGS
 
-    for k in vars(args):
-        # set any None-value args from conf_args
-        if getattr(args, k, None) is None:
-            setattr(args, k, getattr(conf_args, k, None))
+    for k, v in vars(args).items():
+        # set any un-set cli args from conf_args
+        if v is USE_SHARDER_DEFAULT:
+            setattr(args, k, getattr(conf_args, k))
 
     if args.func in (analyze_shard_ranges,):
         args.input = args.path_to_file
