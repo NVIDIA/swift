@@ -245,6 +245,38 @@ class TestS3ApiBucket(S3ApiBaseBoto3):
         for obj in objects:
             self.conn.put_object(Bucket=bucket, Key=obj, Body=b'')
 
+    def test_blank_params(self):
+        bucket = 'bucket'
+        self._prepare_test_get_bucket(bucket, ())
+
+        resp = self.conn.list_objects(
+            Bucket=bucket, Delimiter='', Marker='', Prefix='')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertNotIn('Delimiter', resp)
+        self.assertIn('Marker', resp)
+        self.assertEqual('', resp['Marker'])
+        self.assertIn('Prefix', resp)
+        self.assertEqual('', resp['Prefix'])
+
+        resp = self.conn.list_objects_v2(
+            Bucket=bucket, Delimiter='', StartAfter='', Prefix='')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertNotIn('Delimiter', resp)
+        self.assertIn('StartAfter', resp)
+        self.assertEqual('', resp['StartAfter'])
+        self.assertIn('Prefix', resp)
+        self.assertEqual('', resp['Prefix'])
+
+        resp = self.conn.list_object_versions(
+            Bucket=bucket, Delimiter='', KeyMarker='', Prefix='')
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertIn('Delimiter', resp)
+        self.assertEqual('', resp['Delimiter'])
+        self.assertIn('KeyMarker', resp)
+        self.assertEqual('', resp['KeyMarker'])
+        self.assertIn('Prefix', resp)
+        self.assertEqual('', resp['Prefix'])
+
     def test_get_bucket_with_delimiter(self):
         bucket = 'bucket'
         put_objects = ('object', 'object2', 'subdir/object', 'subdir2/object',
@@ -275,6 +307,49 @@ class TestS3ApiBucket(S3ApiBaseBoto3):
         resp = self.conn.list_objects(Bucket=bucket, Delimiter=delimiter)
         self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
         self.assertEqual(resp['Delimiter'], delimiter)
+        self._validate_object_listing(resp['Contents'], expect_objects)
+        resp_prefixes = resp['CommonPrefixes']
+        self.assertEqual(
+            resp_prefixes,
+            [{'Prefix': p} for p in expect_prefixes])
+
+    def test_get_bucket_with_non_ascii_delimiter(self):
+        bucket = 'bucket'
+        put_objects = (
+            'bar',
+            'foo',
+            u'foobar\N{SNOWMAN}baz',
+            u'foo\N{SNOWMAN}bar',
+            u'foo\N{SNOWMAN}bar\N{SNOWMAN}baz',
+        )
+        self._prepare_test_get_bucket(bucket, put_objects)
+        # boto3 doesn't always unquote everything it should; see
+        # https://github.com/boto/botocore/pull/1901
+        # Fortunately, we can just drop the encoding-type=url param
+        self.conn.meta.events.unregister(
+            'before-parameter-build.s3.ListObjects',
+            botocore.handlers.set_list_objects_encoding_type_url)
+
+        delimiter = u'\N{SNOWMAN}'
+        expect_objects = ('bar', 'foo')
+        expect_prefixes = (u'foobar\N{SNOWMAN}', u'foo\N{SNOWMAN}')
+        resp = self.conn.list_objects(Bucket=bucket, Delimiter=delimiter)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(resp['Delimiter'], delimiter)
+        self._validate_object_listing(resp['Contents'], expect_objects)
+        resp_prefixes = resp['CommonPrefixes']
+        self.assertEqual(
+            resp_prefixes,
+            [{'Prefix': p} for p in expect_prefixes])
+
+        prefix = u'foo\N{SNOWMAN}'
+        expect_objects = (u'foo\N{SNOWMAN}bar',)
+        expect_prefixes = (u'foo\N{SNOWMAN}bar\N{SNOWMAN}',)
+        resp = self.conn.list_objects(
+            Bucket=bucket, Delimiter=delimiter, Prefix=prefix)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(resp['Delimiter'], delimiter)
+        self.assertEqual(resp['Prefix'], prefix)
         self._validate_object_listing(resp['Contents'], expect_objects)
         resp_prefixes = resp['CommonPrefixes']
         self.assertEqual(

@@ -25,6 +25,7 @@ from eventlet import GreenPool, sleep, Timeout
 import six
 
 import swift.common.db
+from swift.common import utils
 from swift.account.backend import AccountBroker, DATADIR
 from swift.common.constraints import check_drive
 from swift.common.direct_client import direct_delete_container, \
@@ -62,10 +63,12 @@ class AccountReaper(Daemon):
 
     def __init__(self, conf, logger=None):
         self.conf = conf
+        utils.STRICT_LOCKS = config_true_value(conf.get(
+            'strict_locks', utils.STRICT_LOCKS))
         self.logger = logger or get_logger(conf, log_route='account-reaper')
         self.devices = conf.get('devices', '/srv/node')
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
-        self.interval = int(conf.get('interval', 3600))
+        self.interval = float(conf.get('interval', 3600))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
         self.account_ring = None
         self.container_ring = None

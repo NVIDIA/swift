@@ -651,6 +651,9 @@ def run_server(conf, logger, sock, global_conf=None, ready_callback=None):
     os.environ['TZ'] = 'UTC+0'
     time.tzset()
 
+    utils.STRICT_LOCKS = config_true_value(conf.get(
+        'strict_locks', utils.STRICT_LOCKS))
+
     eventlet.hubs.use_hub(get_hub())
     eventlet_debug = config_true_value(conf.get('eventlet_debug', 'no'))
     eventlet.debug.hub_exceptions(eventlet_debug)
@@ -897,7 +900,7 @@ class ServersPerPortStrategy(StrategyBase):
         super(ServersPerPortStrategy, self).__init__(conf, logger)
         self.servers_per_port = servers_per_port
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
-        self.ring_check_interval = int(conf.get('ring_check_interval', 15))
+        self.ring_check_interval = float(conf.get('ring_check_interval', 15))
 
         bind_ip = conf.get('bind_ip', '0.0.0.0')
         self.cache = BindPortsCache(self.swift_dir, bind_ip)
