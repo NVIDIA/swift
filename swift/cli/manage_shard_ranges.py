@@ -301,7 +301,8 @@ def _find_ranges(broker, args, status_file=None):
     start = last_report = time.time()
     limit = 5 if status_file else -1
     shard_data, last_found = broker.find_shard_ranges(
-        args.rows_per_shard, limit=limit)
+        args.rows_per_shard, limit=limit,
+        minimum_shard_size=args.minimum_shard_size)
     if shard_data:
         while not last_found:
             if last_report + 10 < time.time():
@@ -311,7 +312,8 @@ def _find_ranges(broker, args, status_file=None):
             # prefix doesn't matter since we aren't persisting it
             found_ranges = make_shard_ranges(broker, shard_data, '.shards_')
             more_shard_data, last_found = broker.find_shard_ranges(
-                args.rows_per_shard, existing_ranges=found_ranges, limit=5)
+                args.rows_per_shard, existing_ranges=found_ranges, limit=5,
+                minimum_shard_size=args.minimum_shard_size)
             shard_data.extend(more_shard_data)
     return shard_data, time.time() - start
 
@@ -709,6 +711,13 @@ def _add_find_args(parser):
         'Default is half of the shard_container_threshold value if that is '
         'given in a conf file specified with --config, otherwise %s.'
         % DEFAULT_SHARDER_CONF['rows_per_shard'])
+    parser.add_argument(
+        '--minimum-shard-size', type=_positive_int,
+        default=USE_SHARDER_DEFAULT,
+        help='Minimum size of the final shard range. If this is greater than '
+        'one then the final shard range may be extended to more than '
+        'rows_per_shard in order to avoid a further shard range with less '
+        'than minimum-shard-size rows.')
 
 
 def _add_replace_args(parser):
@@ -917,6 +926,12 @@ def main(cli_args=None):
         # set any un-set cli args from conf_args
         if v is USE_SHARDER_DEFAULT:
             setattr(args, k, getattr(conf_args, k))
+
+    try:
+        ContainerSharderConf.validate_conf(args)
+    except ValueError as err:
+        print('Invalid arguments: %s' % err, file=sys.stderr)
+        return EXIT_INVALID_ARGS
 
     if args.func in (analyze_shard_ranges,):
         args.input = args.path_to_file
