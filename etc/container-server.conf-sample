@@ -491,6 +491,11 @@ use = egg:swift#xprofile
 # Process at most this many databases per second
 # databases_per_second = 50
 #
+# Minimum size of the final shard range. If this is greater than one then the
+# final shard range may be extended to more than rows_per_shard in order to
+# avoid a further shard range with less than minimum-shard-size rows.
+# minimum_shard_size = 1
+#
 # The container-sharder accepts the following configuration options as defined
 # in the container-replicator section:
 #

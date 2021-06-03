@@ -628,9 +628,22 @@ class ContainerSharderConf(object):
         self.expansion_limit = get_val(
             'expansion_limit', int, self.expansion_limit)
         self.rows_per_shard = self.shard_container_threshold // 2
+        self.minimum_shard_size = get_val(
+            'minimum_shard_size', config_positive_int_value, 1)
 
     def percent_of_threshold(self, val):
         return int(config_percent_value(val) * self.shard_container_threshold)
+
+    @classmethod
+    def validate_conf(cls, namespace):
+        conf = vars(ContainerSharderConf())
+        conf.update(vars(namespace))
+        operands = [(key, conf[key])
+                    for key in ('minimum_shard_size', 'rows_per_shard')]
+        if not operands[0][1] < operands[1][1]:
+            raise ValueError(
+                '%s (%d) must be less than %s (%d)'
+                % (operands[0] + operands[1]))
 
 
 DEFAULT_SHARDER_CONF = vars(ContainerSharderConf())
@@ -1480,7 +1493,8 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         start = time.time()
         shard_data, last_found = broker.find_shard_ranges(
             self.rows_per_shard, limit=self.shard_scanner_batch_size,
-            existing_ranges=shard_ranges)
+            existing_ranges=shard_ranges,
+            minimum_shard_size=self.minimum_shard_size)
         elapsed = time.time() - start
 
         if not shard_data:

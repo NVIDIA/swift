@@ -4357,9 +4357,11 @@ class TestSharder(BaseTestSharder):
                 now, objects[89][0], upper, 10),
         ]
         # first invocation finds 2 ranges
+        # (third shard range will be > minimum_shard_size)
         with self._mock_sharder(
                 conf={'shard_container_threshold': 90,
-                      'shard_scanner_batch_size': 2}) as sharder:
+                      'shard_scanner_batch_size': 2,
+                      'minimum_shard_size': 10}) as sharder:
             with mock_timestamp_now(now):
                 num_found = sharder._find_shard_ranges(broker)
         self.assertEqual(45, sharder.rows_per_shard)
@@ -4410,6 +4412,41 @@ class TestSharder(BaseTestSharder):
 
     def test_find_shard_ranges_finds_three_shard(self):
         self._check_find_shard_ranges_finds_three('.shards_a', 'c_', 'l', 'u')
+
+    def test_find_shard_ranges_with_minimum_size(self):
+        cont = 'c_'
+        lower = 'l'
+        upper = 'u'
+        broker, objects = self._setup_find_ranges(
+            '.shards_a', 'c_', lower, upper)
+        now = Timestamp.now()
+        expected_ranges = [
+            ShardRange(
+                ShardRange.make_path('.shards_a', 'c', cont, now, 0),
+                now, lower, objects[44][0], 45),
+            ShardRange(
+                ShardRange.make_path('.shards_a', 'c', cont, now, 1),
+                now, objects[44][0], upper, 55),
+        ]
+        # first invocation finds 2 ranges - second has been extended to avoid
+        # final shard range < minimum_size
+        with self._mock_sharder(
+                conf={'shard_container_threshold': 90,
+                      'shard_scanner_batch_size': 2,
+                      'minimum_shard_size': 11}) as sharder:
+            with mock_timestamp_now(now):
+                num_found = sharder._find_shard_ranges(broker)
+        self.assertEqual(45, sharder.rows_per_shard)
+        self.assertEqual(11, sharder.minimum_shard_size)
+        self.assertEqual(2, num_found)
+        self.assertEqual(2, len(broker.get_shard_ranges()))
+        self._assert_shard_ranges_equal(expected_ranges[:2],
+                                        broker.get_shard_ranges())
+        expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
+                          'found': 2, 'min_time': mock.ANY,
+                          'max_time': mock.ANY}
+        stats = self._assert_stats(expected_stats, sharder, 'scanned')
+        self.assertGreaterEqual(stats['max_time'], stats['min_time'])
 
     def test_sharding_enabled(self):
         broker = self._make_broker()
@@ -7273,7 +7310,8 @@ class TestContainerSharderConf(unittest.TestCase):
                     'auto_shard': False,
                     'shrink_threshold': 100000,
                     'expansion_limit': 750000,
-                    'rows_per_shard': 500000}
+                    'rows_per_shard': 500000,
+                    'minimum_shard_size': 1}
         self.assertEqual(expected, vars(ContainerSharderConf()))
         self.assertEqual(expected, vars(ContainerSharderConf(None)))
         self.assertEqual(expected, DEFAULT_SHARDER_CONF)
@@ -7292,7 +7330,8 @@ class TestContainerSharderConf(unittest.TestCase):
                 'auto_shard': True,
                 'shrink_threshold': 100001,
                 'expansion_limit': 750001,
-                'rows_per_shard': 500001}
+                'rows_per_shard': 500001,
+                'minimum_shard_size': 20}
         # rows_per_shard is not directly configurable
         expected = dict(conf, rows_per_shard=1000000)
         conf.update({'unexpected': 'option'})
@@ -7309,7 +7348,8 @@ class TestContainerSharderConf(unittest.TestCase):
                      'recon_candidates_limit': 6,
                      'recon_sharded_timeout': 43201,
                      'conn_timeout': 5.1,
-                     'auto_shard': True}
+                     'auto_shard': True,
+                     'minimum_shard_size': 1}
 
         # percent options work
         deprecated_conf = {'shard_shrink_point': 9,
@@ -7347,7 +7387,8 @@ class TestContainerSharderConf(unittest.TestCase):
                'shrink_threshold': not_int,
                'expansion_limit': not_int,
                'shard_shrink_point': not_percent,
-               'shard_shrink_merge_point': not_percent}
+               'shard_shrink_merge_point': not_percent,
+               'minimum_shard_size': not_positive_int}
 
         for key, bad_values in bad.items():
             for bad_value in bad_values:
