@@ -2570,6 +2570,10 @@ class ECFragGetter(object):
                             if nbytes is not None:
                                 nbytes -= len(chunk)
                     except (ChunkReadTimeout, ShortReadError):
+                        if req.environ.get('swift.client_disconnect', False):
+                            self.app.logger.debug(
+                                'Client disconnected, will not retry')
+                            raise
                         exc_type, exc_value, exc_traceback = sys.exc_info()
                         try:
                             self.fast_forward(self.bytes_used_from_backend)
@@ -2579,10 +2583,11 @@ class ECFragGetter(object):
                         except RangeAlreadyComplete:
                             break
                         buf = b''
+                        old_node = self.node
                         new_source, new_node = self._dig_for_source_and_node()
                         if new_source:
                             self.app.error_occurred(
-                                self.node, 'Trying to read EC fragment '
+                                old_node, 'Trying to read EC fragment '
                                 'during GET (retrying)')
                             # Close-out the connection as best as possible.
                             if getattr(self.source, 'swift_conn', None):
@@ -2715,6 +2720,7 @@ class ECFragGetter(object):
                         if end - begin + 1 == self.bytes_used_from_backend:
                             warn = False
             if not req.environ.get('swift.non_client_disconnect') and warn:
+                req.environ['swift.client_disconnect'] = True
                 self.app.logger.warning(
                     'Client disconnected on read of EC frag %r', self.path)
             raise
