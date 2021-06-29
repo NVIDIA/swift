@@ -327,6 +327,18 @@ shard_container_threshold         1000000             This defines the
                                                       shrinking and merging
                                                       shard containers.
 
+minimum_shard_size                100000              Minimum size of the final
+                                                      shard range. If this is
+                                                      greater than one then the
+                                                      final shard range may be
+                                                      extended to more than
+                                                      shard_container_threshold//2
+                                                      in order to avoid a
+                                                      further shard range with
+                                                      less than minimum_shard_size
+                                                      rows. The default value is
+                                                      shard_container_threshold//10.
+
 shrink_threshold                                      This defines the
                                                       object count below which
                                                       a 'donor' shard container

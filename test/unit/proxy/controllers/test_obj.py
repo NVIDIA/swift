@@ -2321,6 +2321,48 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertFalse([h for h in resp.headers
                           if h.lower().startswith('x-object-sysmeta-ec-')])
 
+    def test_GET_disconnect(self):
+        self.app.recoverable_node_timeout = 0.01
+        self.app.client_timeout = 0.1
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-743]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        headers = {
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+        num_slow = 4
+        responses = [
+            (200, SlowBody(body, 0.1 if i < num_slow else 0.0),
+             self._add_frag_index(i, headers))
+            for i, body in enumerate(ec_archive_bodies)
+        ] * self.policy.ec_duplication_factor
+
+        status_codes, body_iter, headers = zip(*responses)
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        with mocked_http_conn(*status_codes, body_iter=body_iter,
+                              headers=headers) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            resp.app_iter.close()
+        self.assertEqual(len(log.requests),
+                         self.policy.ec_ndata + num_slow)
+
+        def make_key(r):
+            r['device'] = r['path'].split('/')[1]
+            return '%(ip)s:%(port)s/%(device)s' % r
+        # the first four slow nodes get errors incr'd
+        expected_error_limiting = {
+            make_key(r): {
+                'errors': 1,
+                'last_error': mock.ANY,
+            }
+            for r in log.requests[:4]
+        }
+        self.assertEqual(self.app._error_limiting, expected_error_limiting)
+
     def test_GET_not_found_when_404_newer(self):
         # if proxy receives a 404, it keeps waiting for other connections until
         # max number of nodes in hopes of finding an object, but if 404 is
@@ -4938,6 +4980,51 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         for line in self.logger.logger.records['ERROR'] + \
                 self.logger.logger.records['WARNING']:
             self.assertIn(req.headers['x-trans-id'], line)
+
+    def test_GET_one_short_fragment_archive(self):
+        # verify that a warning is logged when one fragment archive returns
+        # less whole fragments than others
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-333]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+
+        def do_test(missing_length):
+            self.logger.clear()
+            headers = {
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
+            }
+            responses = [(200, ec_archive_bodies[0][:(-1 * missing_length)],
+                          self._add_frag_index(0, headers))]
+            # ... the rest are fine
+            responses += [
+                (200, body, self._add_frag_index(i, headers))
+                for i, body in enumerate(ec_archive_bodies[1:], start=1)]
+
+            req = swob.Request.blank('/v1/a/c/o')
+
+            status_codes, body_iter, headers = zip(
+                *responses[:self.policy.ec_ndata])
+            with set_http_connect(*status_codes, body_iter=body_iter,
+                                  headers=headers):
+                resp = req.get_response(self.app)
+                self.assertEqual(resp.status_int, 200)
+                self.assertNotEqual(md5(resp.body).hexdigest(), etag)
+            error_lines = self.logger.get_lines_for_level('error')
+            self.assertEqual([], error_lines)
+            warning_lines = self.logger.get_lines_for_level('warning')
+            self.assertEqual(1, len(warning_lines))
+            self.assertIn(
+                'Un-recoverable fragment rebuild. '
+                'Only received 9/10 fragments', warning_lines[0])
+
+        # each fragment archive has 4 fragments of sizes [490, 490, 490, 458];
+        # try dropping whole fragment(s) from one archive
+        do_test(458)
+        do_test(490 + 458)
+        do_test(490 + 490 + 458)
+        do_test(490 + 490 + 490 + 458)
 
     def test_GET_read_timeout_resume_mixed_etag(self):
         segment_size = self.policy.ec_segment_size

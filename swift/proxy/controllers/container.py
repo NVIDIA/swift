@@ -398,9 +398,6 @@ class ContainerController(Controller):
 
             if objs is None:
                 # give up if any non-success response from shard containers
-                self.app.logger.debug(
-                    'Failed to get objects from shard (state=%s), total = %d',
-                    sharding_state, len(objects))
                 self.app.logger.error(
                     'Aborting listing from shards due to bad response: %r'
                     % all_resp_status)
