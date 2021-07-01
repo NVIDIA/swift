@@ -722,6 +722,15 @@ class TestRelinker(unittest.TestCase):
         self.assertEqual(logging.WARNING, logger.getEffectiveLevel())
         self.assertEqual('test-relinker', logger.logger.name)
 
+    def test_relinker_utils_get_hub(self):
+        cli_cmd = ['relink', '--device', 'sdx', '--workers', 'auto',
+                   '--device', '/some/device']
+        with mock.patch('swift.cli.relinker.Relinker'), \
+                mock.patch('swift.cli.relinker.hubs') as mock_hubs:
+            relinker.main(cli_cmd)
+
+        mock_hubs.use_hub.assert_called_with(utils.get_hub())
+
     def test_relink_first_quartile_no_rehash(self):
         # we need object name in lower half of current part
         self._setup_object(lambda part: part < 2 ** (PART_POWER - 1))
