@@ -21,6 +21,7 @@ import fcntl
 import json
 import logging
 import os
+import sys
 import time
 from collections import defaultdict
 
@@ -837,3 +838,7 @@ def main(args):
         'strict_locks', utils.STRICT_LOCKS))
     return parallel_process(
         args.action == 'cleanup', conf, logger, args.device_list)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
