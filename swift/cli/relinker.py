@@ -24,15 +24,18 @@ import os
 import time
 from collections import defaultdict
 
+from eventlet import hubs, tpool
+
 from swift.common.exceptions import LockTimeout
 from swift.common.storage_policy import POLICIES
 from swift.common.utils import replace_partition_in_path, config_true_value, \
     audit_location_generator, get_logger, readconf, drop_privileges, \
     RateLimitedIterator, PrefixLoggerAdapter, distribute_evenly, \
     non_negative_float, non_negative_int, config_auto_int_value, \
-    dump_recon_cache, get_partition_from_path
+    dump_recon_cache, get_partition_from_path, get_hub
 from swift.common import utils
 from swift.obj import diskfile
+from swift.common.recon import RECON_RELINKER_FILE, DEFAULT_RECON_CACHE_PATH
 
 
 LOCK_FILE = '.relink.{datadir}.lock'
@@ -43,8 +46,6 @@ STEP_CLEANUP = 'cleanup'
 EXIT_SUCCESS = 0
 EXIT_NO_APPLICABLE_POLICY = 2
 EXIT_ERROR = 1
-RECON_FILE = 'relinker.recon'
-DEFAULT_RECON_CACHE_PATH = '/var/cache/swift'
 DEFAULT_STATS_INTERVAL = 300.0
 
 
@@ -102,7 +103,7 @@ class Relinker(object):
     def __init__(self, conf, logger, device_list=None, do_cleanup=False):
         self.conf = conf
         self.recon_cache = os.path.join(self.conf['recon_cache_path'],
-                                        RECON_FILE)
+                                        RECON_RELINKER_FILE)
         self.logger = logger
         self.device_list = device_list or []
         self.do_cleanup = do_cleanup
@@ -394,29 +395,6 @@ class Relinker(object):
                 hashes.remove(hsh)
         return hashes
 
-    def check_existing(self, new_file):
-        existing_link = None
-        link_created = False
-        start = self.next_part_power - 1
-        stop = max(start - self.conf['link_check_limit'], -1)
-        for check_part_power in range(start, stop, -1):
-            # Try to create the link from each of several previous part power
-            # locations. If an attempt succeeds then either a link was made or
-            # an existing link with the same inode as the next part power
-            # location was found: either is acceptable. The part power location
-            # that previously failed with EEXIST is included in the further
-            # attempts here for simplicity.
-            target_file = replace_partition_in_path(
-                self.conf['devices'], new_file, check_part_power)
-            try:
-                link_created = diskfile.relink_paths(target_file, new_file,
-                                                     ignore_missing=False)
-                existing_link = target_file
-                break
-            except OSError:
-                pass
-        return existing_link, link_created
-
     def process_location(self, hash_path, new_hash_path):
         # Compare the contents of each hash dir with contents of same hash
         # dir in its new partition to verify that the new location has the
@@ -482,34 +460,15 @@ class Relinker(object):
                     created_links += 1
                     self.stats['linked'] += 1
             except OSError as exc:
-                existing_link = None
-                link_created = False
                 if exc.errno == errno.EEXIST and filename.endswith('.ts'):
-                    # special case for duplicate tombstones in older partition
-                    # power locations
-                    # (https://bugs.launchpad.net/swift/+bug/1921718)
-                    existing_link, link_created = self.check_existing(new_file)
-                if existing_link:
+                    # special case for duplicate tombstones, see:
+                    # https://bugs.launchpad.net/swift/+bug/1921718
+                    # https://bugs.launchpad.net/swift/+bug/1934142
                     self.logger.debug(
-                        "Relinking%s: link not needed: %s to %s due to "
-                        "existing %s", ' (cleanup)' if self.do_cleanup else '',
-                        old_file, new_file, existing_link)
-                    if link_created:
-                        # uncommon case: the retry succeeded in creating a link
-                        created_links += 1
-                        self.stats['linked'] += 1
-                    wanted_file = replace_partition_in_path(
-                        self.conf['devices'], old_file, self.part_power)
-                    if old_file not in (existing_link, wanted_file):
-                        # A link exists to a different file and this file
-                        # is not the current target for client requests. If
-                        # this file is visited again it is possible that
-                        # the existing_link will have been cleaned up and
-                        # the check will fail, so clean it up now.
-                        self.logger.info(
-                            "Relinking%s: cleaning up unwanted file: %s",
-                            ' (cleanup)' if self.do_cleanup else '', old_file)
-                        unwanted_files.append(filename)
+                        "Relinking%s: tolerating different inodes for "
+                        "tombstone with same timestamp: %s to %s",
+                        ' (cleanup)' if self.do_cleanup else '',
+                        old_file, new_file)
                 else:
                     self.logger.warning(
                         "Error relinking%s: failed to relink %s to %s: %s",
@@ -705,7 +664,7 @@ def parallel_process(do_cleanup, conf, logger=None, device_list=None):
 
     # initialise recon dump for collection
     # Lets start by always deleting last run's stats
-    recon_cache = os.path.join(conf['recon_cache_path'], RECON_FILE)
+    recon_cache = os.path.join(conf['recon_cache_path'], RECON_RELINKER_FILE)
     _reset_recon(recon_cache, logger)
 
     device_list = sorted(set(device_list or os.listdir(conf['devices'])))
@@ -826,15 +785,19 @@ def main(args):
                         help='Set log file name. Ignored if using conf_file.')
     parser.add_argument('--debug', default=False, action='store_true',
                         help='Enable debug mode')
+    # --link-check-limit is no longer used but allowed on the command line to
+    # avoid errors after upgrade
     parser.add_argument('--link-check-limit', type=non_negative_int,
                         default=None, dest='link_check_limit',
-                        help='Maximum number of partition power locations to '
-                             'check for a valid link target if relink '
-                             'encounters an existing tombstone with different '
-                             'inode in the next partition power location '
-                             '(default: 2).')
+                        help=argparse.SUPPRESS)
 
     args = parser.parse_args(args)
+    hub = hubs.get_hub()
+    if hub.running:
+        # tests call main a lot; don't bleed hubs/tpools
+        hub.abort(wait=True)
+        tpool.killall()
+    hubs.use_hub(get_hub())
     if args.conf_file:
         conf = readconf(args.conf_file, 'object-relinker')
         if args.debug:
@@ -855,6 +818,9 @@ def main(args):
             filename=args.logfile)
         logger = logging.getLogger()
 
+    if args.link_check_limit is not None:
+        logger.warning('--link-check-limit option is ignored, deprecated and '
+                       'will be removed in a future version')
     conf.update({
         'swift_dir': args.swift_dir or conf.get('swift_dir', '/etc/swift'),
         'devices': args.devices or conf.get('devices', '/srv/node'),
@@ -868,9 +834,6 @@ def main(args):
         'workers': config_auto_int_value(
             conf.get('workers') if args.workers is None else args.workers,
             'auto'),
-        'link_check_limit': (
-            args.link_check_limit if args.link_check_limit is not None
-            else non_negative_int(conf.get('link_check_limit', 2))),
         'recon_cache_path': conf.get('recon_cache_path',
                                      DEFAULT_RECON_CACHE_PATH),
         'stats_interval': non_negative_float(

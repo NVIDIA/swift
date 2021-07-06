@@ -34,16 +34,17 @@ from swift.common.utils import (
     GreenAsyncPile, Timestamp, remove_file,
     load_recon_cache, parse_override_options, distribute_evenly,
     PrefixLoggerAdapter, remove_directory, config_request_node_count_value,
-    non_negative_int)
+    non_negative_int, non_negative_float)
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.bufferedhttp import http_connect
 from swift.common.daemon import Daemon
+from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.common.ring.utils import is_local_device
 from swift.obj.ssync_sender import Sender as ssync_sender
 from swift.common.http import HTTP_OK, HTTP_NOT_FOUND, \
     HTTP_INSUFFICIENT_STORAGE
 from swift.obj.diskfile import DiskFileRouter, get_data_dir, \
-    get_tmp_dir
+    get_tmp_dir, DEFAULT_RECLAIM_AGE
 from swift.common.storage_policy import POLICIES, EC_POLICY
 from swift.common.exceptions import ConnectionTimeout, DiskFileError, \
     SuffixSyncError, PartitionLockTimeout
@@ -202,8 +203,8 @@ class ObjectReconstructor(Daemon):
         self.http_timeout = int(conf.get('http_timeout', 60))
         self.lockup_timeout = int(conf.get('lockup_timeout', 1800))
         self.recon_cache_path = conf.get('recon_cache_path',
-                                         '/var/cache/swift')
-        self.rcache = os.path.join(self.recon_cache_path, "object.recon")
+                                         DEFAULT_RECON_CACHE_PATH)
+        self.rcache = os.path.join(self.recon_cache_path, RECON_OBJECT_FILE)
         self._next_rcache_update = time.time() + self.stats_interval
         # defaults subject to change after beta
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
@@ -235,8 +236,13 @@ class ObjectReconstructor(Daemon):
             'rebuild_handoff_node_count', 2))
         self.quarantine_threshold = non_negative_int(
             conf.get('quarantine_threshold', 0))
+        self.quarantine_age = int(
+            conf.get('quarantine_age',
+                     conf.get('reclaim_age', DEFAULT_RECLAIM_AGE)))
         self.request_node_count = config_request_node_count_value(
             conf.get('request_node_count', '2 * replicas'))
+        self.nondurable_purge_delay = non_negative_float(
+            conf.get('nondurable_purge_delay', '60'))
 
         # When upgrading from liberasurecode<=1.5.0, you may want to continue
         # writing legacy CRCs until all nodes are upgraded and capabale of
@@ -504,7 +510,7 @@ class ObjectReconstructor(Daemon):
             # worth more investigation
             return False
 
-        if time.time() - float(local_timestamp) <= df.manager.reclaim_age:
+        if time.time() - float(local_timestamp) <= self.quarantine_age:
             # If the fragment has not yet passed reclaim age then it is
             # likely that a tombstone will be reverted to this node, or
             # neighbor frags will get reverted from handoffs to *other* nodes
@@ -975,7 +981,14 @@ class ObjectReconstructor(Daemon):
                     job['local_dev']['device'], job['partition'],
                     object_hash, job['policy'],
                     frag_index=frag_index)
-                df.purge(timestamps['ts_data'], frag_index)
+                # legacy durable data files look like modern nondurable data
+                # files; we therefore override nondurable_purge_delay when we
+                # know the data file is durable so that legacy durable data
+                # files get purged
+                nondurable_purge_delay = (0 if timestamps.get('durable')
+                                          else self.nondurable_purge_delay)
+                df.purge(timestamps['ts_data'], frag_index,
+                         nondurable_purge_delay)
             except DiskFileError:
                 self.logger.exception(
                     'Unable to purge DiskFile (%r %r %r)',

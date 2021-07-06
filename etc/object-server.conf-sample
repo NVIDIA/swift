@@ -414,8 +414,11 @@ use = egg:swift#recon
 # Note: the quarantine_threshold applies equally to all policies, but for each
 # policy it is effectively capped at (ec_ndata - 1) so that a fragment is never
 # quarantined when sufficient fragments exist to reconstruct the object.
-# Fragments are not quarantined until they are older than the reclaim_age.
 # quarantine_threshold = 0
+#
+# Fragments are not quarantined until they are older than
+# quarantine_age, which defaults to the value of reclaim_age.
+# quarantine_age =
 #
 # Sets the maximum number of nodes to which requests will be made before
 # quarantining a fragment. You can use '* replicas' at the end to have it use
@@ -425,6 +428,12 @@ use = egg:swift#recon
 # to be rebuilt). The minimum is only exceeded if request_node_count is
 # greater, and only for the purposes of quarantining.
 # request_node_count = 2 * replicas
+#
+# Sets a delay, in seconds, before the reconstructor removes non-durable data
+# files from a handoff node after reverting them to a primary. This gives the
+# object-server a window in which to finish a concurrent PUT on a handoff and
+# mark the data durable.
+# nondurable_purge_delay = 60.0
 
 [object-updater]
 # You can override the default log routing for this app here (don't use set!):
@@ -530,11 +539,19 @@ use = egg:swift#recon
 #
 # watchers =
 
-# Watcher-specific parameters can he added after "object-auditor:watcher:"
-# like the following (note that entry points are qualified by package#):
+# Watcher-specific parameters can be added in a section with a name
+# [object-auditor:watcher:some_package#some_watcher]. The following
+# example uses the built-in reference watcher.
 #
 # [object-auditor:watcher:swift#dark_data]
+#
+# Action type can be 'log' (default), 'delete', or 'quarantine'.
 # action=log
+#
+# The watcher ignores the objects younger than certain minimum age.
+# This prevents spurious actions upon fresh objects while container
+# listings eventually settle.
+# grace_age=604800
 
 [object-expirer]
 # If this true, this expirer will execute tasks from legacy expirer task queue,
@@ -654,25 +671,6 @@ use = egg:swift#xprofile
 # likelihood that the added I/O from a partition-power increase impacts
 # client traffic. Use zero for unlimited.
 # files_per_second = 0.0
-#
-# Maximum number of partition power locations to check for a valid link target
-# if the relinker encounters an existing tombstone, but with different inode,
-# in the next partition power location. If the relinker fails to make a link
-# because a different tombstone already exists in the next partition power
-# location then it will try to validate that the existing tombstone links to a
-# valid target in the current partition power location, or previous partition
-# power locations, in descending order. This option limits the number of
-# partition power locations searched, including the current partition power,
-# and should be a whole number. A value of 0 implies that no validation is
-# attempted, and an error is logged, when an existing tombstone prevents link
-# creation. A value of 1 implies that an existing link is accepted if it links
-# to a tombstone in the current partition power location. The default value of
-# 2 implies that an existing link is acceptable if it links to a tombstone in
-# the current or previous partition power locations. Increased values may be
-# useful if previous partition power increases have failed to cleanup
-# tombstones from their old locations, causing duplicate tombstones with
-# different inodes to be relinked to the next partition power location.
-# link_check_limit = 2
 #
 # stats_interval = 300.0
 # recon_cache_path = /var/cache/swift
