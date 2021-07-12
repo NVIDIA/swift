@@ -72,7 +72,7 @@ class BaseTestSharder(unittest.TestCase):
         datadir = os.path.join(
             self.tempdir, device, 'containers', str(part), hash_[-3:], hash_)
         if epoch:
-            filename = '%s_%s.db' % (hash, epoch)
+            filename = '%s_%s.db' % (hash_, epoch)
         else:
             filename = hash_ + '.db'
         db_file = os.path.join(datadir, filename)
@@ -186,6 +186,20 @@ class TestSharder(BaseTestSharder):
             allow_modify_pipeline=False,
             use_replication_network=True)
 
+        # non-default shard_container_threshold influences other defaults
+        conf = {'shard_container_threshold': 20000000}
+        expected.update({
+            'shard_container_threshold': 20000000,
+            'shrink_threshold': 2000000,
+            'expansion_limit': 15000000,
+            'rows_per_shard': 10000000
+        })
+        sharder, mock_ic = self._do_test_init(conf, expected)
+        mock_ic.assert_called_once_with(
+            '/etc/swift/internal-client.conf', 'Swift Container Sharder', 3,
+            allow_modify_pipeline=False,
+            use_replication_network=True)
+
         # non-default values
         conf = {
             'mount_check': False, 'bind_ip': '10.11.12.13', 'bind_port': 62010,
@@ -212,7 +226,7 @@ class TestSharder(BaseTestSharder):
             'existing_shard_replication_quorum': 0,
             'max_shrinking': 5,
             'max_expanding': 4,
-            'rows_per_shard': 13,  # should be ignored - not configurable
+            'rows_per_shard': 13
         }
         expected = {
             'mount_check': False, 'bind_ip': '10.11.12.13', 'port': 62010,
@@ -224,7 +238,7 @@ class TestSharder(BaseTestSharder):
             'rsync_module': '{replication_ip}::container_sda',
             'reclaim_age': 86400 * 14,
             'shard_container_threshold': 20000000,
-            'rows_per_shard': 10000000,
+            'rows_per_shard': 13,
             'shrink_threshold': 7000000,
             'expansion_limit': 17000000,
             'cleave_batch_size': 4,
@@ -437,7 +451,8 @@ class TestSharder(BaseTestSharder):
                             'min_time': 0.01, 'max_time': 1.3},
                 'misplaced': {'attempted': 1, 'success': 1, 'failure': 0,
                               'found': 1, 'placed': 1, 'unplaced': 0},
-                'audit_root': {'attempted': 5, 'success': 4, 'failure': 1},
+                'audit_root': {'attempted': 5, 'success': 4, 'failure': 1,
+                               'num_overlap': 0, "has_overlap": 0},
                 'audit_shard': {'attempted': 2, 'success': 2, 'failure': 0},
             }
             # NB these are time increments not absolute times...
@@ -4956,10 +4971,48 @@ class TestSharder(BaseTestSharder):
             with annotate_failure(state):
                 check_all_shard_ranges_sent(state)
 
+    def test_audit_root_container_reset_epoch(self):
+        epoch = next(self.ts_iter)
+        broker = self._make_broker(epoch=epoch.normal)
+        shard_bounds = (('', 'j'), ('j', 'k'), ('k', 's'),
+                        ('s', 'y'), ('y', ''))
+        shard_ranges = self._make_shard_ranges(shard_bounds,
+                                               ShardRange.ACTIVE,
+                                               timestamp=next(self.ts_iter))
+        broker.merge_shard_ranges(shard_ranges)
+        own_shard_range = broker.get_own_shard_range()
+        own_shard_range.update_state(ShardRange.SHARDED, next(self.ts_iter))
+        own_shard_range.epoch = epoch
+        broker.merge_shard_ranges(own_shard_range)
+        with self._mock_sharder() as sharder:
+            with mock.patch.object(
+                    sharder, '_audit_shard_container') as mocked:
+                sharder._audit_container(broker)
+        self.assertFalse(sharder.logger.get_lines_for_level('warning'))
+        self.assertFalse(sharder.logger.get_lines_for_level('error'))
+        self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0},
+                           sharder, 'audit_root')
+        mocked.assert_not_called()
+
+        # test for a reset epoch
+        own_shard_range = broker.get_own_shard_range()
+        own_shard_range.epoch = None
+        own_shard_range.state_timestamp = next(self.ts_iter)
+        broker.merge_shard_ranges(own_shard_range)
+        with self._mock_sharder() as sharder:
+            with mock.patch.object(
+                    sharder, '_audit_shard_container') as mocked:
+                sharder._audit_container(broker)
+        lines = sharder.logger.get_lines_for_level('warning')
+
+        self.assertIn("own_shard_range reset to None should be %s"
+                      % broker.db_epoch, lines[0])
+
     def test_audit_root_container(self):
         broker = self._make_broker()
 
-        expected_stats = {'attempted': 1, 'success': 1, 'failure': 0}
+        expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
+                          'has_overlap': 0, 'num_overlap': 0}
         with self._mock_sharder() as sharder:
             with mock.patch.object(
                     sharder, '_audit_shard_container') as mocked:
@@ -4978,7 +5031,8 @@ class TestSharder(BaseTestSharder):
             # check for no duplicates in reversed order
             self.assertNotIn('s-z k-t', line)
 
-        expected_stats = {'attempted': 1, 'success': 0, 'failure': 1}
+        expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
+                          'has_overlap': 1, 'num_overlap': 2}
         shard_bounds = (('a', 'j'), ('k', 't'), ('s', 'y'),
                         ('y', 'z'), ('y', 'z'))
         for state, state_text in ShardRange.STATES.items():
@@ -5010,7 +5064,8 @@ class TestSharder(BaseTestSharder):
                 sharder._audit_container(broker)
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
         self.assertFalse(sharder.logger.get_lines_for_level('error'))
-        self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0},
+        self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0,
+                            'has_overlap': 0, 'num_overlap': 0},
                            sharder, 'audit_root')
         mocked.assert_not_called()
 
@@ -5026,7 +5081,8 @@ class TestSharder(BaseTestSharder):
                     sharder._audit_container(broker)
             self.assertFalse(sharder.logger.get_lines_for_level('warning'))
             self.assertFalse(sharder.logger.get_lines_for_level('error'))
-            self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0},
+            self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0,
+                                'has_overlap': 0, 'num_overlap': 0},
                                sharder, 'audit_root')
             mocked.assert_not_called()
 

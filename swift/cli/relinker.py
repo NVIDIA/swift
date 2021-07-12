@@ -24,7 +24,7 @@ import os
 import time
 from collections import defaultdict
 
-from eventlet import hubs, tpool
+from eventlet import hubs
 
 from swift.common.exceptions import LockTimeout
 from swift.common.storage_policy import POLICIES
@@ -792,11 +792,6 @@ def main(args):
                         help=argparse.SUPPRESS)
 
     args = parser.parse_args(args)
-    hub = hubs.get_hub()
-    if hub.running:
-        # tests call main a lot; don't bleed hubs/tpools
-        hub.abort(wait=True)
-        tpool.killall()
     hubs.use_hub(get_hub())
     if args.conf_file:
         conf = readconf(args.conf_file, 'object-relinker')

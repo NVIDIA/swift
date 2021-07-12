@@ -319,13 +319,27 @@ shard_container_threshold         1000000             This defines the
                                                       enabled will start to
                                                       shard. This also
                                                       indirectly determines the
-                                                      initial nominal size of
-                                                      shard containers, which
-                                                      is shard_container_threshold//2,
-                                                      as well as determining
-                                                      the thresholds for
-                                                      shrinking and merging
-                                                      shard containers.
+                                                      the defaults for
+                                                      rows_per_shard,
+                                                      shrink_threshold and
+                                                      expansion_limit.
+
+rows_per_shard                    500000              This defines the initial
+                                                      nominal size of shard
+                                                      containers. The default
+                                                      is shard_container_threshold // 2.
+
+minimum_shard_size                100000              Minimum size of the final
+                                                      shard range. If this is
+                                                      greater than one then the
+                                                      final shard range may be
+                                                      extended to more than
+                                                      rows_per_shard in order
+                                                      to avoid a further shard
+                                                      range with less than
+                                                      minimum_shard_size rows.
+                                                      The default value is
+                                                      rows_per_shard // 5.
 
 minimum_shard_size                100000              Minimum size of the final
                                                       shard range. If this is
