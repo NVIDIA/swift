@@ -269,7 +269,6 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                 dev_path = os.path.join(self.reconstructor.devices_dir,
                                         self.ec_local_dev['device'])
                 self.ec_obj_path = os.path.join(dev_path, data_dir)
-
                 # create a bunch of FA's to test
                 t = 1421181937.70054  # time.time()
                 with mock.patch('swift.obj.diskfile.time') as mock_time:
@@ -1185,7 +1184,8 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                 for dirpath, files in visit_obj_dirs(context):
                     n_files_after += len(files)
                     for filename in files:
-                        self.assertFalse(filename.endswith(data_file_tail))
+                        self.assertFalse(
+                            filename.endswith(data_file_tail), filename)
             else:
                 self.assertFalse(context.get('include_non_durable'))
 
@@ -1193,8 +1193,8 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         self.assertGreater(n_files, n_files_after)
 
     def test_delete_reverted_nondurable(self):
-        # verify reconstructor only deletes reverted nondurable fragments after
-        # nondurable_purge_delay
+        # verify reconstructor only deletes reverted nondurable fragments older
+        # commit_window
         shutil.rmtree(self.ec_obj_path)
         ips = utils.whataremyips(self.reconstructor.bind_ip)
         local_devs = [dev for dev in self.ec_obj_ring.devs
@@ -1221,7 +1221,6 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         self.assertTrue(os.path.exists(datafile_recent))
         self.assertTrue(os.path.exists(datafile_older))
         self.assertTrue(os.path.exists(datafile_durable))
-
         ssync_calls = []
         with mock.patch('swift.obj.reconstructor.ssync_sender',
                         self._make_fake_ssync(ssync_calls)):
@@ -1230,19 +1229,19 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         for context in ssync_calls:
             self.assertEqual(REVERT, context['job']['job_type'])
             self.assertTrue(True, context.get('include_non_durable'))
-        # neither nondurable should be removed yet with default purge delay
+        # neither nondurable should be removed yet with default commit_window
         # because their mtimes are too recent
         self.assertTrue(os.path.exists(datafile_recent))
         self.assertTrue(os.path.exists(datafile_older))
         # but durable is purged
-        self.assertFalse(os.path.exists(datafile_durable))
+        self.assertFalse(os.path.exists(datafile_durable), datafile_durable)
 
         ssync_calls = []
         with mock.patch('swift.obj.reconstructor.ssync_sender',
                         self._make_fake_ssync(ssync_calls)):
             self.reconstructor.handoffs_only = True
-            # turn down the purge delay...
-            self.reconstructor.nondurable_purge_delay = 0
+            # turn down the commit_window...
+            df_older.manager.commit_window = 0
             self.reconstructor.reconstruct()
         for context in ssync_calls:
             self.assertEqual(REVERT, context['job']['job_type'])
@@ -1251,6 +1250,153 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         # ...now the nondurables get purged
         self.assertFalse(os.path.exists(datafile_recent))
         self.assertFalse(os.path.exists(datafile_older))
+
+    def test_sync_old_nondurable_before_committed_non_zero_commit_window(self):
+        # verify that a *recently written* nondurable fragment survives being
+        # visited by the reconstructor, despite having timestamp older than
+        # reclaim_age
+        shutil.rmtree(self.ec_obj_path)
+        ips = utils.whataremyips(self.reconstructor.bind_ip)
+        local_devs = [dev for dev in self.ec_obj_ring.devs
+                      if dev and dev['replication_ip'] in ips and
+                      dev['replication_port'] ==
+                      self.reconstructor.port]
+        partition = local_devs[0]['id']
+        # recently written, recent timestamp non-durable
+        ts_recent = Timestamp(time.time())
+        df_mgr = self.reconstructor._df_router[self.policy]
+        reclaim_age = df_mgr.reclaim_age
+        df_recent = self._create_diskfile(
+            object_name='recent', part=partition, commit=False,
+            timestamp=ts_recent, frag_index=4)
+        datafile_recent = df_recent.manager.cleanup_ondisk_files(
+            df_recent._datadir, frag_prefs=[])['data_file']
+
+        # recently written but old timestamp non-durable
+        ts_old = Timestamp(time.time() - reclaim_age - 1)
+        df_older = self._create_diskfile(
+            object_name='older', part=partition, commit=False,
+            timestamp=ts_old, frag_index=4)
+        datafile_older = df_older.manager.cleanup_ondisk_files(
+            df_older._datadir, frag_prefs=[])['data_file']
+        self.assertTrue(os.path.exists(datafile_recent))
+        self.assertTrue(os.path.exists(datafile_older))
+
+        # for this test we don't actually need to ssync anything, so pretend
+        # all suffixes are in sync
+        self.reconstructor._get_suffixes_to_sync = (
+            lambda job, node: ([], node))
+        df_mgr.commit_window = 1000  # avoid non-durables being reclaimed
+        self.reconstructor.reconstruct()
+        # neither nondurable should be removed yet with default commit_window
+        # because their mtimes are too recent
+        self.assertTrue(os.path.exists(datafile_recent))
+        self.assertTrue(os.path.exists(datafile_older))
+        # and we can still make the nondurables durable
+        df_recent.writer().commit(ts_recent)
+        self.assertTrue(os.path.exists(datafile_recent.replace('#4', '#4#d')))
+        df_older.writer().commit(ts_old)
+        self.assertTrue(os.path.exists(datafile_older.replace('#4', '#4#d')))
+
+    def test_sync_old_nondurable_before_committed_zero_commit_window(self):
+        # verify that a *recently written* nondurable fragment won't survive
+        # being visited by the reconstructor if its timestamp is older than
+        # reclaim_age and commit_window is zero; this test illustrates the
+        # potential data loss bug that commit_window addresses
+        shutil.rmtree(self.ec_obj_path)
+        ips = utils.whataremyips(self.reconstructor.bind_ip)
+        local_devs = [dev for dev in self.ec_obj_ring.devs
+                      if dev and dev['replication_ip'] in ips and
+                      dev['replication_port'] ==
+                      self.reconstructor.port]
+        partition = local_devs[0]['id']
+        # recently written, recent timestamp non-durable
+        ts_recent = Timestamp(time.time())
+        df_mgr = self.reconstructor._df_router[self.policy]
+        reclaim_age = df_mgr.reclaim_age
+        df_recent = self._create_diskfile(
+            object_name='recent', part=partition, commit=False,
+            timestamp=ts_recent, frag_index=4)
+        datafile_recent = df_recent.manager.cleanup_ondisk_files(
+            df_recent._datadir, frag_prefs=[])['data_file']
+
+        # recently written but old timestamp non-durable
+        ts_old = Timestamp(time.time() - reclaim_age - 1)
+        df_older = self._create_diskfile(
+            object_name='older', part=partition, commit=False,
+            timestamp=ts_old, frag_index=4)
+        datafile_older = df_older.manager.cleanup_ondisk_files(
+            df_older._datadir, frag_prefs=[])['data_file']
+        self.assertTrue(os.path.exists(datafile_recent))
+        self.assertTrue(os.path.exists(datafile_older))
+
+        # for this test we don't actually need to ssync anything, so pretend
+        # all suffixes are in sync
+        self.reconstructor._get_suffixes_to_sync = (
+            lambda job, node: ([], node))
+        df_mgr.commit_window = 0
+        with mock.patch(
+                'swift.obj.diskfile.is_file_older') as mock_is_file_older:
+            self.reconstructor.reconstruct()
+        # older nondurable will be removed with commit_window = 0
+        self.assertTrue(os.path.exists(datafile_recent))
+        self.assertFalse(os.path.exists(datafile_older))
+        df_recent.writer().commit(ts_recent)
+        self.assertTrue(os.path.exists(datafile_recent.replace('#4', '#4#d')))
+        # ...and attempt to commit will fail :(
+        with self.assertRaises(DiskFileError):
+            df_older.writer().commit(ts_old)
+        # with zero commit_window the call to stat the file is not made
+        mock_is_file_older.assert_not_called()
+
+    def test_sync_old_nondurable_before_committed_past_commit_window(self):
+        # verify that a *not so recently written* nondurable fragment won't
+        # survive being visited by the reconstructor if its timestamp is older
+        # than reclaim_age
+        shutil.rmtree(self.ec_obj_path)
+        ips = utils.whataremyips(self.reconstructor.bind_ip)
+        local_devs = [dev for dev in self.ec_obj_ring.devs
+                      if dev and dev['replication_ip'] in ips and
+                      dev['replication_port'] ==
+                      self.reconstructor.port]
+        partition = local_devs[0]['id']
+        # recently written, recent timestamp non-durable
+        ts_recent = Timestamp(time.time())
+        df_mgr = self.reconstructor._df_router[self.policy]
+        reclaim_age = df_mgr.reclaim_age
+        df_recent = self._create_diskfile(
+            object_name='recent', part=partition, commit=False,
+            timestamp=ts_recent, frag_index=4)
+        datafile_recent = df_recent.manager.cleanup_ondisk_files(
+            df_recent._datadir, frag_prefs=[])['data_file']
+
+        # recently written but old timestamp non-durable
+        ts_old = Timestamp(time.time() - reclaim_age - 1)
+        df_older = self._create_diskfile(
+            object_name='older', part=partition, commit=False,
+            timestamp=ts_old, frag_index=4)
+        datafile_older = df_older.manager.cleanup_ondisk_files(
+            df_older._datadir, frag_prefs=[])['data_file']
+        # pretend file was written more than commit_window seconds ago
+        now = time.time()
+        os.utime(datafile_older, (now - 60.1, now - 60.1))
+        self.assertTrue(os.path.exists(datafile_recent))
+        self.assertTrue(os.path.exists(datafile_older))
+
+        # for this test we don't actually need to ssync anything, so pretend
+        # all suffixes are in sync
+        self.reconstructor._get_suffixes_to_sync = (
+            lambda job, node: ([], node))
+        # leave commit_window at default of 60 seconds
+        self.reconstructor.reconstruct()
+        # older nondurable will be removed
+        self.assertTrue(os.path.exists(datafile_recent))
+        self.assertFalse(os.path.exists(datafile_older))
+        df_recent.writer().commit(ts_recent)
+        self.assertTrue(os.path.exists(datafile_recent.replace('#4', '#4#d')))
+        # ...and attempt to commit will fail :(
+        with self.assertRaises(DiskFileError):
+            df_older.writer().commit(ts_old)
 
     def test_no_delete_failed_revert(self):
         # test will only process revert jobs
@@ -5388,24 +5534,6 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 with self.assertRaises(ValueError):
                     object_reconstructor.ObjectReconstructor(
                         {'quarantine_threshold': bad})
-
-    def test_nondurable_purge_delay_conf(self):
-        reconstructor = object_reconstructor.ObjectReconstructor({})
-        self.assertEqual(60, reconstructor.nondurable_purge_delay)
-
-        reconstructor = object_reconstructor.ObjectReconstructor(
-            {'nondurable_purge_delay': '0'})
-        self.assertEqual(0, reconstructor.nondurable_purge_delay)
-
-        reconstructor = object_reconstructor.ObjectReconstructor(
-            {'nondurable_purge_delay': '3.2'})
-        self.assertEqual(3.2, reconstructor.nondurable_purge_delay)
-
-        for bad in ('-1', -1, 'auto', 'bad'):
-            with annotate_failure(bad):
-                with self.assertRaises(ValueError):
-                    object_reconstructor.ObjectReconstructor(
-                        {'nondurable_purge_delay': bad})
 
     def test_quarantine_age_conf(self):
         # defaults to DEFAULT_RECLAIM_AGE

@@ -215,7 +215,8 @@ class PatchPolicies(object):
 class FakeRing(Ring):
 
     def __init__(self, replicas=3, max_more_nodes=0, part_power=0,
-                 base_port=1000, separate_replication=False):
+                 base_port=1000, separate_replication=False,
+                 next_part_power=None, reload_time=15):
         self.serialized_path = '/foo/bar/object.ring.gz'
         self._base_port = base_port
         self.max_more_nodes = max_more_nodes
@@ -224,8 +225,9 @@ class FakeRing(Ring):
         self.separate_replication = separate_replication
         # 9 total nodes (6 more past the initial 3) is the cap, no matter if
         # this is set higher, or R^2 for R replicas
+        self.reload_time = reload_time
         self.set_replicas(replicas)
-        self._next_part_power = None
+        self._next_part_power = next_part_power
         self._reload()
 
     def has_changed(self):
@@ -933,9 +935,15 @@ def fake_http_connect(*code_iter, **kwargs):
 
         if 'give_connect' in kwargs:
             give_conn_fn = kwargs['give_connect']
-            argspec = inspect.getargspec(give_conn_fn)
-            if argspec.keywords or 'connection_id' in argspec.args:
-                ckwargs['connection_id'] = i
+
+            if six.PY2:
+                argspec = inspect.getargspec(give_conn_fn)
+                if argspec.keywords or 'connection_id' in argspec.args:
+                    ckwargs['connection_id'] = i
+            else:
+                argspec = inspect.getfullargspec(give_conn_fn)
+                if argspec.varkw or 'connection_id' in argspec.args:
+                    ckwargs['connection_id'] = i
             give_conn_fn(*args, **ckwargs)
         etag = next(etag_iter)
         headers = next(headers_iter)

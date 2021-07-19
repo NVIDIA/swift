@@ -23,11 +23,14 @@ import os
 import errno
 import itertools
 import random
+import eventlet
 
 from collections import defaultdict
 from datetime import datetime
 import six
 from six.moves import urllib
+from swift.common.storage_policy import StoragePolicy, ECStoragePolicy
+
 from swift.container import reconciler
 from swift.container.server import gen_resp_headers
 from swift.common.direct_client import ClientException
@@ -36,7 +39,8 @@ from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import split_path, Timestamp, encode_timestamps
 
 from test.debug_logger import debug_logger
-from test.unit import FakeRing, fake_http_connect
+from test.unit import FakeRing, fake_http_connect, patch_policies, \
+    DEFAULT_TEST_EC_TYPE
 from test.unit.common.middleware import helpers
 
 
@@ -92,7 +96,7 @@ class FakeStoragePolicySwift(object):
 
 
 class FakeInternalClient(reconciler.InternalClient):
-    def __init__(self, listings):
+    def __init__(self, listings=None):
         self.app = FakeStoragePolicySwift()
         self.user_agent = 'fake-internal-client'
         self.request_tries = 1
@@ -100,6 +104,7 @@ class FakeInternalClient(reconciler.InternalClient):
         self.parse(listings)
 
     def parse(self, listings):
+        listings = listings or {}
         self.accounts = defaultdict(lambda: defaultdict(list))
         for item, timestamp in listings.items():
             # XXX this interface is stupid
@@ -720,6 +725,11 @@ def listing_qs(marker):
         urllib.parse.quote(marker.encode('utf-8')))
 
 
+@patch_policies(
+    [StoragePolicy(0, 'zero', is_default=True),
+     ECStoragePolicy(1, 'one', ec_type=DEFAULT_TEST_EC_TYPE,
+                     ec_ndata=6, ec_nparity=2), ],
+    fake_ring_args=[{}, {'replicas': 8}])
 class TestReconciler(unittest.TestCase):
 
     maxDiff = None
@@ -727,15 +737,36 @@ class TestReconciler(unittest.TestCase):
     def setUp(self):
         self.logger = debug_logger()
         conf = {}
-        with mock.patch('swift.container.reconciler.InternalClient'):
-            self.reconciler = reconciler.ContainerReconciler(conf)
-        self.reconciler.logger = self.logger
+        self.swift = FakeInternalClient()
+        self.reconciler = reconciler.ContainerReconciler(
+            conf, logger=self.logger, swift=self.swift)
         self.start_interval = int(time.time() // 3600 * 3600)
         self.current_container_path = '/v1/.misplaced_objects/%d' % (
             self.start_interval) + listing_qs('')
 
+    def test_concurrency_config(self):
+        conf = {}
+        r = reconciler.ContainerReconciler(conf, self.logger, self.swift)
+        self.assertEqual(r.concurrency, 1)
+
+        conf = {'concurrency': '10'}
+        r = reconciler.ContainerReconciler(conf, self.logger, self.swift)
+        self.assertEqual(r.concurrency, 10)
+
+        conf = {'concurrency': 48}
+        r = reconciler.ContainerReconciler(conf, self.logger, self.swift)
+        self.assertEqual(r.concurrency, 48)
+
+        conf = {'concurrency': 0}
+        self.assertRaises(ValueError, reconciler.ContainerReconciler,
+                          conf, self.logger, self.swift)
+
+        conf = {'concurrency': '-1'}
+        self.assertRaises(ValueError, reconciler.ContainerReconciler,
+                          conf, self.logger, self.swift)
+
     def _mock_listing(self, objects):
-        self.reconciler.swift = FakeInternalClient(objects)
+        self.swift.parse(objects)
         self.fake_swift = self.reconciler.swift.app
 
     def _mock_oldest_spi(self, container_oldest_spi_map):
@@ -767,6 +798,60 @@ class TestReconciler(unittest.TestCase):
 
         return [c[1][1:4] for c in
                 mocks['direct_delete_container_entry'].mock_calls]
+
+    def test_no_concurrency(self):
+        self._mock_listing({
+            (None, "/.misplaced_objects/3600/1:/AUTH_bob/c/o1"): 3618.84187,
+            (None, "/.misplaced_objects/3600/1:/AUTH_bob/c/o2"): 3724.23456,
+            (1, "/AUTH_bob/c/o1"): 3618.84187,
+            (1, "/AUTH_bob/c/o2"): 3724.23456,
+        })
+
+        order_recieved = []
+
+        def fake_reconcile_object(account, container, obj, q_policy_index,
+                                  q_ts, q_op, path, **kwargs):
+            order_recieved.append(obj)
+            return True
+
+        self.reconciler._reconcile_object = fake_reconcile_object
+        self.assertEqual(self.reconciler.concurrency, 1)  # sanity
+        deleted_container_entries = self._run_once()
+        self.assertEqual(order_recieved, ['o1', 'o2'])
+        # process in order recieved
+        self.assertEqual(deleted_container_entries, [
+            ('.misplaced_objects', '3600', '1:/AUTH_bob/c/o1'),
+            ('.misplaced_objects', '3600', '1:/AUTH_bob/c/o2'),
+        ])
+
+    def test_concurrency(self):
+        self._mock_listing({
+            (None, "/.misplaced_objects/3600/1:/AUTH_bob/c/o1"): 3618.84187,
+            (None, "/.misplaced_objects/3600/1:/AUTH_bob/c/o2"): 3724.23456,
+            (1, "/AUTH_bob/c/o1"): 3618.84187,
+            (1, "/AUTH_bob/c/o2"): 3724.23456,
+        })
+
+        order_recieved = []
+
+        def fake_reconcile_object(account, container, obj, q_policy_index,
+                                  q_ts, q_op, path, **kwargs):
+            order_recieved.append(obj)
+            if obj == 'o1':
+                # o1 takes longer than o2 for some reason
+                for i in range(10):
+                    eventlet.sleep(0.0)
+            return True
+
+        self.reconciler._reconcile_object = fake_reconcile_object
+        self.reconciler.concurrency = 2
+        deleted_container_entries = self._run_once()
+        self.assertEqual(order_recieved, ['o1', 'o2'])
+        # ... and so we finish o2 first
+        self.assertEqual(deleted_container_entries, [
+            ('.misplaced_objects', '3600', '1:/AUTH_bob/c/o2'),
+            ('.misplaced_objects', '3600', '1:/AUTH_bob/c/o1'),
+        ])
 
     def test_invalid_queue_name(self):
         self._mock_listing({
@@ -883,6 +968,46 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['cleanup_object'], 0)
         # and we definitely should not pop_queue
         self.assertFalse(deleted_container_entries)
+        self.assertEqual(self.reconciler.stats['retry'], 1)
+
+    @patch_policies(
+        [StoragePolicy(0, 'zero', is_default=True),
+         StoragePolicy(1, 'one'),
+         ECStoragePolicy(2, 'two', ec_type=DEFAULT_TEST_EC_TYPE,
+                         ec_ndata=6, ec_nparity=2)],
+        fake_ring_args=[
+            {'next_part_power': 1}, {}, {'next_part_power': 1}])
+    def test_can_reconcile_policy(self):
+        for policy_index, expected in ((0, False), (1, True), (2, False),
+                                       (3, False), ('apple', False),
+                                       (None, False)):
+            self.assertEqual(
+                self.reconciler.can_reconcile_policy(policy_index), expected)
+
+    @patch_policies(
+        [StoragePolicy(0, 'zero', is_default=True),
+         ECStoragePolicy(1, 'one', ec_type=DEFAULT_TEST_EC_TYPE,
+                         ec_ndata=6, ec_nparity=2), ],
+        fake_ring_args=[{'next_part_power': 1}, {}])
+    def test_fail_to_move_if_ppi(self):
+        self._mock_listing({
+            (None, "/.misplaced_objects/3600/1:/AUTH_bob/c/o1"): 3618.84187,
+            (1, "/AUTH_bob/c/o1"): 3618.84187,
+        })
+        self._mock_oldest_spi({'c': 0})
+        deleted_container_entries = self._run_once()
+
+        # skipped sending because policy_index 0 is in the middle of a PPI
+        self.assertFalse(deleted_container_entries)
+        self.assertEqual(
+            self.fake_swift.calls,
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
+             ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
+             ('GET', '/v1/.misplaced_objects/3600' +
+              listing_qs('1:/AUTH_bob/c/o1'))])
+        self.assertEqual(self.reconciler.stats['ppi_skip'], 1)
         self.assertEqual(self.reconciler.stats['retry'], 1)
 
     def test_object_move(self):
@@ -1280,6 +1405,44 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['pop_queue'], 0)
         self.assertEqual(deleted_container_entries, [])
         self.assertEqual(self.reconciler.stats['retry'], 1)
+
+    def test_object_move_fails_preflight(self):
+        # setup the cluster
+        self._mock_listing({
+            (None, "/.misplaced_objects/3600/1:/AUTH_bob/c/o1"): 3600.123456,
+            (1, '/AUTH_bob/c/o1'): 3600.123457,  # slightly newer
+        })
+        self._mock_oldest_spi({'c': 0})  # destination
+
+        # make the HEAD blow up
+        self.fake_swift.storage_policy[0].register(
+            'HEAD', '/v1/AUTH_bob/c/o1', swob.HTTPServiceUnavailable, {})
+        # turn the crank
+        deleted_container_entries = self._run_once()
+
+        # we did some listings...
+        self.assertEqual(
+            self.fake_swift.calls,
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
+             ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
+             ('GET', '/v1/.misplaced_objects/3600' +
+              listing_qs('1:/AUTH_bob/c/o1'))])
+        # ...but we can't even tell whether anything's misplaced or not
+        self.assertEqual(self.reconciler.stats['misplaced_object'], 0)
+        self.assertEqual(self.reconciler.stats['unavailable_destination'], 1)
+        # so we don't try to do any sort of move or cleanup
+        self.assertEqual(self.reconciler.stats['copy_attempt'], 0)
+        self.assertEqual(self.reconciler.stats['cleanup_attempt'], 0)
+        self.assertEqual(self.reconciler.stats['pop_queue'], 0)
+        self.assertEqual(deleted_container_entries, [])
+        # and we'll have to try again later
+        self.assertEqual(self.reconciler.stats['retry'], 1)
+        self.assertEqual(self.fake_swift.storage_policy[1].calls, [])
+        self.assertEqual(
+            self.fake_swift.storage_policy[0].calls,
+            [('HEAD', '/v1/AUTH_bob/c/o1')])
 
     def test_object_move_fails_cleanup(self):
         # setup the cluster

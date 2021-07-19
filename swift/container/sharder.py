@@ -15,6 +15,7 @@
 import collections
 import errno
 import json
+import operator
 import time
 from collections import defaultdict
 from operator import itemgetter
@@ -634,18 +635,28 @@ class ContainerSharderConf(object):
             'minimum_shard_size', config_positive_int_value,
             max(self.rows_per_shard // 5, 1))
 
-        self.validate_conf()
-
     def percent_of_threshold(self, val):
         return int(config_percent_value(val) * self.shard_container_threshold)
 
-    def validate_conf(self):
-        keys = ('minimum_shard_size', 'rows_per_shard')
-        vals = [getattr(self, key) for key in keys]
-        if not vals[0] <= vals[1]:
-            raise ValueError(
-                '%s (%d) must be less than %s (%d)'
-                % (keys[0], vals[0], keys[1], vals[1]))
+    @classmethod
+    def validate_conf(cls, namespace):
+        ops = {'<': operator.lt,
+               '<=': operator.le}
+        checks = (('minimum_shard_size', '<=', 'rows_per_shard'),
+                  ('shrink_threshold', '<=', 'minimum_shard_size'),
+                  ('rows_per_shard', '<', 'shard_container_threshold'),
+                  ('expansion_limit', '<', 'shard_container_threshold'))
+        for key1, op, key2 in checks:
+            try:
+                val1 = getattr(namespace, key1)
+                val2 = getattr(namespace, key2)
+            except AttributeError:
+                # swift-manage-shard-ranges uses a subset of conf options for
+                # each command so only validate those actually in the namespace
+                continue
+            if not ops[op](val1, val2):
+                raise ValueError('%s (%d) must be %s %s (%d)'
+                                 % (key1, val1, op, key2, val2))
 
 
 DEFAULT_SHARDER_CONF = vars(ContainerSharderConf())
@@ -660,6 +671,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         # rows_per_shard is not configurable for the daemon
         conf.pop('rows_per_shard', None)
         ContainerSharderConf.__init__(self, conf)
+        ContainerSharderConf.validate_conf(self)
         if conf.get('auto_create_account_prefix'):
             self.logger.warning('Option auto_create_account_prefix is '
                                 'deprecated. Configure '
@@ -1605,7 +1617,14 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             self._increment_stat('cleaved', 'failure', statsd=True)
             return CLEAVE_FAILED
 
-        own_shard_range = broker.get_own_shard_range()
+        own_shard_range = broker.get_own_shard_range(no_default=True)
+        if own_shard_range is None:
+            # A default should never be SHRINKING or SHRUNK but because we
+            # may write own_shard_range back to broker, let's make sure
+            # it can't be defaulted.
+            self.logger.warning('Failed to get own_shard_range for %s',
+                                quote(broker.path))
+            return CLEAVE_FAILED
 
         # only cleave from the retiring db - misplaced objects handler will
         # deal with any objects in the fresh db
@@ -1823,7 +1842,14 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             # Move all CLEAVED shards to ACTIVE state and if a shard then
             # delete own shard range; these changes will be simultaneously
             # reported in the next update to the root container.
-            own_shard_range = broker.get_own_shard_range()
+            own_shard_range = broker.get_own_shard_range(no_default=True)
+            if own_shard_range is None:
+                # This is more of a belts and braces, not sure we could even
+                # get this far with without an own_shard_range. But because
+                # we will be writing own_shard_range back, we need to make sure
+                self.logger.warning('Failed to get own_shard_range for %s',
+                                    quote(broker.path))
+                return False
             own_shard_range.update_meta(0, 0)
             if own_shard_range.state in (ShardRange.SHRINKING,
                                          ShardRange.SHRUNK):

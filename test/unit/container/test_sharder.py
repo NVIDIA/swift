@@ -14,6 +14,7 @@
 # limitations under the License.
 import json
 import random
+from argparse import Namespace
 
 import eventlet
 import os
@@ -41,7 +42,8 @@ from swift.container.sharder import ContainerSharder, sharding_enabled, \
     CleavingContext, DEFAULT_SHARDER_CONF, finalize_shrinking, \
     find_shrinking_candidates, process_compactible_shard_sequences, \
     find_compactible_shard_sequences, is_shrinking_candidate, \
-    is_sharding_candidate, find_paths, rank_paths, ContainerSharderConf
+    is_sharding_candidate, find_paths, rank_paths, ContainerSharderConf, \
+    CLEAVE_FAILED
 from swift.common.utils import ShardRange, Timestamp, hash_path, \
     encode_timestamps, parse_db_filename, quorum_size, Everything, md5
 from test import annotate_failure
@@ -210,7 +212,7 @@ class TestSharder(BaseTestSharder):
             'rsync_compress': True,
             'rsync_module': '{replication_ip}::container_sda/',
             'reclaim_age': 86400 * 14,
-            'shrink_threshold': 7000000,
+            'shrink_threshold': 2000000,
             'expansion_limit': 17000000,
             'shard_container_threshold': 20000000,
             'cleave_batch_size': 4,
@@ -226,7 +228,7 @@ class TestSharder(BaseTestSharder):
             'existing_shard_replication_quorum': 0,
             'max_shrinking': 5,
             'max_expanding': 4,
-            'rows_per_shard': 13
+            'rows_per_shard': 13000000
         }
         expected = {
             'mount_check': False, 'bind_ip': '10.11.12.13', 'port': 62010,
@@ -238,8 +240,8 @@ class TestSharder(BaseTestSharder):
             'rsync_module': '{replication_ip}::container_sda',
             'reclaim_age': 86400 * 14,
             'shard_container_threshold': 20000000,
-            'rows_per_shard': 13,
-            'shrink_threshold': 7000000,
+            'rows_per_shard': 13000000,
+            'shrink_threshold': 2000000,
             'expansion_limit': 17000000,
             'cleave_batch_size': 4,
             'shard_scanner_batch_size': 8,
@@ -295,7 +297,7 @@ class TestSharder(BaseTestSharder):
     def test_init_deprecated_options(self):
         # percent values applied if absolute values not given
         conf = {
-            'shard_shrink_point': 15,  # trumps shrink_threshold
+            'shard_shrink_point': 7,  # trumps shrink_threshold
             'shard_shrink_merge_point': 95,  # trumps expansion_limit
             'shard_container_threshold': 20000000,
         }
@@ -310,7 +312,7 @@ class TestSharder(BaseTestSharder):
             'reclaim_age': 86400 * 7,
             'shard_container_threshold': 20000000,
             'rows_per_shard': 10000000,
-            'shrink_threshold': 3000000,
+            'shrink_threshold': 1400000,
             'expansion_limit': 19000000,
             'cleave_batch_size': 2,
             'shard_scanner_batch_size': 10,
@@ -326,10 +328,10 @@ class TestSharder(BaseTestSharder):
         self._do_test_init(conf, expected)
         # absolute values override percent values
         conf = {
-            'shard_shrink_point': 15,  # trumps shrink_threshold
-            'shrink_threshold': 7000000,
-            'shard_shrink_merge_point': 95,  # trumps expansion_limit
-            'expansion_limit': 17000000,
+            'shard_shrink_point': 7,
+            'shrink_threshold': 1300000,  # trumps shard_shrink_point
+            'shard_shrink_merge_point': 95,
+            'expansion_limit': 17000000,  # trumps shard_shrink_merge_point
             'shard_container_threshold': 20000000,
         }
         expected = {
@@ -343,7 +345,7 @@ class TestSharder(BaseTestSharder):
             'reclaim_age': 86400 * 7,
             'shard_container_threshold': 20000000,
             'rows_per_shard': 10000000,
-            'shrink_threshold': 7000000,
+            'shrink_threshold': 1300000,
             'expansion_limit': 17000000,
             'cleave_batch_size': 2,
             'shard_scanner_batch_size': 10,
@@ -1666,6 +1668,27 @@ class TestSharder(BaseTestSharder):
         self.assertEqual(cleaving_context.ranges_todo, 2)
         self.assertFalse(cleaving_context.cleaving_done)
 
+    def test_cleave_shard_range_no_own_shard_range(self):
+        broker = self._make_sharding_broker()
+        obj = {'name': 'obj', 'created_at': next(self.ts_iter).internal,
+               'size': 14, 'content_type': 'text/plain', 'etag': 'an etag',
+               'deleted': 0}
+        broker.get_brokers()[0].merge_items([obj])
+        self.assertEqual(2, len(broker.db_files))  # sanity check
+        context = CleavingContext.load(broker)
+        shard_range = broker.get_shard_ranges()[0]
+
+        with self._mock_sharder() as sharder, mock.patch(
+                'swift.container.backend.ContainerBroker.get_own_shard_range',
+                return_value=None):
+            self.assertEqual(
+                sharder._cleave_shard_range(broker, context, shard_range),
+                CLEAVE_FAILED)
+        self.assertEqual(SHARDING, broker.get_db_state())
+        warning_lines = sharder.logger.get_lines_for_level('warning')
+        self.assertEqual(warning_lines[0],
+                         'Failed to get own_shard_range for a/c')
+
     def test_cleave_shard(self):
         broker = self._make_broker(account='.shards_a', container='shard_c')
         own_shard_range = ShardRange(
@@ -2875,6 +2898,31 @@ class TestSharder(BaseTestSharder):
         broker = self._check_complete_sharding(
             '.shards_', 'shard_c', (('l', 'mid'), ('mid', 'u')))
         self.assertEqual(1, broker.get_own_shard_range().deleted)
+
+    def test_complete_sharding_missing_own_shard_range(self):
+        broker = self._make_sharding_broker()
+        obj = {'name': 'obj', 'created_at': next(self.ts_iter).internal,
+               'size': 14, 'content_type': 'text/plain', 'etag': 'an etag',
+               'deleted': 0}
+        broker.get_brokers()[0].merge_items([obj])
+        self.assertEqual(2, len(broker.db_files))  # sanity check
+
+        # Make cleaving context_done
+        context = CleavingContext.load(broker)
+        self.assertEqual(1, context.max_row)
+        context.cleave_to_row = 1  # pretend all rows have been cleaved
+        context.cleaving_done = True
+        context.misplaced_done = True
+        context.store(broker)
+
+        with self._mock_sharder() as sharder, mock.patch(
+                'swift.container.backend.ContainerBroker.get_own_shard_range',
+                return_value=None):
+            self.assertFalse(sharder._complete_sharding(broker))
+        self.assertEqual(SHARDING, broker.get_db_state())
+        warning_lines = sharder.logger.get_lines_for_level('warning')
+        self.assertEqual(warning_lines[0],
+                         'Failed to get own_shard_range for a/c')
 
     def test_sharded_record_sharding_progress_missing_contexts(self):
         broker = self._check_complete_sharding(
@@ -4224,6 +4272,7 @@ class TestSharder(BaseTestSharder):
             account, cont, lower, upper)
         with self._mock_sharder(conf={'shard_container_threshold': 199,
                                       'minimum_shard_size': 1,
+                                      'shrink_threshold': 0,
                                       'auto_create_account_prefix': '.int_'}
                                 ) as sharder:
             with mock_timestamp_now() as now:
@@ -4240,6 +4289,7 @@ class TestSharder(BaseTestSharder):
         # second invocation finds none
         with self._mock_sharder(conf={'shard_container_threshold': 199,
                                       'minimum_shard_size': 1,
+                                      'shrink_threshold': 0,
                                       'auto_create_account_prefix': '.int_'}
                                 ) as sharder:
             num_found = sharder._find_shard_ranges(broker)
@@ -4325,6 +4375,7 @@ class TestSharder(BaseTestSharder):
             account, cont, lower, upper)
         with self._mock_sharder(conf={'shard_container_threshold': 199,
                                       'minimum_shard_size': 1,
+                                      'shrink_threshold': 0,
                                       'auto_create_account_prefix': '.int_'}
                                 ) as sharder:
             with mock_timestamp_now() as now:
@@ -4413,6 +4464,7 @@ class TestSharder(BaseTestSharder):
         # third invocation finds none
         with self._mock_sharder(conf={'shard_container_threshold': 199,
                                       'shard_scanner_batch_size': 2,
+                                      'shrink_threshold': 0,
                                       'minimum_shard_size': 10}
                                 ) as sharder:
             sharder._send_shard_ranges = mock.MagicMock(return_value=True)
@@ -8223,3 +8275,75 @@ class TestContainerSharderConf(unittest.TestCase):
                         ValueError, msg='{%s : %s}' % (key, bad_value)) as cm:
                     ContainerSharderConf({key: bad_value})
                 self.assertIn('Error setting %s' % key, str(cm.exception))
+
+    def test_validate(self):
+        def assert_bad(conf):
+            with self.assertRaises(ValueError):
+                ContainerSharderConf.validate_conf(ContainerSharderConf(conf))
+
+        def assert_ok(conf):
+            try:
+                ContainerSharderConf.validate_conf(ContainerSharderConf(conf))
+            except ValueError as err:
+                self.fail('Unexpected ValueError: %s' % err)
+
+        assert_ok({})
+        assert_ok({'minimum_shard_size': 100,
+                   'shrink_threshold': 100,
+                   'rows_per_shard': 100})
+        assert_bad({'minimum_shard_size': 100})
+        assert_bad({'shrink_threshold': 100001})
+        assert_ok({'minimum_shard_size': 100,
+                   'shrink_threshold': 100})
+        assert_bad({'minimum_shard_size': 100,
+                    'shrink_threshold': 100,
+                    'rows_per_shard': 99})
+
+        assert_ok({'shard_container_threshold': 100,
+                   'rows_per_shard': 99})
+        assert_bad({'shard_container_threshold': 100,
+                    'rows_per_shard': 100})
+        assert_bad({'rows_per_shard': 10000001})
+
+        assert_ok({'shard_container_threshold': 100,
+                   'expansion_limit': 99})
+        assert_bad({'shard_container_threshold': 100,
+                    'expansion_limit': 100})
+        assert_bad({'expansion_limit': 100000001})
+
+    def test_validate_subset(self):
+        # verify that validation is only applied for keys that exist in the
+        # given namespace
+        def assert_bad(conf):
+            with self.assertRaises(ValueError):
+                ContainerSharderConf.validate_conf(Namespace(**conf))
+
+        def assert_ok(conf):
+            try:
+                ContainerSharderConf.validate_conf(Namespace(**conf))
+            except ValueError as err:
+                self.fail('Unexpected ValueError: %s' % err)
+
+        assert_ok({})
+        assert_ok({'minimum_shard_size': 100,
+                   'shrink_threshold': 100,
+                   'rows_per_shard': 100})
+        assert_ok({'minimum_shard_size': 100})
+        assert_ok({'shrink_threshold': 100001})
+        assert_ok({'minimum_shard_size': 100,
+                   'shrink_threshold': 100})
+        assert_bad({'minimum_shard_size': 100,
+                    'shrink_threshold': 100,
+                    'rows_per_shard': 99})
+
+        assert_ok({'shard_container_threshold': 100,
+                   'rows_per_shard': 99})
+        assert_bad({'shard_container_threshold': 100,
+                    'rows_per_shard': 100})
+        assert_ok({'rows_per_shard': 10000001})
+
+        assert_ok({'shard_container_threshold': 100,
+                   'expansion_limit': 99})
+        assert_bad({'shard_container_threshold': 100,
+                    'expansion_limit': 100})
+        assert_ok({'expansion_limit': 100000001})
