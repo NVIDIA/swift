@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+import unittest
 import uuid
 
 from nose import SkipTest
@@ -39,7 +40,7 @@ from test import annotate_failure
 from test.probe import PROXY_BASE_URL
 from test.probe.brain import BrainSplitter
 from test.probe.common import ReplProbeTest, get_server_number, \
-    wait_for_server_to_hangup
+    wait_for_server_to_hangup, ENABLED_POLICIES
 import mock
 
 
@@ -2214,6 +2215,56 @@ class TestContainerSharding(BaseTestContainerSharding):
         self.assert_container_object_count(1)
         self.assert_container_delete_fails()
         self.assert_container_post_ok('revived')
+
+    def _do_test_sharded_can_get_objects_different_policy(self,
+                                                          policy_idx,
+                                                          new_policy_idx):
+        # create sharded container
+        client.delete_container(self.url, self.token, self.container_name)
+        self.brain.put_container(policy_index=int(policy_idx))
+        all_obj_names = self._make_object_names(self.max_shard_size)
+        self.put_objects(all_obj_names)
+        client.post_container(self.url, self.admin_token, self.container_name,
+                              headers={'X-Container-Sharding': 'on'})
+        for n in self.brain.node_numbers:
+            self.sharders.once(
+                number=n, additional_args='--partitions=%s' % self.brain.part)
+        # empty and delete
+        self.delete_objects(all_obj_names)
+        shard_ranges = self.get_container_shard_ranges()
+        self.run_sharders(shard_ranges)
+        client.delete_container(self.url, self.token, self.container_name)
+
+        # re-create with new_policy_idx
+        self.brain.put_container(policy_index=int(new_policy_idx))
+
+        # we re-use shard ranges
+        new_shard_ranges = self.get_container_shard_ranges()
+        self.assertEqual(shard_ranges, new_shard_ranges)
+        self.put_objects(all_obj_names)
+
+        # The shard is still on the old policy index, but the root spi
+        # is passed to shard container server and is used to pull objects
+        # of that index out.
+        self.assert_container_listing(all_obj_names)
+        # although a head request is getting object count for the shard spi
+        self.assert_container_object_count(0)
+
+    @unittest.skipIf(len(ENABLED_POLICIES) < 2, "Need more than one policy")
+    def test_sharded_can_get_objects_different_policy(self):
+        policy_idx = self.policy.idx
+        new_policy_idx = [pol.idx for pol in ENABLED_POLICIES
+                          if pol != self.policy.idx][0]
+        self._do_test_sharded_can_get_objects_different_policy(
+            policy_idx, new_policy_idx)
+
+    @unittest.skipIf(len(ENABLED_POLICIES) < 2, "Need more than one policy")
+    def test_sharded_can_get_objects_different_policy_reversed(self):
+        policy_idx = [pol.idx for pol in ENABLED_POLICIES
+                      if pol != self.policy][0]
+        new_policy_idx = self.policy.idx
+        self._do_test_sharded_can_get_objects_different_policy(
+            policy_idx, new_policy_idx)
 
     def test_object_update_redirection(self):
         all_obj_names = self._make_object_names(self.max_shard_size)
