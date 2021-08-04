@@ -373,6 +373,9 @@ class ContainerController(Controller):
                 headers['X-Backend-Record-Type'] = 'object'
             if config_true_value(req.headers.get('x-newest', False)):
                 headers['X-Newest'] = 'true'
+            policy_key = 'X-Backend-Storage-Policy-Index'
+            if policy_key in resp.headers and policy_key not in req.headers:
+                headers[policy_key] = resp.headers[policy_key]
 
             if prefix:
                 if prefix > shard_range:
