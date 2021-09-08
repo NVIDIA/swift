@@ -31,6 +31,29 @@ from swift.common.http import is_success
 from swift.common.utils import Timestamp, majority_size, get_db_files
 
 
+def check_merge_own_shard_range(shards, broker, logger, source):
+    """
+    If broker has own_shard_range *with an epoch* then filter out an
+    own_shard_range *without an epoch*, and log a warning about it.
+
+    :param shards: a list of candidate ShardRanges to merge
+    :param broker: a ContainerBroker
+    :param logger: a logger
+    :param source: string to log as source of shards
+    :return: a list of ShardRanges to actually merge
+    """
+    if broker.get_own_shard_range().epoch is None:
+        return shards
+    to_merge = []
+    for shard in shards:
+        if shard['name'] == broker.path and shard['epoch'] is None:
+            logger.warning('Ignoring remote osr w/o epoch: %r, from: %s',
+                           shard, source)
+            continue
+        to_merge.append(shard)
+    return to_merge
+
+
 class ContainerReplicator(db_replicator.Replicator):
     server_type = 'container'
     brokerclass = ContainerBroker
@@ -138,8 +161,10 @@ class ContainerReplicator(db_replicator.Replicator):
         with Timeout(self.node_timeout):
             response = http.replicate('get_shard_ranges')
         if response and is_success(response.status):
-            broker.merge_shard_ranges(json.loads(
-                response.data.decode('ascii')))
+            shards = json.loads(response.data.decode('ascii'))
+            shards = check_merge_own_shard_range(
+                shards, broker, self.logger, '%s%s' % (http.host, http.path))
+            broker.merge_shard_ranges(shards)
 
     def find_local_handoff_for_part(self, part):
         """
@@ -394,11 +419,15 @@ class ContainerReplicatorRpc(db_replicator.ReplicatorRpc):
     def _post_rsync_then_merge_hook(self, existing_broker, new_broker):
         # Note the following hook will need to change to using a pointer and
         # limit in the future.
-        new_broker.merge_shard_ranges(
-            existing_broker.get_all_shard_range_data())
+        shards = existing_broker.get_all_shard_range_data()
+        shards = check_merge_own_shard_range(
+            shards, new_broker, self.logger, 'rsync')
+        new_broker.merge_shard_ranges(shards)
 
     def merge_shard_ranges(self, broker, args):
-        broker.merge_shard_ranges(args[0])
+        shards = check_merge_own_shard_range(
+            args[0], broker, self.logger, 'repl_req')
+        broker.merge_shard_ranges(shards)
         return HTTPAccepted()
 
     def get_shard_ranges(self, broker, args):
