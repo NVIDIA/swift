@@ -1312,7 +1312,7 @@ class GetOrHeadHandler(object):
                                         _('Trying to read during GET'))
             raise
         except ChunkWriteTimeout:
-            self.app.logger.warning(
+            self.app.logger.info(
                 _('Client did not read from proxy within %ss') %
                 self.app.client_timeout)
             self.app.logger.increment('client_timeouts')
@@ -1327,8 +1327,8 @@ class GetOrHeadHandler(object):
                         if end - begin + 1 == self.bytes_used_from_backend:
                             warn = False
             if not req.environ.get('swift.non_client_disconnect') and warn:
-                self.app.logger.warning('Client disconnected on read of %r',
-                                        self.path)
+                self.app.logger.info('Client disconnected on read of %r',
+                                     self.path)
             raise
         except Exception:
             self.app.logger.exception(_('Trying to send to client'))
@@ -2285,7 +2285,9 @@ class Controller(object):
         :param req: original Request instance.
         :param account: account in which `container` is stored.
         :param container: container from which listing should be fetched.
-        :param headers: headers to be included with the request
+        :param headers: extra headers to be included with the listing
+            sub-request; these update the headers copied from the original
+            request.
         :param params: query string parameters to be used.
         :return: a tuple of (deserialized json data structure, swob Response)
         """

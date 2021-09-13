@@ -318,6 +318,17 @@ class ContainerController(Controller):
         #      shard may return the root's shard range.
         shard_listing_history = req.environ.setdefault(
             'swift.shard_listing_history', [])
+        policy_key = 'X-Backend-Storage-Policy-Index'
+        if not (shard_listing_history or policy_key in req.headers):
+            # We're handling the original request to the root container: set
+            # the root policy index in the request, unless it is already set,
+            # so that shards will return listings for that policy index.
+            # Note: we only get here if the root responded with shard ranges,
+            # or if the shard ranges were cached and the cached root container
+            # info has sharding_state==sharded; in both cases we can assume
+            # that the response is "modern enough" to include
+            # 'X-Backend-Storage-Policy-Index'.
+            req.headers[policy_key] = resp.headers[policy_key]
         shard_listing_history.append((self.account_name, self.container_name))
         shard_ranges = [ShardRange.from_dict(data)
                         for data in json.loads(resp.body)]
@@ -405,7 +416,16 @@ class ContainerController(Controller):
                     'Aborting listing from shards due to bad response: %r'
                     % all_resp_status)
                 return HTTPServiceUnavailable(request=req)
-
+            shard_policy = shard_resp.headers.get(
+                'X-Backend-Record-Storage-Policy-Index',
+                shard_resp.headers[policy_key]
+            )
+            if shard_policy != req.headers[policy_key]:
+                self.app.logger.error(
+                    'Aborting listing from shards due to bad shard policy '
+                    'index: %s (expected %s)',
+                    shard_policy, req.headers[policy_key])
+                return HTTPServiceUnavailable(request=req)
             self.app.logger.debug(
                 'Found %d objects in shard (state=%s), total = %d',
                 len(objs), sharding_state, len(objs) + len(objects))

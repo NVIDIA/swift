@@ -776,7 +776,7 @@ class ContainerController(BaseStorageServer):
             storage_policy_index = (
                 requested_policy_index if requested_policy_index is not None
                 else info['storage_policy_index'])
-            resp_headers['X-Backend-Storage-Policy-Index'] = \
+            resp_headers['X-Backend-Record-Storage-Policy-Index'] = \
                 storage_policy_index
             # Use the retired db while container is in process of sharding,
             # otherwise use current db

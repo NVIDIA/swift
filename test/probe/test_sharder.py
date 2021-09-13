@@ -24,6 +24,7 @@ import six
 from six.moves.urllib.parse import quote
 
 from swift.common import direct_client, utils
+from swift.common.internal_client import UnexpectedResponse
 from swift.common.manager import Manager
 from swift.common.memcached import MemcacheRing
 from swift.common.utils import ShardRange, parse_db_filename, get_db_files, \
@@ -2249,6 +2250,22 @@ class TestContainerSharding(BaseTestContainerSharding):
         self.assert_container_listing(all_obj_names)
         # although a head request is getting object count for the shard spi
         self.assert_container_object_count(0)
+
+        # we can force the listing to use the old policy index in which case we
+        # expect no objects to be listed
+        try:
+            resp = self.internal_client.make_request(
+                'GET',
+                path=self.internal_client.make_path(
+                    self.account, self.container_name),
+                headers={'X-Backend-Storage-Policy-Index': str(policy_idx)},
+                acceptable_statuses=(2,),
+                params={'format': 'json'}
+            )
+        except UnexpectedResponse as exc:
+            self.fail('Listing failed with %s' % exc.resp.status)
+
+        self.assertEqual([], json.loads(b''.join(resp.app_iter)))
 
     @unittest.skipIf(len(ENABLED_POLICIES) < 2, "Need more than one policy")
     def test_sharded_can_get_objects_different_policy(self):

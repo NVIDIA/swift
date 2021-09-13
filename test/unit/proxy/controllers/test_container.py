@@ -1184,15 +1184,19 @@ class TestContainerController(TestRingBase):
                           'X-Container-Object-Count': num_all_objects,
                           'X-Container-Bytes-Used': size_all_objects,
                           'X-Backend-Storage-Policy-Index': 0,
+                          'X-Backend-Record-Storage-Policy-Index': 0,
                           'X-Backend-Record-Type': 'shard',
                           }
         shard_resp_hdrs = {'X-Backend-Sharding-State': 'unsharded',
                            'X-Container-Object-Count': 2,
                            'X-Container-Bytes-Used': 4,
-                           'X-Backend-Storage-Policy-Index': 0}
+                           'X-Backend-Storage-Policy-Index': 0,
+                           'X-Backend-Record-Storage-Policy-Index': 0,
+                           }
         shrinking_resp_hdrs = {
             'X-Backend-Sharding-State': 'sharded',
             'X-Backend-Record-Type': 'shard',
+            'X-Backend-Storage-Policy-Index': 0
         }
         limit = CONTAINER_LISTING_LIMIT
 
@@ -1815,7 +1819,8 @@ class TestContainerController(TestRingBase):
              'X-Container-Bytes-Used':
                  sum([obj['bytes'] for obj in sr_objs[i]]),
              'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 1}
+             'X-Backend-Storage-Policy-Index': 1,
+             'X-Backend-Record-Storage-Policy-Index': 0}
             for i in range(3)]
         shard_1_shard_resp_hdrs = dict(shard_resp_hdrs[1])
         shard_1_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
@@ -1834,7 +1839,8 @@ class TestContainerController(TestRingBase):
              'X-Container-Bytes-Used':
                  sum([obj['bytes'] for obj in sub_sr_objs[i]]),
              'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 1}
+             'X-Backend-Storage-Policy-Index': 1,
+             'X-Backend-Record-Storage-Policy-Index': 0}
             for i in range(2)]
 
         all_objects = []
@@ -1892,7 +1898,7 @@ class TestContainerController(TestRingBase):
               'X-Backend-Storage-Policy-Index': '0'},
              dict(marker='j', end_marker='lemon\x00', states='listing',
                   limit=str(limit - len(sr_objs[0] + sub_sr_objs[0])))),
-            # get remainder of first shard objects
+            # get remainder of second shard objects
             (shard_ranges[1].name,
              {'X-Backend-Record-Type': 'object',
               'X-Backend-Storage-Policy-Index': '0'},
@@ -1913,6 +1919,67 @@ class TestContainerController(TestRingBase):
             mock_responses, expected_objects, expected_requests)
         # root object count will overridden by actual length of listing
         self.check_response(resp, root_resp_hdrs)
+
+    @patch_policies([
+        StoragePolicy(0, 'zero', True, object_ring=FakeRing()),
+        StoragePolicy(1, 'one', False, object_ring=FakeRing())
+    ])
+    def test_GET_sharded_container_mixed_policies_error(self):
+        # scenario: shards have different policy than root, listing requests
+        # root policy index but shards not upgraded and respond with their own
+        # policy index
+        def do_test(shard_policy):
+            # only need first shard for this test...
+            sr = ShardRange('.shards_a/c_pie', Timestamp.now(), '', 'pie')
+            sr_objs = self._make_shard_objects(sr)
+            shard_resp_hdrs = {
+                'X-Backend-Sharding-State': 'unsharded',
+                'X-Container-Object-Count': len(sr_objs),
+                'X-Container-Bytes-Used':
+                    sum([obj['bytes'] for obj in sr_objs]),
+            }
+
+            if shard_policy is not None:
+                shard_resp_hdrs['X-Backend-Storage-Policy-Index'] = \
+                    shard_policy
+
+            size_all_objects = sum([obj['bytes'] for obj in sr_objs])
+            num_all_objects = len(sr_objs)
+            limit = CONTAINER_LISTING_LIMIT
+            root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
+                              'X-Backend-Timestamp': '99',
+                              'X-Container-Object-Count': num_all_objects,
+                              'X-Container-Bytes-Used': size_all_objects,
+                              'X-Container-Meta-Flavour': 'peach',
+                              # NB root policy 1 differes from shard policy
+                              'X-Backend-Storage-Policy-Index': 1}
+            root_shard_resp_hdrs = dict(root_resp_hdrs)
+            root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+
+            mock_responses = [
+                # status, body, headers
+                (200, [dict(sr)], root_shard_resp_hdrs),
+                (200, sr_objs, shard_resp_hdrs),
+            ]
+            # NB marker always advances to last object name
+            expected_requests = [
+                # get root shard ranges
+                ('a/c', {'X-Backend-Record-Type': 'auto'},
+                 dict(states='listing')),  # 200
+                # get first shard objects
+                (sr.name,
+                 {'X-Backend-Record-Type': 'auto',
+                  'X-Backend-Storage-Policy-Index': '1'},
+                 dict(marker='', end_marker='pie\x00', states='listing',
+                      limit=str(limit))),  # 200
+                # error to client; no request for second shard objects
+            ]
+            self._check_GET_shard_listing(
+                mock_responses, [], expected_requests,
+                expected_status=503)
+
+        do_test(0)
+        do_test(None)
 
     def _build_request(self, headers, params, infocache=None):
         # helper to make a GET request with caches set in environ
@@ -2089,32 +2156,19 @@ class TestContainerController(TestRingBase):
             self.memcache.calls)
 
     def test_get_from_shards_add_root_spi(self):
-        req = Request.blank(
-            '/v1/a/c', environ={'REQUEST_METHOD': 'GET'})
         self._setup_shard_range_stubs()
-        resp = mock.MagicMock(body=self._stub_shards_dump,
-                              headers=self.root_resp_hdrs)
         shard_resp = mock.MagicMock(status_int=204, headers={})
-        resp.request = req
 
-        def mock_get_container_listing(*args, **kargs):
-            shard_listing_headers.update(kargs.get('headers', {}))
+        def mock_get_container_listing(self_, req, *args, **kargs):
+            captured_hdrs.update(req.headers)
             return None, shard_resp
 
-        # no header in response -> no header added to request
-        shard_listing_headers = {}
-        del resp.headers['X-Backend-Storage-Policy-Index']
-        with mock.patch('swift.proxy.controllers.container.'
-                        'ContainerController._get_container_listing',
-                        mock_get_container_listing):
-            controller_cls, d = self.app.get_controller(req)
-            controller = controller_cls(self.app, **d)
-            controller._get_from_shards(req, resp)
-
-        self.assertEqual({}, shard_listing_headers)
-
         # header in response -> header added to request
-        shard_listing_headers = {}
+        captured_hdrs = {}
+        req = Request.blank('/v1/a/c', environ={'REQUEST_METHOD': 'GET'})
+        resp = mock.MagicMock(body=self._stub_shards_dump,
+                              headers=self.root_resp_hdrs,
+                              request=req)
         resp.headers['X-Backend-Storage-Policy-Index'] = '0'
         with mock.patch('swift.proxy.controllers.container.'
                         'ContainerController._get_container_listing',
@@ -2123,11 +2177,15 @@ class TestContainerController(TestRingBase):
             controller = controller_cls(self.app, **d)
             controller._get_from_shards(req, resp)
 
-        self.assertIn('X-Backend-Storage-Policy-Index', shard_listing_headers)
+        self.assertIn('X-Backend-Storage-Policy-Index', captured_hdrs)
         self.assertEqual(
-            shard_listing_headers['X-Backend-Storage-Policy-Index'], '0')
+            captured_hdrs['X-Backend-Storage-Policy-Index'], '0')
 
-        shard_listing_headers = {}
+        captured_hdrs = {}
+        req = Request.blank('/v1/a/c', environ={'REQUEST_METHOD': 'GET'})
+        resp = mock.MagicMock(body=self._stub_shards_dump,
+                              headers=self.root_resp_hdrs,
+                              request=req)
         resp.headers['X-Backend-Storage-Policy-Index'] = '1'
         with mock.patch('swift.proxy.controllers.container.'
                         'ContainerController._get_container_listing',
@@ -2136,13 +2194,21 @@ class TestContainerController(TestRingBase):
             controller = controller_cls(self.app, **d)
             controller._get_from_shards(req, resp)
 
-        self.assertIn('X-Backend-Storage-Policy-Index', shard_listing_headers)
+        self.assertIn('X-Backend-Storage-Policy-Index', captured_hdrs)
         self.assertEqual(
-            shard_listing_headers['X-Backend-Storage-Policy-Index'], '1')
+            captured_hdrs['X-Backend-Storage-Policy-Index'], '1')
 
-        # existing X-Backend-Storage-Policy-Index in request is respected
-        shard_listing_headers = {}
-        req.headers['X-Backend-Storage-Policy-Index'] = '0'
+        # header not added to request if not root request
+        captured_hdrs = {}
+        req = Request.blank('/v1/a/c',
+                            environ={
+                                'REQUEST_METHOD': 'GET',
+                                'swift.shard_listing_history': [('a', 'c')]}
+                            )
+        resp = mock.MagicMock(body=self._stub_shards_dump,
+                              headers=self.root_resp_hdrs,
+                              request=req)
+        resp.headers['X-Backend-Storage-Policy-Index'] = '0'
         with mock.patch('swift.proxy.controllers.container.'
                         'ContainerController._get_container_listing',
                         mock_get_container_listing):
@@ -2150,7 +2216,26 @@ class TestContainerController(TestRingBase):
             controller = controller_cls(self.app, **d)
             controller._get_from_shards(req, resp)
 
-        self.assertEqual({}, shard_listing_headers)
+        self.assertNotIn('X-Backend-Storage-Policy-Index', captured_hdrs)
+
+        # existing X-Backend-Storage-Policy-Index in request is respected
+        captured_hdrs = {}
+        req = Request.blank('/v1/a/c', environ={'REQUEST_METHOD': 'GET'})
+        req.headers['X-Backend-Storage-Policy-Index'] = '0'
+        resp = mock.MagicMock(body=self._stub_shards_dump,
+                              headers=self.root_resp_hdrs,
+                              request=req)
+        resp.headers['X-Backend-Storage-Policy-Index'] = '1'
+        with mock.patch('swift.proxy.controllers.container.'
+                        'ContainerController._get_container_listing',
+                        mock_get_container_listing):
+            controller_cls, d = self.app.get_controller(req)
+            controller = controller_cls(self.app, **d)
+            controller._get_from_shards(req, resp)
+
+        self.assertIn('X-Backend-Storage-Policy-Index', captured_hdrs)
+        self.assertEqual(
+            captured_hdrs['X-Backend-Storage-Policy-Index'], '0')
 
     def test_GET_shard_ranges(self):
         self._setup_shard_range_stubs()
