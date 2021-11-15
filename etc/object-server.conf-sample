@@ -440,6 +440,14 @@ use = egg:swift#recon
 # greater, and only for the purposes of quarantining.
 # request_node_count = 2 * replicas
 
+# max_objects_per_sync can be used to limit the number of objects sync'd inside
+# a single SSYNC request. If more than max_objects_per_sync are available, the
+# remaining objects will remain in the sender partition and will not be sync'd
+# until the next call to ssync.Sender, which would currently be the next time
+# the reconstructor visits that partition. A value of 0 (the default) means
+# there is no limit.
+# max_objects_per_sync = 0
+
 [object-updater]
 # You can override the default log routing for this app here (don't use set!):
 # log_name = object-updater
