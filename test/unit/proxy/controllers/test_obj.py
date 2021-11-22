@@ -46,7 +46,7 @@ from swift.proxy.controllers import obj
 from swift.proxy.controllers.base import \
     get_container_info as _real_get_container_info
 from swift.common.storage_policy import POLICIES, ECDriverError, \
-    StoragePolicy, ECStoragePolicy
+    StoragePolicy, ECStoragePolicy, ECInvalidFragmentMetadata
 
 from test.debug_logger import debug_logger
 from test.unit import (
@@ -4745,6 +4745,11 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         mix_index = random.randint(0, self.policy.ec_ndata - 1)
         mixed_responses = responses1[:self.policy.ec_ndata]
         mixed_responses[mix_index] = responses2[mix_index]
+        # TODO(mattoliverau): find out how to get these numbers dynamically
+        #  cause who know's they may vary based on arch or even python
+        #  verions :shrug:
+        mixed_lengths = ["458" for _ in responses1[:self.policy.ec_ndata]]
+        mixed_lengths[mix_index] = '490'
 
         status_codes, body_iter, headers = zip(*mixed_responses)
         with set_http_connect(*status_codes, body_iter=body_iter,
@@ -4753,7 +4758,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
         try:
             resp.body
-        except ECDriverError:
+        except (ECDriverError, ECInvalidFragmentMetadata):
             resp._app_iter.close()
         else:
             self.fail('invalid ec fragment response body did not blow up!')
@@ -4762,8 +4767,10 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         msg = error_lines[0]
         self.assertIn('Error decoding fragments', msg)
         self.assertIn('/a/c/o', msg)
-        log_msg_args, log_msg_kwargs = self.logger.log_dict['error'][0]
-        self.assertEqual(log_msg_kwargs['exc_info'][0], ECDriverError)
+        self.assertIn('Segments decoded: 3', msg)
+        self.assertIn("[%s]" % ", ".join(mixed_lengths), msg)
+        self.assertIn("Invalid fragment payload in ECPyECLibDriver.decode",
+                      msg)
 
     def test_GET_read_timeout(self):
         # verify EC GET behavior when initial batch of nodes time out then
@@ -5025,6 +5032,46 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         do_test(490 + 458)
         do_test(490 + 490 + 458)
         do_test(490 + 490 + 490 + 458)
+
+    def test_GET_trigger_ec_metadata_check_failure(self):
+        # verify that a warning is logged when there are only k - 1 fragment
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-333]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        bad_bodies = [b'd' * segment_size] * (self.policy.ec_nparity + 1)
+        ec_archive_bodies = \
+            ec_archive_bodies[:self.policy.ec_ndata - 1] + bad_bodies
+
+        self.logger.clear()
+        headers = {
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
+        }
+        responses = [
+            (200, body, self._add_frag_index(i, headers))
+            for i, body in enumerate(ec_archive_bodies)]
+
+        req = swob.Request.blank('/v1/a/c/o')
+
+        status_codes, body_iter, headers = zip(
+            *responses[:self.policy.ec_ndata])
+        with set_http_connect(*status_codes, body_iter=body_iter,
+                              headers=headers):
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 500)
+            self.assertNotEqual(md5(resp.body).hexdigest(), etag)
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertTrue(error_lines)
+        self.assertIn(
+            'pyeclib_c_decode ERROR: Fragment integrity check failed. '
+            'Please inspect syslog for liberasurecode error report',
+            error_lines[0])
+        lengths = ", ".join([
+            str(self.policy.fragment_size)
+            for _ in range(self.policy.ec_ndata)])
+        expected_line_segment = "Segments decoded: 0 Lengths: [%s]" % lengths
+        self.assertIn(expected_line_segment, error_lines[0])
 
     def test_GET_read_timeout_resume_mixed_etag(self):
         segment_size = self.policy.ec_segment_size

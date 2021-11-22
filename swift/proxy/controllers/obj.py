@@ -62,8 +62,9 @@ from swift.common.http import (
     HTTP_SERVICE_UNAVAILABLE, HTTP_INSUFFICIENT_STORAGE,
     HTTP_PRECONDITION_FAILED, HTTP_CONFLICT, HTTP_UNPROCESSABLE_ENTITY,
     HTTP_REQUESTED_RANGE_NOT_SATISFIABLE, HTTP_NOT_FOUND)
-from swift.common.storage_policy import (POLICIES, REPL_POLICY, EC_POLICY,
-                                         ECDriverError, PolicyError)
+from swift.common.storage_policy import (
+    POLICIES, REPL_POLICY, EC_POLICY, PolicyError)
+from pyeclib.ec_iface import ECDriverError, ECInvalidFragmentMetadata
 from swift.proxy.controllers.base import Controller, delay_denial, \
     cors_validation, update_headers, bytes_to_skip, close_swift_conn, \
     ByteCountEnforcer
@@ -1417,6 +1418,7 @@ class ECAppIter(object):
                 queue.put(None)
                 frag_iter.close()
 
+        segments_decoded = 0
         with ContextPool(len(fragment_iters)) as pool:
             for frag_iter, queue in zip(fragment_iters, queues):
                 pool.spawn(put_fragments_in_queue, frag_iter, queue,
@@ -1444,12 +1446,19 @@ class ECAppIter(object):
                             len(fragments), quote(self.path))
                     break
                 try:
-                    segment = self.policy.pyeclib_driver.decode(fragments)
-                except ECDriverError:
-                    self.logger.exception("Error decoding fragments for %r",
-                                          quote(self.path))
+                    segment = self.policy.pyeclib_driver.decode(
+                        fragments, force_metadata_checks=True)
+                except (ECDriverError, ECInvalidFragmentMetadata) as err:
+                    self.logger.error(
+                        "Error decoding fragments for %r. "
+                        "Segments decoded: %d "
+                        "Lengths: [%s]: %s" % (
+                            quote(self.path), segments_decoded,
+                            ', '.join(map(str, map(len, fragments))),
+                            str(err)))
                     raise
 
+                segments_decoded += 1
                 yield segment
 
     def app_iter_range(self, start, end):
