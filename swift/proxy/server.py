@@ -295,6 +295,8 @@ class Application(object):
             name.strip().title()
             for name in swift_owner_headers.split(',') if name.strip()]
 
+        self.pyeclib_force_metadata_checks = config_true_value(
+            conf.get('pyeclib_force_metadata_check', False))
         # When upgrading from liberasurecode<=1.5.0, you may want to continue
         # writing legacy CRCs until all nodes are upgraded and capabale of
         # reading fragments with zlib CRCs.
