@@ -1040,7 +1040,7 @@ class ECAppIter(object):
     :param logger: a logger
     """
     def __init__(self, path, policy, internal_parts_iters, range_specs,
-                 fa_length, obj_length, logger):
+                 fa_length, obj_length, logger, force_metadata_checks=False):
         self.path = path
         self.policy = policy
         self.internal_parts_iters = internal_parts_iters
@@ -1049,6 +1049,7 @@ class ECAppIter(object):
         self.obj_length = obj_length if obj_length is not None else 0
         self.boundary = b''
         self.logger = logger
+        self.force_metadata_checks = force_metadata_checks
 
         self.mime_boundary = None
         self.learned_content_type = None
@@ -1417,6 +1418,7 @@ class ECAppIter(object):
                 queue.put(None)
                 frag_iter.close()
 
+        segments_decoded = 0
         with ContextPool(len(fragment_iters)) as pool:
             for frag_iter, queue in zip(fragment_iters, queues):
                 pool.spawn(put_fragments_in_queue, frag_iter, queue,
@@ -1444,12 +1446,20 @@ class ECAppIter(object):
                             len(fragments), quote(self.path))
                     break
                 try:
-                    segment = self.policy.pyeclib_driver.decode(fragments)
-                except ECDriverError:
-                    self.logger.exception("Error decoding fragments for %r",
-                                          quote(self.path))
+                    segment = self.policy.pyeclib_driver.decode(
+                        fragments,
+                        force_metadata_checks=self.force_metadata_checks)
+                except ECDriverError as err:
+                    self.logger.error(
+                        "Error decoding fragments for %r. "
+                        "Segments decoded: %d, "
+                        "Lengths: [%s]: %s" % (
+                            quote(self.path), segments_decoded,
+                            ', '.join(map(str, map(len, fragments))),
+                            str(err)))
                     raise
 
+                segments_decoded += 1
                 yield segment
 
     def app_iter_range(self, start, end):
@@ -3022,7 +3032,7 @@ class ECObjectController(BaseObjectController):
                 policy,
                 [p_iter for _getter, p_iter in best_bucket.get_responses()],
                 range_specs, fa_length, obj_length,
-                self.app.logger)
+                self.app.logger, self.app.pyeclib_force_metadata_checks)
             resp = Response(
                 request=req,
                 conditional_response=True,
