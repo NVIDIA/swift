@@ -201,6 +201,7 @@ class Application(object):
             self.logger = logger
         self.logger.set_statsd_prefix('proxy-server')
         self._error_limiting = {}
+        self.backend_user_agent = 'proxy-server %s' % os.getpid()
 
         swift_dir = conf.get('swift_dir', '/etc/swift')
         self.swift_dir = swift_dir
