@@ -585,6 +585,10 @@ class TestObjectUpdater(unittest.TestCase):
             op_path))))
         self.assertEqual(ou.logger.get_increment_counts(),
                          {'unlinks': 1, 'successes': 1})
+        self.assertEqual([args for args, kw in ou.logger.log_dict['timing']], [
+            ('updater.timing.status.201', mock.ANY),
+            ('updater.timing.node.127_0_0_1.sda1', mock.ANY),
+        ])
 
     def test_obj_put_legacy_updates(self):
         ts = (normalize_timestamp(t) for t in
