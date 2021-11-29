@@ -199,7 +199,7 @@ class Sender(object):
                     can_delete_obj = dict((hash_, available_map[hash_])
                                           for hash_ in in_sync_hashes)
                 self.daemon.logger.debug(
-                    'ssync.Sender dev: %s, part: %s, policy: %d, '
+                    'ssync completed ok: dev: %s, part: %s, policy: %d, '
                     'num suffixes: %s, available: %d, sent: %d, deletable: %d',
                     self.job['device'], self.job['partition'],
                     self.job['policy'].idx, len(self.suffixes),

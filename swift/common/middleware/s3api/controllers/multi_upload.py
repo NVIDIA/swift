@@ -325,6 +325,7 @@ class UploadsController(Controller):
                         'last_modified': object_info['last_modified']}
             return obj_dict
 
+        is_part = re.compile('/[0-9]+$')
         while len(uploads) < maxuploads:
             try:
                 resp = req.get_response(self.app, container=container,
@@ -336,13 +337,8 @@ class UploadsController(Controller):
             if not objects:
                 break
 
-            # uploads is a list consists of dict, {key, upload_id,
-            # last_modified} Note that pattern matcher will drop whole segments
-            # objects like as object_name/upload_id/1.
-            pattern = re.compile('/[0-9]+$')
             new_uploads = [object_to_upload(obj) for obj in objects if
-                           pattern.search(obj.get('name', '')) is None]
-
+                           is_part.search(obj.get('name', '')) is None]
             new_prefixes = []
             if 'delimiter' in req.params:
                 prefix = req.params.get('prefix', '')
