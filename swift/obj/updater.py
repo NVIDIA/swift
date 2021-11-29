@@ -466,6 +466,11 @@ class ObjectUpdater(Daemon):
             tuple of (a path, a timestamp string).
         """
         redirect = None
+        start = time.time()
+        node_timing_string = 'updater.timing.node.%s.%s' % (
+            node['replication_ip'].replace('.', '_'), node['device'])
+        # Assume an error until we hear otherwise
+        status = 500
         try:
             with ConnectionTimeout(self.conn_timeout):
                 conn = http_connect(
@@ -474,8 +479,9 @@ class ObjectUpdater(Daemon):
             with Timeout(self.node_timeout):
                 resp = conn.getresponse()
                 resp.read()
+            status = resp.status
 
-            if resp.status == HTTP_MOVED_PERMANENTLY:
+            if status == HTTP_MOVED_PERMANENTLY:
                 try:
                     redirect = get_redirect_data(resp)
                 except ValueError as err:
@@ -483,7 +489,7 @@ class ObjectUpdater(Daemon):
                         'Container update failed for %r; problem with '
                         'redirect location: %s' % (obj, err))
 
-            success = is_success(resp.status)
+            success = is_success(status)
             if not success:
                 self.logger.debug(
                     'Error code %(status)d is returned from remote '
@@ -492,8 +498,22 @@ class ObjectUpdater(Daemon):
                      'port': node['replication_port'],
                      'device': node['device']})
             return success, node['id'], redirect
-        except (Exception, Timeout):
+        except Exception:
             self.logger.exception(
                 'ERROR with remote server '
                 '%(replication_ip)s:%(replication_port)s/%(device)s', node)
+        except Timeout as exc:
+            if not isinstance(exc, ConnectionTimeout):
+                # i.e., we definitely made the request but gave up
+                # waiting for the response
+                status = 499
+            self.logger.info(
+                'Timeout talking to remote server '
+                '%(replication_ip)s:%(replication_port)s/%(device)s: %(exc)s',
+                dict(node, exc=exc))
+        finally:
+            elapsed = time.time() - start
+            self.logger.timing('updater.timing.status.%s' % status,
+                               elapsed * 1000)
+            self.logger.timing(node_timing_string, elapsed * 1000)
         return HTTP_INTERNAL_SERVER_ERROR, node['id'], redirect
