@@ -1446,9 +1446,7 @@ class ECAppIter(object):
                             len(fragments), quote(self.path))
                     break
                 try:
-                    segment = self.policy.pyeclib_driver.decode(
-                        fragments,
-                        force_metadata_checks=self.force_metadata_checks)
+                    segment = self.policy.pyeclib_driver.decode(fragments)
                 except ECDriverError as err:
                     self.logger.error(
                         "Error decoding fragments for %r. "

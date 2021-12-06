@@ -4718,27 +4718,53 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         req = swob.Request.blank('/v1/a/c/o')
 
-        # sanity check responses1
+        orig_decode = self.policy.pyeclib_driver.decode
+        captured_fragments = []
+
+        def mock_decode(fragments):
+            captured_fragments.append(fragments)
+            return orig_decode(fragments)
+
+        # sanity check responses1 and capture frag lengths
         responses = responses1[:self.policy.ec_ndata]
         status_codes, body_iter, headers = zip(*responses)
         with set_http_connect(*status_codes, body_iter=body_iter,
                               headers=headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 200)
-        self.assertEqual(
-            md5(resp.body, usedforsecurity=False).hexdigest(),
-            etag1)
+            with mock.patch.object(
+                    self.policy.pyeclib_driver, 'decode', mock_decode):
+                resp = req.get_response(self.app)
+                self.assertEqual(resp.status_int, 200)
+                # read body while decode is mocked
+                self.assertEqual(
+                    md5(resp.body, usedforsecurity=False).hexdigest(),
+                    etag1)
+        fragment_lengths1 = [[len(frag) for frag in frags]
+                             for frags in captured_fragments]
+        self.assertEqual(  # sanity check
+            len(ec_archive_bodies1[0]),
+            sum([length for length in [lengths[0]
+                                       for lengths in fragment_lengths1]]))
 
-        # sanity check responses2
+        # sanity check responses2 and capture frag lengths
+        captured_fragments = []
         responses = responses2[:self.policy.ec_ndata]
         status_codes, body_iter, headers = zip(*responses)
         with set_http_connect(*status_codes, body_iter=body_iter,
                               headers=headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 200)
-        self.assertEqual(
-            md5(resp.body, usedforsecurity=False).hexdigest(),
-            etag2)
+            with mock.patch.object(
+                    self.policy.pyeclib_driver, 'decode', mock_decode):
+                resp = req.get_response(self.app)
+                self.assertEqual(resp.status_int, 200)
+                # read body while decode is mocked
+                self.assertEqual(
+                    md5(resp.body, usedforsecurity=False).hexdigest(),
+                    etag2)
+        fragment_lengths2 = [[len(frag) for frag in frags]
+                             for frags in captured_fragments]
+        self.assertEqual(  # sanity check
+            len(ec_archive_bodies2[0]),
+            sum([length for length in [lengths[0]
+                                       for lengths in fragment_lengths2]]))
 
         # now mix the responses a bit
         mix_index = random.randint(0, self.policy.ec_ndata - 1)
@@ -4749,6 +4775,11 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         #  verions :shrug:
         mixed_lengths = ["458" for _ in responses1[:self.policy.ec_ndata]]
         mixed_lengths[mix_index] = '490'
+
+        num_segments = len(fragment_lengths1)
+        mixed_lengths = fragment_lengths1[num_segments - 1]
+        mixed_lengths[mix_index] = fragment_lengths2[
+            num_segments - 1][mix_index]
 
         status_codes, body_iter, headers = zip(*mixed_responses)
         with set_http_connect(*status_codes, body_iter=body_iter,
@@ -4766,8 +4797,9 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         msg = error_lines[0]
         self.assertIn('Error decoding fragments', msg)
         self.assertIn('/a/c/o', msg)
-        self.assertIn('Segments decoded: 3', msg)
-        self.assertIn("[%s]" % ", ".join(mixed_lengths), msg)
+        self.assertIn('Segments decoded: %d' % (num_segments - 1), msg)
+        self.assertIn(
+            "[%s]" % ", ".join([str(length) for length in mixed_lengths]), msg)
         self.assertIn("Invalid fragment payload in ECPyECLibDriver.decode",
                       msg)
 

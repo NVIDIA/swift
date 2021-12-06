@@ -52,21 +52,33 @@ from test.unit import (patch_policies, mocked_http_conn, FabricatedRing,
 from test.unit.obj.common import write_diskfile
 
 
-@contextmanager
-def mock_ssync_sender(ssync_calls=None, response_callback=None, **kwargs):
-    def fake_ssync(daemon, node, job, suffixes, **kwargs):
+class FakeSsyncSender(object):
+    def __init__(self, daemon, node, job, suffixes, ssync_calls=None,
+                 response_callback=None, **kwargs):
         if ssync_calls is not None:
             call_args = {'node': node, 'job': job, 'suffixes': suffixes}
             call_args.update(kwargs)
             ssync_calls.append(call_args)
+        self.response_callback = response_callback
+        self.node = node
+        self.job = job
+        self.suffixes = suffixes
+        self.limited_by_max_objects = False
 
-        def fake_call():
-            if response_callback:
-                response = response_callback(node, job, suffixes)
-            else:
-                response = True, {}
-            return response
-        return fake_call
+    def __call__(self):
+        if self.response_callback:
+            response = self.response_callback(
+                self.node, self.job, self.suffixes)
+        else:
+            response = True, {}
+        return response
+
+
+@contextmanager
+def mock_ssync_sender(ssync_calls=None, response_callback=None, **kwargs):
+    def fake_ssync(daemon, node, job, suffixes, **kwargs):
+        return FakeSsyncSender(daemon, node, job, suffixes, ssync_calls,
+                               response_callback, **kwargs)
 
     with mock.patch('swift.obj.reconstructor.ssync_sender', fake_ssync):
         yield fake_ssync
@@ -1108,14 +1120,14 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         """
         class _fake_ssync(object):
             def __init__(self, daemon, node, job, suffixes,
-                         include_non_durable=False, max_objects_per_sync=0,
+                         include_non_durable=False, max_objects=0,
                          **kwargs):
                 # capture context and generate an available_map of objs
                 context = {}
                 context['node'] = node
                 context['job'] = job
                 context['suffixes'] = suffixes
-                context['max_objects_per_sync'] = max_objects_per_sync
+                context['max_objects'] = max_objects
                 self.suffixes = suffixes
                 self.daemon = daemon
                 self.job = job
@@ -1126,13 +1138,16 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                     frag_index=self.job.get('frag_index'),
                     frag_prefs=frag_prefs)
                 self.available_map = {}
+                self.limited_by_max_objects = False
                 nlines = 0
                 for hash_, timestamps in hash_gen:
                     self.available_map[hash_] = timestamps
                     nlines += 1
-                    if 0 < max_objects_per_sync <= nlines:
+                    if 0 < max_objects <= nlines:
                         break
-
+                for _ in hash_gen:
+                    self.limited_by_max_objects = True
+                    break
                 context['available_map'] = self.available_map
                 ssync_calls.append(context)
                 self.success = True
@@ -1186,7 +1201,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                                       context['available_map']))
             else:
                 self.assertFalse(context.get('include_non_durable'))
-            self.assertEqual(0, context.get('max_objects_per_sync'))
+            self.assertEqual(0, context.get('max_objects'))
 
         mock_delete.assert_has_calls(expected_calls, any_order=True)
 
@@ -1215,15 +1230,15 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                             filename.endswith(data_file_tail), filename)
             else:
                 self.assertFalse(context.get('include_non_durable'))
-            self.assertEqual(0, context.get('max_objects_per_sync'))
+            self.assertEqual(0, context.get('max_objects'))
 
         # sanity check that some files should were deleted
         self.assertGreater(n_files, n_files_after)
 
-    def test_max_object_per_sync_revert_only(self):
-        # verify max_objects_per_sync option is only passed to revert jobs
+    def test_max_objects_per_revert_only_for_revert_jobs(self):
+        # verify max_objects_per_revert option is only passed to revert jobs
         ssync_calls = []
-        conf = dict(self.conf, max_objects_per_sync=2)
+        conf = dict(self.conf, max_objects_per_revert=2)
         with mock.patch('swift.obj.reconstructor.ssync_sender',
                         self._make_fake_ssync(ssync_calls)), \
                 mocked_http_conn(*[200] * 6, body=pickle.dumps({})):
@@ -1233,10 +1248,10 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         reverts = syncs = 0
         for context in ssync_calls:
             if context['job']['job_type'] == REVERT:
-                self.assertEqual(2, context.get('max_objects_per_sync'))
+                self.assertEqual(2, context.get('max_objects'))
                 reverts += 1
             else:
-                self.assertEqual(0, context.get('max_objects_per_sync'))
+                self.assertEqual(0, context.get('max_objects'))
                 syncs += 1
         self.assertGreater(reverts, 0)
         self.assertGreater(syncs, 0)
@@ -1449,9 +1464,9 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         with self.assertRaises(DiskFileError):
             df_older.writer().commit(ts_old)
 
-    def test_delete_reverted_max_objects_per_sync(self):
+    def test_delete_reverted_max_objects_per_revert(self):
         # verify reconstructor only deletes objects that were actually reverted
-        # when ssync is limited by max_objects_per_sync
+        # when ssync is limited by max_objects_per_revert
         shutil.rmtree(self.ec_obj_path)
         ips = utils.whataremyips(self.reconstructor.bind_ip)
         local_devs = [dev for dev in self.ec_obj_ring.devs
@@ -1459,7 +1474,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                       dev['replication_port'] ==
                       self.reconstructor.port]
         partition = (local_devs[0]['id'] + 1) % 3
-        # 2 durable objects
+        # three durable objects
         df_0 = self._create_diskfile(
             object_name='zero', part=partition)
         datafile_0 = df_0.manager.cleanup_ondisk_files(
@@ -1480,9 +1495,9 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         actual_datafiles = [df for df in datafiles if os.path.exists(df)]
         self.assertEqual(datafiles, actual_datafiles)
 
-        # only two object will be sync'd and purged...
+        # only two objects will be sync'd and purged...
         ssync_calls = []
-        conf = dict(self.conf, max_objects_per_sync=2, handoffs_only=True)
+        conf = dict(self.conf, max_objects_per_revert=2, handoffs_only=True)
         self.reconstructor = object_reconstructor.ObjectReconstructor(
             conf, logger=self.logger)
         with mock.patch('swift.obj.reconstructor.ssync_sender',
@@ -1490,21 +1505,28 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             self.reconstructor.reconstruct()
         for context in ssync_calls:
             self.assertEqual(REVERT, context['job']['job_type'])
-            self.assertEqual(2, context.get('max_objects_per_sync'))
+            self.assertEqual(2, context.get('max_objects'))
         actual_datafiles = [df for df in datafiles if os.path.exists(df)]
         self.assertEqual(1, len(actual_datafiles), actual_datafiles)
+        # handoff still reported as remaining
+        self.assertEqual(1, self.reconstructor.handoffs_remaining)
 
         # ...until next reconstructor run which will sync and purge the last
-        # object
+        # object; max_objects_per_revert == actual number of objects
         ssync_calls = []
+        conf = dict(self.conf, max_objects_per_revert=1, handoffs_only=True)
+        self.reconstructor = object_reconstructor.ObjectReconstructor(
+            conf, logger=self.logger)
         with mock.patch('swift.obj.reconstructor.ssync_sender',
                         self._make_fake_ssync(ssync_calls)):
             self.reconstructor.reconstruct()
         for context in ssync_calls:
             self.assertEqual(REVERT, context['job']['job_type'])
-            self.assertEqual(2, context.get('max_objects_per_sync'))
+            self.assertEqual(1, context.get('max_objects'))
         actual_datafiles = [df for df in datafiles if os.path.exists(df)]
         self.assertEqual([], actual_datafiles)
+        # handoff is no longer remaining
+        self.assertEqual(0, self.reconstructor.handoffs_remaining)
 
     def test_no_delete_failed_revert(self):
         # test will only process revert jobs
