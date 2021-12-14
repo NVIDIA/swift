@@ -52,11 +52,11 @@ class TestContainerUpdater(unittest.TestCase):
                            'replication_ip': '127.0.0.1',
                            # replication_port may be overridden in tests but
                            # include here for completeness...
-                           'replication_port': '67890',
+                           'replication_port': 67890,
                            'device': 'sda1', 'zone': 0},
                           {'id': 1, 'ip': '127.0.0.2', 'port': 12345,
                            'replication_ip': '127.0.0.1',
-                           'replication_port': '67890',
+                           'replication_port': 67890,
                            'device': 'sda1', 'zone': 2}], 30),
                 f)
         self.devices_dir = os.path.join(self.testdir, 'devices')
