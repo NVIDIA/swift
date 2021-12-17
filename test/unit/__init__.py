@@ -42,13 +42,14 @@ import random
 import errno
 import xattr
 from io import BytesIO
+import collections
 
 import six
 import six.moves.cPickle as pickle
 from six.moves import range
 from six.moves.http_client import HTTPException
 
-from swift.common import storage_policy, swob, utils
+from swift.common import storage_policy, swob, utils, internal_client
 from swift.common.memcached import MemcacheConnectionError
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          VALID_EC_TYPES)
@@ -1034,6 +1035,37 @@ def mocked_http_conn(*args, **kwargs):
         if fake_conn.unexpected_requests:
             raise AssertionError('unexpected requests:\n%s' % '\n  '.join(
                 '%r' % (req,) for req in fake_conn.unexpected_requests))
+
+
+AppCall = collections.namedtuple('AppCall', [
+    'method', 'path', 'query', 'headers', 'body'])
+
+
+class FakeInternalClient(internal_client.InternalClient):
+    def __init__(self, responses):
+        self.resp_iter = iter(responses)
+        self.calls = []
+
+    def make_request(self, method, path, headers, acceptable_statuses,
+                     body_file=None, params=None):
+        if body_file is None:
+            body = None
+        else:
+            body = body_file.read()
+        path, _, query = path.partition('?')
+        self.calls.append(AppCall(method, path, query, dict(headers), body))
+        resp = next(self.resp_iter)
+        if isinstance(resp, Exception):
+            raise resp
+        return resp
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        unused_responses = [r for r in self.resp_iter]
+        if unused_responses:
+            raise Exception('Unused responses: %r' % unused_responses)
 
 
 def make_timestamp_iter(offset=0):
