@@ -26,7 +26,10 @@ from eventlet.greenpool import GreenPool
 
 from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common.daemon import Daemon
+from swift.common.http import is_success
 from swift.common.internal_client import InternalClient, UnexpectedResponse
+from swift.common.middleware.s3api.utils import sysmeta_header as \
+    s3_sysmeta_header
 from swift.common.utils import get_logger, dump_recon_cache, split_path, \
     Timestamp, config_true_value, normalize_delete_at_timestamp, \
     RateLimitedIterator, md5, non_negative_float, parse_content_type
@@ -562,7 +565,7 @@ class ObjectExpirer(Daemon):
                 '%(account)s %(container)s %(obj)s: %(err)s' % {
                     'account': task_account, 'container': task_container,
                     'obj': task_object, 'err': str(err.resp.status_int)})
-            self.logger.debug(err.resp.body)
+            self.logger.debug('%s: %s', err.resp.body, err.resp.headers)
         except (Exception, Timeout) as err:
             self.logger.increment('errors')
             self.logger.exception(
@@ -581,11 +584,32 @@ class ObjectExpirer(Daemon):
         direct_delete_container_entry(self.swift.container_ring, task_account,
                                       task_container, task_object)
 
+    def _delete_mpu_segments(self, a, c, o, upload_id, num_segments, headers):
+        # if the segment gets reaped before the manifest that's ok
+        acceptable_statuses = (2, HTTP_CONFLICT, HTTP_NOT_FOUND)
+        c = '%s+segments' % c
+        for segment_number in range(int(num_segments)):
+            segment_name = '%s/%s/%s' % (o, upload_id, segment_number + 1)
+            try:
+                self.swift.delete_object(
+                    a, c, segment_name, headers=headers,
+                    acceptable_statuses=acceptable_statuses)
+            except UnexpectedResponse as err:
+                self.logger.increment('errors')
+                self.logger.exception(
+                    '%s unable to delete a segment: %s/%s/%s' % (
+                        err, a, c, segment_name))
+            else:
+                self.logger.increment('segments')
+
     def delete_actual_object(self, actual_obj, timestamp, is_async_delete):
         """
         Deletes the end-user object indicated by the actual object name given
-        '<account>/<container>/<object>' if and only if the X-Delete-At value
-        of the object is exactly the timestamp given.
+        '<account>/<container>/<object>'.
+
+        For "normal" expiration the DELETE request may be rejected if the
+        X-Delete-At value of the object is exactly the timestamp given; this
+        behavior does not effect is_async_delete=True.
 
         :param actual_obj: The name of the end-user object to delete:
                            '<account>/<container>/<object>'
@@ -606,6 +630,20 @@ class ObjectExpirer(Daemon):
                        'X-If-Delete-At': timestamp.normal,
                        'X-Backend-Clean-Expiring-Object-Queue': 'no'}
             acceptable_statuses = (2, HTTP_CONFLICT)
-        self.swift.delete_object(*split_path('/' + actual_obj, 3, 3, True),
-                                 headers=headers,
-                                 acceptable_statuses=acceptable_statuses)
+        a, c, o = split_path('/' + actual_obj, 3, 3, True)
+        resp = self.swift.delete_object(
+            a, c, o,
+            headers=headers, acceptable_statuses=acceptable_statuses)
+        upload_id_key = s3_sysmeta_header('object', 'upload-id')
+        segments_key = s3_sysmeta_header('object', 'etag')
+        if not (is_success(resp.status_int) and all(
+                resp.headers.get(key) for key in (
+                    upload_id_key, segments_key))):
+            # upload_id/segments headers may have been set to the empty string
+            # during a COPY that creates a non-mpu object
+            return
+        # cleanup s3api mpu segments
+        headers.pop('X-If-Delete-At', None)
+        num_segments = int(resp.headers[segments_key].rsplit('-', 1)[1])
+        self._delete_mpu_segments(a, c, o, resp.headers[upload_id_key],
+                                  num_segments, headers)
