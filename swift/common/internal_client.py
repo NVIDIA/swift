@@ -240,10 +240,16 @@ class InternalClient(object):
             six.reraise(exc_type, exc_value, exc_traceback)
 
     def handle_request(self, *args, **kwargs):
+        """
+        Make the request and drain the body.
+
+        :returns: a closed swob response
+        """
         resp = self.make_request(*args, **kwargs)
         # Drain the response body to prevent unexpected disconnect
         # in proxy-server
         drain_and_close(resp)
+        return resp
 
     def _get_metadata(
             self, path, metadata_prefix='', acceptable_statuses=(2,),
@@ -659,6 +665,8 @@ class InternalClient(object):
                                     defaults to (2, HTTP_NOT_FOUND).
         :param headers: extra headers to send with request
 
+        :returns: a closed swob response
+
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
         :raises Exception: Exception is raised when code fails in an
@@ -666,8 +674,8 @@ class InternalClient(object):
         """
 
         path = self.make_path(account, container, obj)
-        self.handle_request('DELETE', path, (headers or {}),
-                            acceptable_statuses)
+        return self.handle_request('DELETE', path, (headers or {}),
+                                   acceptable_statuses)
 
     def get_object_metadata(
             self, account, container, obj, metadata_prefix='',
