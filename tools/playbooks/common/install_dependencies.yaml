@@ -43,6 +43,8 @@
         # For some reason, pip on py2 isn't smart enough to prevent us
         # trying to install a too-new mock??
         - 'mock<4'
+        # this is duplicated from test-requirements.txt
+        - 'boto3>=1.9'
 
     - name: install PasteDeploy - CentOS 7
       pip: name={{ item }} state=present extra_args='--upgrade'
