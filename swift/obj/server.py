@@ -1275,11 +1275,16 @@ class ObjectController(BaseStorageServer):
                 'DELETE', account, container, obj, request,
                 HeaderKeyDict({'x-timestamp': req_timestamp.internal}),
                 device, policy)
-        return response_class(
+        response = response_class(
             request=request,
             headers={'X-Backend-Timestamp': response_timestamp.internal,
                      'X-Backend-Content-Type': orig_metadata.get(
                          'Content-Type', '')})
+        for key, value in orig_metadata.items():
+            if (is_sys_or_user_meta('object', key) or
+                    is_object_transient_sysmeta(key)):
+                response.headers[key] = value
+        return response
 
     @public
     @replication
