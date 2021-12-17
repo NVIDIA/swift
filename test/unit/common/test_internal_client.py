@@ -97,6 +97,14 @@ class InternalClient(internal_client.InternalClient):
         pass
 
 
+class StubSwobResponse(object):
+    def __init__(self, status_int, body=None, headers=None, app_iter=None):
+        self.status_int = status_int
+        self.body = body or ''
+        self.headers = headers or {}
+        self.app_iter = app_iter
+
+
 class GetMetadataInternalClient(internal_client.InternalClient):
     def __init__(self, test, path, metadata_prefix, acceptable_statuses):
         self.test = test
@@ -925,11 +933,6 @@ class TestInternalClient(unittest.TestCase):
             internal_client.sleep = old_sleep
 
     def test_get_metadata(self):
-        class Response(object):
-            def __init__(self, headers):
-                self.headers = headers
-                self.status_int = 200
-
         class InternalClient(internal_client.InternalClient):
             def __init__(self, test, path, resp_headers):
                 self.test = test
@@ -945,7 +948,7 @@ class TestInternalClient(unittest.TestCase):
                 self.test.assertEqual(self.path, path)
                 self.test.assertEqual((2,), acceptable_statuses)
                 self.test.assertIsNone(body_file)
-                return Response(self.resp_headers)
+                return StubSwobResponse(200, headers=self.resp_headers)
 
         path = 'some_path'
         metadata_prefix = 'some_key-'
@@ -996,11 +999,6 @@ class TestInternalClient(unittest.TestCase):
         self.assertRaises(ValueError, c.make_path, 'account', None, 'obj')
 
     def test_iter_items(self):
-        class Response(object):
-            def __init__(self, status_int, body):
-                self.status_int = status_int
-                self.body = body
-
         class InternalClient(internal_client.InternalClient):
             def __init__(self, test, responses):
                 self.test = test
@@ -1014,7 +1012,7 @@ class TestInternalClient(unittest.TestCase):
                 return self.responses.pop(0)
 
         exp_items = []
-        responses = [Response(200, json.dumps([]).encode('ascii')), ]
+        responses = [StubSwobResponse(200, json.dumps([]).encode('ascii')), ]
         items = []
         client = InternalClient(self, responses)
         for item in client._iter_items('/'):
@@ -1027,9 +1025,10 @@ class TestInternalClient(unittest.TestCase):
             data = [
                 {'name': 'item%02d' % (2 * i)},
                 {'name': 'item%02d' % (2 * i + 1)}]
-            responses.append(Response(200, json.dumps(data).encode('ascii')))
+            responses.append(StubSwobResponse(
+                200, json.dumps(data).encode('ascii')))
             exp_items.extend(data)
-        responses.append(Response(204, ''))
+        responses.append(StubSwobResponse(204, ''))
 
         items = []
         client = InternalClient(self, responses)
@@ -1038,11 +1037,6 @@ class TestInternalClient(unittest.TestCase):
         self.assertEqual(exp_items, items)
 
     def test_iter_items_with_markers(self):
-        class Response(object):
-            def __init__(self, status_int, body):
-                self.status_int = status_int
-                self.body = body.encode('ascii')
-
         class InternalClient(internal_client.InternalClient):
             def __init__(self, test, paths, responses):
                 self.test = test
@@ -1063,10 +1057,10 @@ class TestInternalClient(unittest.TestCase):
         ]
 
         responses = [
-            Response(200, json.dumps([{
+            StubSwobResponse(200, json.dumps([{
                 'name': b'one\xc3\xa9'.decode('utf8')}, ])),
-            Response(200, json.dumps([{'name': 'two'}, ])),
-            Response(204, ''),
+            StubSwobResponse(200, json.dumps([{'name': 'two'}, ])),
+            StubSwobResponse(204, ''),
         ]
 
         items = []
@@ -1077,11 +1071,6 @@ class TestInternalClient(unittest.TestCase):
         self.assertEqual(b'one\xc3\xa9 two'.split(), items)
 
     def test_iter_items_with_markers_and_prefix(self):
-        class Response(object):
-            def __init__(self, status_int, body):
-                self.status_int = status_int
-                self.body = body.encode('ascii')
-
         class InternalClient(internal_client.InternalClient):
             def __init__(self, test, paths, responses):
                 self.test = test
@@ -1105,10 +1094,10 @@ class TestInternalClient(unittest.TestCase):
         ]
 
         responses = [
-            Response(200, json.dumps([{
+            StubSwobResponse(200, json.dumps([{
                 'name': b'prefixed_one\xc3\xa9'.decode('utf8')}, ])),
-            Response(200, json.dumps([{'name': 'prefixed_two'}, ])),
-            Response(204, ''),
+            StubSwobResponse(200, json.dumps([{'name': 'prefixed_two'}, ])),
+            StubSwobResponse(204, ''),
         ]
 
         items = []
@@ -1151,8 +1140,8 @@ class TestInternalClient(unittest.TestCase):
                 num_list.append(i)
 
         exp_items = []
-        responses = [Response(204, json.dumps([]).encode('ascii'),
-                              generate_resp_body())]
+        responses = [StubSwobResponse(204, body=json.dumps([]).encode('ascii'),
+                                      app_iter=generate_resp_body())]
         items = []
         client = InternalClient(self, responses)
         for item in client._iter_items('/'):
@@ -1160,15 +1149,15 @@ class TestInternalClient(unittest.TestCase):
         self.assertEqual(exp_items, items)
         self.assertEqual(len(num_list), 0)
 
-        responses = [Response(300, json.dumps([]).encode('ascii'),
-                              generate_resp_body())]
+        responses = [StubSwobResponse(300, body=json.dumps([]).encode('ascii'),
+                                      app_iter=generate_resp_body())]
         client = InternalClient(self, responses)
         self.assertRaises(internal_client.UnexpectedResponse,
                           next, client._iter_items('/'))
 
         exp_items = []
-        responses = [Response(404, json.dumps([]).encode('ascii'),
-                              generate_resp_body())]
+        responses = [StubSwobResponse(404, body=json.dumps([]).encode('ascii'),
+                                      app_iter=generate_resp_body())]
         items = []
         client = InternalClient(self, responses)
         for item in client._iter_items('/'):
@@ -1193,6 +1182,7 @@ class TestInternalClient(unittest.TestCase):
                 self.test.assertEqual(self.exp_headers, headers)
                 self.test.assertEqual((2,), acceptable_statuses)
                 self.test.assertIsNone(body_file)
+                return StubSwobResponse(200)
 
         path = 'some_path'
         metadata_prefix = 'some_key-'
@@ -1255,13 +1245,11 @@ class TestInternalClient(unittest.TestCase):
         self.assertEqual(app.backend_user_agent, 'test')
 
     def test_get_account_info(self):
-        class Response(object):
-            def __init__(self, containers, objects):
-                self.headers = {
-                    'x-account-container-count': containers,
-                    'x-account-object-count': objects,
-                }
-                self.status_int = 200
+        def make_resp(containers, objects):
+            return StubSwobResponse(200, headers={
+                'x-account-container-count': containers,
+                'x-account-object-count': objects,
+            })
 
         class InternalClient(internal_client.InternalClient):
             def __init__(self, test, path, resp):
@@ -1282,19 +1270,11 @@ class TestInternalClient(unittest.TestCase):
         account, container, obj = path_parts()
         path = make_path(account)
         containers, objects = 10, 100
-        client = InternalClient(self, path, Response(containers, objects))
+        client = InternalClient(self, path, make_resp(containers, objects))
         info = client.get_account_info(account)
         self.assertEqual((containers, objects), info)
 
     def test_get_account_info_404(self):
-        class Response(object):
-            def __init__(self):
-                self.headers = {
-                    'x-account-container-count': 10,
-                    'x-account-object-count': 100,
-                }
-                self.status_int = 404
-
         class InternalClient(internal_client.InternalClient):
             def __init__(self):
                 pass
@@ -1303,7 +1283,10 @@ class TestInternalClient(unittest.TestCase):
                 return 'some_path'
 
             def make_request(self, *a, **kw):
-                return Response()
+                return StubSwobResponse(404, headers={
+                    'x-account-container-count': 10,
+                    'x-account-object-count': 100,
+                })
 
         client = InternalClient()
         info = client.get_account_info('some_account')
@@ -1371,10 +1354,6 @@ class TestInternalClient(unittest.TestCase):
         self.assertEqual(1, client.set_metadata_called)
 
     def test_container_exists(self):
-        class Response(object):
-            def __init__(self, status_int):
-                self.status_int = status_int
-
         class InternalClient(internal_client.InternalClient):
             def __init__(self, test, path, resp):
                 self.test = test
@@ -1396,11 +1375,11 @@ class TestInternalClient(unittest.TestCase):
         account, container, obj = path_parts()
         path = make_path(account, container)
 
-        client = InternalClient(self, path, Response(200))
+        client = InternalClient(self, path, StubSwobResponse(200))
         self.assertEqual(True, client.container_exists(account, container))
         self.assertEqual(1, client.make_request_called)
 
-        client = InternalClient(self, path, Response(404))
+        client = InternalClient(self, path, StubSwobResponse(404))
         self.assertEqual(False, client.container_exists(account, container))
         self.assertEqual(1, client.make_request_called)
 
@@ -1436,6 +1415,7 @@ class TestInternalClient(unittest.TestCase):
                 self.test.assertEqual(self.headers, headers)
                 self.test.assertEqual((2,), acceptable_statuses)
                 self.test.assertIsNone(body_file)
+                return StubSwobResponse(200)
 
         account, container, obj = path_parts()
         path = make_path(account, container)
@@ -1471,6 +1451,7 @@ class TestInternalClient(unittest.TestCase):
                 self.test.assertEqual({}, headers)
                 self.test.assertEqual((2, 404), acceptable_statuses)
                 self.test.assertIsNone(body_file)
+                return StubSwobResponse(200)
 
         account, container, obj = path_parts()
         path = make_path(account, container)
@@ -1540,20 +1521,32 @@ class TestInternalClient(unittest.TestCase):
         account, container, obj = path_parts()
         path = make_path_info(account, container, obj)
         client, app = get_client_app()
-        app.register('DELETE', path, swob.HTTPNoContent, {})
-        client.delete_object(account, container, obj)
+        app.register('DELETE', path, swob.HTTPNoContent, {'foo': 'bar'})
+        resp = client.delete_object(account, container, obj)
         self.assertEqual(app.unclosed_requests, {})
         self.assertEqual(1, len(app._calls))
         self.assertEqual({}, app.unread_requests)
         self.assertEqual({}, app.unclosed_requests)
         self.assertEqual(app.backend_user_agent, 'test')
+        self.assertEqual(204, resp.status_int)
+        self.assertEqual({
+            'Content-Length': '0',
+            'Foo': 'bar',
+            'Content-Type': 'text/html; charset=UTF-8',
+        }, resp.headers)
 
-        app.register('DELETE', path, swob.HTTPNotFound, {})
-        client.delete_object(account, container, obj)
+        app.register('DELETE', path, swob.HTTPNotFound, {'bar': 'baz'})
+        resp = client.delete_object(account, container, obj)
         self.assertEqual(app.unclosed_requests, {})
         self.assertEqual(2, len(app._calls))
         self.assertEqual({}, app.unread_requests)
         self.assertEqual({}, app.unclosed_requests)
+        self.assertEqual(404, resp.status_int)
+        self.assertEqual({
+            'Content-Length': '0',
+            'Bar': 'baz',
+            'Content-Type': 'text/html; charset=UTF-8',
+        }, resp.headers)
 
     def test_get_object_metadata(self):
         account, container, obj = path_parts()
@@ -1732,6 +1725,7 @@ class TestInternalClient(unittest.TestCase):
                 exp_headers['Transfer-Encoding'] = 'chunked'
                 self.test.assertEqual(exp_headers, headers)
                 self.test.assertEqual(self.fobj, fobj)
+                return StubSwobResponse(200)
 
         fobj = 'some_fobj'
         account, container, obj = path_parts()
@@ -1759,6 +1753,7 @@ class TestInternalClient(unittest.TestCase):
                 exp_headers = dict(self.headers)
                 self.test.assertEqual(exp_headers, headers)
                 self.test.assertEqual(self.fobj, fobj)
+                return StubSwobResponse(200)
 
         fobj = 'some_fobj'
         account, container, obj = path_parts()
