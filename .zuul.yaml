@@ -385,11 +385,13 @@
       under Python 3.
     timeout: 7200
     vars:
+      s3_acl: yes
       bindep_profile: test py36
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
       - tools/playbooks/saio_single_node_setup/make_rings.yaml
+      - tools/playbooks/saio_single_node_setup/add_s3api.yaml
     run: tools/playbooks/probetests/run.yaml
     post-run: tools/playbooks/probetests/post.yaml
 
