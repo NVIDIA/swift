@@ -451,6 +451,9 @@ class ProbeTest(unittest.TestCase):
     def tearDown(self):
         Manager(['all']).kill()
 
+    def _make_name(self, prefix):
+        return ('%s%s' % (prefix, uuid4())).encode()
+
     def assertLengthEqual(self, obj, length):
         obj_len = len(obj)
         self.assertEqual(obj_len, length, 'len(%r) == %d, not %d' % (
@@ -678,9 +681,6 @@ class ECProbeTest(ProbeTest):
     obj_required_replicas = 6
     obj_required_devices = 8
     policy_requirements = {'policy_type': EC_POLICY}
-
-    def _make_name(self, prefix):
-        return ('%s%s' % (prefix, uuid4())).encode()
 
     def setUp(self):
         super(ECProbeTest, self).setUp()
