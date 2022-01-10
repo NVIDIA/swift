@@ -49,6 +49,7 @@ from six.moves import range
 from six.moves.http_client import HTTPException
 
 from swift.common import storage_policy, swob, utils
+from swift.common.memcached import MemcacheConnectionError
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          VALID_EC_TYPES)
 from swift.common.utils import Timestamp, md5
@@ -400,42 +401,64 @@ class FabricatedRing(Ring):
         self._update_bookkeeping()
 
 
+def track(f):
+    def wrapper(self, *a, **kw):
+        self.calls.append(getattr(mocklib.call, f.__name__)(*a, **kw))
+        return f(self, *a, **kw)
+    return wrapper
+
+
 class FakeMemcache(object):
 
     def __init__(self):
         self.store = {}
         self.calls = []
+        self.error_on_incr = False
+        self.init_incr_return_neg = False
 
     def clear_calls(self):
         del self.calls[:]
 
-    def _called(self, method, key=None, value=None, time=None):
-        self.calls.append((method, key, value, time))
-
-    def get(self, key):
-        self._called('get', key)
+    @track
+    def get(self, key, skip_cache_pct=0.0):
         return self.store.get(key)
 
+    @property
     def keys(self):
-        self._called('keys')
-        return self.store.keys()
+        return self.store.keys
 
-    def set(self, key, value, time=0):
-        self._called('set', key, value, time)
+    @track
+    def set(self, key, value, serialize=True, time=0):
+        if serialize:
+            value = json.loads(json.dumps(value))
+        else:
+            assert isinstance(value, (str, bytes))
         self.store[key] = value
         return True
 
-    def incr(self, key, time=0):
-        self._called('incr', key, time=time)
-        self.store[key] = self.store.setdefault(key, 0) + 1
+    @track
+    def incr(self, key, delta=1, time=0):
+        if self.error_on_incr:
+            raise MemcacheConnectionError('Memcache restarting')
+        if self.init_incr_return_neg:
+            # simulate initial hit, force reset of memcache
+            self.init_incr_return_neg = False
+            return -10000000
+        self.store[key] = int(self.store.setdefault(key, 0)) + delta
+        if self.store[key] < 0:
+            self.store[key] = 0
         return self.store[key]
+
+    # tracked via incr()
+    def decr(self, key, delta=1, time=0):
+        return self.incr(key, delta=-delta, time=time)
 
     @contextmanager
     def soft_lock(self, key, timeout=0, retries=5):
         yield True
 
+    @track
     def delete(self, key):
-        self._called('delete', key)
         try:
             del self.store[key]
         except Exception:
@@ -444,6 +467,11 @@ class FakeMemcache(object):
 
     def delete_all(self):
         self.store.clear()
+
+
+# This decorator only makes sense in the context of FakeMemcache;
+# may as well clean it up now
+del track
 
 
 class FakeIterable(object):
