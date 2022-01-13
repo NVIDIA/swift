@@ -546,8 +546,6 @@ class Application(object):
                     req.host.split(':')[0] in self.deny_host_headers:
                 return HTTPForbidden(request=req, body='Invalid host header')
 
-            self.logger.set_statsd_prefix('proxy-server.' +
-                                          controller.server_type.lower())
             controller = controller(self, **path_parts)
             if 'swift.trans_id' not in req.environ:
                 # if this wasn't set by an earlier middleware, set it now
@@ -702,9 +700,10 @@ class Application(object):
             'msg': msg, 'ip': node['ip'],
             'port': node['port'], 'device': node['device']})
 
-    def iter_nodes(self, ring, partition, node_iter=None, policy=None):
+    def iter_nodes(self, ring, partition, node_iter=None, policy=None,
+                   logger=None):
         return NodeIter(self, ring, partition, node_iter=node_iter,
-                        policy=policy)
+                        policy=policy, logger=logger)
 
     def exception_occurred(self, node, typ, additional_info,
                            **kwargs):
