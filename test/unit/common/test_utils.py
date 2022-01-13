@@ -6474,6 +6474,55 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
                 self.assertEqual(called, [12345])
 
 
+class TestSwiftLoggerAdapter(unittest.TestCase):
+    def test_metric_prefix(self):
+        logger = utils.get_logger({}, 'foo')
+        adapter1 = utils.SwiftLoggerAdapter(logger, {'metric_prefix': 'one'})
+        adapter2 = utils.SwiftLoggerAdapter(logger, {'metric_prefix': 'two'})
+        adapter3 = utils.SwiftLoggerAdapter(logger, {})
+        self.assertEqual('foo', logger.name)
+        self.assertEqual('foo', adapter1.logger.name)
+        self.assertEqual('foo', adapter2.logger.name)
+        self.assertEqual('foo', adapter3.logger.name)
+
+        with mock.patch.object(logger, 'increment') as mock_increment:
+            adapter1.increment('test1')
+            adapter2.increment('test2')
+            adapter3.increment('test3')
+            logger.increment('test')
+        self.assertEqual(
+            [mock.call('one.test1'), mock.call('two.test2'),
+             mock.call('test3'), mock.call('test')],
+            mock_increment.call_args_list)
+
+        adapter1.extra['metric_prefix'] = 'not one'
+        with mock.patch.object(logger, 'increment') as mock_increment:
+            adapter1.increment('test1')
+            adapter2.increment('test2')
+            adapter3.increment('test3')
+            logger.increment('test')
+        self.assertEqual(
+            [mock.call('not one.test1'), mock.call('two.test2'),
+             mock.call('test3'), mock.call('test')],
+            mock_increment.call_args_list)
+
+    def test_thread_locals(self):
+        logger = utils.get_logger({}, 'foo')
+        adapter1 = utils.SwiftLoggerAdapter(logger, {'metric_prefix': 'one'})
+        adapter2 = utils.SwiftLoggerAdapter(logger, {'metric_prefix': 'two'})
+        locals1 = ('tx_123', '1.2.3.4')
+        adapter1.thread_locals = locals1
+        self.assertEqual(adapter1.thread_locals, locals1)
+        self.assertEqual(adapter2.thread_locals, locals1)
+        self.assertEqual(logger.thread_locals, locals1)
+
+        locals2 = ('tx_456', '1.2.3.456')
+        logger.thread_locals = locals2
+        self.assertEqual(adapter1.thread_locals, locals2)
+        self.assertEqual(adapter2.thread_locals, locals2)
+        self.assertEqual(logger.thread_locals, locals2)
+
+
 class TestAuditLocationGenerator(unittest.TestCase):
 
     def test_drive_tree_access(self):

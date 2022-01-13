@@ -2088,28 +2088,41 @@ def timing_stats(**dec_kwargs):
 class SwiftLoggerAdapter(logging.LoggerAdapter):
     """
     A logging.LoggerAdapter subclass that also passes through StatsD method
-    calls.
+    calls. Adds an optional metric_prefix to statsd metric names.
 
     Like logging.LoggerAdapter, you have to subclass this and override the
     process() method to accomplish anything useful.
     """
-    def update_stats(self, *a, **kw):
-        return self.logger.update_stats(*a, **kw)
+    def prefix_metric(self, metric):
+        if 'metric_prefix' in self.extra:
+            return '%s.%s' % (self.extra['metric_prefix'], metric)
+        return metric
 
-    def increment(self, *a, **kw):
-        return self.logger.increment(*a, **kw)
+    def update_stats(self, metric, *a, **kw):
+        return self.logger.update_stats(self.prefix_metric(metric), *a, **kw)
 
-    def decrement(self, *a, **kw):
-        return self.logger.decrement(*a, **kw)
+    def increment(self, metric, *a, **kw):
+        return self.logger.increment(self.prefix_metric(metric), *a, **kw)
 
-    def timing(self, *a, **kw):
-        return self.logger.timing(*a, **kw)
+    def decrement(self, metric, *a, **kw):
+        return self.logger.decrement(self.prefix_metric(metric), *a, **kw)
 
-    def timing_since(self, *a, **kw):
-        return self.logger.timing_since(*a, **kw)
+    def timing(self, metric, *a, **kw):
+        return self.logger.timing(self.prefix_metric(metric), *a, **kw)
 
-    def transfer_rate(self, *a, **kw):
-        return self.logger.transfer_rate(*a, **kw)
+    def timing_since(self, metric, *a, **kw):
+        return self.logger.timing_since(self.prefix_metric(metric), *a, **kw)
+
+    def transfer_rate(self, metric, *a, **kw):
+        return self.logger.transfer_rate(self.prefix_metric(metric), *a, **kw)
+
+    @property
+    def thread_locals(self):
+        return self.logger.thread_locals
+
+    @thread_locals.setter
+    def thread_locals(self, thread_locals):
+        self.logger.thread_locals = thread_locals
 
 
 class PrefixLoggerAdapter(SwiftLoggerAdapter):

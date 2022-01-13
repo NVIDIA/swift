@@ -4024,8 +4024,12 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'shard_updating.backend.200': 1}, stats)
+            self.assertEqual({'object.shard_updating.backend.200': 1}, stats)
             backend_requests = fake_conn.requests
+            self.assertEqual(
+                # account, container HEAD, container GET, obj
+                [(('proxy-server',), {})] * 4,
+                self.app.logger.log_dict['set_statsd_prefix'])
 
             account_request = backend_requests[0]
             self._check_request(
@@ -4113,8 +4117,12 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'shard_updating.cache.miss': 1,
-                              'shard_updating.backend.200': 1}, stats)
+            self.assertEqual({'object.shard_updating.cache.miss': 1,
+                              'object.shard_updating.backend.200': 1}, stats)
+            self.assertEqual(
+                # account, container HEAD, container GET, obj
+                [(('proxy-server',), {})] * 4,
+                self.app.logger.log_dict['set_statsd_prefix'])
 
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]
@@ -4211,7 +4219,10 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'shard_updating.cache.hit': 1}, stats)
+            self.assertEqual({'object.shard_updating.cache.hit': 1}, stats)
+            self.assertEqual(
+                [(('proxy-server',), {})] * 3,  # account, container HEAD, obj
+                self.app.logger.log_dict['set_statsd_prefix'])
 
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]
@@ -4314,8 +4325,12 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'shard_updating.cache.skip': 1,
-                              'shard_updating.backend.200': 1}, stats)
+            self.assertEqual({'object.shard_updating.cache.skip': 1,
+                              'object.shard_updating.backend.200': 1}, stats)
+            self.assertEqual(
+                # account, container HEAD, container GET, obj
+                [(('proxy-server',), {})] * 4,
+                self.app.logger.log_dict['set_statsd_prefix'])
 
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]
@@ -4398,7 +4413,7 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'shard_updating.backend.404': 1}, stats)
+            self.assertEqual({'object.shard_updating.backend.404': 1}, stats)
 
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]
