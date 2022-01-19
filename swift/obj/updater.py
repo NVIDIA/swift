@@ -69,6 +69,7 @@ class BucketizedUpdateSkippingLimiter(object):
 
     :param update_iterable: an async_pending update iterable
     :param logger: a logger instance
+    :param stats: a SweepStats instance
     :param num_buckets: number of buckets to divide container hashes into, the
                         more buckets total the less containers to a bucket
                         (once a busy container slows down a bucket the whole
@@ -84,12 +85,13 @@ class BucketizedUpdateSkippingLimiter(object):
         until either all buckets have drained or this time is reached.
     """
 
-    def __init__(self, update_iterable, logger, num_buckets,
-                 max_elements_per_group_per_second,
+    def __init__(self, update_iterable, logger, stats, num_buckets=1000,
+                 max_elements_per_group_per_second=50,
                  max_deferred_elements=0,
-                 drain_until=0,):
-        self.logger = logger
+                 drain_until=0):
         self.iterator = iter(update_iterable)
+        self.logger = logger
+        self.stats = stats
         # if we want a smaller "blast radius" we could make this number bigger
         self.num_buckets = max(num_buckets, 1)
         try:
@@ -104,9 +106,6 @@ class BucketizedUpdateSkippingLimiter(object):
         self.buckets = [RateLimiterBucket(self.bucket_update_delta)
                         for _ in range(self.num_buckets)]
         self.buckets_ordered_by_readiness = None
-        self.deferrals = 0  # num placed on the deferrals queue
-        self.drains = 0  # num yielded from the deferrals queue
-        self.skips = 0  # num evicted from deferrals queue, never yielded
 
     def __iter__(self):
         return self
@@ -136,7 +135,7 @@ class BucketizedUpdateSkippingLimiter(object):
                     # read from disk less recently.
                     oldest_deferred_bucket = self.deferred_buckets.popleft()
                     oldest_deferred_bucket.deque.popleft()
-                    self.skips += 1
+                    self.stats.skips += 1
                     self.logger.increment("skips")
                 # append the update to the bucket's queue and append the bucket
                 # to the queue of deferred buckets
@@ -144,10 +143,10 @@ class BucketizedUpdateSkippingLimiter(object):
                 # one for each deferred update in that particular bucket
                 bucket.deque.append(update_ctx)
                 self.deferred_buckets.append(bucket)
-                self.deferrals += 1
+                self.stats.deferrals += 1
                 self.logger.increment("deferrals")
             else:
-                self.skips += 1
+                self.stats.skips += 1
                 self.logger.increment("skips")
 
         if self.buckets_ordered_by_readiness is None:
@@ -174,7 +173,7 @@ class BucketizedUpdateSkippingLimiter(object):
                     # bucket has more deferred elements, re-insert in queue in
                     # correct chronological position
                     self.buckets_ordered_by_readiness.put(bucket)
-                self.drains += 1
+                self.stats.drains += 1
                 self.logger.increment("drains")
                 return item
             else:
@@ -183,7 +182,7 @@ class BucketizedUpdateSkippingLimiter(object):
 
         if undrained_elements:
             # report final batch of skipped elements
-            self.skips += len(undrained_elements)
+            self.stats.skips += len(undrained_elements)
             self.logger.update_stats("skips", len(undrained_elements))
 
         raise StopIteration()
@@ -526,11 +525,11 @@ class ObjectUpdater(Daemon):
             self._iter_async_pendings(device),
             elements_per_second=self.max_objects_per_second)
         ap_iter = BucketizedUpdateSkippingLimiter(
-            ap_iter, self.logger,
+            ap_iter, self.logger, self.stats,
             self.per_container_ratelimit_buckets,
             self.max_objects_per_container_per_second,
-            self.max_deferred_updates,
-            self.begin + self.interval)
+            max_deferred_elements=self.max_deferred_updates,
+            drain_until=self.begin + self.interval)
         with ContextPool(self.concurrency) as pool:
             for update_ctx in ap_iter:
                 pool.spawn(self.process_object_update, **update_ctx)

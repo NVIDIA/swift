@@ -2090,10 +2090,11 @@ class TestContainerController(TestRingBase):
         # this test gets shard ranges into cache and then reads from cache
         sharding_state = 'sharded'
         self.memcache.delete_all()
-        self.memcache.clear_calls()
+
         # container is sharded but proxy does not have that state cached;
         # expect a backend request and expect shard ranges to be cached
         self.memcache.clear_calls()
+        self.logger.clear()
         req = self._build_request({'X-Backend-Record-Type': record_type},
                                   {'states': 'listing'}, {})
         backend_req, resp = self._capture_backend_request(
@@ -2121,10 +2122,57 @@ class TestContainerController(TestRingBase):
         self.assertIn('shard-listing/a/c', req.environ['swift.infocache'])
         self.assertEqual(tuple(self.sr_dicts),
                          req.environ['swift.infocache']['shard-listing/a/c'])
+        self.assertEqual(
+            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            [])
+        self.assertEqual(
+            [(('proxy-server',), {})],
+            self.app.logger.log_dict['set_statsd_prefix'])
+
+        # container is sharded and proxy has that state cached, but
+        # no shard ranges cached; expect a cache miss and write-back
+        self.memcache.delete('shard-listing/a/c')
+        self.memcache.clear_calls()
+        self.logger.clear()
+        req = self._build_request({'X-Backend-Record-Type': record_type},
+                                  {'states': 'listing'}, {})
+        backend_req, resp = self._capture_backend_request(
+            req, 200, self._stub_shards_dump,
+            {'X-Backend-Record-Type': 'shard',
+             'X-Backend-Sharding-State': sharding_state,
+             'X-Backend-Override-Shard-Name-Filter': 'true'})
+        self._check_backend_req(
+            req, backend_req,
+            extra_hdrs={'X-Backend-Record-Type': record_type,
+                        'X-Backend-Override-Shard-Name-Filter': 'sharded'})
+        self._check_response(resp, self.sr_dicts, {
+            'X-Backend-Recheck-Container-Existence': '60',
+            'X-Backend-Record-Type': 'shard',
+            'X-Backend-Sharding-State': sharding_state})
+        self.assertEqual(
+            [mock.call.get('container/a/c'),
+             mock.call.get('shard-listing/a/c'),
+             mock.call.set('shard-listing/a/c', self.sr_dicts,
+                           time=exp_recheck_listing),
+             # Since there was a backend request, we go ahead and cache
+             # container info, too
+             mock.call.set('container/a/c', mock.ANY, time=60)],
+            self.memcache.calls)
+        self.assertIn('swift.infocache', req.environ)
+        self.assertIn('shard-listing/a/c', req.environ['swift.infocache'])
+        self.assertEqual(tuple(self.sr_dicts),
+                         req.environ['swift.infocache']['shard-listing/a/c'])
+        self.assertEqual(
+            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            ['container.shard_listing.cache.miss'])
+        self.assertEqual(
+            [(('proxy-server',), {})],
+            self.app.logger.log_dict['set_statsd_prefix'])
 
         # container is sharded and proxy does have that state cached and
         # also has shard ranges cached; expect a read from cache
         self.memcache.clear_calls()
+        self.logger.clear()
         req = self._build_request({'X-Backend-Record-Type': record_type},
                                   {'states': 'listing'}, {})
         resp = req.get_response(self.app)
@@ -2134,12 +2182,86 @@ class TestContainerController(TestRingBase):
             'X-Backend-Sharding-State': sharding_state})
         self.assertEqual(
             [mock.call.get('container/a/c'),
-             mock.call.get('shard-listing/a/c', skip_cache_pct=0.0)],
+             mock.call.get('shard-listing/a/c')],
             self.memcache.calls)
         self.assertIn('swift.infocache', req.environ)
         self.assertIn('shard-listing/a/c', req.environ['swift.infocache'])
         self.assertEqual(tuple(self.sr_dicts),
                          req.environ['swift.infocache']['shard-listing/a/c'])
+        self.assertEqual(
+            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            ['container.shard_listing.cache.hit'])
+        self.assertEqual(
+            [(('proxy-server',), {})],
+            self.app.logger.log_dict['set_statsd_prefix'])
+
+        # if there's a chance to skip cache, maybe we go to disk again...
+        self.memcache.clear_calls()
+        self.logger.clear()
+        self.app.container_listing_shard_ranges_skip_cache = 0.001
+        req = self._build_request({'X-Backend-Record-Type': record_type},
+                                  {'states': 'listing'}, {})
+        with mock.patch('random.random', return_value=0.0005):
+            backend_req, resp = self._capture_backend_request(
+                req, 200, self._stub_shards_dump,
+                {'X-Backend-Record-Type': 'shard',
+                 'X-Backend-Sharding-State': sharding_state,
+                 'X-Backend-Override-Shard-Name-Filter': 'true'})
+        self._check_backend_req(
+            req, backend_req,
+            extra_hdrs={'X-Backend-Record-Type': record_type,
+                        'X-Backend-Override-Shard-Name-Filter': 'sharded'})
+        self._check_response(resp, self.sr_dicts, {
+            'X-Backend-Recheck-Container-Existence': '60',
+            'X-Backend-Record-Type': 'shard',
+            'X-Backend-Sharding-State': sharding_state})
+        self.assertEqual(
+            [mock.call.get('container/a/c'),
+             mock.call.set('shard-listing/a/c', self.sr_dicts,
+                           time=exp_recheck_listing),
+             # Since there was a backend request, we go ahead and cache
+             # container info, too
+             mock.call.set('container/a/c', mock.ANY, time=60)],
+            self.memcache.calls)
+        self.assertIn('swift.infocache', req.environ)
+        self.assertIn('shard-listing/a/c', req.environ['swift.infocache'])
+        self.assertEqual(tuple(self.sr_dicts),
+                         req.environ['swift.infocache']['shard-listing/a/c'])
+        self.assertEqual(
+            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            ['container.shard_listing.cache.skip'])
+        self.assertEqual(
+            [(('proxy-server',), {})],
+            self.app.logger.log_dict['set_statsd_prefix'])
+
+        # ... or maybe we serve from cache
+        self.memcache.clear_calls()
+        self.logger.clear()
+        req = self._build_request({'X-Backend-Record-Type': record_type},
+                                  {'states': 'listing'}, {})
+        with mock.patch('random.random', return_value=0.005):
+            resp = req.get_response(self.app)
+        self._check_response(resp, self.sr_dicts, {
+            'X-Backend-Cached-Results': 'true',
+            'X-Backend-Record-Type': 'shard',
+            'X-Backend-Sharding-State': sharding_state})
+        self.assertEqual(
+            [mock.call.get('container/a/c'),
+             mock.call.get('shard-listing/a/c')],
+            self.memcache.calls)
+        self.assertIn('swift.infocache', req.environ)
+        self.assertIn('shard-listing/a/c', req.environ['swift.infocache'])
+        self.assertEqual(tuple(self.sr_dicts),
+                         req.environ['swift.infocache']['shard-listing/a/c'])
+        self.assertEqual(
+            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            ['container.shard_listing.cache.hit'])
+        self.assertEqual(
+            [(('proxy-server',), {})],
+            self.app.logger.log_dict['set_statsd_prefix'])
+
+        # put this back the way we found it for later subtests
+        self.app.container_listing_shard_ranges_skip_cache = 0.0
 
         # delete the container; check that shard ranges are evicted from cache
         self.memcache.clear_calls()
@@ -2281,7 +2403,7 @@ class TestContainerController(TestRingBase):
         # deleted from cache
         self.assertEqual(
             [mock.call.get('container/a/c'),
-             mock.call.get('shard-listing/a/c', skip_cache_pct=0.0),
+             mock.call.get('shard-listing/a/c'),
              mock.call.set('container/a/c', mock.ANY, time=6.0)],
             self.memcache.calls)
         self.assertEqual(404, self.memcache.calls[2][1][1]['status'])
@@ -2304,7 +2426,7 @@ class TestContainerController(TestRingBase):
         resp = req.get_response(self.app)
         self.assertEqual(
             [mock.call.get('container/a/c'),
-             mock.call.get('shard-listing/a/c', skip_cache_pct=0.1)],
+             mock.call.get('shard-listing/a/c')],
             self.memcache.calls)
         return resp
 

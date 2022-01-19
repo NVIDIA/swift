@@ -21,6 +21,7 @@ from tempfile import mkdtemp
 from shutil import rmtree
 from collections import defaultdict
 from copy import deepcopy
+from test import unit
 
 import mock
 import six
@@ -91,7 +92,7 @@ class FakeInternalClient(object):
         return resp
 
     def delete_object(*a, **kw):
-        pass
+        return swob.HTTPNoContent()
 
 
 class TestObjectExpirer(TestCase):
@@ -1001,6 +1002,7 @@ class TestObjectExpirer(TestCase):
         x.swift.make_request = mock.Mock()
         x.swift.make_request.return_value.status_int = 204
         x.swift.make_request.return_value.app_iter = []
+        x.swift.make_request.return_value.headers = {}
         x.delete_actual_object(name, timestamp, False)
         self.assertEqual(x.swift.make_request.call_count, 1)
         self.assertEqual(x.swift.make_request.call_args[0][1],
@@ -1010,13 +1012,43 @@ class TestObjectExpirer(TestCase):
         name = 'acc/cont/something'
         timestamp = Timestamp('1515544858.80602')
         x = expirer.ObjectExpirer({})
-        x.swift.make_request = mock.MagicMock()
+        x.swift.make_request = mock.MagicMock(
+            return_value=swob.HTTPNoContent())
         x.delete_actual_object(name, timestamp, False)
         self.assertEqual(x.swift.make_request.call_count, 1)
         header = 'X-Backend-Clean-Expiring-Object-Queue'
         self.assertEqual(
             x.swift.make_request.call_args[0][2].get(header),
             'no')
+
+    def test_delete_actual_object_s3api_mpu(self):
+        stub_responses = [
+            # delete manifest response
+            swob.Response(status=204, headers={
+                'X-Object-Sysmeta-S3Api-Upload-Id': 'upload-foo',
+                'X-Object-Sysmeta-S3Api-Etag': 'bar-1',
+            }),
+            # delete segment response
+            swob.Response(status=204),
+        ]
+        x = expirer.ObjectExpirer(
+            {}, swift=unit.FakeInternalClient(stub_responses))
+        ts = Timestamp('1234')
+        with x.swift:
+            x.delete_actual_object('account/bucket/mpu', ts, False)
+        self.assertEqual(2, len(x.swift.calls))
+        self.assertEqual('/v1/account/bucket/mpu', x.swift.calls[0].path)
+        self.assertEqual({
+            'X-Backend-Clean-Expiring-Object-Queue': 'no',
+            'X-If-Delete-At': '0000001234.00000',
+            'X-Timestamp': '0000001234.00000',
+        }, x.swift.calls[0].headers)
+        self.assertEqual('/v1/account/bucket%2Bsegments/mpu/upload-foo/1',
+                         x.swift.calls[1].path)
+        self.assertEqual({
+            'X-Backend-Clean-Expiring-Object-Queue': 'no',
+            'X-Timestamp': '0000001234.00000',
+        }, x.swift.calls[1].headers)
 
     def test_pop_queue(self):
         x = expirer.ObjectExpirer({}, logger=self.logger,

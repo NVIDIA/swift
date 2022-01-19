@@ -33,6 +33,7 @@ import functools
 import inspect
 import itertools
 import operator
+import random
 from copy import deepcopy
 from sys import exc_info
 
@@ -45,7 +46,7 @@ from swift.common.utils import Timestamp, WatchdogTimeout, config_true_value, \
     public, split_path, list_from_csv, GreenthreadSafeIterator, \
     GreenAsyncPile, quorum_size, parse_content_type, drain_and_close, \
     document_iters_to_http_response_body, ShardRange, find_shard_range, \
-    cache_from_env
+    cache_from_env, PrefixLoggerAdapter
 from swift.common.bufferedhttp import http_connect
 from swift.common import constraints
 from swift.common.exceptions import ChunkReadTimeout, ChunkWriteTimeout, \
@@ -955,7 +956,7 @@ class ByteCountEnforcer(object):
 class GetOrHeadHandler(object):
     def __init__(self, app, req, server_type, node_iter, partition, path,
                  backend_headers, concurrency=1, policy=None,
-                 client_chunk_size=None, newest=None):
+                 client_chunk_size=None, newest=None, logger=None):
         self.app = app
         self.node_iter = node_iter
         self.server_type = server_type
@@ -963,6 +964,7 @@ class GetOrHeadHandler(object):
         self.path = path
         self.backend_headers = backend_headers
         self.client_chunk_size = client_chunk_size
+        self.logger = logger if logger else app.logger
         self.skip_bytes = 0
         self.bytes_used_from_backend = 0
         self.used_nodes = []
@@ -1311,10 +1313,10 @@ class GetOrHeadHandler(object):
                                         'Trying to read during GET')
             raise
         except ChunkWriteTimeout:
-            self.app.logger.info(
+            self.logger.info(
                 'Client did not read from proxy within %ss',
                 self.app.client_timeout)
-            self.app.logger.increment('client_timeouts')
+            self.logger.increment('client_timeouts')
         except GeneratorExit:
             warn = True
             req_range = self.backend_headers['Range']
@@ -1326,11 +1328,11 @@ class GetOrHeadHandler(object):
                         if end - begin + 1 == self.bytes_used_from_backend:
                             warn = False
             if not req.environ.get('swift.non_client_disconnect') and warn:
-                self.app.logger.info('Client disconnected on read of %r',
-                                     self.path)
+                self.logger.info('Client disconnected on read of %r',
+                                 self.path)
             raise
         except Exception:
-            self.app.logger.exception('Trying to send to client')
+            self.logger.exception('Trying to send to client')
             raise
         finally:
             # Close-out the connection as best as possible.
@@ -1352,7 +1354,7 @@ class GetOrHeadHandler(object):
             return None
 
     def _make_node_request(self, node, node_timeout, logger_thread_locals):
-        self.app.logger.thread_locals = logger_thread_locals
+        self.logger.thread_locals = logger_thread_locals
         if node in self.used_nodes:
             return False
         req_headers = dict(self.backend_headers)
@@ -1472,7 +1474,7 @@ class GetOrHeadHandler(object):
 
         for node in nodes:
             pile.spawn(self._make_node_request, node, node_timeout,
-                       self.app.logger.thread_locals)
+                       self.logger.thread_locals)
             _timeout = self.app.get_policy_options(
                 self.policy).concurrency_timeout \
                 if pile.inflight < self.concurrency else None
@@ -1542,7 +1544,7 @@ class GetOrHeadHandler(object):
 
         return document_iters_to_http_response_body(
             (add_content_type(pi) for pi in parts_iter),
-            boundary, is_multipart, self.app.logger)
+            boundary, is_multipart, self.logger)
 
     def get_working_response(self, req):
         source, node = self._get_source_and_node()
@@ -1588,9 +1590,11 @@ class NodeIter(object):
         want to filter or reorder the nodes.
     :param policy: an instance of :class:`BaseStoragePolicy`. This should be
         None for an account or container ring.
+    :param logger: a logger instance; defaults to the app logger
     """
 
-    def __init__(self, app, ring, partition, node_iter=None, policy=None):
+    def __init__(self, app, ring, partition, node_iter=None, policy=None,
+                 logger=None):
         self.app = app
         self.ring = ring
         self.partition = partition
@@ -1610,6 +1614,7 @@ class NodeIter(object):
             policy=policy)
         self.handoff_iter = node_iter
         self._node_provider = None
+        self.logger = logger if logger else self.app.logger
 
     @property
     def primaries_left(self):
@@ -1635,12 +1640,12 @@ class NodeIter(object):
             return
         extra_handoffs = handoffs - self.expected_handoffs
         if extra_handoffs > 0:
-            self.app.logger.increment('handoff_count')
-            self.app.logger.warning(
+            self.logger.increment('handoff_count')
+            self.logger.warning(
                 'Handoff requested (%d)' % handoffs)
             if (extra_handoffs == self.num_primary_nodes):
                 # all the primaries were skipped, and handoffs didn't help
-                self.app.logger.increment('handoff_all_count')
+                self.logger.increment('handoff_all_count')
 
     def set_node_provider(self, callback):
         """
@@ -1703,6 +1708,9 @@ class Controller(object):
         self.trans_id = '-'
         self._allowed_methods = None
         self._private_methods = None
+        # adapt the app logger to prefix statsd metrics with the server type
+        self.logger = PrefixLoggerAdapter(
+            self.app.logger, {'metric_prefix': self.server_type.lower()})
 
     @property
     def allowed_methods(self):
@@ -1856,11 +1864,11 @@ class Controller(object):
         :param body: byte string to use as the request body.
                      Try to keep it small.
         :param logger_thread_locals: The thread local values to be set on the
-                                     self.app.logger to retain transaction
+                                     self.logger to retain transaction
                                      logging information.
         :returns: a swob.Response object, or None if no responses were received
         """
-        self.app.logger.thread_locals = logger_thread_locals
+        self.logger.thread_locals = logger_thread_locals
         if body:
             if not isinstance(body, bytes):
                 raise TypeError('body must be bytes, not %s' % type(body))
@@ -1925,14 +1933,15 @@ class Controller(object):
         :returns: a swob.Response object
         """
         nodes = GreenthreadSafeIterator(
-            node_iterator or self.app.iter_nodes(ring, part)
+            node_iterator or self.app.iter_nodes(ring, part,
+                                                 logger=self.logger)
         )
         node_number = node_count or len(ring.get_part_nodes(part))
         pile = GreenAsyncPile(node_number)
 
         for head in headers:
             pile.spawn(self._make_request, nodes, part, method, path,
-                       head, query_string, body, self.app.logger.thread_locals)
+                       head, query_string, body, self.logger.thread_locals)
         response = []
         statuses = []
         for resp in pile:
@@ -2025,8 +2034,8 @@ class Controller(object):
 
         if not resp:
             resp = HTTPServiceUnavailable(request=req)
-            self.app.logger.error('%(type)s returning 503 for %(statuses)s',
-                                  {'type': server_type, 'statuses': statuses})
+            self.logger.error('%(type)s returning 503 for %(statuses)s',
+                              {'type': server_type, 'statuses': statuses})
 
         return resp
 
@@ -2099,12 +2108,11 @@ class Controller(object):
                                   self.app.account_ring, partition, 'PUT',
                                   path, [headers] * len(nodes))
         if is_success(resp.status_int):
-            self.app.logger.info('autocreate account %r', path)
+            self.logger.info('autocreate account %r', path)
             clear_info_cache(self.app, req.environ, account)
             return True
         else:
-            self.app.logger.warning('Could not autocreate account %r',
-                                    path)
+            self.logger.warning('Could not autocreate account %r', path)
             return False
 
     def GETorHEAD_base(self, req, server_type, node_iter, partition, path,
@@ -2128,7 +2136,8 @@ class Controller(object):
         handler = GetOrHeadHandler(self.app, req, self.server_type, node_iter,
                                    partition, path, backend_headers,
                                    concurrency, policy=policy,
-                                   client_chunk_size=client_chunk_size)
+                                   client_chunk_size=client_chunk_size,
+                                   logger=self.logger)
         res = handler.get_working_response(req)
 
         if not res:
@@ -2147,7 +2156,7 @@ class Controller(object):
             if policy:
                 res.headers['X-Storage-Policy'] = policy.name
             else:
-                self.app.logger.error(
+                self.logger.error(
                     'Could not translate %s (%r) from %r to policy',
                     'X-Backend-Storage-Policy-Index',
                     res.headers['X-Backend-Storage-Policy-Index'], path)
@@ -2259,7 +2268,7 @@ class Controller(object):
 
     def _parse_listing_response(self, req, response):
         if not is_success(response.status_int):
-            self.app.logger.warning(
+            self.logger.warning(
                 'Failed to get container listing from %s: %s',
                 req.path_qs, response.status_int)
             return None
@@ -2270,7 +2279,7 @@ class Controller(object):
                 raise ValueError('not a list')
             return data
         except ValueError as err:
-            self.app.logger.error(
+            self.logger.error(
                 'Problem with listing response from %s: %r',
                 req.path_qs, err)
             return None
@@ -2299,7 +2308,7 @@ class Controller(object):
         if headers:
             subreq.headers.update(headers)
         subreq.params = params
-        self.app.logger.debug(
+        self.logger.debug(
             'Get listing from %s %s' % (subreq.path_qs, headers))
         response = self.app.handle_request(subreq)
         data = self._parse_listing_response(req, response)
@@ -2312,15 +2321,15 @@ class Controller(object):
         record_type = response.headers.get('x-backend-record-type')
         if record_type != 'shard':
             err = 'unexpected record type %r' % record_type
-            self.app.logger.error("Failed to get shard ranges from %s: %s",
-                                  req.path_qs, err)
+            self.logger.error("Failed to get shard ranges from %s: %s",
+                              req.path_qs, err)
             return None
 
         try:
             return [ShardRange.from_dict(shard_range)
                     for shard_range in listing]
         except (ValueError, TypeError, KeyError) as err:
-            self.app.logger.error(
+            self.logger.error(
                 "Failed to get shard ranges from %s: invalid data: %r",
                 req.path_qs, err)
             return None
@@ -2372,7 +2381,7 @@ class Controller(object):
             # caching is disabled; fall back to old behavior
             shard_ranges, response = self._get_shard_ranges(
                 req, account, container, states='updating', includes=obj)
-            self.app.logger.increment(
+            self.logger.increment(
                 'shard_updating.backend.%s' % response.status_int)
             if not shard_ranges:
                 return None
@@ -2384,11 +2393,16 @@ class Controller(object):
 
         cached_ranges = infocache.get(cache_key)
         if cached_ranges is None and memcache:
-            skip_pct = \
-                self.app.container_updating_shard_ranges_skip_cache_pct
-            cached_ranges = memcache.get(cache_key, skip_cache_pct=skip_pct)
-            self.app.logger.increment('shard_updating.cache.%s'
-                                      % ('hit' if cached_ranges else 'miss'))
+            skip_chance = \
+                self.app.container_updating_shard_ranges_skip_cache
+            if skip_chance and random.random() < skip_chance:
+                self.logger.increment('shard_updating.cache.skip')
+            else:
+                cached_ranges = memcache.get(cache_key)
+                if cached_ranges:
+                    self.logger.increment('shard_updating.cache.hit')
+                else:
+                    self.logger.increment('shard_updating.cache.miss')
 
         if cached_ranges:
             shard_ranges = [
@@ -2397,7 +2411,7 @@ class Controller(object):
         else:
             shard_ranges, response = self._get_shard_ranges(
                 req, account, container, states='updating')
-            self.app.logger.increment(
+            self.logger.increment(
                 'shard_updating.backend.%s' % response.status_int)
             if shard_ranges:
                 cached_ranges = [dict(sr) for sr in shard_ranges]

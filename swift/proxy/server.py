@@ -227,10 +227,10 @@ class Application(object):
         self.recheck_account_existence = \
             int(conf.get('recheck_account_existence',
                          DEFAULT_RECHECK_ACCOUNT_EXISTENCE))
-        self.container_updating_shard_ranges_skip_cache_pct = \
+        self.container_updating_shard_ranges_skip_cache = \
             config_percent_value(conf.get(
                 'container_updating_shard_ranges_skip_cache_pct', 0))
-        self.container_listing_shard_ranges_skip_cache_pct = \
+        self.container_listing_shard_ranges_skip_cache = \
             config_percent_value(conf.get(
                 'container_listing_shard_ranges_skip_cache_pct', 0))
         self.allow_account_management = \
@@ -548,8 +548,6 @@ class Application(object):
                     req.host.split(':')[0] in self.deny_host_headers:
                 return HTTPForbidden(request=req, body='Invalid host header')
 
-            self.logger.set_statsd_prefix('proxy-server.' +
-                                          controller.server_type.lower())
             controller = controller(self, **path_parts)
             if 'swift.trans_id' not in req.environ:
                 # if this wasn't set by an earlier middleware, set it now
@@ -704,9 +702,10 @@ class Application(object):
             'msg': msg, 'ip': node['ip'],
             'port': node['port'], 'device': node['device']})
 
-    def iter_nodes(self, ring, partition, node_iter=None, policy=None):
+    def iter_nodes(self, ring, partition, node_iter=None, policy=None,
+                   logger=None):
         return NodeIter(self, ring, partition, node_iter=node_iter,
-                        policy=policy)
+                        policy=policy, logger=logger)
 
     def exception_occurred(self, node, typ, additional_info,
                            **kwargs):

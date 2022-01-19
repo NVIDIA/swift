@@ -1891,23 +1891,28 @@ class TestObjectUpdaterFunctions(unittest.TestCase):
 
 
 class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
+
+    def setUp(self):
+        self.logger = debug_logger()
+        self.stats = object_updater.SweepStats()
+
     def test_init(self):
         it = object_updater.BucketizedUpdateSkippingLimiter(
-            [3, 1], debug_logger(), 1000, 10)
+            [3, 1], self.logger, self.stats, 1000, 10)
         self.assertEqual(1000, it.num_buckets)
         self.assertEqual(0.1, it.bucket_update_delta)
         self.assertEqual([3, 1], [x for x in it.iterator])
 
         # rate of 0 implies unlimited
         it = object_updater.BucketizedUpdateSkippingLimiter(
-            iter([3, 1]), debug_logger(), 9, 0)
+            iter([3, 1]), self.logger, self.stats, 9, 0)
         self.assertEqual(9, it.num_buckets)
         self.assertEqual(-1, it.bucket_update_delta)
         self.assertEqual([3, 1], [x for x in it.iterator])
 
         # num_buckets is collared at 1
         it = object_updater.BucketizedUpdateSkippingLimiter(
-            iter([3, 1]), debug_logger(), 0, 1)
+            iter([3, 1]), self.logger, self.stats, 0, 1)
         self.assertEqual(1, it.num_buckets)
         self.assertEqual(1, it.bucket_update_delta)
         self.assertEqual([3, 1], [x for x in it.iterator])
@@ -1918,11 +1923,11 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
             {'update': {'account': '%d' % i, 'container': '%s' % i}}
             for i in range(20)]
         it = object_updater.BucketizedUpdateSkippingLimiter(
-            iter(update_ctxs), debug_logger(), 9, 0)
+            iter(update_ctxs), self.logger, self.stats, 9, 0)
         self.assertEqual(update_ctxs, [x for x in it])
-        self.assertEqual(0, it.skips)
-        self.assertEqual(0, it.drains)
-        self.assertEqual(0, it.deferrals)
+        self.assertEqual(0, self.stats.skips)
+        self.assertEqual(0, self.stats.drains)
+        self.assertEqual(0, self.stats.deferrals)
 
     def test_iteration_ratelimited(self):
         # verify iteration at limited rate - single bucket
@@ -1930,12 +1935,12 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
             {'update': {'account': '%d' % i, 'container': '%s' % i}}
             for i in range(2)]
         it = object_updater.BucketizedUpdateSkippingLimiter(
-            iter(update_ctxs), debug_logger(), 1, 0.1)
+            iter(update_ctxs), self.logger, self.stats, 1, 0.1)
         # second update is skipped
         self.assertEqual(update_ctxs[:1], [x for x in it])
-        self.assertEqual(1, it.skips)
-        self.assertEqual(0, it.drains)
-        self.assertEqual(0, it.deferrals)
+        self.assertEqual(1, self.stats.skips)
+        self.assertEqual(0, self.stats.drains)
+        self.assertEqual(0, self.stats.deferrals)
 
     def test_deferral_single_bucket(self):
         # verify deferral - single bucket
@@ -1949,7 +1954,7 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
                         side_effect=[now, now, now, now, now]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
-                    iter(update_ctxs[:3]), debug_logger(), 1, 10,
+                    iter(update_ctxs[:3]), self.logger, self.stats, 1, 10,
                     max_deferred_elements=2,
                     drain_until=now + 10)
                 actual = [x for x in it]
@@ -1958,16 +1963,17 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
                           update_ctxs[1]],
                          actual)
         self.assertEqual(2, mock_sleep.call_count)
-        self.assertEqual(0, it.skips)
-        self.assertEqual(2, it.drains)
-        self.assertEqual(2, it.deferrals)
+        self.assertEqual(0, self.stats.skips)
+        self.assertEqual(2, self.stats.drains)
+        self.assertEqual(2, self.stats.deferrals)
+        self.stats.reset()
 
         # only space for one deferral
         with mock.patch('swift.obj.updater.time.time',
                         side_effect=[now, now, now, now, now]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
-                    iter(update_ctxs[:3]), debug_logger(), 1, 10,
+                    iter(update_ctxs[:3]), self.logger, self.stats, 1, 10,
                     max_deferred_elements=1,
                     drain_until=now + 10)
                 actual = [x for x in it]
@@ -1975,16 +1981,17 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
                           update_ctxs[2]],  # deferrals...
                          actual)
         self.assertEqual(1, mock_sleep.call_count)
-        self.assertEqual(1, it.skips)
-        self.assertEqual(1, it.drains)
-        self.assertEqual(2, it.deferrals)
+        self.assertEqual(1, self.stats.skips)
+        self.assertEqual(1, self.stats.drains)
+        self.assertEqual(2, self.stats.deferrals)
+        self.stats.reset()
 
         # only time for one deferral
         with mock.patch('swift.obj.updater.time.time',
                         side_effect=[now, now, now, now, now + 20]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
-                    iter(update_ctxs[:3]), debug_logger(), 1, 10,
+                    iter(update_ctxs[:3]), self.logger, self.stats, 1, 10,
                     max_deferred_elements=2,
                     drain_until=now + 10)
                 actual = [x for x in it]
@@ -1992,16 +1999,17 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
                           update_ctxs[2]],  # deferrals...
                          actual)
         self.assertEqual(1, mock_sleep.call_count)
-        self.assertEqual(1, it.skips)
-        self.assertEqual(1, it.drains)
-        self.assertEqual(2, it.deferrals)
+        self.assertEqual(1, self.stats.skips)
+        self.assertEqual(1, self.stats.drains)
+        self.assertEqual(2, self.stats.deferrals)
+        self.stats.reset()
 
         # only space for two deferrals, only time for one deferral
         with mock.patch('swift.obj.updater.time.time',
                         side_effect=[now, now, now, now, now, now + 20]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
-                    iter(update_ctxs), debug_logger(), 1, 10,
+                    iter(update_ctxs), self.logger, self.stats, 1, 10,
                     max_deferred_elements=2,
                     drain_until=now + 10)
                 actual = [x for x in it]
@@ -2009,9 +2017,10 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
                           update_ctxs[3]],  # deferrals...
                          actual)
         self.assertEqual(1, mock_sleep.call_count)
-        self.assertEqual(2, it.skips)
-        self.assertEqual(1, it.drains)
-        self.assertEqual(3, it.deferrals)
+        self.assertEqual(2, self.stats.skips)
+        self.assertEqual(1, self.stats.drains)
+        self.assertEqual(3, self.stats.deferrals)
+        self.stats.reset()
 
     def test_deferral_multiple_buckets(self):
         # verify deferral - multiple buckets
@@ -2029,8 +2038,8 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
                         side_effect=[next(time_iter) for _ in range(10)]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
-                    iter(update_ctxs_1 + update_ctxs_2), debug_logger(),
-                    4, 10,
+                    iter(update_ctxs_1 + update_ctxs_2),
+                    self.logger, self.stats, 4, 10,
                     max_deferred_elements=4,
                     drain_until=next(time_iter))
                 it.salt = ''  # make container->bucket hashing predictable
@@ -2044,17 +2053,18 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
                           ],
                          actual)
         self.assertEqual(4, mock_sleep.call_count)
-        self.assertEqual(0, it.skips)
-        self.assertEqual(4, it.drains)
-        self.assertEqual(4, it.deferrals)
+        self.assertEqual(0, self.stats.skips)
+        self.assertEqual(4, self.stats.drains)
+        self.assertEqual(4, self.stats.deferrals)
+        self.stats.reset()
 
         # oldest deferral bumped from one bucket due to max_deferrals == 3
         with mock.patch('swift.obj.updater.time.time',
                         side_effect=[next(time_iter) for _ in range(10)]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
-                    iter(update_ctxs_1 + update_ctxs_2), debug_logger(),
-                    4, 10,
+                    iter(update_ctxs_1 + update_ctxs_2),
+                    self.logger, self.stats, 4, 10,
                     max_deferred_elements=3,
                     drain_until=next(time_iter))
                 it.salt = ''  # make container->bucket hashing predictable
@@ -2067,17 +2077,18 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
                           ],
                          actual)
         self.assertEqual(3, mock_sleep.call_count)
-        self.assertEqual(1, it.skips)
-        self.assertEqual(3, it.drains)
-        self.assertEqual(4, it.deferrals)
+        self.assertEqual(1, self.stats.skips)
+        self.assertEqual(3, self.stats.drains)
+        self.assertEqual(4, self.stats.deferrals)
+        self.stats.reset()
 
         # older deferrals bumped from one bucket due to max_deferrals == 2
         with mock.patch('swift.obj.updater.time.time',
                         side_effect=[next(time_iter) for _ in range(10)]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
-                    iter(update_ctxs_1 + update_ctxs_2), debug_logger(),
-                    4, 10,
+                    iter(update_ctxs_1 + update_ctxs_2),
+                    self.logger, self.stats, 4, 10,
                     max_deferred_elements=2,
                     drain_until=next(time_iter))
                 it.salt = ''  # make container->bucket hashing predictable
@@ -2089,9 +2100,10 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
                           ],
                          actual)
         self.assertEqual(2, mock_sleep.call_count)
-        self.assertEqual(2, it.skips)
-        self.assertEqual(2, it.drains)
-        self.assertEqual(4, it.deferrals)
+        self.assertEqual(2, self.stats.skips)
+        self.assertEqual(2, self.stats.drains)
+        self.assertEqual(4, self.stats.deferrals)
+        self.stats.reset()
 
 
 class TestRateLimiterBucket(unittest.TestCase):
