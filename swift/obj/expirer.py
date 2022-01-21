@@ -267,7 +267,9 @@ class ObjectExpirer(Daemon):
         task_container, task_object, timestamp_to_delete, and target_path
         """
         for task_account, task_container in task_account_container_list:
+            container_empty = True
             for o in self.swift.iter_objects(task_account, task_container):
+                container_empty = False
                 if six.PY2:
                     task_object = o['name'].encode('utf8')
                 else:
@@ -297,6 +299,17 @@ class ObjectExpirer(Daemon):
                            target_account, target_container, target_object]),
                        'delete_timestamp': delete_timestamp,
                        'is_async_delete': is_async}
+            if container_empty:
+                try:
+                    self.swift.delete_container(
+                        task_account, task_container,
+                        acceptable_statuses=(2, HTTP_NOT_FOUND, HTTP_CONFLICT))
+                except (Exception, Timeout) as err:
+                    self.logger.exception(
+                        'Exception while deleting container %(account)s '
+                        '%(container)s %(err)s', {
+                            'account': task_account,
+                            'container': task_container, 'err': str(err)})
 
     def run_once(self, *args, **kwargs):
         """
@@ -325,7 +338,6 @@ class ObjectExpirer(Daemon):
         self.report_objects = 0
         try:
             self.logger.debug('Run begin')
-            task_account_container_list_to_delete = list()
             for task_account, my_index, divisor in \
                     self.iter_task_accounts_to_expire():
                 container_count, obj_count = \
@@ -347,9 +359,6 @@ class ObjectExpirer(Daemon):
                     [(task_account, task_container) for task_container in
                      self.iter_task_containers_to_expire(task_account)]
 
-                task_account_container_list_to_delete.extend(
-                    task_account_container_list)
-
                 # delete_task_iter is a generator to yield a dict of
                 # task_account, task_container, task_object, delete_timestamp,
                 # target_path to handle delete actual object and pop the task
@@ -364,18 +373,6 @@ class ObjectExpirer(Daemon):
                     pool.spawn_n(self.delete_object, **delete_task)
 
             pool.waitall()
-            for task_account, task_container in \
-                    task_account_container_list_to_delete:
-                try:
-                    self.swift.delete_container(
-                        task_account, task_container,
-                        acceptable_statuses=(2, HTTP_NOT_FOUND, HTTP_CONFLICT))
-                except (Exception, Timeout) as err:
-                    self.logger.exception(
-                        'Exception while deleting container %(account)s '
-                        '%(container)s %(err)s', {
-                            'account': task_account,
-                            'container': task_container, 'err': str(err)})
             self.logger.debug('Run end')
             self.report(final=True)
         except (Exception, Timeout):
