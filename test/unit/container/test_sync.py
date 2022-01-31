@@ -178,24 +178,6 @@ class TestContainerSync(unittest.TestCase):
                                    'log_name': 'my-container-sync'},
                                   'my-container-sync-ic')
 
-    def test_init_internal_client_log_name(self):
-        def _do_test_init_ic_log_name(conf, exp_internal_client_log_name):
-            with mock.patch(
-                    'swift.container.sync.InternalClient') \
-                    as mock_ic:
-                sync.ContainerSync(conf, container_ring='dummy object')
-            mock_ic.assert_called_once_with(
-                'conf-path',
-                'Swift Container Sync', 3,
-                global_conf={'log_name': exp_internal_client_log_name},
-                use_replication_network=True)
-
-        _do_test_init_ic_log_name({'internal_client_conf_path': 'conf-path'},
-                                  'container-sync-ic')
-        _do_test_init_ic_log_name({'internal_client_conf_path': 'conf-path',
-                                   'log_name': 'my-container-sync'},
-                                  'my-container-sync-ic')
-
     def test_run_forever(self):
         # This runs runs_forever with fakes to succeed for two loops, the first
         # causing a report but no interval sleep, the second no report but an

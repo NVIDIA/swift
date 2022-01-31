@@ -2093,28 +2093,28 @@ class SwiftLoggerAdapter(logging.LoggerAdapter):
     Like logging.LoggerAdapter, you have to subclass this and override the
     process() method to accomplish anything useful.
     """
-    def prefix_metric(self, metric):
-        if 'metric_prefix' in self.extra:
-            return '%s.%s' % (self.extra['metric_prefix'], metric)
+    def get_metric_name(self, metric):
+        # subclasses may override this method to annotate the metric name
         return metric
 
     def update_stats(self, metric, *a, **kw):
-        return self.logger.update_stats(self.prefix_metric(metric), *a, **kw)
+        return self.logger.update_stats(self.get_metric_name(metric), *a, **kw)
 
     def increment(self, metric, *a, **kw):
-        return self.logger.increment(self.prefix_metric(metric), *a, **kw)
+        return self.logger.increment(self.get_metric_name(metric), *a, **kw)
 
     def decrement(self, metric, *a, **kw):
-        return self.logger.decrement(self.prefix_metric(metric), *a, **kw)
+        return self.logger.decrement(self.get_metric_name(metric), *a, **kw)
 
     def timing(self, metric, *a, **kw):
-        return self.logger.timing(self.prefix_metric(metric), *a, **kw)
+        return self.logger.timing(self.get_metric_name(metric), *a, **kw)
 
     def timing_since(self, metric, *a, **kw):
-        return self.logger.timing_since(self.prefix_metric(metric), *a, **kw)
+        return self.logger.timing_since(self.get_metric_name(metric), *a, **kw)
 
     def transfer_rate(self, metric, *a, **kw):
-        return self.logger.transfer_rate(self.prefix_metric(metric), *a, **kw)
+        return self.logger.transfer_rate(
+            self.get_metric_name(metric), *a, **kw)
 
     @property
     def thread_locals(self):
@@ -2123,6 +2123,11 @@ class SwiftLoggerAdapter(logging.LoggerAdapter):
     @thread_locals.setter
     def thread_locals(self, thread_locals):
         self.logger.thread_locals = thread_locals
+
+    def exception(self, msg, *a, **kw):
+        # We up-call to exception() where stdlib uses error() so we can get
+        # some of the traceback suppression from LogAdapter, below
+        self.logger.exception(msg, *a, **kw)
 
 
 class PrefixLoggerAdapter(SwiftLoggerAdapter):
@@ -2136,15 +2141,33 @@ class PrefixLoggerAdapter(SwiftLoggerAdapter):
     def exception(self, msg, *a, **kw):
         if 'prefix' in self.extra:
             msg = self.extra['prefix'] + msg
-        # We up-call to exception() where stdlib uses error() so we can get
-        # some of the traceback suppression from LogAdapter, below
-        self.logger.exception(msg, *a, **kw)
+        super(PrefixLoggerAdapter, self).exception(msg, *a, **kw)
 
     def process(self, msg, kwargs):
         msg, kwargs = super(PrefixLoggerAdapter, self).process(msg, kwargs)
         if 'prefix' in self.extra:
             msg = self.extra['prefix'] + msg
         return (msg, kwargs)
+
+
+class MetricsPrefixLoggerAdapter(SwiftLoggerAdapter):
+    """
+    Adds a prefix to all Statsd metrics' names.
+    """
+    def __init__(self, logger, extra, metric_prefix):
+        """
+        :param logger: an instance of logging.Logger
+        :param extra: a dict-like object
+        :param metric_prefix: A prefix that will be added to the start of each
+            metric name such that the metric name is transformed to:
+            ``<metric_prefix>.<metric name>``. Note that the logger's
+            StatsdClient also adds its configured prefix to metric names.
+        """
+        super(MetricsPrefixLoggerAdapter, self).__init__(logger, extra)
+        self.metric_prefix = metric_prefix
+
+    def get_metric_name(self, metric):
+        return '%s.%s' % (self.metric_prefix, metric)
 
 
 # double inheritance to support property with setter
@@ -2417,6 +2440,9 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
     :param fmt: Override log format
     :return: an instance of ``LogAdapter``
     """
+    # note: log_name is typically specified in conf (i.e. defined by
+    # operators), whereas log_route is typically hard-coded in callers of
+    # get_logger (i.e. defined by developers)
     if not conf:
         conf = {}
     if name is None:

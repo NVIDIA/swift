@@ -107,7 +107,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         # will be short-circuited
 
         # check all defaults
-        expected = Config()
+        expected = dict(Config())
         expected.update({
             'auth_pipeline_check': True,
             'check_bucket_owner': False,
@@ -127,7 +127,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
 
         # check all non-defaults are loaded
         conf = {
-            'storage_domain': 'somewhere',
+            'storage_domain': 'somewhere,some.other.where',
             'location': 'us-west-1',
             'force_swift_request_proxy_log': True,
             'dns_compliant_bucket_names': False,
@@ -150,6 +150,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         s3api = S3ApiMiddleware(None, conf)
         conf['cors_preflight_allow_origin'] = \
             conf['cors_preflight_allow_origin'].split(',')
+        conf['storage_domains'] = conf.pop('storage_domain').split(',')
         self.assertEqual(conf, s3api.conf)
 
         # test allow_origin list with a '*' fails.
@@ -870,17 +871,16 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(elem.find('./ResourceType').text, 'ACL')
 
     def test_registered_defaults(self):
-        filter_factory(self.conf)
+        conf_from_file = {k: str(v) for k, v in self.conf.items()}
+        filter_factory(conf_from_file)
         swift_info = utils.get_swift_info()
         self.assertTrue('s3api' in swift_info)
-        self.assertEqual(swift_info['s3api'].get('max_bucket_listing'),
-                         self.conf['max_bucket_listing'])
-        self.assertEqual(swift_info['s3api'].get('max_parts_listing'),
-                         self.conf['max_parts_listing'])
-        self.assertEqual(swift_info['s3api'].get('max_upload_part_num'),
-                         self.conf['max_upload_part_num'])
-        self.assertEqual(swift_info['s3api'].get('max_multi_delete_objects'),
-                         self.conf['max_multi_delete_objects'])
+        registered_keys = [
+            'max_bucket_listing', 'max_parts_listing', 'max_upload_part_num',
+            'max_multi_delete_objects', 'allow_multipart_uploads',
+            'min_segment_size', 's3_acl']
+        expected = dict((k, self.conf[k]) for k in registered_keys)
+        self.assertEqual(expected, swift_info['s3api'])
 
     def test_check_pipeline(self):
         with patch("swift.common.middleware.s3api.s3api.loadcontext"), \

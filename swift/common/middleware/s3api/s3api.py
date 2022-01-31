@@ -263,7 +263,8 @@ class S3ApiMiddleware(object):
             wsgi_conf.get('multi_delete_concurrency', 2))
         self.conf.s3_acl = config_true_value(
             wsgi_conf.get('s3_acl', False))
-        self.conf.storage_domain = wsgi_conf.get('storage_domain', '')
+        self.conf.storage_domains = list_from_csv(
+            wsgi_conf.get('storage_domain', ''))
         self.conf.auth_pipeline_check = config_true_value(
             wsgi_conf.get('auth_pipeline_check', True))
         self.conf.max_upload_part_num = config_positive_int_value(
@@ -463,8 +464,8 @@ def filter_factory(global_conf, **local_conf):
     register_swift_info(
         's3api',
         # TODO: make default values as variables
-        max_bucket_listing=conf.get('max_bucket_listing', 1000),
-        max_parts_listing=conf.get('max_parts_listing', 1000),
+        max_bucket_listing=int(conf.get('max_bucket_listing', 1000)),
+        max_parts_listing=int(conf.get('max_parts_listing', 1000)),
         max_upload_part_num=int(conf.get('max_upload_part_num', 1000)),
         max_multi_delete_objects=int(
             conf.get('max_multi_delete_objects', 1000)),
@@ -472,7 +473,6 @@ def filter_factory(global_conf, **local_conf):
             conf.get('allow_multipart_uploads', True)),
         min_segment_size=int(conf.get('min_segment_size', 5242880)),
         s3_acl=config_true_value(conf.get('s3_acl', False)),
-        completed_grace_period=int(conf.get('completed_grace_period', 300)),
     )
 
     def s3api_filter(app):

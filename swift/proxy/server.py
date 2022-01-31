@@ -198,7 +198,9 @@ class Application(object):
             self.logger = get_logger(conf, log_route='proxy-server')
         else:
             self.logger = logger
+        self.logger.set_statsd_prefix('proxy-server')
         self._error_limiting = {}
+        self.backend_user_agent = 'proxy-server %s' % os.getpid()
 
         swift_dir = conf.get('swift_dir', '/etc/swift')
         self.swift_dir = swift_dir
@@ -516,7 +518,6 @@ class Application(object):
         :param req: swob.Request object
         """
         try:
-            self.logger.set_statsd_prefix('proxy-server')
             if req.content_length and req.content_length < 0:
                 self.logger.increment('errors')
                 return HTTPBadRequest(request=req,
@@ -702,8 +703,7 @@ class Application(object):
             'msg': msg, 'ip': node['ip'],
             'port': node['port'], 'device': node['device']})
 
-    def iter_nodes(self, ring, partition, node_iter=None, policy=None,
-                   logger=None):
+    def iter_nodes(self, ring, partition, logger, node_iter=None, policy=None):
         return NodeIter(self, ring, partition, node_iter=node_iter,
                         policy=policy, logger=logger)
 

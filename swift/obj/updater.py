@@ -127,6 +127,8 @@ class BucketizedUpdateSkippingLimiter(object):
                 bucket.last_time = now
                 return update_ctx
 
+            self.stats.deferrals += 1
+            self.logger.increment("deferrals")
             if self.max_deferred_elements > 0:
                 if len(self.deferred_buckets) >= self.max_deferred_elements:
                     # create space to defer this update by popping the least
@@ -143,8 +145,6 @@ class BucketizedUpdateSkippingLimiter(object):
                 # one for each deferred update in that particular bucket
                 bucket.deque.append(update_ctx)
                 self.deferred_buckets.append(bucket)
-                self.stats.deferrals += 1
-                self.logger.increment("deferrals")
             else:
                 self.stats.skips += 1
                 self.logger.increment("skips")
@@ -515,11 +515,6 @@ class ObjectUpdater(Daemon):
         my_pid = os.getpid()
         self.logger.info("Object update sweep starting on %s (pid: %d)",
                          device, my_pid)
-
-        def skip_counting_f(update_ctx):
-            # in the future we could defer update_ctx
-            self.stats.skips += 1
-            self.logger.increment("skips")
 
         ap_iter = RateLimitedIterator(
             self._iter_async_pendings(device),

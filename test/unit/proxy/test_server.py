@@ -1335,6 +1335,13 @@ class TestProxyServer(unittest.TestCase):
         self.assertTrue('swift.valid_api_versions' in
                         path_parts.get('disallowed_sections'))
 
+    def test_statsd_prefix(self):
+        app = proxy_server.Application({}, logger=debug_logger(),
+                                       account_ring=FakeRing(),
+                                       container_ring=FakeRing())
+        self.assertEqual([(('proxy-server',), {})],
+                         app.logger.log_dict['set_statsd_prefix'])
+
 
 @patch_policies([
     StoragePolicy(0, 'zero', is_default=True),
@@ -1420,10 +1427,7 @@ class TestProxyServerLoading(unittest.TestCase):
             object_ring_path = os.path.join(self.tempdir,
                                             policy.ring_name + '.ring.gz')
             write_fake_ring(object_ring_path)
-        app = loadapp(conf_path)
-        # find the end of the pipeline
-        while hasattr(app, 'app'):
-            app = app.app
+        app = loadapp(conf_path)._pipeline_final_app
 
         # validate loaded rings
         self.assertEqual(app.account_ring.serialized_path,
@@ -2341,9 +2345,10 @@ class TestReplicatedObjectController(
     def setUp(self):
         skip_if_no_xattrs()
         _test_servers[0]._error_limiting = {}  # clear out errors
+        self.logger = debug_logger('proxy-ut')
         self.app = proxy_server.Application(
             None,
-            logger=debug_logger('proxy-ut'),
+            logger=self.logger,
             account_ring=FakeRing(),
             container_ring=FakeRing())
         super(TestReplicatedObjectController, self).setUp()
@@ -4002,7 +4007,7 @@ class TestReplicatedObjectController(
         self.app.recheck_updating_shard_ranges = 0
 
         def do_test(method, sharding_state):
-            self.app.logger = debug_logger('proxy-ut')  # clean capture state
+            self.app.logger.clear()  # clean capture state
             req = Request.blank('/v1/a/c/o', {}, method=method, body='',
                                 headers={'Content-Type': 'text/plain'})
 
@@ -4024,10 +4029,8 @@ class TestReplicatedObjectController(
             stats = self.app.logger.get_increment_counts()
             self.assertEqual({'object.shard_updating.backend.200': 1}, stats)
             backend_requests = fake_conn.requests
-            self.assertEqual(
-                # account, container HEAD, container GET, obj
-                [(('proxy-server',), {})] * 4,
-                self.app.logger.log_dict['set_statsd_prefix'])
+            # verify statsd prefix is not mutated
+            self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
             account_request = backend_requests[0]
             self._check_request(
@@ -4086,8 +4089,7 @@ class TestReplicatedObjectController(
         self.app.recheck_updating_shard_ranges = 3600
 
         def do_test(method, sharding_state):
-            self.app.logger = debug_logger('proxy-ut')  # clean capture state
-            cache = FakeMemcache()
+            self.app.logger.clear()  # clean capture state
             req = Request.blank(
                 '/v1/a/c/o', {'swift.cache': cache},
                 method=method, body='', headers={'Content-Type': 'text/plain'})
@@ -4121,10 +4123,8 @@ class TestReplicatedObjectController(
             stats = self.app.logger.get_increment_counts()
             self.assertEqual({'object.shard_updating.cache.miss': 1,
                               'object.shard_updating.backend.200': 1}, stats)
-            self.assertEqual(
-                # account, container HEAD, container GET, obj
-                [(('proxy-server',), {})] * 4,
-                self.app.logger.log_dict['set_statsd_prefix'])
+            # verify statsd prefix is not mutated
+            self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]
@@ -4195,7 +4195,7 @@ class TestReplicatedObjectController(
         self.app.recheck_updating_shard_ranges = 3600
 
         def do_test(method, sharding_state):
-            self.app.logger = debug_logger('proxy-ut')  # clean capture state
+            self.app.logger.clear()  # clean capture state
             shard_ranges = [
                 utils.ShardRange(
                     '.shards_a/c_not_used', utils.Timestamp.now(), '', 'l'),
@@ -4225,9 +4225,8 @@ class TestReplicatedObjectController(
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
             self.assertEqual({'object.shard_updating.cache.hit': 1}, stats)
-            self.assertEqual(
-                [(('proxy-server',), {})] * 3,  # account, container HEAD, obj
-                self.app.logger.log_dict['set_statsd_prefix'])
+            # verify statsd prefix is not mutated
+            self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
             self.assertEqual(1, cache.calls.count(
                 mock.call.get('shard-updating/a/c', skip_cache_pct=1.0)
@@ -4292,7 +4291,7 @@ class TestReplicatedObjectController(
         self.app.container_updating_shard_ranges_skip_cache = 0.001
 
         def do_test(method, sharding_state):
-            self.app.logger = debug_logger('proxy-ut')  # clean capture state
+            self.app.logger.clear()  # clean capture state
             cached_shard_ranges = [
                 utils.ShardRange(
                     '.shards_a/c_nope', utils.Timestamp.now(), '', 'l'),
@@ -4304,14 +4303,41 @@ class TestReplicatedObjectController(
             cache = FakeMemcache()
             cache.set('shard-updating/a/c', tuple(
                 dict(shard_range) for shard_range in cached_shard_ranges))
+
+            # sanity check: we can get the old shard from cache
             req = Request.blank(
                 '/v1/a/c/o', {'swift.cache': cache},
                 method=method, body='', headers={'Content-Type': 'text/plain'})
-
+            # acc HEAD, cont HEAD, obj POSTs
             # we want the container_info response to say policy index of 1 and
             # sharding state
-            # acc HEAD, cont HEAD, cont shard GET, obj POSTs
-            status_codes = (200, 200, 200, 202, 202, 202)
+            status_codes = (200, 200, 202, 202, 202)
+            resp_headers = {'X-Backend-Storage-Policy-Index': 1,
+                            'x-backend-sharding-state': sharding_state,
+                            'X-Backend-Record-Type': 'shard'}
+            with mock.patch('random.random', return_value=1), \
+                 mocked_http_conn(*status_codes, headers=resp_headers):
+                resp = req.get_response(self.app)
+
+            self.assertEqual(resp.status_int, 202)
+            stats = self.app.logger.get_increment_counts()
+            self.assertEqual({'object.shard_updating.cache.hit': 1}, stats)
+
+            # cached shard ranges are still there
+            cache_key = 'shard-updating/a/c'
+            self.assertIn(cache_key, req.environ['swift.cache'].store)
+            self.assertEqual(req.environ['swift.cache'].store[cache_key],
+                             [dict(sr) for sr in cached_shard_ranges])
+            self.assertIn(cache_key, req.environ.get('swift.infocache'))
+            self.assertEqual(req.environ['swift.infocache'][cache_key],
+                             tuple(dict(sr) for sr in cached_shard_ranges))
+
+            # ...but we have some chance to skip cache
+            req = Request.blank(
+                '/v1/a/c/o', {'swift.cache': cache},
+                method=method, body='', headers={'Content-Type': 'text/plain'})
+            # cont shard GET, obj POSTs
+            status_codes = (200, 202, 202, 202)
             resp_headers = {'X-Backend-Storage-Policy-Index': 1,
                             'x-backend-sharding-state': sharding_state,
                             'X-Backend-Record-Type': 'shard'}
@@ -4334,25 +4360,19 @@ class TestReplicatedObjectController(
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
             self.assertEqual({'object.shard_updating.cache.skip': 1,
+                              'object.shard_updating.cache.hit': 1,
                               'object.shard_updating.backend.200': 1}, stats)
-            self.assertEqual(
-                # account, container HEAD, container GET, obj
-                [(('proxy-server',), {})] * 4,
-                self.app.logger.log_dict['set_statsd_prefix'])
+            # verify statsd prefix is not mutated
+            self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
             backend_requests = fake_conn.requests
-            account_request = backend_requests[0]
-            self._check_request(
-                account_request, method='HEAD', path='/sda/0/a')
-            container_request = backend_requests[1]
-            self._check_request(
-                container_request, method='HEAD', path='/sda/0/a/c')
-            container_request_shard = backend_requests[2]
+            container_request_shard = backend_requests[0]
             self._check_request(
                 container_request_shard, method='GET', path='/sda/0/a/c',
                 params={'states': 'updating'},
                 headers={'X-Backend-Record-Type': 'shard'})
 
+            # and skipping cache will refresh it
             cache_key = 'shard-updating/a/c'
             self.assertIn(cache_key, req.environ['swift.cache'].store)
             self.assertEqual(req.environ['swift.cache'].store[cache_key],
@@ -4364,7 +4384,7 @@ class TestReplicatedObjectController(
             # make sure backend requests included expected container headers
             container_headers = {}
 
-            for request in backend_requests[3:]:
+            for request in backend_requests[1:]:
                 req_headers = request['headers']
                 device = req_headers['x-container-device']
                 container_headers[device] = req_headers['x-container-host']
@@ -4405,7 +4425,7 @@ class TestReplicatedObjectController(
         self.app.recheck_updating_shard_ranges = 0
 
         def do_test(method, sharding_state):
-            self.app.logger = debug_logger('proxy-ut')  # clean capture state
+            self.app.logger.clear()  # clean capture state
             req = Request.blank('/v1/a/c/o', {}, method=method, body='',
                                 headers={'Content-Type': 'text/plain'})
 
@@ -4985,8 +5005,8 @@ class TestReplicatedObjectController(
                                                          'container',
                                                          'object')
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring,
-                                                partition):
+                for node in self.app.iter_nodes(object_ring, partition,
+                                                self.logger):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 5)
 
@@ -4996,21 +5016,22 @@ class TestReplicatedObjectController(
                                                          'container',
                                                          'object')
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring,
-                                                partition):
+                for node in self.app.iter_nodes(object_ring, partition,
+                                                self.logger):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 9)
 
                 # zero error-limited primary nodes -> no handoff warnings
                 self.app.log_handoffs = True
-                self.app.logger = debug_logger()
+                self.app.logger.clear()  # clean capture state
                 self.app.request_node_count = lambda r: 7
                 object_ring.max_more_nodes = 20
                 partition, nodes = object_ring.get_nodes('account',
                                                          'container',
                                                          'object')
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring, partition):
+                for node in self.app.iter_nodes(object_ring, partition,
+                                                self.logger):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 7)
                 self.assertEqual(self.app.logger.log_dict['warning'], [])
@@ -5018,14 +5039,15 @@ class TestReplicatedObjectController(
 
                 # one error-limited primary node -> one handoff warning
                 self.app.log_handoffs = True
-                self.app.logger = debug_logger()
+                self.app.logger.clear()  # clean capture state
                 self.app.request_node_count = lambda r: 7
                 self.app._error_limiting = {}  # clear out errors
                 set_node_errors(self.app, object_ring._devs[0], 999,
                                 last_error=(2 ** 63 - 1))
 
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring, partition):
+                for node in self.app.iter_nodes(object_ring, partition,
+                                                self.logger):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 7)
                 self.assertEqual(
@@ -5036,7 +5058,7 @@ class TestReplicatedObjectController(
 
                 # two error-limited primary nodes -> two handoff warnings
                 self.app.log_handoffs = True
-                self.app.logger = debug_logger()
+                self.app.logger.clear()  # clean capture state
                 self.app.request_node_count = lambda r: 7
                 self.app._error_limiting = {}  # clear out errors
                 for i in range(2):
@@ -5044,7 +5066,8 @@ class TestReplicatedObjectController(
                                     last_error=(2 ** 63 - 1))
 
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring, partition):
+                for node in self.app.iter_nodes(object_ring, partition,
+                                                self.logger):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 7)
                 self.assertEqual(
@@ -5059,7 +5082,7 @@ class TestReplicatedObjectController(
                 # all error-limited primary nodes -> four handoff warnings,
                 # plus a handoff-all metric
                 self.app.log_handoffs = True
-                self.app.logger = debug_logger()
+                self.app.logger.clear()  # clean capture state
                 self.app.request_node_count = lambda r: 10
                 object_ring.set_replicas(4)  # otherwise we run out of handoffs
                 self.app._error_limiting = {}  # clear out errors
@@ -5068,7 +5091,8 @@ class TestReplicatedObjectController(
                                     last_error=(2 ** 63 - 1))
 
                 collected_nodes = []
-                for node in self.app.iter_nodes(object_ring, partition):
+                for node in self.app.iter_nodes(object_ring, partition,
+                                                self.logger):
                     collected_nodes.append(node)
                 self.assertEqual(len(collected_nodes), 10)
                 self.assertEqual(
@@ -5099,7 +5123,7 @@ class TestReplicatedObjectController(
         with mock.patch.object(self.app, 'sort_nodes',
                                side_effect=fake_sort_nodes):
             object_ring = self.app.get_object_ring(None)
-            for node in self.app.iter_nodes(object_ring, 0):
+            for node in self.app.iter_nodes(object_ring, 0, self.logger):
                 pass
             self.assertEqual(called, [
                 mock.call(object_ring.get_part_nodes(0), policy=None)
@@ -5109,12 +5133,15 @@ class TestReplicatedObjectController(
         with mock.patch.object(self.app, 'sort_nodes',
                                lambda n, *args, **kwargs: n):
             object_ring = self.app.get_object_ring(None)
-            first_nodes = list(self.app.iter_nodes(object_ring, 0))
-            second_nodes = list(self.app.iter_nodes(object_ring, 0))
+            first_nodes = list(self.app.iter_nodes(
+                object_ring, 0, self.logger))
+            second_nodes = list(self.app.iter_nodes(
+                object_ring, 0, self.logger))
             self.assertIn(first_nodes[0], second_nodes)
 
             self.app.error_limit(first_nodes[0], 'test')
-            second_nodes = list(self.app.iter_nodes(object_ring, 0))
+            second_nodes = list(self.app.iter_nodes(
+                object_ring, 0, self.logger))
             self.assertNotIn(first_nodes[0], second_nodes)
 
     def test_iter_nodes_gives_extra_if_error_limited_inline(self):
@@ -5124,9 +5151,10 @@ class TestReplicatedObjectController(
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 6), \
                 mock.patch.object(object_ring, 'max_more_nodes', 99):
-            first_nodes = list(self.app.iter_nodes(object_ring, 0))
+            first_nodes = list(self.app.iter_nodes(
+                object_ring, 0, self.logger))
             second_nodes = []
-            for node in self.app.iter_nodes(object_ring, 0):
+            for node in self.app.iter_nodes(object_ring, 0, self.logger):
                 if not second_nodes:
                     self.app.error_limit(node, 'test')
                 second_nodes.append(node)
@@ -5141,7 +5169,7 @@ class TestReplicatedObjectController(
                                lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 3):
-            got_nodes = list(self.app.iter_nodes(object_ring, 0,
+            got_nodes = list(self.app.iter_nodes(object_ring, 0, self.logger,
                                                  node_iter=iter(node_list)))
         self.assertEqual(node_list[:3], got_nodes)
 
@@ -5149,7 +5177,7 @@ class TestReplicatedObjectController(
                                lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 1000000):
-            got_nodes = list(self.app.iter_nodes(object_ring, 0,
+            got_nodes = list(self.app.iter_nodes(object_ring, 0, self.logger,
                                                  node_iter=iter(node_list)))
         self.assertEqual(node_list, got_nodes)
 
@@ -11193,7 +11221,7 @@ class FakeObjectController(object):
         resp = Response(app_iter=iter(body))
         return resp
 
-    def iter_nodes(self, ring, partition):
+    def iter_nodes(self, ring, partition, logger):
         for node in ring.get_part_nodes(partition):
             yield node
         for node in ring.get_more_nodes(partition):

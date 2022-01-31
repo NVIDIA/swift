@@ -196,8 +196,8 @@ class BaseObjectController(Controller):
         policy_options = self.app.get_policy_options(policy)
         is_local = policy_options.write_affinity_is_local_fn
         if is_local is None:
-            return self.app.iter_nodes(ring, partition, policy=policy,
-                                       logger=self.logger)
+            return self.app.iter_nodes(ring, partition, self.logger,
+                                       policy=policy)
 
         primary_nodes = ring.get_part_nodes(partition)
         handoff_nodes = ring.get_more_nodes(partition)
@@ -230,8 +230,8 @@ class BaseObjectController(Controller):
             (node for node in all_nodes if node not in preferred_nodes)
         )
 
-        return self.app.iter_nodes(ring, partition, node_iter=node_iter,
-                                   policy=policy, logger=self.logger)
+        return self.app.iter_nodes(ring, partition, self.logger,
+                                   node_iter=node_iter, policy=policy)
 
     def GETorHEAD(self, req):
         """Handle HTTP GET or HEAD requests."""
@@ -250,8 +250,8 @@ class BaseObjectController(Controller):
                 return aresp
         partition = obj_ring.get_part(
             self.account_name, self.container_name, self.object_name)
-        node_iter = self.app.iter_nodes(obj_ring, partition, policy=policy,
-                                        logger=self.logger)
+        node_iter = self.app.iter_nodes(obj_ring, partition, self.logger,
+                                        policy=policy)
 
         resp = self._get_or_head_response(req, node_iter, partition, policy)
 
@@ -2379,7 +2379,7 @@ class ECFragGetter(object):
 
     def __init__(self, app, req, node_iter, partition, policy, path,
                  backend_headers, header_provider, logger_thread_locals,
-                 logger=None):
+                 logger):
         self.app = app
         self.req = req
         self.node_iter = node_iter
@@ -2393,7 +2393,7 @@ class ECFragGetter(object):
         self.bytes_used_from_backend = 0
         self.source = None
         self.logger_thread_locals = logger_thread_locals
-        self.logger = logger if logger else app.logger
+        self.logger = logger
 
     def fast_forward(self, num_bytes):
         """
@@ -2860,7 +2860,8 @@ class ECObjectController(BaseObjectController):
 
         getter = ECFragGetter(self.app, req, node_iter, partition,
                               policy, req.swift_entity_path, backend_headers,
-                              header_provider, logger_thread_locals)
+                              header_provider, logger_thread_locals,
+                              self.logger)
         return (getter, getter.response_parts_iter(req))
 
     def _convert_range(self, req, policy):

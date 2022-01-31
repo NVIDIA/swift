@@ -26,7 +26,6 @@
 
 from six.moves.urllib.parse import quote
 
-import os
 import time
 import json
 import functools
@@ -46,7 +45,7 @@ from swift.common.utils import Timestamp, WatchdogTimeout, config_true_value, \
     public, split_path, list_from_csv, GreenthreadSafeIterator, \
     GreenAsyncPile, quorum_size, parse_content_type, drain_and_close, \
     document_iters_to_http_response_body, ShardRange, find_shard_range, \
-    cache_from_env, PrefixLoggerAdapter
+    cache_from_env, MetricsPrefixLoggerAdapter
 from swift.common.bufferedhttp import http_connect
 from swift.common import constraints
 from swift.common.exceptions import ChunkReadTimeout, ChunkWriteTimeout, \
@@ -964,7 +963,7 @@ class GetOrHeadHandler(object):
         self.path = path
         self.backend_headers = backend_headers
         self.client_chunk_size = client_chunk_size
-        self.logger = logger if logger else app.logger
+        self.logger = logger or app.logger
         self.skip_bytes = 0
         self.bytes_used_from_backend = 0
         self.used_nodes = []
@@ -1614,7 +1613,7 @@ class NodeIter(object):
             policy=policy)
         self.handoff_iter = node_iter
         self._node_provider = None
-        self.logger = logger if logger else self.app.logger
+        self.logger = logger or self.app.logger
 
     @property
     def primaries_left(self):
@@ -1709,8 +1708,8 @@ class Controller(object):
         self._allowed_methods = None
         self._private_methods = None
         # adapt the app logger to prefix statsd metrics with the server type
-        self.logger = PrefixLoggerAdapter(
-            self.app.logger, {'metric_prefix': self.server_type.lower()})
+        self.logger = MetricsPrefixLoggerAdapter(
+            self.app.logger, {}, self.server_type.lower())
 
     @property
     def allowed_methods(self):
@@ -1783,7 +1782,7 @@ class Controller(object):
             referer = ''
         headers['x-trans-id'] = self.trans_id
         headers['connection'] = 'close'
-        headers['user-agent'] = 'proxy-server %s' % os.getpid()
+        headers['user-agent'] = self.app.backend_user_agent
         headers['referer'] = referer
         return headers
 
@@ -1933,8 +1932,7 @@ class Controller(object):
         :returns: a swob.Response object
         """
         nodes = GreenthreadSafeIterator(
-            node_iterator or self.app.iter_nodes(ring, part,
-                                                 logger=self.logger)
+            node_iterator or self.app.iter_nodes(ring, part, self.logger)
         )
         node_number = node_count or len(ring.get_part_nodes(part))
         pile = GreenAsyncPile(node_number)
@@ -2399,10 +2397,8 @@ class Controller(object):
                 self.logger.increment('shard_updating.cache.skip')
             else:
                 cached_ranges = memcache.get(cache_key)
-                if cached_ranges:
-                    self.logger.increment('shard_updating.cache.hit')
-                else:
-                    self.logger.increment('shard_updating.cache.miss')
+                self.logger.increment('shard_updating.cache.%s' % (
+                    'hit' if cached_ranges else 'miss'))
 
         if cached_ranges:
             shard_ranges = [

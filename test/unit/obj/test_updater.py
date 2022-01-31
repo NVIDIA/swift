@@ -626,11 +626,9 @@ class TestObjectUpdater(unittest.TestCase):
 
         # final update has Timeout
         ou.logger.clear()
-        mock_connect = mock.MagicMock()
-        mock_connect.getresponse = mock.MagicMock(side_effect=Timeout(99))
-
-        with mock.patch('swift.obj.updater.http_connect',
-                        return_value=mock_connect):
+        with Timeout(99) as exc, \
+                mock.patch('swift.obj.updater.http_connect') as mock_connect:
+            mock_connect.return_value.getresponse.side_effect = exc
             ou.run_once()
         self.assertTrue(os.path.exists(op_path))
         self.assertEqual(ou.logger.get_increment_counts(),
@@ -647,12 +645,9 @@ class TestObjectUpdater(unittest.TestCase):
 
         # final update has ConnectionTimeout
         ou.logger.clear()
-        mock_connect = mock.MagicMock()
-        mock_connect.getresponse = mock.MagicMock(
-            side_effect=ConnectionTimeout(9))
-
-        with mock.patch('swift.obj.updater.http_connect',
-                        return_value=mock_connect):
+        with ConnectionTimeout(9) as exc, \
+                mock.patch('swift.obj.updater.http_connect') as mock_connect:
+            mock_connect.return_value.getresponse.side_effect = exc
             ou.run_once()
         self.assertTrue(os.path.exists(op_path))
         self.assertEqual(ou.logger.get_increment_counts(),
@@ -1401,9 +1396,10 @@ class TestObjectUpdater(unittest.TestCase):
         info_lines = self.logger.get_lines_for_level('info')
         self.assertTrue(info_lines)
         self.assertIn('2 successes, 0 failures, 0 quarantines, 2 unlinks, '
-                      '0 errors, 0 redirects, 9 skips, 0 deferrals, 0 drains',
+                      '0 errors, 0 redirects, 9 skips, 9 deferrals, 0 drains',
                       info_lines[-1])
-        self.assertEqual({'skips': 9, 'successes': 2, 'unlinks': 2},
+        self.assertEqual({'skips': 9, 'successes': 2, 'unlinks': 2,
+                          'deferrals': 9},
                          self.logger.get_increment_counts())
 
     @mock.patch('swift.obj.updater.dump_recon_cache')
@@ -1507,9 +1503,10 @@ class TestObjectUpdater(unittest.TestCase):
         info_lines = self.logger.get_lines_for_level('info')
         self.assertTrue(info_lines)
         self.assertIn('2 successes, 0 failures, 0 quarantines, 2 unlinks, '
-                      '0 errors, 0 redirects, 2 skips, 0 deferrals, 0 drains',
+                      '0 errors, 0 redirects, 2 skips, 2 deferrals, 0 drains',
                       info_lines[-1])
-        self.assertEqual({'skips': 2, 'successes': 2, 'unlinks': 2},
+        self.assertEqual({'skips': 2, 'successes': 2, 'unlinks': 2,
+                          'deferrals': 2},
                          self.logger.get_increment_counts())
 
     @mock.patch('swift.obj.updater.dump_recon_cache')
@@ -1940,7 +1937,7 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
         self.assertEqual(update_ctxs[:1], [x for x in it])
         self.assertEqual(1, self.stats.skips)
         self.assertEqual(0, self.stats.drains)
-        self.assertEqual(0, self.stats.deferrals)
+        self.assertEqual(1, self.stats.deferrals)
 
     def test_deferral_single_bucket(self):
         # verify deferral - single bucket
