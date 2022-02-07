@@ -68,7 +68,12 @@ MULTIPARTS_TEMPLATE = \
      ('subdir/object/Z/1', '2014-05-07T19:47:58.592270', '0123456789abcdef',
       41),
      ('subdir/object/Z/2', '2014-05-07T19:47:58.592270', 'fedcba9876543210',
-      41))
+      41),
+     # NB: wsgi strings
+     ('subdir/object/completed\xe2\x98\x83/W/1', '2014-05-07T19:47:58.592270',
+      '0123456789abcdef', 41),
+     ('subdir/object/completed\xe2\x98\x83/W/2', '2014-05-07T19:47:58.592270',
+      'fedcba9876543210', 41))
 
 S3_ETAG = '"%s-2"' % md5(binascii.a2b_hex(
     '0123456789abcdef0123456789abcdef'

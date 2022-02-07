@@ -1585,6 +1585,7 @@ class NodeIter(object):
     :param app: a proxy app
     :param ring: ring to get yield nodes from
     :param partition: ring partition to yield nodes for
+    :param logger: a logger instance
     :param node_iter: optional iterable of nodes to try. Useful if you
         want to filter or reorder the nodes.
     :param policy: an instance of :class:`BaseStoragePolicy`. This should be
@@ -1592,11 +1593,12 @@ class NodeIter(object):
     :param logger: a logger instance; defaults to the app logger
     """
 
-    def __init__(self, app, ring, partition, node_iter=None, policy=None,
-                 logger=None):
+    def __init__(self, app, ring, partition, logger, node_iter=None,
+                 policy=None):
         self.app = app
         self.ring = ring
         self.partition = partition
+        self.logger = logger
 
         part_nodes = ring.get_part_nodes(partition)
         if node_iter is None:

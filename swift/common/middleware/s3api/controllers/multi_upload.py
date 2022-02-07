@@ -347,7 +347,10 @@ class UploadsController(Controller):
                     new_uploads, prefix, delimiter)
             uploads.extend(new_uploads)
             prefixes.extend(new_prefixes)
-            query['marker'] = objects[-1]['name']
+            if six.PY2:
+                query['marker'] = objects[-1]['name'].encode('utf-8')
+            else:
+                query['marker'] = objects[-1]['name']
 
         truncated = len(uploads) >= maxuploads
         if len(uploads) > maxuploads:

@@ -19,8 +19,9 @@ import json
 from swift.cli.container_deleter import make_delete_jobs
 from swift.common.constraints import MAX_OBJECT_NAME_LENGTH
 from swift.common.http import HTTP_NO_CONTENT
-from swift.common.utils import public, StreamingPile, get_swift_info, \
-    Timestamp, config_true_value
+from swift.common.utils import public, StreamingPile, Timestamp, \
+    config_true_value
+from swift.common.registry import get_swift_info
 from swift.common.wsgi import make_pre_authed_request
 
 from swift.common.middleware.s3api.controllers.base import Controller, \

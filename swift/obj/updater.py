@@ -65,7 +65,32 @@ class RateLimiterBucket(object):
 
 class BucketizedUpdateSkippingLimiter(object):
     """
-    Wrap an iterator to filter elements that show up too often.
+    Wrap an iterator to rate-limit updates on a per-bucket basis, where updates
+    are mapped to buckets by hashing their destination path. If an update is
+    rate-limited then it is placed on a deferral queue and may be sent later if
+    the wrapped iterator is exhausted before the ``drain_until`` time is
+    reached.
+
+    The deferral queue has constrained size and once the queue is full updates
+    are evicted using a first-in-first-out policy. This policy is used because
+    updates on the queue may have been made obsolete by newer updates written
+    to disk, and this is more likely for updates that have been on the queue
+    longest.
+
+    The iterator increments stats as follows:
+
+      * The `deferrals` stat is incremented for each update that is
+        rate-limited. Note that a individual update is rate-limited at most
+        once.
+      * The `skips` stat is incremented for each rate-limited update that is
+        not eventually yielded. This includes updates that are evicted from the
+        deferral queue and all updates that remain in the deferral queue when
+        ``drain_until`` time is reached and the iterator terminates.
+      * The `drains` stat is incremented for each rate-limited update that is
+        eventually yielded.
+
+    Consequently, when this iterator terminates, the the sum of `skips` and
+    `drains` is equal to the number of `deferrals`.
 
     :param update_iterable: an async_pending update iterable
     :param logger: a logger instance
@@ -193,6 +218,15 @@ class BucketizedUpdateSkippingLimiter(object):
 class SweepStats(object):
     """
     Stats bucket for an update sweep
+
+    A measure of the rate at which updates are being rate-limited is:
+
+        deferrals / (deferrals + successes + failures - drains)
+
+    A measure of the rate at which updates are not being sent during a sweep
+    is:
+
+        skips / (skips + successes + failures)
     """
     def __init__(self, errors=0, failures=0, quarantines=0, successes=0,
                  unlinks=0, redirects=0, skips=0, deferrals=0, drains=0):
