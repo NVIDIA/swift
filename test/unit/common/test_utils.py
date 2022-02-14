@@ -85,6 +85,11 @@ from swift.common.swob import Request, Response
 from test.unit import requires_o_tmpfile_support_in_tmp, \
     quiet_eventlet_exceptions
 
+if six.PY2:
+    import eventlet.green.httplib as green_http_client
+else:
+    import eventlet.green.http.client as green_http_client
+
 threading = eventlet.patcher.original('threading')
 
 
@@ -2057,6 +2062,13 @@ class TestUtils(unittest.TestCase):
 
             # test BadStatusLine
             log_exception(http_client.BadStatusLine(''))
+            log_msg = strip_value(sio)
+            self.assertNotIn('Traceback', log_msg)
+            self.assertIn('BadStatusLine', log_msg)
+            self.assertIn("''", log_msg)
+
+            # green version is separate :-(
+            log_exception(green_http_client.BadStatusLine(''))
             log_msg = strip_value(sio)
             self.assertNotIn('Traceback', log_msg)
             self.assertIn('BadStatusLine', log_msg)
@@ -5417,6 +5429,16 @@ class TestStatsdLogging(unittest.TestCase):
         self.assertEqual(logger.logger.statsd_client._prefix, 'some-name.')
         self.assertEqual(logger.logger.statsd_client._default_sample_rate, 1)
 
+        logger2 = utils.get_logger(
+            {'log_statsd_host': 'some.host.com'},
+            'other-name', log_route='some-route',
+            statsd_tail_prefix='some-name.more-specific')
+        self.assertEqual(logger.logger.statsd_client._prefix,
+                         'some-name.more-specific.')
+        self.assertEqual(logger2.logger.statsd_client._prefix,
+                         'some-name.more-specific.')
+
+        # note: set_statsd_prefix is deprecated
         logger2 = utils.get_logger({'log_statsd_host': 'some.host.com'},
                                    'other-name', log_route='some-route')
         logger.set_statsd_prefix('some-name.more-specific')
@@ -5429,15 +5451,23 @@ class TestStatsdLogging(unittest.TestCase):
         self.assertEqual(logger2.logger.statsd_client._prefix, '')
 
     def test_get_logger_statsd_client_non_defaults(self):
-        logger = utils.get_logger({
+        conf = {
             'log_statsd_host': 'another.host.com',
             'log_statsd_port': '9876',
             'log_statsd_default_sample_rate': '0.75',
             'log_statsd_sample_rate_factor': '0.81',
             'log_statsd_metric_prefix': 'tomato.sauce',
-        }, 'some-name', log_route='some-route')
+        }
+        logger = utils.get_logger(conf, 'some-name', log_route='some-route')
         self.assertEqual(logger.logger.statsd_client._prefix,
                          'tomato.sauce.some-name.')
+
+        logger = utils.get_logger(conf, 'other-name', log_route='some-route',
+                                  statsd_tail_prefix='some-name.more-specific')
+        self.assertEqual(logger.logger.statsd_client._prefix,
+                         'tomato.sauce.some-name.more-specific.')
+
+        # note: set_statsd_prefix is deprecated
         logger.set_statsd_prefix('some-name.more-specific')
         self.assertEqual(logger.logger.statsd_client._prefix,
                          'tomato.sauce.some-name.more-specific.')
@@ -5449,6 +5479,37 @@ class TestStatsdLogging(unittest.TestCase):
                          0.75)
         self.assertEqual(logger.logger.statsd_client._sample_rate_factor,
                          0.81)
+
+    def test_statsd_set_prefix_deprecation(self):
+        conf = {'log_statsd_host': 'another.host.com'}
+
+        with warnings.catch_warnings(record=True) as cm:
+            warnings.resetwarnings()
+            warnings.simplefilter('always', DeprecationWarning)
+            logger = utils.get_logger(
+                conf, 'some-name', log_route='some-route')
+            logger.logger.statsd_client.set_prefix('some-name.more-specific')
+        msgs = [str(warning.message)
+                for warning in cm
+                if str(warning.message).startswith('set_prefix')]
+        self.assertEqual(
+            ['set_prefix() is deprecated; use the ``tail_prefix`` argument of '
+             'the constructor when instantiating the class instead.'],
+            msgs)
+
+        with warnings.catch_warnings(record=True) as cm:
+            warnings.resetwarnings()
+            warnings.simplefilter('always', DeprecationWarning)
+            logger = utils.get_logger(
+                conf, 'some-name', log_route='some-route')
+            logger.set_statsd_prefix('some-name.more-specific')
+        msgs = [str(warning.message)
+                for warning in cm
+                if str(warning.message).startswith('set_prefix')]
+        self.assertEqual(
+            ['set_prefix() is deprecated; use the ``tail_prefix`` argument of '
+             'the constructor when instantiating the class instead.'],
+            msgs)
 
     def test_ipv4_or_ipv6_hostname_defaults_to_ipv4(self):
         def stub_getaddrinfo_both_ipv4_and_ipv6(host, port, family, *rest):

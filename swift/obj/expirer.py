@@ -267,7 +267,9 @@ class ObjectExpirer(Daemon):
         task_container, task_object, timestamp_to_delete, and target_path
         """
         for task_account, task_container in task_account_container_list:
+            container_empty = True
             for o in self.swift.iter_objects(task_account, task_container):
+                container_empty = False
                 if six.PY2:
                     task_object = o['name'].encode('utf8')
                 else:
@@ -297,6 +299,17 @@ class ObjectExpirer(Daemon):
                            target_account, target_container, target_object]),
                        'delete_timestamp': delete_timestamp,
                        'is_async_delete': is_async}
+            if container_empty:
+                try:
+                    self.swift.delete_container(
+                        task_account, task_container,
+                        acceptable_statuses=(2, HTTP_NOT_FOUND, HTTP_CONFLICT))
+                except (Exception, Timeout) as err:
+                    self.logger.exception(
+                        'Exception while deleting container %(account)s '
+                        '%(container)s %(err)s', {
+                            'account': task_account,
+                            'container': task_container, 'err': str(err)})
 
     def run_once(self, *args, **kwargs):
         """
@@ -325,7 +338,6 @@ class ObjectExpirer(Daemon):
         self.report_objects = 0
         try:
             self.logger.debug('Run begin')
-            task_account_container_list_to_delete = list()
             for task_account, my_index, divisor in \
                     self.iter_task_accounts_to_expire():
                 container_count, obj_count = \
@@ -347,9 +359,6 @@ class ObjectExpirer(Daemon):
                     [(task_account, task_container) for task_container in
                      self.iter_task_containers_to_expire(task_account)]
 
-                task_account_container_list_to_delete.extend(
-                    task_account_container_list)
-
                 # delete_task_iter is a generator to yield a dict of
                 # task_account, task_container, task_object, delete_timestamp,
                 # target_path to handle delete actual object and pop the task
@@ -364,18 +373,6 @@ class ObjectExpirer(Daemon):
                     pool.spawn_n(self.delete_object, **delete_task)
 
             pool.waitall()
-            for task_account, task_container in \
-                    task_account_container_list_to_delete:
-                try:
-                    self.swift.delete_container(
-                        task_account, task_container,
-                        acceptable_statuses=(2, HTTP_NOT_FOUND, HTTP_CONFLICT))
-                except (Exception, Timeout) as err:
-                    self.logger.exception(
-                        'Exception while deleting container %(account)s '
-                        '%(container)s %(err)s', {
-                            'account': task_account,
-                            'container': task_container, 'err': str(err)})
             self.logger.debug('Run end')
             self.report(final=True)
         except (Exception, Timeout):
@@ -473,8 +470,9 @@ class ObjectExpirer(Daemon):
         direct_delete_container_entry(self.swift.container_ring, task_account,
                                       task_container, task_object)
 
-    def _delete_mpu_segments(self, a, c, o, upload_id, num_segments, headers,
-                             acceptable_statuses):
+    def _delete_mpu_segments(self, a, c, o, upload_id, num_segments, headers):
+        # if the segment gets reaped before the manifest that's ok
+        acceptable_statuses = (2, HTTP_CONFLICT, HTTP_NOT_FOUND)
         c = '%s+segments' % c
         for segment_number in range(int(num_segments)):
             segment_name = '%s/%s/%s' % (o, upload_id, segment_number + 1)
@@ -527,4 +525,4 @@ class ObjectExpirer(Daemon):
         headers.pop('X-If-Delete-At', None)
         num_segments = int(resp.headers[segments_key].rsplit('-', 1)[1])
         self._delete_mpu_segments(a, c, o, resp.headers[upload_id_key],
-                                  num_segments, headers, acceptable_statuses)
+                                  num_segments, headers)

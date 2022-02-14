@@ -16,6 +16,7 @@
 # Used by get_swift_info and register_swift_info to store information about
 # the swift cluster.
 from copy import deepcopy
+import six
 
 _swift_info = {}
 _swift_admin_info = {}
@@ -84,3 +85,70 @@ def register_swift_info(name='swift', admin=False, **kwargs):
         if "." in key:
             raise ValueError('Cannot use "." in a swift_info key: %s' % key)
         dict_to_use[name][key] = val
+
+
+_sensitive_headers = set()
+_sensitive_params = set()
+
+
+def get_sensitive_headers():
+    """
+    Returns the set of registered sensitive headers.
+
+    Used by :mod:`swift.common.middleware.proxy_logging` to perform redactions
+    prior to logging.
+    """
+    return frozenset(_sensitive_headers)
+
+
+def register_sensitive_header(header):
+    """
+    Register a header as being "sensitive".
+
+    Sensitive headers are automatically redacted when logging. See the
+    ``reveal_sensitive_prefix`` option in the proxy-server sample config
+    for more information.
+
+    :param header: The (case-insensitive) header name which, if present, may
+        contain sensitive information. Examples include ``X-Auth-Token`` and
+        (if s3api is enabled) ``Authorization``. Limited to ASCII characters.
+    """
+    if not isinstance(header, str):
+        raise TypeError
+    if six.PY2:
+        header.decode('ascii')
+    else:
+        header.encode('ascii')
+    _sensitive_headers.add(header.lower())
+
+
+def get_sensitive_params():
+    """
+    Returns the set of registered sensitive query parameters.
+
+    Used by :mod:`swift.common.middleware.proxy_logging` to perform redactions
+    prior to logging.
+    """
+    return frozenset(_sensitive_params)
+
+
+def register_sensitive_param(query_param):
+    """
+    Register a query parameter as being "sensitive".
+
+    Sensitive query parameters are automatically redacted when logging. See
+    the ``reveal_sensitive_prefix`` option in the proxy-server sample config
+    for more information.
+
+    :param query_param: The (case-sensitive) query parameter name which, if
+        present, may contain sensitive information. Examples include
+        ``temp_url_signature`` and (if s3api is enabled) ``X-Amz-Signature``.
+        Limited to ASCII characters.
+    """
+    if not isinstance(query_param, str):
+        raise TypeError
+    if six.PY2:
+        query_param.decode('ascii')
+    else:
+        query_param.encode('ascii')
+    _sensitive_params.add(query_param)

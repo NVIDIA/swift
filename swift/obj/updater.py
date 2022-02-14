@@ -89,7 +89,7 @@ class BucketizedUpdateSkippingLimiter(object):
       * The `drains` stat is incremented for each rate-limited update that is
         eventually yielded.
 
-    Consequently, when this iterator terminates, the the sum of `skips` and
+    Consequently, when this iterator terminates, the sum of `skips` and
     `drains` is equal to the number of `deferrals`.
 
     :param update_iterable: an async_pending update iterable
