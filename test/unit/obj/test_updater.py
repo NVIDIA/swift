@@ -1652,7 +1652,7 @@ class TestObjectUpdater(unittest.TestCase):
                          len(self._find_async_pending_files()))
         # indexes 0, 2 succeed; 1, 3, 4 deferred but 1 is bumped from deferral
         # queue by 4; 4, 3 are then drained
-        latencies = [0, 0.05, .051, 0, 0, 0, .11]
+        latencies = [0, 0.05, .051, 0, 0, 0, .11, .01]
         expected_success = 4
 
         contexts_fed_in = []
@@ -1692,7 +1692,8 @@ class TestObjectUpdater(unittest.TestCase):
                 mock.patch.object(daemon, 'object_update',
                                   fake_object_update), \
                 mock.patch('swift.obj.updater.RateLimitedIterator',
-                           fake_rate_limited_iterator):
+                           fake_rate_limited_iterator), \
+                mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
             daemon.run_once()
         self.assertEqual(expected_success, daemon.stats.successes)
         expected_skipped = expected_total - expected_success
@@ -1718,7 +1719,7 @@ class TestObjectUpdater(unittest.TestCase):
         self.assertEqual([aorder[o] for o in expected_updates_sent],
                          [aorder[o] for o in actual_updates_sent])
 
-        self.assertEqual([0, 0, 0, 0, 0, 1, 1], captured_skips_stats)
+        self.assertEqual([0, 0, 0, 0, 0, 1, 1, 1], captured_skips_stats)
 
         expected_deferrals = [
             [],
@@ -1728,10 +1729,15 @@ class TestObjectUpdater(unittest.TestCase):
             [objs_fed_in[1], objs_fed_in[3]],
             [objs_fed_in[3], objs_fed_in[4]],
             [objs_fed_in[3]],  # note: rightmost element is drained
+            [objs_fed_in[3]],
         ]
         self.assertEqual(
             expected_deferrals,
             [[ctx['update']['obj'] for ctx in q] for q in captured_queues])
+        actual_sleeps = [call[0][0] for call in mock_sleep.call_args_list]
+        self.assertEqual(2, len(actual_sleeps))
+        self.assertAlmostEqual(0.1, actual_sleeps[0], 3)
+        self.assertAlmostEqual(0.09, actual_sleeps[1], 3)
         info_lines = self.logger.get_lines_for_level('info')
         self.assertTrue(info_lines)
         self.assertIn('4 successes, 0 failures, 0 quarantines, 4 unlinks, '
@@ -1769,7 +1775,8 @@ class TestObjectUpdater(unittest.TestCase):
                          len(self._find_async_pending_files()))
         # first pass: 0, 2 and 5 succeed, 1, 3, 4, 6 deferred
         # last 2 deferred items sent before interval elapses
-        latencies = [0, .05, 0.051, 0, 0, .11, 0, 0, 0.1, 0.1]  # total 0.42
+        latencies = [0, .05, 0.051, 0, 0, .11, 0, 0,
+                     0.1, 0, 0.1, 0]  # total 0.42
         expected_success = 5
 
         contexts_fed_in = []
@@ -1812,7 +1819,8 @@ class TestObjectUpdater(unittest.TestCase):
                 mock.patch.object(daemon, 'object_update',
                                   fake_object_update), \
                 mock.patch('swift.obj.updater.RateLimitedIterator',
-                           fake_rate_limited_iterator):
+                           fake_rate_limited_iterator), \
+                mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
             daemon.run_once()
         self.assertEqual(expected_success, daemon.stats.successes)
         expected_skipped = expected_total - expected_success
@@ -1832,7 +1840,7 @@ class TestObjectUpdater(unittest.TestCase):
         self.assertEqual(expected_updates_sent, actual_updates_sent)
 
         # skips (un-drained deferrals) not reported until end of cycle
-        self.assertEqual([0] * 10, captured_skips_stats)
+        self.assertEqual([0] * 12, captured_skips_stats)
 
         objs_fed_in = [ctx['update']['obj'] for ctx in contexts_fed_in]
         expected_deferrals = [
@@ -1848,11 +1856,17 @@ class TestObjectUpdater(unittest.TestCase):
             # note: rightmost element is drained
             [objs_fed_in[1], objs_fed_in[3], objs_fed_in[4], objs_fed_in[6]],
             [objs_fed_in[1], objs_fed_in[3], objs_fed_in[4]],
+            [objs_fed_in[1], objs_fed_in[3], objs_fed_in[4]],
+            [objs_fed_in[1], objs_fed_in[3]],
             [objs_fed_in[1], objs_fed_in[3]],
         ]
         self.assertEqual(
             expected_deferrals,
             [[ctx['update']['obj'] for ctx in q] for q in captured_queues])
+        actual_sleeps = [call[0][0] for call in mock_sleep.call_args_list]
+        self.assertEqual(2, len(actual_sleeps))
+        self.assertAlmostEqual(0.1, actual_sleeps[0], 3)
+        self.assertAlmostEqual(0.1, actual_sleeps[1], 3)
         info_lines = self.logger.get_lines_for_level('info')
         self.assertTrue(info_lines)
         self.assertIn('5 successes, 0 failures, 0 quarantines, 5 unlinks, '
@@ -1948,7 +1962,7 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
 
         # enough capacity for all deferrals
         with mock.patch('swift.obj.updater.time.time',
-                        side_effect=[now, now, now, now, now]):
+                        side_effect=[now, now, now, now, now, now]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
                     iter(update_ctxs[:3]), self.logger, self.stats, 1, 10,
@@ -1985,7 +1999,7 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
 
         # only time for one deferral
         with mock.patch('swift.obj.updater.time.time',
-                        side_effect=[now, now, now, now, now + 20]):
+                        side_effect=[now, now, now, now, now + 20, now + 20]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
                     iter(update_ctxs[:3]), self.logger, self.stats, 1, 10,
@@ -2003,7 +2017,8 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
 
         # only space for two deferrals, only time for one deferral
         with mock.patch('swift.obj.updater.time.time',
-                        side_effect=[now, now, now, now, now, now + 20]):
+                        side_effect=[now, now, now, now, now,
+                                     now + 20, now + 20]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
                     iter(update_ctxs), self.logger, self.stats, 1, 10,
@@ -2032,7 +2047,7 @@ class TestBucketizedUpdateSkippingLimiter(unittest.TestCase):
 
         # deferrals stick in both buckets
         with mock.patch('swift.obj.updater.time.time',
-                        side_effect=[next(time_iter) for _ in range(10)]):
+                        side_effect=[next(time_iter) for _ in range(12)]):
             with mock.patch('swift.obj.updater.time.sleep') as mock_sleep:
                 it = object_updater.BucketizedUpdateSkippingLimiter(
                     iter(update_ctxs_1 + update_ctxs_2),
@@ -2120,6 +2135,14 @@ class TestRateLimiterBucket(unittest.TestCase):
         b1.deque.pop()
         self.assertEqual(1, len(b1))
 
+    def test_bool(self):
+        b1 = object_updater.RateLimiterBucket(10)
+        self.assertFalse(b1)
+        b1.deque.append(1)
+        self.assertTrue(b1)
+        b1.deque.pop()
+        self.assertFalse(b1)
+
     def test_bucket_ordering(self):
         time_iter = itertools.count(time(), step=0.001)
         b1 = object_updater.RateLimiterBucket(10)
@@ -2139,7 +2162,8 @@ class TestRateLimiterBucket(unittest.TestCase):
 
 class TestSweepStats(unittest.TestCase):
     def test_copy(self):
-        stats = object_updater.SweepStats(1, 2, 3, 4, 5, 6, 7, 8, 9)
+        num_props = len(vars(object_updater.SweepStats()))
+        stats = object_updater.SweepStats(*range(1, num_props + 1))
         stats2 = stats.copy()
         self.assertEqual(vars(stats), vars(stats2))
 
@@ -2150,13 +2174,15 @@ class TestSweepStats(unittest.TestCase):
         self.assertEqual(vars(expected), vars(stats2.since(stats)))
 
     def test_reset(self):
-        stats = object_updater.SweepStats(1, 2, 3, 4, 5, 6, 7, 8, 9)
+        num_props = len(vars(object_updater.SweepStats()))
+        stats = object_updater.SweepStats(*range(1, num_props + 1))
         stats.reset()
         expected = object_updater.SweepStats()
         self.assertEqual(vars(expected), vars(stats))
 
     def test_str(self):
-        stats = object_updater.SweepStats(1, 2, 3, 4, 5, 6, 7, 8, 9)
+        num_props = len(vars(object_updater.SweepStats()))
+        stats = object_updater.SweepStats(*range(1, num_props + 1))
         self.assertEqual(
             '4 successes, 2 failures, 3 quarantines, 5 unlinks, 1 errors, '
             '6 redirects, 7 skips, 8 deferrals, 9 drains', str(stats))

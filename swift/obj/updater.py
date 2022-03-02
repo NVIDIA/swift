@@ -56,6 +56,11 @@ class RateLimiterBucket(object):
     def __len__(self):
         return len(self.deque)
 
+    def __bool__(self):
+        return bool(self.deque)
+
+    __nonzero__ = __bool__  # py2
+
     def __lt__(self, other):
         # used to sort buckets by readiness
         if isinstance(other, RateLimiterBucket):
@@ -127,7 +132,6 @@ class BucketizedUpdateSkippingLimiter(object):
         self.deferred_buckets = deque()
         self.drain_until = drain_until
         self.salt = str(uuid.uuid4())
-        # an array might be more efficient; but this is pretty cheap
         self.buckets = [RateLimiterBucket(self.bucket_update_delta)
                         for _ in range(self.num_buckets)]
         self.buckets_ordered_by_readiness = None
@@ -180,7 +184,7 @@ class BucketizedUpdateSkippingLimiter(object):
             # ready to serve an element
             self.buckets_ordered_by_readiness = queue.PriorityQueue()
             for bucket in self.buckets:
-                if len(bucket) > 0:
+                if bucket:
                     self.buckets_ordered_by_readiness.put(bucket)
 
         # now drain the buckets...
@@ -193,10 +197,10 @@ class BucketizedUpdateSkippingLimiter(object):
                 time.sleep(max(0, bucket.wait_until - now))
                 # drain the most recently deferred element
                 item = bucket.deque.pop()
-                bucket.last_time = bucket.wait_until
-                if len(bucket) > 0:
+                if bucket:
                     # bucket has more deferred elements, re-insert in queue in
                     # correct chronological position
+                    bucket.last_time = self._get_time()
                     self.buckets_ordered_by_readiness.put(bucket)
                 self.stats.drains += 1
                 self.logger.increment("drains")
