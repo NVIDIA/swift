@@ -472,4 +472,7 @@ ACL_MAP = {
     {'Permission': 'WRITE'},
     ('DELETE', 'GET', 'container'):
     {'Permission': 'WRITE'},
+    # Inventory
+    ('DELETE', 'POST', 'container'):
+    {'Permission': 'WRITE'},
 }
