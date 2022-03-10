@@ -35,6 +35,8 @@ from swift.common.middleware.s3api.controllers.tagging import \
     TaggingController
 from swift.common.middleware.s3api.controllers.object_lock import \
     ObjectLockController
+from swift.common.middleware.s3api.controllers.inventory import \
+    InventoryController
 
 __all__ = [
     'Controller',
@@ -53,6 +55,7 @@ __all__ = [
     'VersioningController',
     'TaggingController',
     'ObjectLockController',
+    'InventoryController',
 
     'UnsupportedController',
 ]

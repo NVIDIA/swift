@@ -125,6 +125,14 @@
     value: public
   become: true
 
+- name: Configure s3api s3_inventory_enabled
+  ini_file:
+    path: /etc/swift/proxy-server.conf
+    section: filter:s3api
+    option: "s3_inventory_enabled"
+    value: "{{ s3_inventory_enabled }}"
+  become: true
+
 - name: Copy ring for Policy-1
   copy:
     remote_src: true

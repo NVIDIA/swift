@@ -112,7 +112,9 @@ class S3ApiTestCase(BaseUnitTestCase):
             'force_swift_request_proxy_log': False,
             'allow_multipart_uploads': True,
             'min_segment_size': 5242880,
-            'log_level': 'debug'
+            'log_level': 'debug',
+            's3_inventory_enabled': False,
+            's3_inventory_allowed_paths': '*',
         }
 
         # note: self.conf has no __file__ key so check_pipeline will be skipped
@@ -204,9 +206,10 @@ class S3ApiTestCase(BaseUnitTestCase):
                              {x.tag for x in elem})
         return self._get_error_code(body)
 
-    def get_date_header(self, skew=0):
+    def get_date_header(self, now=None, skew=0):
         # email.utils.formatdate returns utc timestamp in default
-        return email.utils.formatdate(time.time() + skew)
+        now = time.time() if now is None else now
+        return email.utils.formatdate(now + skew)
 
     def get_v4_amz_date_header(self, offset=None):
         when = datetime.now(timezone.utc)
