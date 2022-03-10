@@ -671,6 +671,21 @@ use = egg:swift#s3api
 # You can override the default log routing for this filter here:
 # log_name = s3api
 
+# If S3 bucket inventory generation is supported then the inventory
+# configuration API can be enabled.
+# s3_inventory_enabled = false
+
+# Specifies a restricted list of paths for which inventory configurations are
+# allowed to be created or deleted. The value should be a comma separated list;
+# any entry ending with '*' will match any path starting with that entry. Each
+# path should have the form <access_key_id>/<bucket_name>. Note that
+# access_key_id is used in the path rather than account name. Depending on the
+# auth middleware in use, the access_key_id may differ from the account name
+# e.g. the account "AUTH_foo" might have access_key_id "foo". The default
+# allows all paths. This option does not restrict getting or listing inventory
+# configurations on any path.
+# s3_inventory_allowed_paths = *
+
 [filter:s3token]
 # s3token middleware authenticates with keystone using the s3 credentials
 # provided in the request header. Please put s3token between s3api
