@@ -90,9 +90,13 @@ class S3ApiTestCase(unittest.TestCase):
             'force_swift_request_proxy_log': False,
             'allow_multipart_uploads': True,
             'min_segment_size': 5242880,
-            'log_level': 'debug'
+            'log_level': 'debug',
+            's3_inventory_enabled': False,
+            's3_inventory_allowed_paths': '*',
         }
+        self.make_app()
 
+    def make_app(self):
         self.app = FakeApp()
         self.swift = self.app.swift
         # note: self.conf has no __file__ key so check_pipeline will be skipped
