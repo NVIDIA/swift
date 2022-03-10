@@ -340,6 +340,7 @@
     timeout: 5400
     vars:
       s3_acl: yes
+      s3_inventory_enabled: yes
       bindep_profile: test py36
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
@@ -361,6 +362,7 @@
     timeout: 1800
     vars:
       s3_acl: yes
+      s3_inventory_enabled: yes
       bindep_profile: test py36
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
@@ -398,6 +400,7 @@
     timeout: 7200
     vars:
       s3_acl: no
+      s3_inventory_enabled: no
       bindep_profile: test py36
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
@@ -425,6 +428,8 @@
     description: |
       Setup a SAIO dev environment and run Swift's CORS functional tests
     timeout: 1200
+    vars:
+      s3_inventory_enabled: no
     pre-run:
       - tools/playbooks/cors/install_selenium.yaml
     run: tools/playbooks/cors/run.yaml
