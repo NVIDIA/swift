@@ -295,6 +295,10 @@ class S3ApiMiddleware(object):
                              'all domains, * must be the only entry')
         self.conf.ratelimit_as_client_error = config_true_value(
             wsgi_conf.get('ratelimit_as_client_error', False))
+        self.conf.s3_inventory_enabled = config_true_value(
+            wsgi_conf.get('s3_inventory_enabled', False))
+        self.conf.s3_inventory_allowed_paths = list_from_csv(
+            wsgi_conf.get('s3_inventory_allowed_paths', '*'))
 
         self.logger = get_logger(
             wsgi_conf, log_route='s3api', statsd_tail_prefix='s3api')
@@ -471,6 +475,8 @@ def filter_factory(global_conf, **local_conf):
             conf.get('allow_multipart_uploads', True)),
         min_segment_size=int(conf.get('min_segment_size', 5242880)),
         s3_acl=config_true_value(conf.get('s3_acl', False)),
+        s3_inventory_enabled=config_true_value(
+            conf.get('s3_inventory_enabled', False)),
     )
 
     register_sensitive_header('authorization')
