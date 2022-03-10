@@ -247,6 +247,7 @@
         swift: true
         s3api: true
       zuul_work_dir: src/opendev.org/openstack/swift
+      s3_inventory_enabled: yes
     pre-run: tools/playbooks/dsvm/pre.yaml
     run: tools/playbooks/dsvm/run.yaml
     post-run: tools/playbooks/dsvm/post.yaml
@@ -271,6 +272,7 @@
       tox_environment:
         COLUMNS: 240
       s3_acl: yes
+      s3_inventory_enabled: yes
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
@@ -293,6 +295,7 @@
       tox_environment:
         COLUMNS: 240
       s3_acl: yes
+      s3_inventory_enabled: yes
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
@@ -315,6 +318,7 @@
       tox_environment:
         COLUMNS: 240
       s3_acl: no
+      s3_inventory_enabled: no
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
@@ -341,6 +345,8 @@
     description: |
       Setup a SAIO dev environment and run Swift's CORS functional tests
     timeout: 1200
+    vars:
+      s3_inventory_enabled: no
     pre-run:
       - tools/playbooks/cors/install_selenium.yaml
     run: tools/playbooks/cors/run.yaml
