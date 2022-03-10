@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<grammar xmlns="http://relaxng.org/ns/structure/1.0"
+         datatypeLibrary="http://www.w3.org/2001/XMLSchema-datatypes">
+    <start>
+        <element name="InventoryConfiguration">
+            <interleave>
+                <element name="Destination">
+                    <element name="S3BucketDestination">
+                        <interleave>
+                            <optional>
+                                <element name="AccountId">
+                                    <data type="string"/>
+                                </element>
+                            </optional>
+                            <element name="Bucket">
+                                <data type="string"/>
+                            </element>
+                            <element name="Format">
+                                <choice>
+                                    <value type="string">Parquet</value>
+                                    <value type="string">CSV</value>
+                                    <value type="string">ORC</value>
+                                </choice>
+                            </element>
+                            <optional>
+                                <element name="Prefix">
+                                    <data type="string"/>
+                                </element>
+                            </optional>
+                            <optional>
+                                <element name="Encryption">
+                                    <interleave>
+                                        <optional>
+                                            <element name="SSE-KMS">
+                                                <element name="KeyId">
+                                                    <data type="string"/>
+                                                </element>
+                                            </element>
+                                        </optional>
+                                        <optional>
+                                            <element name="SSE-S3">
+                                                <data type="string"/>
+                                            </element>
+                                        </optional>
+                                    </interleave>
+                                </element>
+                            </optional>
+                        </interleave>
+                    </element>
+                </element>
+                <element name="IsEnabled">
+                    <data type="boolean"/>
+                </element>
+                <optional>
+                    <element name="Filter">
+                        <element name="Prefix">
+                            <data type="string"/>
+                        </element>
+                    </element>
+                </optional>
+                <element name="Id">
+                    <data type="string"/>
+                </element>
+                <element name="IncludedObjectVersions">
+                    <choice>
+                        <value type="string">All</value>
+                        <value type="string">Current</value>
+                    </choice>
+                </element>
+                <optional>
+                    <element name="OptionalFields">
+                        <oneOrMore>
+                            <element name="Field">
+                                <data type="string"/>
+                            </element>
+                        </oneOrMore>
+                    </element>
+                </optional>
+                <element name="Schedule">
+                    <element name="Frequency">
+                        <choice>
+                            <value type="string">Daily</value>
+                            <value type="string">Weekly</value>
+                        </choice>
+                    </element>
+                </element>
+            </interleave>
+        </element>
+    </start>
+</grammar>
