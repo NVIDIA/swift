@@ -48,7 +48,7 @@ from swift.common.middleware.s3api.controllers import ServiceController, \
     LocationController, LoggingStatusController, PartController, \
     UploadController, UploadsController, VersioningController, \
     UnsupportedController, S3AclController, BucketController, \
-    TaggingController, ObjectLockController
+    TaggingController, ObjectLockController, InventoryController
 from swift.common.middleware.s3api.s3response import AccessDenied, \
     InvalidArgument, InvalidDigest, BucketAlreadyOwnedByYou, \
     RequestTimeTooSkewed, S3Response, SignatureDoesNotMatch, \
@@ -1822,6 +1822,8 @@ class S3Request(swob.Request):
             return TaggingController
         if 'object-lock' in self.params:
             return ObjectLockController
+        if 'inventory' in self.params:
+            return InventoryController
 
         unsupported = ('notification', 'policy', 'requestPayment', 'torrent',
                        'website', 'cors', 'restore')
