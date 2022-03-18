@@ -2055,12 +2055,22 @@ class TestRingBuilder(unittest.TestCase):
         for d in devs:
             rb.add_dev(d)
         rb.rebalance()
+        # There are so few devs,we'll be currently storing them in 1 byte
+        # dev ids.
+        self.assertEqual(rb.dev_id_bytes, 1)
+        self.assertEqual(rb._replica2part2dev[0].itemsize, 1)
         builder_file = os.path.join(self.testdir, 'test_save.builder')
         rb.save(builder_file)
+        # When we save the rb if the dev_id_bytes is < 2, we write it out to
+        # disk as 2 byte arrays (H) for backwards compatibility
+        self.assertEqual(rb.dev_id_bytes, 2)
+        self.assertEqual(rb._replica2part2dev[0].itemsize, 2)
         loaded_rb = ring.RingBuilder.load(builder_file)
         self.maxDiff = None
         self.assertEqual(loaded_rb.to_dict(), rb.to_dict())
         self.assertEqual(loaded_rb.overload, 3.14159)
+        self.assertEqual(loaded_rb.dev_id_bytes, 2)
+        self.assertEqual(loaded_rb._replica2part2dev[0].itemsize, 2)
 
     @mock.patch('builtins.open', autospec=True)
     @mock.patch('swift.common.ring.builder.pickle.dump', autospec=True)
@@ -2767,6 +2777,17 @@ class TestRingBuilder(unittest.TestCase):
         except exceptions.DuplicateDeviceError:
             self.fail("device hole not reused")
 
+
+class TestPartPowerIncrease(unittest.TestCase):
+
+    FORMAT_VERSION = 1
+
+    def setUp(self):
+        self.testdir = mkdtemp()
+
+    def tearDown(self):
+        rmtree(self.testdir, ignore_errors=1)
+
     def test_prepare_increase_partition_power(self):
         ring_file = os.path.join(self.testdir, 'test_partpower.ring.gz')
 
@@ -2794,7 +2815,7 @@ class TestRingBuilder(unittest.TestCase):
 
         # Save .ring.gz, and load ring from it to ensure prev/next is set
         rd = rb.get_ring()
-        rd.save(ring_file)
+        rd.save(ring_file, format_version=self.FORMAT_VERSION)
 
         r = ring.Ring(ring_file)
         expected_part_shift = 32 - 8
@@ -2815,7 +2836,7 @@ class TestRingBuilder(unittest.TestCase):
         # Let's save the ring, and get the nodes for an object
         ring_file = os.path.join(self.testdir, 'test_partpower.ring.gz')
         rd = rb.get_ring()
-        rd.save(ring_file)
+        rd.save(ring_file, format_version=self.FORMAT_VERSION)
         r = ring.Ring(ring_file)
         old_part, old_nodes = r.get_nodes("acc", "cont", "obj")
         old_version = rb.version
@@ -2834,7 +2855,7 @@ class TestRingBuilder(unittest.TestCase):
 
         old_ring = r
         rd = rb.get_ring()
-        rd.save(ring_file)
+        rd.save(ring_file, format_version=self.FORMAT_VERSION)
         r = ring.Ring(ring_file)
         new_part, new_nodes = r.get_nodes("acc", "cont", "obj")
 
@@ -2906,7 +2927,7 @@ class TestRingBuilder(unittest.TestCase):
 
         # Save .ring.gz, and load ring from it to ensure prev/next is set
         rd = rb.get_ring()
-        rd.save(ring_file)
+        rd.save(ring_file, format_version=self.FORMAT_VERSION)
 
         r = ring.Ring(ring_file)
         expected_part_shift = 32 - 9
@@ -2973,6 +2994,10 @@ class TestRingBuilder(unittest.TestCase):
         self.assertEqual(8, rb.part_power)
         self.assertEqual(8, rb.next_part_power)
         self.assertEqual(rb.version, old_version + 2)
+
+
+class TestPartPowerIncreaseV2(TestPartPowerIncrease):
+    FORMAT_VERSION = 2
 
 
 class TestGetRequiredOverload(unittest.TestCase):
