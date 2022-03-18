@@ -46,6 +46,7 @@ Overview and Concepts
     api/object_api_v1_overview
     overview_architecture
     overview_ring
+    overview_ring_format
     overview_policies
     overview_reaper
     overview_auth

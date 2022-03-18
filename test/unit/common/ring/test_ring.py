@@ -15,10 +15,12 @@
 
 import array
 import collections
+import json
 import six.moves.cPickle as pickle
 import os
 import unittest
 import stat
+import struct
 from contextlib import closing
 from gzip import GzipFile
 from tempfile import mkdtemp
@@ -27,11 +29,12 @@ from time import sleep, time
 import sys
 import copy
 import mock
+import zlib
 
 from six.moves import range
 from swift.common import ring, utils
-from swift.common.ring import utils as ring_utils
-from swift.common.utils import md5
+from swift.common.ring import io, utils as ring_utils
+from swift.common.ring.ring import RING_CODECS
 
 
 class TestRingBase(unittest.TestCase):
@@ -58,13 +61,19 @@ class TestRingData(unittest.TestCase):
     def tearDown(self):
         rmtree(self.testdir, ignore_errors=1)
 
-    def assert_ring_data_equal(self, rd_expected, rd_got):
-        self.assertEqual(rd_expected._replica2part2dev_id,
-                         rd_got._replica2part2dev_id)
+    def assert_ring_data_equal(self, rd_expected, rd_got, metadata_only=False):
         self.assertEqual(rd_expected.devs, rd_got.devs)
         self.assertEqual(rd_expected._part_shift, rd_got._part_shift)
         self.assertEqual(rd_expected.next_part_power, rd_got.next_part_power)
         self.assertEqual(rd_expected.version, rd_got.version)
+        self.assertEqual(rd_expected.dev_id_bytes, rd_got.dev_id_bytes)
+        self.assertEqual(rd_expected.replica_count, rd_got.replica_count)
+
+        if metadata_only:
+            self.assertEqual([], rd_got._replica2part2dev_id)
+        else:
+            self.assertEqual(rd_expected._replica2part2dev_id,
+                             rd_got._replica2part2dev_id)
 
     def test_attrs(self):
         r2p2d = [[0, 1, 0, 1], [0, 1, 0, 1]]
@@ -102,18 +111,40 @@ class TestRingData(unittest.TestCase):
             ring_data = ring.RingData.load(ring_fname)
             self.assert_ring_data_equal(rd, ring_data)
 
+    def test_can_load_pickled_ring_dict(self):
+        rd = ring.RingData(
+            [[0, 1, 0, 1], [0, 1, 0, 1]],
+            [{'id': 0, 'zone': 0, 'ip': '10.1.1.0', 'port': 7000},
+             {'id': 1, 'zone': 1, 'ip': '10.1.1.1', 'port': 7000}],
+            30)
+        ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
+        for p in range(pickle.HIGHEST_PROTOCOL):
+            with closing(GzipFile(ring_fname, 'wb')) as f:
+                pickle.dump(rd.to_dict(), f, protocol=p)
+            meta_only = ring.RingData.load(ring_fname, metadata_only=True)
+            self.assertEqual([
+                {'id': 0, 'zone': 0, 'region': 1,
+                 'ip': '10.1.1.0', 'port': 7000,
+                 'replication_ip': '10.1.1.0', 'replication_port': 7000},
+                {'id': 1, 'zone': 1, 'region': 1,
+                 'ip': '10.1.1.1', 'port': 7000,
+                 'replication_ip': '10.1.1.1', 'replication_port': 7000},
+            ], meta_only.devs)
+            # Pickled rings can't load only metadata, so you get it all
+            self.assert_ring_data_equal(rd, meta_only)
+            ring_data = ring.RingData.load(ring_fname)
+            self.assert_ring_data_equal(rd, ring_data)
+
     def test_roundtrip_serialization(self):
         ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
         rd = ring.RingData(
             [array.array('H', [0, 1, 0, 1]), array.array('H', [0, 1, 0, 1])],
             [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}], 30)
         rd.save(ring_fname)
+
         meta_only = ring.RingData.load(ring_fname, metadata_only=True)
-        self.assertEqual([
-            {'id': 0, 'zone': 0, 'region': 1},
-            {'id': 1, 'zone': 1, 'region': 1},
-        ], meta_only.devs)
-        self.assertEqual([], meta_only._replica2part2dev_id)
+        self.assert_ring_data_equal(rd, meta_only, metadata_only=True)
+
         rd2 = ring.RingData.load(ring_fname)
         self.assert_ring_data_equal(rd, rd2)
 
@@ -128,7 +159,7 @@ class TestRingData(unittest.TestCase):
             calls = []
 
             def close(self):
-                self.calls.append(('close', self.fp))
+                self.calls.append(('close', self.raw_fp))
                 return super(MockReader, self).close()
 
         with mock.patch('swift.common.ring.ring.RingReader',
@@ -155,7 +186,9 @@ class TestRingData(unittest.TestCase):
             rds = ring.RingData(swapped_data,
                                 [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}],
                                 30)
-            rds.save(ring_fname)
+            # note that this can only be an issue for v1 rings;
+            # v2 rings always write network order
+            rds.save(ring_fname, format_version=1)
 
         rd1 = ring.RingData(data, [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}],
                             30)
@@ -209,8 +242,188 @@ class TestRingData(unittest.TestCase):
             30)
         self.assertEqual(rd.replica_count, 1.75)
 
+    def test_deserialize_v1(self):
+        # First save it as a ring v2 and then try and load it using
+        # deserialize_v1
+        ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
+        rd = ring.RingData(
+            [[0, 1, 0, 1], [0, 1, 0, 1]],
+            [{'id': 0, 'zone': 0, 'ip': '10.1.1.0', 'port': 7000},
+             {'id': 1, 'zone': 1, 'ip': '10.1.1.1', 'port': 7000}],
+            30)
+        rd.save(ring_fname, format_version=2)
+
+        with self.assertRaises(ValueError) as err:
+            ring.RingData.deserialize_v1(io.RingReader(ring_fname))
+        self.assertIn("unexpected magic:", str(err.exception))
+
+        # Now let's save it as v1 then load it up metadata_only
+        rd.save(ring_fname, format_version=1)
+        loaded_rd = ring.RingData.deserialize_v1(io.RingReader(ring_fname),
+                                                 metadata_only=True)
+        self.assertTrue(loaded_rd['byteorder'])
+        expected_devs = [
+            {'id': 0, 'ip': '10.1.1.0', 'port': 7000, 'region': 1, 'zone': 0,
+             'replication_ip': '10.1.1.0', 'replication_port': 7000},
+            {'id': 1, 'ip': '10.1.1.1', 'port': 7000, 'region': 1, 'zone': 1,
+             'replication_ip': '10.1.1.1', 'replication_port': 7000}]
+        self.assertEqual(loaded_rd['devs'], expected_devs)
+        self.assertEqual(loaded_rd['part_shift'], 30)
+        self.assertEqual(loaded_rd['replica_count'], 2)
+        self.assertEqual(loaded_rd['dev_id_bytes'], 2)
+
+        # but there is no replica2part2dev table
+        self.assertFalse(loaded_rd['replica2part2dev_id'])
+
+        # But if we load it up with metadata_only = false
+        loaded_rd = ring.RingData.deserialize_v1(io.RingReader(ring_fname))
+        self.assertTrue(loaded_rd['byteorder'])
+        self.assertEqual(loaded_rd['devs'], expected_devs)
+        self.assertEqual(loaded_rd['part_shift'], 30)
+        self.assertEqual(loaded_rd['replica_count'], 2)
+        self.assertEqual(loaded_rd['dev_id_bytes'], 2)
+        self.assertTrue(loaded_rd['replica2part2dev_id'])
+
+    def test_deserialize_v2(self):
+        # First save it as a ring v1 and then try and load it using
+        # deserialize_v2
+        ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
+        rd = ring.RingData(
+            [[0, 1, 0, 1], [0, 1, 0, 1]],
+            [{'id': 0, 'zone': 0, 'ip': '10.1.1.0', 'port': 7000},
+             {'id': 1, 'zone': 1, 'ip': '10.1.1.1', 'port': 7000}],
+            30)
+        rd.save(ring_fname, format_version=2)
+        loaded_rd = ring.RingData.deserialize_v2(io.RingReader(ring_fname),
+                                                 metadata_only=True,
+                                                 include_devices=False)
+        self.assertEqual(loaded_rd['part_shift'], 30)
+        self.assertEqual(loaded_rd['replica_count'], 2)
+        self.assertEqual(loaded_rd['dev_id_bytes'], 1)
+
+        # but there is no replica2part2dev table or devs
+        self.assertFalse(loaded_rd['devs'])
+        self.assertFalse(loaded_rd['replica2part2dev_id'])
+
+        # Next we load it up with metadata and devs only
+        loaded_rd = ring.RingData.deserialize_v2(io.RingReader(ring_fname),
+                                                 metadata_only=True)
+        expected_devs = [
+            {'id': 0, 'ip': '10.1.1.0', 'port': 7000, 'region': 1, 'zone': 0,
+             'replication_ip': '10.1.1.0', 'replication_port': 7000},
+            {'id': 1, 'ip': '10.1.1.1', 'port': 7000, 'region': 1, 'zone': 1,
+             'replication_ip': '10.1.1.1', 'replication_port': 7000}]
+        self.assertEqual(loaded_rd['devs'], expected_devs)
+        self.assertEqual(loaded_rd['part_shift'], 30)
+        self.assertEqual(loaded_rd['replica_count'], 2)
+        self.assertEqual(loaded_rd['dev_id_bytes'], 1)
+        self.assertFalse(loaded_rd['replica2part2dev_id'])
+
+        # But if we load it up with metadata_only = false
+        loaded_rd = ring.RingData.deserialize_v2(io.RingReader(ring_fname))
+        self.assertEqual(loaded_rd['devs'], expected_devs)
+        self.assertEqual(loaded_rd['part_shift'], 30)
+        self.assertEqual(loaded_rd['replica_count'], 2)
+        self.assertEqual(loaded_rd['dev_id_bytes'], 1)
+        self.assertTrue(loaded_rd['replica2part2dev_id'])
+
+    def test_load(self):
+        rd = ring.RingData(
+            [[0, 1, 0, 1], [0, 1, 0, 1]],
+            [{'id': 0, 'zone': 0, 'ip': '10.1.1.0', 'port': 7000},
+             {'id': 1, 'zone': 1, 'ip': '10.1.1.1', 'port': 7000}],
+            30)
+        ring_fname_1 = os.path.join(self.testdir, 'foo-1.ring.gz')
+        ring_fname_2 = os.path.join(self.testdir, 'foo-2.ring.gz')
+        ring_fname_pickle = os.path.join(self.testdir, 'foo-pickle.ring.gz')
+        ring_fname_bad_version = os.path.join(self.testdir, 'foo-bar.ring.gz')
+        rd.save(ring_fname_1, format_version=1)
+        rd.save(ring_fname_2, format_version=2)
+        with io.RingWriter(ring_fname_pickle) as writer:
+            RING_CODECS[0]['serialize'](rd, writer)
+        with io.RingWriter(ring_fname_bad_version) as writer:
+            writer.write_magic(5)
+            with writer.section('foo'):
+                writer.write_blob(b'\xde\xad\xbe\xef' * 10240)
+
+        # Loading the bad ring will fail because it's an unknown version
+        with self.assertRaises(Exception) as ex:
+            ring.RingData.load(ring_fname_bad_version)
+        self.assertEqual('Unsupported ring version: 5', str(ex.exception))
+
+        orig_load_index = io.RingReader.load_index
+
+        def mock_load_index(cls):
+            cls.version = 5
+            orig_load_index(cls)
+
+        with mock.patch('swift.common.ring.io.RingReader.load_index',
+                        mock_load_index):
+            with self.assertRaises(Exception) as ex:
+                ring.RingData.load(ring_fname_1)
+        self.assertEqual('Unknown ring format version 5', str(ex.exception))
+
+        expected_r2p2d = [
+            array.array('B', [0, 1, 0, 1]),
+            array.array('B', [0, 1, 0, 1])]
+        expected_rd_dict = {
+            'devs': [
+                {'id': 0, 'region': 1, 'zone': 0,
+                 'ip': '10.1.1.0', 'port': 7000,
+                 'replication_ip': '10.1.1.0', 'replication_port': 7000},
+                {'id': 1, 'zone': 1, 'region': 1,
+                 'ip': '10.1.1.1', 'port': 7000,
+                 'replication_ip': '10.1.1.1', 'replication_port': 7000}],
+            'replica2part2dev_id': expected_r2p2d,
+            'part_shift': 30,
+            'next_part_power': None,
+            'dev_id_bytes': 1,
+            'version': None}
+
+        # version 0
+        loaded_rd = ring.RingData.load(ring_fname_pickle)
+        self.assertEqual(expected_rd_dict, loaded_rd.to_dict())
+
+        # version 2
+        loaded_rd = ring.RingData.load(ring_fname_2)
+        self.assertEqual(loaded_rd.to_dict(), expected_rd_dict)
+        loaded_rd = ring.RingData.load(ring_fname_2, metadata_only=True)
+        expected_rd_dict['replica2part2dev_id'] = []
+        self.assertEqual(loaded_rd.to_dict(), expected_rd_dict)
+
+        # version 1
+        expected_rd_dict['dev_id_bytes'] = 2
+        expected_rd_dict['replica2part2dev_id'] = expected_r2p2d
+        loaded_rd = ring.RingData.load(ring_fname_1)
+        self.assertEqual(loaded_rd.to_dict(), expected_rd_dict)
+        loaded_rd = ring.RingData.load(ring_fname_1, metadata_only=True)
+        expected_rd_dict['replica2part2dev_id'] = []
+        self.assertEqual(loaded_rd.to_dict(), expected_rd_dict)
+
+    def test_save(self):
+        ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
+        rd = ring.RingData(
+            [[0, 1, 0, 1], [0, 1, 0, 1]],
+            [{'id': 0, 'zone': 0, 'ip': '10.1.1.0', 'port': 7000},
+             {'id': 1, 'zone': 1, 'ip': '10.1.1.1', 'port': 7000}],
+            30)
+
+        # First test the supported versions
+        for version in (0, 1, 2):
+            rd.save(ring_fname, format_version=version)
+
+        # Now try an unknown version
+        with self.assertRaises(ValueError) as err:
+            for version in (3, None, "some version"):
+                rd.save(ring_fname, format_version=version)
+        self.assertEqual("format_version mus"
+                         "t be one of (0, 1, 2)",
+                         str(err.exception))
+        # re-serialisation is already handled in test_load.
+
 
 class TestRing(TestRingBase):
+    FORMAT_VERSION = 1
 
     def setUp(self):
         super(TestRing, self).setUp()
@@ -239,9 +452,10 @@ class TestRing(TestRingBase):
                                'replication_port': 6066}]
         self.intended_part_shift = 30
         self.intended_reload_time = 15
-        ring.RingData(
+        rd = ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift).save(self.testgz)
+            self.intended_devs, self.intended_part_shift)
+        rd.save(self.testgz, format_version=self.FORMAT_VERSION)
         self.ring = ring.Ring(
             self.testdir,
             reload_time=self.intended_reload_time, ring_name='whatever')
@@ -260,12 +474,9 @@ class TestRing(TestRingBase):
         self.assertIsNone(self.ring.version)
 
         with open(self.testgz, 'rb') as fp:
-            expected_md5 = md5(usedforsecurity=False)
             expected_size = 0
             for chunk in iter(lambda: fp.read(2 ** 16), b''):
-                expected_md5.update(chunk)
                 expected_size += len(chunk)
-        self.assertEqual(self.ring.md5, expected_md5.hexdigest())
         self.assertEqual(self.ring.size, expected_size)
 
         # test invalid endcap
@@ -295,7 +506,8 @@ class TestRing(TestRingBase):
              'ip': '10.1.1.1', 'port': 9876})
         ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift).save(self.testgz)
+            self.intended_devs, self.intended_part_shift,
+        ).save(self.testgz, format_version=self.FORMAT_VERSION)
         sleep(0.1)
         self.ring.get_nodes('a')
         self.assertEqual(len(self.ring.devs), 6)
@@ -311,7 +523,8 @@ class TestRing(TestRingBase):
              'ip': '10.5.5.5', 'port': 9876})
         ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift).save(self.testgz)
+            self.intended_devs, self.intended_part_shift,
+        ).save(self.testgz, format_version=self.FORMAT_VERSION)
         sleep(0.1)
         self.ring.get_part_nodes(0)
         self.assertEqual(len(self.ring.devs), 7)
@@ -328,7 +541,8 @@ class TestRing(TestRingBase):
              'ip': '10.6.6.6', 'port': 6200})
         ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift).save(self.testgz)
+            self.intended_devs, self.intended_part_shift,
+        ).save(self.testgz, format_version=self.FORMAT_VERSION)
         sleep(0.1)
         next(self.ring.get_more_nodes(part))
         self.assertEqual(len(self.ring.devs), 8)
@@ -344,7 +558,8 @@ class TestRing(TestRingBase):
              'ip': '10.5.5.5', 'port': 6200})
         ring.RingData(
             self.intended_replica2part2dev_id,
-            self.intended_devs, self.intended_part_shift).save(self.testgz)
+            self.intended_devs, self.intended_part_shift,
+        ).save(self.testgz, format_version=self.FORMAT_VERSION)
         sleep(0.1)
         self.assertEqual(len(self.ring.devs), 9)
         self.assertNotEqual(self.ring._mtime, orig_mtime)
@@ -383,7 +598,8 @@ class TestRing(TestRingBase):
         testgz = os.path.join(self.testdir, 'without_replication.ring.gz')
         ring.RingData(
             self.intended_replica2part2dev_id,
-            replication_less_devs, self.intended_part_shift).save(testgz)
+            replication_less_devs, self.intended_part_shift,
+        ).save(testgz, format_version=self.FORMAT_VERSION)
         self.ring = ring.Ring(
             self.testdir,
             reload_time=self.intended_reload_time,
@@ -589,7 +805,7 @@ class TestRing(TestRingBase):
                                 'device': "d%s" % device})
                     next_dev_id += 1
         rb.rebalance(seed=43)
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
         # every part has the same number of handoffs
@@ -636,7 +852,7 @@ class TestRing(TestRingBase):
         next_dev_id += 1
         rb.pretend_min_part_hours_passed()
         num_parts_changed, _balance, _removed_dev = rb.rebalance(seed=43)
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
         # so now we expect the device list to be longer by one device
@@ -684,7 +900,7 @@ class TestRing(TestRingBase):
         # Remove a device - no need to fluff min_part_hours.
         rb.remove_dev(0)
         num_parts_changed, _balance, _removed_dev = rb.rebalance(seed=87)
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
         # so now we expect the device list to be shorter by one device
@@ -754,7 +970,7 @@ class TestRing(TestRingBase):
         # Add a partial replica
         rb.set_replicas(3.5)
         num_parts_changed, _balance, _removed_dev = rb.rebalance(seed=164)
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
         # Change expectations
@@ -872,7 +1088,7 @@ class TestRing(TestRingBase):
         rb.rebalance(seed=1)
         rb.pretend_min_part_hours_passed()
         rb.rebalance(seed=1)
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
         # There's 5 regions now, so the primary nodes + first 2 handoffs
@@ -942,7 +1158,7 @@ class TestRing(TestRingBase):
                 dev['weight'] = 1.0
             rb.add_dev(dev)
         rb.rebalance()
-        rb.get_ring().save(self.testgz)
+        rb.get_ring().save(self.testgz, format_version=self.FORMAT_VERSION)
         r = ring.Ring(self.testdir, ring_name='whatever')
         self.assertEqual(r.version, rb.version)
 
@@ -1003,6 +1219,218 @@ class TestRing(TestRingBase):
         # Hard limit at 50 (we've seen as bad as 41, 45)
         self.assertEqual(sum(histogram.get(x, 0) for x in range(50, 100)), 0,
                          histogram)
+
+
+class TestRingV2(TestRing):
+    FORMAT_VERSION = 2
+
+    def test_1_byte_dev_ids(self):
+        ring_file = os.path.join(self.testdir, 'test.ring.gz')
+        index = {}
+        with GzipFile(ring_file, 'wb') as fp:
+            fp.write(b'R1NG\x00\x02')
+
+            fp.write(b'some extra data at the start')
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            index['swift/ring/metadata'] = [
+                os.fstat(fp.fileno()).st_size, fp.tell(),
+                None, None, None, None]
+            meta = json.dumps({
+                "dev_id_bytes": 1,
+                "part_shift": 29,
+                "replica_count": 3,
+            }).encode('ascii')
+            fp.write(struct.pack('!Q', len(meta)) + meta)
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            fp.write(b'some extra data in the middle')
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            index['swift/ring/devices'] = [
+                os.fstat(fp.fileno()).st_size, fp.tell(),
+                None, None, None, None]
+            devs = json.dumps([
+                {"id": 0, "zone": 1, "ip": "127.0.0.1", "port": 6200,
+                 "device": "sda", "weight": 1},
+                {"id": 1, "zone": 1, "ip": "127.0.0.1", "port": 6201,
+                 "device": "sdb", "weight": 1},
+                None,
+                {"id": 3, "zone": 1, "ip": "127.0.0.1", "port": 6202,
+                 "device": "sdc", "weight": 1},
+            ]).encode('ascii')
+            fp.write(struct.pack('!Q', len(devs)) + devs)
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            index['swift/ring/assignments'] = [
+                os.fstat(fp.fileno()).st_size, fp.tell(),
+                None, None, None, None]
+            fp.write(struct.pack('!Q', 12) + b'\x00\x01\x03' * 4)
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            index['swift/index'] = [
+                os.fstat(fp.fileno()).st_size, fp.tell(),
+                None, None, None, None]
+            blob = json.dumps(index).encode('ascii')
+            fp.write(struct.pack('!Q', len(blob)) + blob)
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            fp.write(b'some extra data at the end')
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            fp.compress = zlib.compressobj(
+                0, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
+            fp.write(struct.pack('!Q', index['swift/index'][0]))
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+        r = ring.Ring(ring_file)
+        self.assertEqual(
+            [[d['id'] for d in r.get_part_nodes(p)] for p in range(8)],
+            [[0, 3], [1, 0], [3, 1], [0, 3], [1], [3], [0], [1]])
+
+    def test_4_byte_dev_ids(self):
+        ring_file = os.path.join(self.testdir, 'test.ring.gz')
+        index = {}
+        with GzipFile(ring_file, 'wb') as fp:
+            fp.write(b'R1NG\x00\x02')
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            index['swift/ring/metadata'] = [
+                os.fstat(fp.fileno()).st_size, fp.tell(),
+                None, None, None, None]
+            meta = json.dumps({
+                "dev_id_bytes": 4,
+                "part_shift": 29,
+                "replica_count": 3,
+            }).encode('ascii')
+            fp.write(struct.pack('!Q', len(meta)) + meta)
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            index['swift/ring/devices'] = [
+                os.fstat(fp.fileno()).st_size, fp.tell(),
+                None, None, None, None]
+            devs = json.dumps([
+                {"id": 0, "zone": 1, "ip": "127.0.0.1", "port": 6200,
+                 "device": "sda", "weight": 1},
+                None,
+                {"id": 2, "zone": 1, "ip": "127.0.0.1", "port": 6201,
+                 "device": "sdb", "weight": 1},
+                {"id": 3, "zone": 1, "ip": "127.0.0.1", "port": 6202,
+                 "device": "sdc", "weight": 1},
+            ]).encode('ascii')
+            fp.write(struct.pack('!Q', len(devs)) + devs)
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            index['swift/ring/assignments'] = [
+                os.fstat(fp.fileno()).st_size, fp.tell(),
+                None, None, None, None]
+            fp.write(struct.pack('!Q', 48) + 4 * (
+                b'\x00\x00\x00\x03'
+                b'\x00\x00\x00\x02'
+                b'\x00\x00\x00\x00'))
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            index['swift/index'] = [
+                os.fstat(fp.fileno()).st_size, fp.tell(),
+                None, None, None, None]
+            blob = json.dumps(index).encode('ascii')
+            fp.write(struct.pack('!Q', len(blob)) + blob)
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+            fp.compress = zlib.compressobj(
+                0, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
+            fp.write(struct.pack('!Q', index['swift/index'][0]))
+            fp.flush(zlib.Z_FULL_FLUSH)
+
+        r = ring.Ring(ring_file)
+        self.assertEqual(
+            [[d['id'] for d in r.get_part_nodes(p)] for p in range(8)],
+            [[3, 0], [2, 3], [0, 2], [3, 0], [2], [0], [3], [2]])
+
+    def test_set_dev_id_bytes(self):
+        ring_data = ring.RingData.load(self.testgz)
+        # first test the correct values
+        for dev_id_bytes in (1, 2, 4):
+            ring_data.set_dev_id_bytes(dev_id_bytes)
+            self.assertEqual(ring_data._replica2part2dev_id[0].itemsize,
+                             dev_id_bytes)
+
+        # now use some incorrect dev_id_bytes
+        for dev_id_bytes in (3, None, "foo"):
+            with self.assertRaises(ValueError) as err:
+                ring_data.set_dev_id_bytes(dev_id_bytes)
+            self.assertEqual(str(err.exception),
+                             'dev_id_bytes must be one of (1, 2, 4)')
+
+        with mock.patch('swift.common.ring.ring.calc_dev_id_bytes',
+                        return_value=2**4):
+            ring_data = ring.RingData.load(self.testgz)
+            with self.assertRaises(ValueError) as err:
+                ring_data.set_dev_id_bytes(2)
+            self.assertEqual(str(err.exception),
+                             'Too many devices for 2-byte device ids')
+
+
+class TestRingV0(TestRing):
+    FORMAT_VERSION = 0
+
+
+class ExtendedRing(ring.RingData):
+    extra = b'some super-specific data'
+
+    def to_dict(self):
+        ring_data = super(ExtendedRing, self).to_dict()
+        ring_data.setdefault('extra', self.extra)
+        return ring_data
+
+    def serialize_v2(self, writer):
+        super(ExtendedRing, self).serialize_v2(writer)
+        with writer.section('my-custom-section') as s:
+            s.write_blob(self.extra)
+
+    @classmethod
+    def deserialize_v2(cls, reader, *args, **kwargs):
+        ring_data = super(ExtendedRing, cls).deserialize_v2(
+            reader, *args, **kwargs)
+        with reader.open_section('my-custom-section') as s:
+            ring_data['extra'] = s.read()
+        return ring_data
+
+    @classmethod
+    def from_dict(cls, ring_data):
+        obj = super(ExtendedRing, cls).from_dict(ring_data)
+        obj.extra = ring_data.get('extra')
+        return obj
+
+
+class TestRingExtensibility(unittest.TestCase):
+    def test(self):
+        r2p2d = [[0, 1, 0, 1], [0, 1, 0, 1]]
+        d = [{'id': 0, 'zone': 0, 'region': 0, 'ip': '10.1.1.0', 'port': 7000},
+             {'id': 1, 'zone': 1, 'region': 1, 'ip': '10.1.1.1', 'port': 7000}]
+        s = 30
+        rd = ExtendedRing(r2p2d, d, s)
+        self.assertEqual(rd._replica2part2dev_id, r2p2d)
+        self.assertEqual(rd.devs, d)
+        self.assertEqual(rd._part_shift, s)
+        self.assertEqual(rd.extra, b'some super-specific data')
+
+        # Can update it and round-trip to disk and back
+        rd.extra = b'some other value'
+        testdir = mkdtemp()
+        try:
+            ring_fname = os.path.join(testdir, 'foo.ring.gz')
+            rd.save(ring_fname, format_version=2)
+            bytes_written = os.path.getsize(ring_fname)
+            rd2 = ExtendedRing.load(ring_fname)
+        finally:
+            rmtree(testdir, ignore_errors=1)
+
+        self.assertEqual(rd2._replica2part2dev_id, r2p2d)
+        self.assertEqual(rd2.devs, d)
+        self.assertEqual(rd2._part_shift, s)
+        self.assertEqual(rd2.extra, b'some other value')
+        self.assertEqual(rd2.size, bytes_written)
 
 
 if __name__ == '__main__':
