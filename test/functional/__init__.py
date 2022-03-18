@@ -288,8 +288,7 @@ def _in_process_setup_ring(swift_conf, conf_src_dir, testdir):
                 {'id': 2, 'zone': 2, 'device': 'sdc1', 'ip': '127.0.0.1',
                  'port': obj_sockets[2].getsockname()[1]}]
         ring_data = ring.RingData(replica2part2dev_id, devs, 30)
-        with closing(GzipFile(ring_file_test, 'wb')) as f:
-            pickle.dump(ring_data, f)
+        ring_data.save(ring_file_test, format_version=0)
 
     for dev in ring_data.devs:
         _debug('Ring file dev: %s' % dev)
