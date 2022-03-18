@@ -2767,6 +2767,17 @@ class TestRingBuilder(unittest.TestCase):
         except exceptions.DuplicateDeviceError:
             self.fail("device hole not reused")
 
+
+class TestPartPowerIncrease(unittest.TestCase):
+
+    FORMAT_VERSION = 1
+
+    def setUp(self):
+        self.testdir = mkdtemp()
+
+    def tearDown(self):
+        rmtree(self.testdir, ignore_errors=1)
+
     def test_prepare_increase_partition_power(self):
         ring_file = os.path.join(self.testdir, 'test_partpower.ring.gz')
 
@@ -2794,7 +2805,7 @@ class TestRingBuilder(unittest.TestCase):
 
         # Save .ring.gz, and load ring from it to ensure prev/next is set
         rd = rb.get_ring()
-        rd.save(ring_file)
+        rd.save(ring_file, format_version=self.FORMAT_VERSION)
 
         r = ring.Ring(ring_file)
         expected_part_shift = 32 - 8
@@ -2815,7 +2826,7 @@ class TestRingBuilder(unittest.TestCase):
         # Let's save the ring, and get the nodes for an object
         ring_file = os.path.join(self.testdir, 'test_partpower.ring.gz')
         rd = rb.get_ring()
-        rd.save(ring_file)
+        rd.save(ring_file, format_version=self.FORMAT_VERSION)
         r = ring.Ring(ring_file)
         old_part, old_nodes = r.get_nodes("acc", "cont", "obj")
         old_version = rb.version
@@ -2834,7 +2845,7 @@ class TestRingBuilder(unittest.TestCase):
 
         old_ring = r
         rd = rb.get_ring()
-        rd.save(ring_file)
+        rd.save(ring_file, format_version=self.FORMAT_VERSION)
         r = ring.Ring(ring_file)
         new_part, new_nodes = r.get_nodes("acc", "cont", "obj")
 
@@ -2906,7 +2917,7 @@ class TestRingBuilder(unittest.TestCase):
 
         # Save .ring.gz, and load ring from it to ensure prev/next is set
         rd = rb.get_ring()
-        rd.save(ring_file)
+        rd.save(ring_file, format_version=self.FORMAT_VERSION)
 
         r = ring.Ring(ring_file)
         expected_part_shift = 32 - 9
@@ -2973,6 +2984,10 @@ class TestRingBuilder(unittest.TestCase):
         self.assertEqual(8, rb.part_power)
         self.assertEqual(8, rb.next_part_power)
         self.assertEqual(rb.version, old_version + 2)
+
+
+class TestPartPowerIncreaseV2(TestPartPowerIncrease):
+    FORMAT_VERSION = 2
 
 
 class TestGetRequiredOverload(unittest.TestCase):
