@@ -36,6 +36,7 @@ from swift.common import exceptions
 from swift.common.ring import RingBuilder, Ring, RingData
 from swift.common.ring.builder import MAX_BALANCE
 from swift.common.ring.composite_builder import CompositeRingBuilder
+from swift.common.ring.ring import RING_CODECS, DEFAULT_RING_FORMAT_VERSION
 from swift.common.ring.utils import validate_args, \
     validate_and_normalize_ip, build_dev_from_opts, \
     parse_builder_ring_filename_args, parse_search_value, \
@@ -48,6 +49,8 @@ MINOR_VERSION = 3
 EXIT_SUCCESS = 0
 EXIT_WARNING = 1
 EXIT_ERROR = 2
+
+FORMAT_CHOICES = [str(v) for v in RING_CODECS]
 
 global argv, backup_dir, builder, builder_file, ring_file
 argv = backup_dir = builder = builder_file = ring_file = None
@@ -608,6 +611,8 @@ swift-ring-builder <builder_file>
 
         ring_dict = None
         builder_dict = builder.get_ring().to_dict()
+        # mostly just an implementation detail
+        builder_dict.pop('dev_id_bytes', None)
 
         # compare ring file against builder file
         if not exists(ring_file):
@@ -619,6 +624,8 @@ swift-ring-builder <builder_file>
             except Exception as exc:
                 print('Ring file %s is invalid: %r' % (ring_file, exc))
             else:
+                # again, mostly just an implementation detail
+                ring_dict.pop('dev_id_bytes', None)
                 if builder_dict == ring_dict:
                     print('Ring file %s is up-to-date' % ring_file)
                 else:
@@ -1053,7 +1060,19 @@ swift-ring-builder <builder_file> rebalance [options]
         parser.add_option('-s', '--seed', help="seed to use for rebalance")
         parser.add_option('-d', '--debug', action='store_true',
                           help="print debug information")
+        parser.add_option('--format-version',
+                          choices=FORMAT_CHOICES, default=None,
+                          help="specify ring format version")
         options, args = parser.parse_args(argv)
+        if options.format_version is None:
+            print("Defaulting to --format-version=1. This ensures the ring\n"
+                  "written will be readable by older versions of Swift.\n"
+                  "In a future release, the default will change to\n"
+                  "--format-version=2\n")
+            options.format_version = DEFAULT_RING_FORMAT_VERSION
+        else:
+            # N.B. choices doesn't work with type=int
+            options.format_version = int(options.format_version)
 
         def get_seed(index):
             if options.seed:
@@ -1168,9 +1187,11 @@ swift-ring-builder <builder_file> rebalance [options]
             status = EXIT_WARNING
         ts = time()
         builder.get_ring().save(
-            pathjoin(backup_dir, '%d.' % ts + basename(ring_file)))
+            pathjoin(backup_dir, '%d.' % ts + basename(ring_file)),
+            format_version=options.format_version)
         builder.save(pathjoin(backup_dir, '%d.' % ts + basename(builder_file)))
-        builder.get_ring().save(ring_file)
+        builder.get_ring().save(
+            ring_file, format_version=options.format_version)
         builder.save(builder_file)
         exit(status)
 
@@ -1295,6 +1316,22 @@ swift-ring-builder <builder_file> write_ring
     'set_info' calls when no rebalance is needed but you want to send out the
     new device information.
         """
+        usage = Commands.write_ring.__doc__.strip()
+        parser = optparse.OptionParser(usage)
+        parser.add_option('--format-version',
+                          choices=FORMAT_CHOICES, default=None,
+                          help="specify ring format version")
+        options, args = parser.parse_args(argv)
+        if options.format_version is None:
+            print("Defaulting to --format-version=1. This ensures the ring\n"
+                  "written will be readable by older versions of Swift.\n"
+                  "In a future release, the default will change to\n"
+                  "--format-version=2\n")
+            options.format_version = DEFAULT_RING_FORMAT_VERSION
+        else:
+            # N.B. choices doesn't work with type=int
+            options.format_version = int(options.format_version)
+
         if not builder.devs:
             print('Unable to write empty ring.')
             exit(EXIT_ERROR)
@@ -1306,8 +1343,9 @@ swift-ring-builder <builder_file> write_ring
                       'assignments but with devices; did you forget to run '
                       '"rebalance"?')
         ring_data.save(
-            pathjoin(backup_dir, '%d.' % time() + basename(ring_file)))
-        ring_data.save(ring_file)
+            pathjoin(backup_dir, '%d.' % time() + basename(ring_file)),
+            format_version=options.format_version)
+        ring_data.save(ring_file, format_version=options.format_version)
         exit(EXIT_SUCCESS)
 
     @staticmethod
