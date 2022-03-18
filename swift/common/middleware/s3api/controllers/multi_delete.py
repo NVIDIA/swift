@@ -19,6 +19,7 @@ import json
 from swift.cli.container_deleter import make_delete_jobs
 from swift.common.constraints import MAX_OBJECT_NAME_LENGTH
 from swift.common.http import HTTP_NO_CONTENT
+from swift.common.swob import str_to_wsgi
 from swift.common.utils import public, StreamingPile, Timestamp, \
     config_true_value
 from swift.common.registry import get_swift_info
@@ -117,7 +118,7 @@ class MultiObjectDeleteController(Controller):
         def do_delete(base_req, key, version):
             req = copy.copy(base_req)
             req.environ = copy.copy(base_req.environ)
-            req.object_name = key
+            req.object_name = str_to_wsgi(key)
             if version:
                 req.params = {'version-id': version, 'symlink': 'get'}
 

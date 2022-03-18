@@ -24,18 +24,19 @@ import boto
 from distutils.version import StrictVersion
 
 import six
-from six.moves import zip, zip_longest
+from six.moves import urllib, zip, zip_longest
 
 import test.functional as tf
 from swift.common.middleware.s3api.etree import fromstring, tostring, \
     Element, SubElement
-from swift.common.middleware.s3api.utils import mktime
+from swift.common.middleware.s3api.utils import MULTIUPLOAD_SUFFIX, mktime
 from swift.common.utils import md5
 
 from test.functional.s3api import S3ApiBase
 from test.functional.s3api.s3_test_client import Connection
 from test.functional.s3api.utils import get_error_code, get_error_msg, \
     calculate_md5
+from test.functional.swift_test_client import Connection as SwiftConnection
 
 
 def setUpModule():
@@ -112,7 +113,7 @@ class TestS3ApiMultiUpload(S3ApiBase):
 
     def test_object_multi_upload(self):
         bucket = 'bucket'
-        keys = [u'obj1\N{SNOWMAN}', 'obj2', 'obj3']
+        keys = [u'obj1\N{SNOWMAN}', u'obj2\N{SNOWMAN}', 'obj3']
         bad_content_md5 = base64.b64encode(b'a' * 16).strip().decode('ascii')
         headers = [{'Content-Type': 'foo/bar', 'x-amz-meta-baz': 'quux'},
                    {'Content-MD5': bad_content_md5},
@@ -145,40 +146,56 @@ class TestS3ApiMultiUpload(S3ApiBase):
         self.assertEqual(len(uploads), len(keys))  # sanity
 
         # List Multipart Uploads
-        query = 'uploads'
-        status, headers, body = \
-            self.conn.make_request('GET', bucket, query=query)
-        self.assertEqual(status, 200)
-        self.assertCommonResponseHeaders(headers)
-        self.assertTrue('content-type' in headers)
-        self.assertEqual(headers['content-type'], 'application/xml')
-        self.assertTrue('content-length' in headers)
-        self.assertEqual(headers['content-length'], str(len(body)))
-        elem = fromstring(body, 'ListMultipartUploadsResult')
-        self.assertEqual(elem.find('Bucket').text, bucket)
-        self.assertIsNone(elem.find('KeyMarker').text)
-        self.assertEqual(elem.find('NextKeyMarker').text, uploads[-1][0])
-        self.assertIsNone(elem.find('UploadIdMarker').text)
-        self.assertEqual(elem.find('NextUploadIdMarker').text, uploads[-1][1])
-        self.assertEqual(elem.find('MaxUploads').text, '1000')
-        self.assertTrue(elem.find('EncodingType') is None)
-        self.assertEqual(elem.find('IsTruncated').text, 'false')
-        self.assertEqual(len(elem.findall('Upload')), 3)
-        for (expected_key, expected_upload_id), u in \
-                zip(uploads, elem.findall('Upload')):
-            key = u.find('Key').text
-            upload_id = u.find('UploadId').text
-            self.assertEqual(expected_key, key)
-            self.assertEqual(expected_upload_id, upload_id)
-            self.assertEqual(u.find('Initiator/ID').text,
-                             self.conn.user_id)
-            self.assertEqual(u.find('Initiator/DisplayName').text,
-                             self.conn.user_id)
-            self.assertEqual(u.find('Owner/ID').text, self.conn.user_id)
-            self.assertEqual(u.find('Owner/DisplayName').text,
-                             self.conn.user_id)
-            self.assertEqual(u.find('StorageClass').text, 'STANDARD')
-            self.assertTrue(u.find('Initiated').text is not None)
+        expected_uploads_list = [uploads]
+        for upload in uploads:
+            expected_uploads_list.append([upload])
+        for expected_uploads in expected_uploads_list:
+            query = 'uploads'
+            if len(expected_uploads) == 1:
+                query += '&' + urllib.parse.urlencode(
+                    {'prefix': expected_uploads[0][0]})
+            status, headers, body = \
+                self.conn.make_request('GET', bucket, query=query)
+            self.assertEqual(status, 200)
+            self.assertCommonResponseHeaders(headers)
+            self.assertTrue('content-type' in headers)
+            self.assertEqual(headers['content-type'], 'application/xml')
+            self.assertTrue('content-length' in headers)
+            self.assertEqual(headers['content-length'], str(len(body)))
+            elem = fromstring(body, 'ListMultipartUploadsResult')
+            self.assertEqual(elem.find('Bucket').text, bucket)
+            self.assertIsNone(elem.find('KeyMarker').text)
+            if len(expected_uploads) > 1:
+                self.assertEqual(elem.find('NextKeyMarker').text,
+                                 expected_uploads[-1][0])
+            else:
+                self.assertIsNone(elem.find('NextKeyMarker').text)
+            self.assertIsNone(elem.find('UploadIdMarker').text)
+            if len(expected_uploads) > 1:
+                self.assertEqual(elem.find('NextUploadIdMarker').text,
+                                 expected_uploads[-1][1])
+            else:
+                self.assertIsNone(elem.find('NextUploadIdMarker').text)
+            self.assertEqual(elem.find('MaxUploads').text, '1000')
+            self.assertTrue(elem.find('EncodingType') is None)
+            self.assertEqual(elem.find('IsTruncated').text, 'false')
+            self.assertEqual(len(elem.findall('Upload')),
+                             len(expected_uploads))
+            for (expected_key, expected_upload_id), u in \
+                    zip(expected_uploads, elem.findall('Upload')):
+                key = u.find('Key').text
+                upload_id = u.find('UploadId').text
+                self.assertEqual(expected_key, key)
+                self.assertEqual(expected_upload_id, upload_id)
+                self.assertEqual(u.find('Initiator/ID').text,
+                                 self.conn.user_id)
+                self.assertEqual(u.find('Initiator/DisplayName').text,
+                                 self.conn.user_id)
+                self.assertEqual(u.find('Owner/ID').text, self.conn.user_id)
+                self.assertEqual(u.find('Owner/DisplayName').text,
+                                 self.conn.user_id)
+                self.assertEqual(u.find('StorageClass').text, 'STANDARD')
+                self.assertTrue(u.find('Initiated').text is not None)
 
         # Upload Part
         key, upload_id = uploads[0]
@@ -405,6 +422,8 @@ class TestS3ApiMultiUpload(S3ApiBase):
 
         # Abort Multipart Uploads
         # note that uploads[1] has part data while uploads[2] does not
+        sw_conn = SwiftConnection(tf.config)
+        sw_conn.authenticate()
         for key, upload_id in uploads[1:]:
             query = 'uploadId=%s' % upload_id
             status, headers, body = \
@@ -416,6 +435,11 @@ class TestS3ApiMultiUpload(S3ApiBase):
                              'text/html; charset=UTF-8')
             self.assertTrue('content-length' in headers)
             self.assertEqual(headers['content-length'], '0')
+            # Check if all parts have been deleted
+            segments = sw_conn.get_account().container(
+                bucket + MULTIUPLOAD_SUFFIX).files(
+                    parms={'prefix': '%s/%s' % (key, upload_id)})
+            self.assertFalse(segments)
 
         # Check object
         def check_obj(req_headers, exp_status):
