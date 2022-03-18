@@ -31,6 +31,7 @@ from swift.cli import ringbuilder
 from swift.cli.ringbuilder import EXIT_SUCCESS, EXIT_WARNING, EXIT_ERROR
 from swift.common import exceptions
 from swift.common.ring import RingBuilder
+from swift.common.ring.io import RingReader
 from swift.common.ring.composite_builder import CompositeRingBuilder
 
 from test.unit import Timeout, write_stub_builder
@@ -2397,6 +2398,23 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
     def test_rebalance_remove_zero_weighted_device(self):
         self.create_sample_ring()
         ring = RingBuilder.load(self.tmpfile)
+        ring.set_dev_weight(2, 0.0)
+        ring.rebalance()
+        ring.pretend_min_part_hours_passed()
+        ring.remove_dev(2)
+        ring.save(self.tmpfile)
+
+        # Test rebalance after remove 0 weighted device
+        argv = ["", self.tmpfile, "rebalance", "3"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+        self.assertTrue(ring.validate())
+        self.assertEqual(len(ring.devs), 4)
+        self.assertIsNone(ring.devs[2])
+
+    def test_rebalance_remove_off_end_trims_dev_list(self):
+        self.create_sample_ring()
+        ring = RingBuilder.load(self.tmpfile)
         ring.set_dev_weight(3, 0.0)
         ring.rebalance()
         ring.pretend_min_part_hours_passed()
@@ -2408,7 +2426,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
         ring = RingBuilder.load(self.tmpfile)
         self.assertTrue(ring.validate())
-        self.assertIsNone(ring.devs[3])
+        self.assertEqual(len(ring.devs), 3)
 
     def test_rebalance_resets_time_remaining(self):
         self.create_sample_ring()
@@ -2546,12 +2564,32 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         argv = ["", self.tmpfile, "write_ring"]
         self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
 
+        for version in "0", "1", "2":
+            argv = ["", self.tmpfile, "write_ring", "--format-version",
+                    version]
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+            with RingReader.open("%s.ring.gz" % self.tmpfile) as reader:
+                self.assertEqual(int(version), reader.version)
+
+        exp_results = {'valid_exit_codes': [EXIT_ERROR]}
+        out, err = self.run_srb("write_ring", "--format-version", "3",
+                                exp_results=exp_results)
+        self.assertIn('invalid choice', err)
+
     def test_write_empty_ring(self):
         ring = RingBuilder(6, 3, 1)
         ring.save(self.tmpfile)
-        exp_results = {'valid_exit_codes': [2]}
+        exp_results = {'valid_exit_codes': [EXIT_ERROR]}
         out, err = self.run_srb("write_ring", exp_results=exp_results)
-        self.assertEqual('Unable to write empty ring.\n', out)
+        exp_out = 'Unable to write empty ring.\n'
+        self.assertEqual(exp_out, out[-len(exp_out):])
+        self.assertIn("Defaulting to --format-version=1", out)
+
+        for version in 0, 1, 2:
+            out, err = self.run_srb("write_ring",
+                                    "--format-version={}".format(version),
+                                    exp_results=exp_results)
+            self.assertEqual(exp_out, out)
 
     def test_write_builder(self):
         # Test builder file already exists
