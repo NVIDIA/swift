@@ -31,7 +31,7 @@ from swift.proxy.controllers.base import Controller, delay_denial, \
     get_cache_key, headers_from_container_info, update_headers
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, HTTPNotFound, \
-    HTTPServiceUnavailable, str_to_wsgi, wsgi_to_str, bytes_to_wsgi, Response
+    HTTPServiceUnavailable, str_to_wsgi, wsgi_to_str, Response
 
 
 class ContainerController(Controller):
@@ -390,6 +390,7 @@ class ContainerController(Controller):
         marker = wsgi_to_str(params.get('marker'))
         end_marker = wsgi_to_str(params.get('end_marker'))
         prefix = wsgi_to_str(params.get('prefix'))
+        delimiter = wsgi_to_str(params.get('delimiter'))
 
         limit = req_limit
         all_resp_status = []
@@ -400,10 +401,13 @@ class ContainerController(Controller):
             # is empty then the original request marker, if any, is used. This
             # allows misplaced objects below the expected shard range to be
             # included in the listing.
+            last_name = ''
             if objects:
                 last_name = objects[-1].get('name',
                                             objects[-1].get('subdir', u''))
-                params['marker'] = bytes_to_wsgi(last_name.encode('utf-8'))
+                if six.PY2:
+                    last_name = last_name.encode('utf8')
+                params['marker'] = str_to_wsgi(last_name)
             elif marker:
                 params['marker'] = str_to_wsgi(marker)
             else:
@@ -436,6 +440,15 @@ class ContainerController(Controller):
                     pass
                 else:
                     if just_past < shard_range:
+                        continue
+
+            if delimiter and last_name.endswith(delimiter):
+                if reverse:
+                    if str(shard_range.lower).startswith(last_name):
+                        continue
+                else:
+                    if str(shard_range.upper).startswith(last_name) and \
+                            shard_range.upper != last_name:
                         continue
 
             self.logger.debug(
