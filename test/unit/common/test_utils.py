@@ -4040,18 +4040,27 @@ cluster_dfw1 = http://dfw1.host/v1/
             m_socket.reset_mock()
             m_sock.reset_mock()
             utils.systemd_notify()
-            self.assertEqual(m_socket.call_count, 0)
-            self.assertEqual(m_sock.connect.call_count, 0)
-            self.assertEqual(m_sock.sendall.call_count, 0)
+            self.assertEqual(m_socket.mock_calls, [
+                mock.call(socket.AF_UNIX, socket.SOCK_DGRAM)])
+            self.assertEqual(m_sock.connect.mock_calls, [
+                mock.call(utils.get_pid_notify_socket())])
+            self.assertEqual(m_sock.sendall.mock_calls, [
+                mock.call(b'READY=1')])
 
             # File notification socket
             m_socket.reset_mock()
             m_sock.reset_mock()
             os.environ['NOTIFY_SOCKET'] = 'foobar'
             utils.systemd_notify()
-            m_socket.assert_called_once_with(socket.AF_UNIX, socket.SOCK_DGRAM)
-            m_sock.connect.assert_called_once_with('foobar')
-            m_sock.sendall.assert_called_once_with(b'READY=1')
+            self.assertEqual(m_socket.mock_calls, [
+                mock.call(socket.AF_UNIX, socket.SOCK_DGRAM),
+                mock.call(socket.AF_UNIX, socket.SOCK_DGRAM)])
+            self.assertEqual(m_sock.connect.mock_calls, [
+                mock.call(utils.get_pid_notify_socket()),
+                mock.call('foobar')])
+            self.assertEqual(m_sock.sendall.mock_calls, [
+                mock.call(b'READY=1'),
+                mock.call(b'READY=1')])
             # Still there, so we can send STOPPING/RELOADING messages
             self.assertIn('NOTIFY_SOCKET', os.environ)
 
@@ -4059,18 +4068,30 @@ cluster_dfw1 = http://dfw1.host/v1/
             m_sock.reset_mock()
             logger = debug_logger()
             utils.systemd_notify(logger, "RELOADING=1")
-            m_socket.assert_called_once_with(socket.AF_UNIX, socket.SOCK_DGRAM)
-            m_sock.connect.assert_called_once_with('foobar')
-            m_sock.sendall.assert_called_once_with(b'RELOADING=1')
+            self.assertEqual(m_socket.mock_calls, [
+                mock.call(socket.AF_UNIX, socket.SOCK_DGRAM),
+                mock.call(socket.AF_UNIX, socket.SOCK_DGRAM)])
+            self.assertEqual(m_sock.connect.mock_calls, [
+                mock.call(utils.get_pid_notify_socket()),
+                mock.call('foobar')])
+            self.assertEqual(m_sock.sendall.mock_calls, [
+                mock.call(b'RELOADING=1'),
+                mock.call(b'RELOADING=1')])
 
             # Abstract notification socket
             m_socket.reset_mock()
             m_sock.reset_mock()
             os.environ['NOTIFY_SOCKET'] = '@foobar'
             utils.systemd_notify()
-            m_socket.assert_called_once_with(socket.AF_UNIX, socket.SOCK_DGRAM)
-            m_sock.connect.assert_called_once_with('\0foobar')
-            m_sock.sendall.assert_called_once_with(b'READY=1')
+            self.assertEqual(m_socket.mock_calls, [
+                mock.call(socket.AF_UNIX, socket.SOCK_DGRAM),
+                mock.call(socket.AF_UNIX, socket.SOCK_DGRAM)])
+            self.assertEqual(m_sock.connect.mock_calls, [
+                mock.call(utils.get_pid_notify_socket()),
+                mock.call('\x00foobar')])
+            self.assertEqual(m_sock.sendall.mock_calls, [
+                mock.call(b'READY=1'),
+                mock.call(b'READY=1')])
             self.assertIn('NOTIFY_SOCKET', os.environ)
 
         # Test logger with connection error
@@ -4090,8 +4111,9 @@ cluster_dfw1 = http://dfw1.host/v1/
             m_logger.reset_mock()
             utils.systemd_notify(logger=m_logger)
             self.assertEqual(0, m_sock.sendall.call_count)
-            m_logger.debug.assert_called_once_with(
-                "Systemd notification failed", exc_info=True)
+            self.assertEqual(m_logger.debug.mock_calls, [
+                mock.call("Systemd notification failed", exc_info=True),
+                mock.call("Systemd notification failed", exc_info=True)])
 
         # Test it for real
         def do_test_real_socket(socket_address, notify_socket):
@@ -4111,6 +4133,33 @@ cluster_dfw1 = http://dfw1.host/v1/
         if sys.platform.startswith('linux'):
             # test abstract socket address
             do_test_real_socket('\0foobar', '@foobar')
+
+            with utils.NotificationServer(os.getpid(), 1) as swift_listener:
+                do_test_real_socket('\0foobar', '@foobar')
+                self.assertEqual(swift_listener.recv_from_pid(1024),
+                                 b'READY=1')
+
+    def test_notification_server_recv_from_bad_pid(self):
+        if six.PY2:
+            raise unittest.SkipTest("py2 doesn't know how to check ancdata")
+
+        class TestServer(utils.NotificationServer):
+            def __init__(self):
+                super(TestServer, self).__init__(os.getpid() + 1, 0.1)
+                self.discarded = False
+
+            def discard_handler(self, *args):
+                self.discarded = True
+
+        with TestServer() as swift_listener:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            sock.settimeout(5)
+            sock.connect('\0swift-notifications\0%d' % (os.getpid() + 1))
+            sock.sendall(b'the message')
+            self.assertFalse(swift_listener.discarded)
+            with self.assertRaises(socket.timeout):
+                swift_listener.recv_from_pid(1024)
+            self.assertTrue(swift_listener.discarded)
 
     def test_md5_with_data(self):
         if not self.fips_enabled:
