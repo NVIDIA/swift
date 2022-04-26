@@ -121,6 +121,8 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             'use_async_delete': False,
             'cors_preflight_allow_origin': [],
             'ratelimit_as_client_error': False,
+            's3_inventory_allowed_paths': ['*'],
+            's3_inventory_enabled': False,
         })
         s3api = S3ApiMiddleware(None, {})
         self.assertEqual(expected, s3api.conf)
@@ -146,11 +148,14 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             'use_async_delete': False,
             'cors_preflight_allow_origin': 'foo.example.com,bar.example.com',
             'ratelimit_as_client_error': True,
+            's3_inventory_allowed_paths': 'a/path,  another/path',
+            's3_inventory_enabled': True,
         }
         s3api = S3ApiMiddleware(None, conf)
         conf['cors_preflight_allow_origin'] = \
             conf['cors_preflight_allow_origin'].split(',')
         conf['storage_domains'] = conf.pop('storage_domain').split(',')
+        conf['s3_inventory_allowed_paths'] = ['a/path', 'another/path']
         self.assertEqual(conf, s3api.conf)
 
         # test allow_origin list with a '*' fails.
@@ -891,7 +896,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         registered_keys = [
             'max_bucket_listing', 'max_parts_listing', 'max_upload_part_num',
             'max_multi_delete_objects', 'allow_multipart_uploads',
-            'min_segment_size', 's3_acl']
+            'min_segment_size', 's3_acl', 's3_inventory_enabled']
         expected = dict((k, self.conf[k]) for k in registered_keys)
         self.assertEqual(expected, swift_info['s3api'])
 
@@ -916,9 +921,6 @@ class TestS3ApiMiddleware(S3ApiTestCase):
 
             # This should work now; no more doubled-up requests to keystone!
             pipeline.return_value = 's3api s3token keystoneauth proxy-server'
-            self.s3api.check_pipeline(self.conf)
-
-            pipeline.return_value = 's3api swauth proxy-server'
             self.s3api.check_pipeline(self.conf)
 
             # Note that authtoken would need to have delay_auth_decision=True
@@ -952,9 +954,6 @@ class TestS3ApiMiddleware(S3ApiTestCase):
 
             pipeline.return_value = 's3api s3token authtoken keystoneauth ' \
                 'proxy-server'
-            self.s3api.check_pipeline(self.conf)
-
-            pipeline.return_value = 's3api swauth proxy-server'
             self.s3api.check_pipeline(self.conf)
 
             pipeline.return_value = 's3api authtoken s3token keystoneauth ' \
