@@ -345,7 +345,7 @@ def quarantine_renamer(device_path, corrupted_file_path):
                   basename(from_dir))
     if len(basename(from_dir)) == 3:
         # quarantining whole suffix
-        invalidate_hash(from_dir)
+        invalidate_hash(from_dir, removed=True)
     else:
         invalidate_hash(dirname(from_dir))
     try:
@@ -434,7 +434,10 @@ def consolidate_hashes(partition_dir):
                 for line in inv_fh:
                     found_invalidation_entry = True
                     suffix = line.strip()
-                    hashes[suffix] = None
+                    if line.startswith('!'):
+                        hashes.pop(suffix[1:], None)
+                    else:
+                        hashes[suffix] = None
         except (IOError, OSError) as e:
             if e.errno != errno.ENOENT:
                 raise
@@ -449,12 +452,14 @@ def consolidate_hashes(partition_dir):
         return hashes
 
 
-def invalidate_hash(suffix_dir):
+def invalidate_hash(suffix_dir, removed=False):
     """
     Invalidates the hash for a suffix_dir in the partition's hashes file.
 
     :param suffix_dir: absolute path to suffix dir whose hash needs
                        invalidating
+    :param removed: if true, mark the suffix as not just invalidated, but
+                    removed
     """
 
     suffix = basename(suffix_dir)
@@ -463,7 +468,10 @@ def invalidate_hash(suffix_dir):
     if not isinstance(suffix, bytes):
         suffix = suffix.encode('utf-8')
     with lock_path(partition_dir), open(invalidations_file, 'ab') as inv_fh:
-        inv_fh.write(suffix + b"\n")
+        if removed:
+            inv_fh.write(b"!" + suffix + b"\n")
+        else:
+            inv_fh.write(suffix + b"\n")
 
 
 def relink_paths(target_path, new_target_path, ignore_missing=True):
