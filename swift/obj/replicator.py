@@ -36,13 +36,15 @@ from swift.common.utils import whataremyips, unlink_older_than, \
     rsync_module_interpolation, mkdirs, config_true_value, \
     config_auto_int_value, storage_directory, \
     load_recon_cache, PrefixLoggerAdapter, parse_override_options, \
-    distribute_evenly, listdir, node_to_string, parse_options
+    distribute_evenly, listdir, node_to_string, parse_options, \
+    config_positive_int_value
 from swift.common.bufferedhttp import http_connect
 from swift.common.daemon import Daemon, run_daemon
 from swift.common.http import HTTP_OK, HTTP_INSUFFICIENT_STORAGE
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.obj import ssync_sender
-from swift.obj.diskfile import get_data_dir, get_tmp_dir, DiskFileRouter
+from swift.obj.diskfile import get_data_dir, get_tmp_dir, DiskFileRouter, \
+    invalidate_hash
 from swift.common.storage_policy import POLICIES, REPL_POLICY
 from swift.common.exceptions import PartitionLockTimeout
 
@@ -166,6 +168,8 @@ class ObjectReplicator(Daemon):
                                           DEFAULT_RSYNC_TIMEOUT))
         self.rsync_io_timeout = conf.get('rsync_io_timeout', '30')
         self.rsync_bwlimit = conf.get('rsync_bwlimit', '0')
+        self.sync_batches_per_revert = config_positive_int_value(
+            conf.get('sync_batches_per_revert', '1'))
         self.rsync_compress = config_true_value(
             conf.get('rsync_compress', 'no'))
         self.rsync_module = conf.get('rsync_module', '').rstrip('/')
@@ -406,6 +410,7 @@ class ObjectReplicator(Daemon):
             return 1  # failure response code
 
         total_time = time.time() - start_time
+        logged_line = False
         for result in results.decode('utf8').split('\n'):
             if result == '':
                 continue
@@ -413,6 +418,7 @@ class ObjectReplicator(Daemon):
                 continue
             if result.startswith('<') and not self.log_rsync_transfers:
                 continue
+            logged_line = True
             if not ret_val:
                 self.logger.debug(result)
             else:
@@ -423,7 +429,7 @@ class ObjectReplicator(Daemon):
                     'Bad rsync return code: %(ret)d <- %(args)s' %
                     {'args': str(args), 'ret': ret_val}))
         else:
-            log_method = self.logger.info if results else self.logger.debug
+            log_method = self.logger.info if logged_line else self.logger.debug
             log_method(
                 "Successful rsync of %(src)s to %(dst)s (%(time).03f)",
                 {'src': args[-2][:-3] + '...', 'dst': args[-1],
@@ -532,11 +538,16 @@ class ObjectReplicator(Daemon):
             with df_mgr.partition_lock(job['device'], job['policy'],
                                        job['partition'], name='replication',
                                        timeout=0.2):
-                responses = []
+                all_batches_synced_successfully = True
                 suffixes = tpool.execute(tpool_get_suffixes, job['path'])
-                synced_remote_regions = {}
-                delete_objs = None
-                if suffixes:
+                random.shuffle(suffixes)
+                for suffixes_to_revert in distribute_evenly(
+                        suffixes, self.sync_batches_per_revert):
+                    if not suffixes_to_revert:
+                        break
+                    responses = []
+                    synced_remote_regions = {}
+                    delete_objs = None
                     for node in job['nodes']:
                         stats.rsync += 1
                         kwargs = {}
@@ -547,7 +558,7 @@ class ObjectReplicator(Daemon):
                         # candidates is a dict(hash=>timestamp) of objects
                         # for deletion
                         success, candidates = self.sync(
-                            node, job, suffixes, **kwargs)
+                            node, job, suffixes_to_revert, **kwargs)
                         if not success:
                             failure_devs_info.add((node['replication_ip'],
                                                    node['device']))
@@ -561,38 +572,43 @@ class ObjectReplicator(Daemon):
                         else:
                             delete_objs = delete_objs & cand_objs
 
-                if self.handoff_delete:
-                    # delete handoff if we have had handoff_delete successes
-                    successes_count = len([resp for resp in responses if resp])
-                    delete_handoff = successes_count >= min(
-                        self.handoff_delete, len(job['nodes']))
-                else:
-                    # delete handoff if all syncs were successful
-                    delete_handoff = len(responses) == len(job['nodes']) and \
-                        all(responses)
-                if delete_handoff:
-                    stats.remove += 1
-                    if (self.conf.get('sync_method', 'rsync') == 'ssync' and
-                            delete_objs is not None):
-                        self.logger.info("Removing %s objects",
-                                         len(delete_objs))
-                        _junk, error_paths = self.delete_handoff_objs(
-                            job, delete_objs)
-                        # if replication works for a hand-off device and it
-                        # failed, the remote devices which are target of the
-                        # replication from the hand-off device will be marked.
-                        # Because cleanup after replication failed means
-                        # replicator needs to replicate again with the same
-                        # info.
-                        if error_paths:
-                            failure_devs_info.update(
-                                [(failure_dev['replication_ip'],
-                                  failure_dev['device'])
-                                 for failure_dev in job['nodes']])
+                    successes_count = sum(1 for resp in responses if resp)
+                    required_successes = min(
+                        self.handoff_delete or len(job['nodes']),
+                        len(job['nodes']))
+                    if successes_count >= required_successes:
+                        stats.remove += 1
+                        if (self.conf.get('sync_method', 'rsync') == 'ssync'
+                                and delete_objs is not None):
+                            # multi-region ssync will send at most one replica
+                            # per region, with the hope that intra-region
+                            # replication will resolve any other disparities
+                            # more cheaply by our next cycle. Progressively
+                            # delete anything that we see *has* been fully
+                            # replicated though.
+                            all_batches_synced_successfully = False
+                            self.logger.info("Removing %s objects",
+                                             len(delete_objs))
+                            _junk, error_paths = self.delete_handoff_objs(
+                                job, delete_objs)
+                            # error_paths will have stuff that successfully
+                            # replicated but couldn't be deleted (most likely,
+                            # the remote indicated it didn't need it, or we
+                            # would have hit some error during read).
+                            # Since it was some kind of failure,  flag the
+                            # remotes (!?) in failure_devs_info.
+                            if error_paths:
+                                failure_devs_info.update(
+                                    [(failure_dev['replication_ip'],
+                                      failure_dev['device'])
+                                     for failure_dev in job['nodes']])
+                        else:
+                            self.delete_suffixes(
+                                job['path'], suffixes_to_revert)
                     else:
-                        self.delete_partition(job['path'])
-                        handoff_partition_deleted = True
-                elif not suffixes:
+                        all_batches_synced_successfully = False
+
+                if all_batches_synced_successfully:
                     self.delete_partition(job['path'])
                     handoff_partition_deleted = True
         except PartitionLockTimeout:
@@ -613,6 +629,22 @@ class ObjectReplicator(Daemon):
                 self.handoffs_remaining += 1
             self.partition_times.append(time.time() - begin)
             self.logger.timing_since('partition.delete.timing', begin)
+
+    def delete_suffixes(self, part_path, suffixes):
+        self.logger.debug("Removing %s suffixes from partition: %s",
+                          len(suffixes), part_path)
+        for suffix in suffixes:
+            suffix_dir = os.path.join(part_path, suffix)
+            try:
+                tpool.execute(shutil.rmtree, suffix_dir)
+            except OSError as e:
+                if e.errno not in (errno.ENOENT, errno.ENOTEMPTY,
+                                   errno.ENODATA):
+                    # Don't worry if there was a race to create or delete,
+                    # or some disk corruption that happened after the sync
+                    raise
+            finally:
+                invalidate_hash(suffix_dir)
 
     def delete_partition(self, path):
         self.logger.info("Removing partition: %s", path)
@@ -638,6 +670,10 @@ class ObjectReplicator(Daemon):
                 success_paths.append(object_path)
             except OSError as e:
                 if e.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+                    # TODO: Can't we just quarantine?
+                    # At this point, we should know everything's fully
+                    # durable anyway, and then we could stop trying to
+                    # track success/error_paths at all
                     error_paths.append(object_path)
                     self.logger.exception(
                         "Unexpected error trying to cleanup suffix dir %r",
