@@ -1645,15 +1645,13 @@ class TestObjectReplicator(unittest.TestCase):
             self.call_nums = 0
             self.conf['sync_method'] = 'ssync'
 
-            in_sync_objs = {}
-
             def _fake_ssync(node, job, suffixes, remote_check_objs=None):
                 self.call_nums += 1
                 if remote_check_objs is None:
                     # sync job
                     ret_val = {ohash: ts}
                 else:
-                    ret_val = in_sync_objs
+                    ret_val = {}
                 return True, ret_val
 
             self.replicator.sync_method = _fake_ssync
@@ -1705,17 +1703,18 @@ class TestObjectReplicator(unittest.TestCase):
                 instance.errno = error_no
                 instance.strerror = os.strerror(error_no)
 
-                def func(directory):
+                def func(directory, **kwargs):
                     if directory == suffix_dir_path:
                         raise instance
                     else:
-                        rmdir_func(directory)
+                        rmdir_func(directory, **kwargs)
 
                 return func
 
             self.replicator.sync_method = _fake_ssync
             self.replicator.replicate()
             # The file should still exist
+            self.assertFalse(mock_logger.get_lines_for_level('error'))
             self.assertTrue(os.access(whole_path_from, os.F_OK))
             self.assertTrue(os.access(suffix_dir_path, os.F_OK))
             self.assertTrue(os.access(part_path, os.F_OK))
@@ -2361,6 +2360,66 @@ class TestObjectReplicator(unittest.TestCase):
         logs = self.logger.get_lines_for_level('info')
         self.assertEqual(['Unable to lock handoff partition 1 for '
                           'replication on device sda policy 0'], logs)
+
+    def test_update_deleted_can_batch_suffixes(self):
+        self.replicator.handoffs_remaining = 0
+        self.replicator.sync_batches_per_revert = 4
+        jobs = self.replicator.collect_jobs()
+        delete_jobs = [j for j in jobs if j['delete']]
+        delete_jobs.sort(key=lambda j: j['policy'])
+        job = delete_jobs[0]
+        for suffix in range(11):
+            os.mkdir(os.path.join(job['path'], "%03x" % suffix))
+        with mock.patch.object(self.replicator, 'sync',
+                               return_value=(True, {})) as mock_sync, \
+                mock.patch('shutil.rmtree') as mock_rmtree:
+            self.replicator.update_deleted(job)
+        self.assertEqual(len(mock_sync.mock_calls), 12)
+        self.assertEqual(mock_sync.mock_calls, [
+            mock.call(node, job, mock.ANY) for node in job['nodes']] * 4)
+        self.assertEqual([len(c[1][2]) for c in mock_sync.mock_calls], [
+            3, 3, 3,
+            3, 3, 3,
+            3, 3, 3,
+            2, 2, 2,
+        ])
+        self.assertEqual(sorted(mock_rmtree.mock_calls[:-1]), [
+            mock.call(os.path.join(job['path'], "%03x" % suffix))
+            for suffix in range(11)])
+        self.assertEqual(mock_rmtree.mock_calls[-1], mock.call(job['path']))
+
+    def test_update_deleted_batch_suffixes_carry_on(self):
+        self.replicator.handoffs_remaining = 0
+        self.replicator.sync_batches_per_revert = 4
+        jobs = self.replicator.collect_jobs()
+        delete_jobs = [j for j in jobs if j['delete']]
+        delete_jobs.sort(key=lambda j: j['policy'])
+        job = delete_jobs[0]
+        for suffix in range(11):
+            os.mkdir(os.path.join(job['path'], "%03x" % suffix))
+        sync_returns = [
+            (True, {}), (True, {}), (True, {}),
+            (True, {}), (True, {}), (False, {"doesn't": "matter"}),
+            (True, {}), (True, {}), (True, {}),
+            (True, {}), (True, {}), (True, {}),
+        ]
+        with mock.patch.object(self.replicator, 'sync',
+                               side_effect=sync_returns) as mock_sync, \
+                mock.patch('shutil.rmtree') as mock_rmtree, \
+                mock.patch('random.shuffle', side_effect=lambda x: None):
+            self.replicator.update_deleted(job)
+        self.assertEqual(len(mock_sync.mock_calls), 12)
+        self.assertEqual(mock_sync.mock_calls, [
+            mock.call(node, job, mock.ANY) for node in job['nodes']] * 4)
+        self.assertEqual([len(c[1][2]) for c in mock_sync.mock_calls], [
+            3, 3, 3,
+            3, 3, 3,
+            3, 3, 3,
+            2, 2, 2,
+        ])
+        self.assertEqual(mock_rmtree.mock_calls, [
+            mock.call(os.path.join(job['path'], "%03x" % suffix))
+            for suffix in (0, 4, 8, 2, 6, 10, 3, 7)])
 
     def test_replicate_skipped_partpower_increase(self):
         _create_test_rings(self.testdir, next_part_power=4)
