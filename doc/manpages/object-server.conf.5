@@ -383,6 +383,11 @@ slow down the syncing process. The default is false.
 .IP \fBrsync_module\fR
 Format of the rsync module where the replicator will send data. See
 etc/rsyncd.conf-sample for some usage examples. The default is empty.
+.IP \fBsync_batches_per_revert\fR
+Maximum number of batches to use when syncing a handoff back to primaries.
+This progressively deletes handoff data as batches complete; it may be
+useful to increase this when rebalancing a fairly full cluster.
+Note that this will inflate some progress stats emitted to logs and recon.
 .IP \fBnode_timeout\fR
 Request timeout to external services. The default is 10 seconds.
 .IP \fBrsync_bwlimit\fR
