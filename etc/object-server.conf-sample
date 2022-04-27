@@ -302,6 +302,9 @@ use = egg:swift#backend_ratelimit
 # etc/rsyncd.conf-sample for some usage examples.
 # rsync_module = {replication_ip}::object
 #
+# Maximum number of batches to use when syncing a handoff back to primaries.
+# sync_batches_per_revert = 1
+#
 # node_timeout = <whatever's in the DEFAULT section or 10>
 # max duration of an http request; this is for REPLICATE finalization calls and
 # so should be longer than node_timeout
