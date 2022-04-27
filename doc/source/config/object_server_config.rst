@@ -390,6 +390,15 @@ rsync_module                 {replication_ip}::object  Format of the rsync modul
                                                        examples.
 rsync_error_log_line_length  0                         Limits how long rsync error log
                                                        lines are
+sync_batches_per_revert      1                         Maximum number of batches to use
+                                                       when syncing a handoff back to
+                                                       primaries. This progressively
+                                                       deletes handoff data as batches
+                                                       complete; it may be useful to
+                                                       increase this when rebalancing a
+                                                       fairly full cluster. Note that
+                                                       this will inflate some progress
+                                                       stats emitted to logs and recon.
 ring_check_interval          15                        Interval for checking new ring
                                                        file
 recon_cache_path             /var/cache/swift          Path to recon cache
