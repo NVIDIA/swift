@@ -6306,9 +6306,27 @@ class PipeMutex(object):
         self.close()
 
 
+class NoopMutex(object):
+    """
+    "Mutex" that doesn't lock anything.
+
+    We only allow our syslog logging to be configured via UDS or UDP, neither
+    of which have the message-interleaving trouble you'd expect from TCP or
+    file handlers.
+    """
+    def acquire(self, blocking=True):
+        pass
+
+    def release(self):
+        pass
+
+
 class ThreadSafeSysLogHandler(SysLogHandler):
     def createLock(self):
-        self.lock = PipeMutex()
+        if config_true_value(os.environ.get('SWIFT_NOOP_LOGGING_MUTEX')):
+            self.lock = NoopMutex()
+        else:
+            self.lock = PipeMutex()
 
 
 def round_robin_iter(its):
