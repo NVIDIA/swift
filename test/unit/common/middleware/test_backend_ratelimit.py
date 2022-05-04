@@ -46,6 +46,11 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         super(TestBackendRatelimitMiddleware, self).setUp()
         self.swift = FakeSwift()
         self.tempdir = mkdtemp()
+        self.default_req_per_dev_per_sec = dict(
+            (key, 0.0) for key in
+            (None, 'GET', 'HEAD', 'PUT', 'POST', 'DELETE', 'UPDATE',
+             'REPLICATE')
+        )
 
     def tearDown(self):
         shutil.rmtree(self.tempdir, ignore_errors=True)
@@ -54,15 +59,20 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         conf = {}
         factory = backend_ratelimit.filter_factory(conf)
         rl = factory(self.swift)
-        self.assertEqual(0.0, rl.requests_per_device_per_second)
+        self.assertEqual(self.default_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(1.0, rl.requests_per_device_rate_buffer)
 
         conf = {'requests_per_device_per_second': 1.3,
                 'requests_per_device_rate_buffer': 2.4}
         factory = backend_ratelimit.filter_factory(conf)
         rl = factory(self.swift)
-        self.assertEqual(1.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 1.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
+        self.assertEqual(1.3, rl.max_requests_per_device_per_second)
 
         conf = {'requests_per_device_per_second': -1}
         factory = backend_ratelimit.filter_factory(conf)
@@ -128,7 +138,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                     'swift.common.middleware.backend_ratelimit.get_logger',
                     return_value=debug_logger()):
                 rl = factory(self.swift)
-            self.assertEqual(1.3, rl.requests_per_device_per_second)
+            exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+            exp_req_per_dev_per_sec.update({None: 1.3})
+            self.assertEqual(exp_req_per_dev_per_sec,
+                             rl.requests_per_device_per_second)
             self.assertEqual(1.0, rl.requests_per_device_rate_buffer)
             self.assertEqual([], rl.logger.get_lines_for_level('error'))
             self.assertEqual(
@@ -146,7 +159,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                 'swift.common.middleware.backend_ratelimit.get_logger',
                 return_value=debug_logger()):
             rl = factory(self.swift)
-        self.assertEqual(1.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 1.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(1.0, rl.requests_per_device_rate_buffer)
         self.assertEqual([], rl.logger.get_lines_for_level('error'))
         self.assertEqual([], rl.logger.get_lines_for_level('warning'))
@@ -163,7 +179,11 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         with mock.patch('swift.common.middleware.backend_ratelimit.get_logger',
                         return_value=debug_logger()):
             rl = factory(self.swift)
-        self.assertEqual(1.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 1.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
+        self.assertEqual(1.0, rl.requests_per_device_rate_buffer)
         lines = rl.logger.get_lines_for_level('warning')
         self.assertEqual(1, len(lines), lines)
         self.assertIn('Invalid config file', lines[0])
@@ -185,9 +205,13 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                         return_value=debug_logger()):
             rl = factory(self.swift)
         # backend-ratelimit.conf overrides options
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 12.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         # but only the ones that are listed
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
+        self.assertEqual(12.3, rl.max_requests_per_device_per_second)
         lines = rl.logger.get_lines_for_level('info')
         self.assertEqual(['Loaded config file %s, config changed' % conf_path],
                          lines)
@@ -209,15 +233,107 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         with mock.patch('swift.common.middleware.backend_ratelimit.get_logger',
                         return_value=debug_logger()):
             rl = factory(self.swift)
-        # we DO read rate limit options
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 12.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(12.4, rl.requests_per_device_rate_buffer)
-        # but we do NOT read config reload options
+        self.assertEqual(12.3, rl.max_requests_per_device_per_second)
+        # options related to conf file loading are not loaded from conf file...
         self.assertEqual(conf_path, rl.conf_path)
         self.assertEqual(15, rl.config_reload_interval)
         lines = rl.logger.logger.get_lines_for_level('info')
         self.assertEqual(['Loaded config file %s, config changed' % conf_path],
                          lines)
+
+    def _do_test_init_config_file_overrides_filter_conf(self, actual_path,
+                                                        conf_path):
+        # verify that conf file options override filter conf options
+        # create the actual file, but no options
+        with open(actual_path, 'w') as fd:
+            fd.write('[backend_ratelimit]')
+        conf = {'swift_dir': self.tempdir,
+                'requests_per_device_per_second': "1.3",
+                'requests_per_device_rate_buffer': "2.4",
+                'config_reload_interval': 15}
+        if conf_path:
+            # only configure if given a conf_path
+            conf['backend_ratelimit_conf_path'] = conf_path
+        else:
+            conf_path = os.path.join(self.tempdir, 'backend-ratelimit.conf')
+        factory = backend_ratelimit.filter_factory(conf)
+        rl = factory(self.swift)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 1.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
+        self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
+        self.assertEqual(1.3, rl.max_requests_per_device_per_second)
+        self.assertEqual(conf_path, rl.conf_path)
+        self.assertEqual(15, rl.config_reload_interval)
+
+        # create file with option
+        with open(actual_path, 'w') as fd:
+            fd.write('[backend_ratelimit]\n'
+                     'requests_per_device_per_second = 12.3\n'
+                     'backend_ratelimit_conf_path = /etc/swift/ignored.conf\n'
+                     'config_reload_interval = 999999\n')
+        factory = backend_ratelimit.filter_factory(conf)
+        rl = factory(self.swift)
+        exp_req_per_dev_per_sec[None] = 12.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
+        self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
+        self.assertEqual(12.3, rl.max_requests_per_device_per_second)
+        # options related to conf file loading are not loaded from conf file...
+        self.assertEqual(conf_path, rl.conf_path)
+        self.assertEqual(15, rl.config_reload_interval)
+
+        with open(actual_path, 'w') as fd:
+            fd.write(
+                '[backend_ratelimit]\n'
+                'requests_per_device_per_second = 5.3\n'
+                'requests_per_device_rate_buffer = 0.5\n'
+                'delete_requests_per_device_per_second = 1\n'
+                'get_requests_per_device_per_second = 2\n'
+                'head_requests_per_device_per_second = 3\n'
+                'post_requests_per_device_per_second = 4\n'
+                'put_requests_per_device_per_second = 5\n'
+                'replicate_requests_per_device_per_second = 6\n'
+                'update_requests_per_device_per_second = 7\n'
+                'backend_ratelimit_conf_path = /etc/swift/ignored.conf\n'
+                'config_reload_interval = 999999\n'
+            )
+        factory = backend_ratelimit.filter_factory(conf)
+        rl = factory(self.swift)
+        exp_req_per_dev_per_sec.update(
+            {
+                None: 5.3,
+                'DELETE': 1,
+                'GET': 2,
+                'HEAD': 3,
+                'POST': 4,
+                'PUT': 5,
+                'REPLICATE': 6,
+                'UPDATE': 7,
+            }
+        )
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
+        self.assertEqual(0.5, rl.requests_per_device_rate_buffer)
+        self.assertEqual(7, rl.max_requests_per_device_per_second)
+        # options related to conf file loading are not loaded from conf file...
+        self.assertEqual(conf_path, rl.conf_path)
+        self.assertEqual(15, rl.config_reload_interval)
+
+    def test_init_config_file_overrides_filter_conf(self):
+        # default conf path
+        actual_path = os.path.join(self.tempdir, 'backend-ratelimit.conf')
+        self._do_test_init_config_file_overrides_filter_conf(actual_path, None)
+        # explicitly configure conf path
+        actual_path = os.path.join(self.tempdir, 'backend_rl.conf')
+        self._do_test_init_config_file_overrides_filter_conf(actual_path,
+                                                             actual_path)
 
     def _do_test_config_file_reload(self, filter_conf, exp_reload_time):
         # verify that conf file options are periodically reloaded
@@ -233,7 +349,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         with mock.patch('swift.common.middleware.backend_ratelimit.time.time',
                         return_value=now):
             rl = factory(self.swift)
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec.update({None: 12.3, 'HEAD': 6.2})
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         self.assertEqual(conf_path, rl.conf_path)
 
@@ -243,11 +362,15 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                      'requests_per_device_per_second = 29.3\n'
                      'requests_per_device_rate_buffer = 12.4\n'
                      'backend_ratelimit_conf_path = /etc/swift/rl.conf\n'
-                     'config_reload_interval = 999999\n')
+                     'config_reload_interval = 999999\n'
+                     'head_requests_per_device_per_second = 5.1\n'
+                     'delete_requests_per_device_per_second = 7.3\n'
+                     'get_requests_per_device_per_second = 8.4\n')
 
         # send some requests, but too soon for config file to be reloaded
         req1 = Request.blank('/sda1/99/a/c/o')
-        req2 = Request.blank('/sda2/99/a/c/o')
+        req2 = Request.blank('/sda2/99/a/c/o',
+                             environ={'REQUEST_METHOD': 'DELETE'})
         self.swift.register(req1.method, req1.path, HTTPOk, {})
         self.swift.register(req2.method, req2.path, HTTPOk, {})
         with mock.patch('swift.common.middleware.backend_ratelimit.time.time',
@@ -256,9 +379,21 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
             resp2 = req2.get_response(rl)
         self.assertEqual(200, resp1.status_int)
         self.assertEqual(200, resp2.status_int)
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         self.assertEqual(conf_path, rl.conf_path)
+
+        # verify the per dev ratelimiters
+        self.assertEqual({('sda1', 'GET'): 0.0,
+                          ('sda2', 'DELETE'): 0.0,
+                          ('sda1', None): 12.3,
+                          ('sda2', None): 12.3},
+                         dict((key, val.max_rate)
+                              for key, val in rl.rate_limiters.items()))
+        for (dev, method), limiter in rl.rate_limiters.items():
+            self.assertEqual(2.4 * limiter.clock_accuracy,
+                             limiter.rate_buffer_ms, (dev, method))
 
         # send some requests, time for config file to be reloaded
         with mock.patch('swift.common.middleware.backend_ratelimit.time.time',
@@ -267,24 +402,36 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
             resp2 = req2.get_response(rl)
         self.assertEqual(200, resp1.status_int)
         self.assertEqual(200, resp2.status_int)
-        self.assertEqual(29.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec.update({
+            None: 29.3,
+            'HEAD': 5.1,
+            'DELETE': 7.3,
+            'GET': 8.4})
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(12.4, rl.requests_per_device_rate_buffer)
         self.assertEqual(conf_path, rl.conf_path)
 
         # verify the per dev ratelimiters were updated
-        per_dev_rl_rates = [per_dev_rl.max_rate
-                            for per_dev_rl in list(rl.rate_limiters.values())]
-        self.assertEqual([29.3, 29.3], per_dev_rl_rates)
-        per_dev_rl_buffer = [per_dev_rl.rate_buffer_ms
-                             for per_dev_rl in list(rl.rate_limiters.values())]
-        self.assertEqual([12400, 12400], sorted(per_dev_rl_buffer))
+        self.assertEqual({('sda1', 'GET'): 8.4,
+                          ('sda2', 'DELETE'): 7.3,
+                          ('sda1', None): 29.3,
+                          ('sda2', None): 29.3},
+                         dict((key, val.max_rate)
+                              for key, val in rl.rate_limiters.items()))
+        for (dev, method), limiter in rl.rate_limiters.items():
+            self.assertEqual(12.4 * limiter.clock_accuracy,
+                             limiter.rate_buffer_ms, (dev, method))
 
         # modify the config file again
         # remove requests_per_device_per_second option
+        # remove [head|delete]_requests_per_device_per_second options
         with open(conf_path, 'w') as fd:
             fd.write('[backend_ratelimit]\n'
                      'backend_ratelimit_conf_path = /etc/swift/rl.conf\n'
-                     'config_reload_interval = 999999\n')
+                     'config_reload_interval = 999999\n'
+                     'requests_per_device_rate_buffer = 0.5\n'
+                     'get_requests_per_device_per_second = 9.5\n')
 
         # send some requests, not yet time for config file to be reloaded
         with mock.patch('swift.common.middleware.backend_ratelimit.time.time',
@@ -293,17 +440,21 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
             resp2 = req2.get_response(rl)
         self.assertEqual(200, resp1.status_int)
         self.assertEqual(200, resp2.status_int)
-        self.assertEqual(29.3, rl.requests_per_device_per_second)
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(12.4, rl.requests_per_device_rate_buffer)
         self.assertEqual(conf_path, rl.conf_path)
 
         # verify the per dev ratelimiters were not updated
-        per_dev_rl_rates = [per_dev_rl.max_rate
-                            for per_dev_rl in list(rl.rate_limiters.values())]
-        self.assertEqual([29.3, 29.3], sorted(per_dev_rl_rates))
-        per_dev_rl_buffer = [per_dev_rl.rate_buffer_ms
-                             for per_dev_rl in list(rl.rate_limiters.values())]
-        self.assertEqual([12400, 12400], sorted(per_dev_rl_buffer))
+        self.assertEqual({('sda1', 'GET'): 8.4,
+                          ('sda2', 'DELETE'): 7.3,
+                          ('sda1', None): 29.3,
+                          ('sda2', None): 29.3},
+                         dict((key, val.max_rate)
+                              for key, val in rl.rate_limiters.items()))
+        for (dev, method), limiter in rl.rate_limiters.items():
+            self.assertEqual(12.4 * limiter.clock_accuracy,
+                             limiter.rate_buffer_ms, (dev, method))
 
         # send some requests, time for config file to be reloaded
         with mock.patch('swift.common.middleware.backend_ratelimit.time.time',
@@ -313,23 +464,35 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         self.assertEqual(200, resp1.status_int)
         self.assertEqual(200, resp2.status_int)
         # requests_per_device_per_second option reverts to filter conf
-        self.assertEqual(1.3, rl.requests_per_device_per_second)
-        self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
+        # delete_requests_per_device_per_second option reverts to default
+        # head_requests_per_device_per_second option reverts to filter conf
+        exp_req_per_dev_per_sec.update({
+            None: 1.3,
+            'HEAD': 6.2,
+            'DELETE': 0.0,
+            'GET': 9.5})
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
+        self.assertEqual(0.5, rl.requests_per_device_rate_buffer)
         self.assertEqual(conf_path, rl.conf_path)
 
-        # verify the per dev ratelimiters were not updated
-        per_dev_rl_rates = [per_dev_rl.max_rate
-                            for per_dev_rl in list(rl.rate_limiters.values())]
-        self.assertEqual([1.3, 1.3], sorted(per_dev_rl_rates))
-        per_dev_rl_buffer = [per_dev_rl.rate_buffer_ms
-                             for per_dev_rl in list(rl.rate_limiters.values())]
-        self.assertEqual([2400, 2400], sorted(per_dev_rl_buffer))
+        # verify the per dev ratelimiters were updated
+        self.assertEqual({('sda1', 'GET'): 9.5,
+                          ('sda2', 'DELETE'): 0.0,
+                          ('sda1', None): 1.3,
+                          ('sda2', None): 1.3},
+                         dict((key, val.max_rate)
+                              for key, val in rl.rate_limiters.items()))
+        for (dev, method), limiter in rl.rate_limiters.items():
+            self.assertEqual(0.5 * limiter.clock_accuracy,
+                             limiter.rate_buffer_ms, (dev, method))
         return rl
 
     def test_config_file_reload_default_interval(self):
         filter_conf = {'swift_dir': self.tempdir,
                        'requests_per_device_per_second': "1.3",
-                       'requests_per_device_rate_buffer': "2.4"}
+                       'requests_per_device_rate_buffer': "2.4",
+                       'head_requests_per_device_per_second': '6.2'}
         rl = self._do_test_config_file_reload(filter_conf, 60)
         self.assertEqual(60, rl.config_reload_interval)
 
@@ -337,7 +500,8 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         filter_conf = {'swift_dir': self.tempdir,
                        'config_reload_interval': "30",
                        'requests_per_device_per_second': "1.3",
-                       'requests_per_device_rate_buffer': "2.4"}
+                       'requests_per_device_rate_buffer': "2.4",
+                       'head_requests_per_device_per_second': '6.2'}
         rl = self._do_test_config_file_reload(filter_conf, 30)
         self.assertEqual(30, rl.config_reload_interval)
 
@@ -359,7 +523,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                     return_value=debug_logger()):
                 rl = factory(self.swift)
         # filter conf has been applied
-        self.assertEqual(1.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 1.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         self.assertEqual(
             ['Failed to load config file: Unable to read config from %s'
@@ -375,7 +542,8 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                         return_value=now + 10000):
             resp1 = req1.get_response(rl)
         self.assertEqual(200, resp1.status_int)
-        self.assertEqual(1.3, rl.requests_per_device_per_second)
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         self.assertEqual([], rl.logger.get_lines_for_level('warning'))
         self.assertEqual([], rl.logger.get_lines_for_level('error'))
@@ -396,7 +564,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                     return_value=debug_logger()):
                 rl = factory(self.swift)
         # filter conf has been applied
-        self.assertEqual(1.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 1.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         self.assertEqual([], rl.logger.get_lines_for_level('warning'))
         self.assertEqual([], rl.logger.get_lines_for_level('error'))
@@ -410,7 +581,8 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
             resp1 = req1.get_response(rl)
         self.assertEqual(200, resp1.status_int)
         # previous conf file value has been retained
-        self.assertEqual(1.3, rl.requests_per_device_per_second)
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         self.assertEqual([], rl.logger.get_lines_for_level('warning'))
         self.assertEqual([], rl.logger.get_lines_for_level('error'))
@@ -433,7 +605,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                     return_value=debug_logger()):
                 rl = factory(self.swift)
         # conf file value has been applied
-        self.assertEqual(1.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 1.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         self.assertEqual([], rl.logger.get_lines_for_level('warning'))
         self.assertEqual([], rl.logger.get_lines_for_level('error'))
@@ -457,7 +632,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                     return_value=debug_logger()):
                 rl = factory(self.swift)
         # conf file value has been applied
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 12.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         self.assertEqual([], rl.logger.get_lines_for_level('warning'))
         self.assertEqual([], rl.logger.get_lines_for_level('error'))
@@ -478,7 +656,8 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                 resp1 = req1.get_response(rl)
         self.assertEqual(200, resp1.status_int)
         # previous conf file value has been retained
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         mock_readconf.assert_called_once()
         self.assertEqual(['Invalid config file %s: BOOM' % conf_path],
@@ -492,7 +671,8 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
             resp1 = req1.get_response(rl)
         self.assertEqual(200, resp1.status_int)
         # previous conf file value has been retained
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         self.assertEqual([], rl.logger.get_lines_for_level('warning'))
         self.assertEqual([], rl.logger.get_lines_for_level('error'))
@@ -503,8 +683,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                         return_value=now + 10060):
             resp1 = req1.get_response(rl)
         self.assertEqual(200, resp1.status_int)
-        # updated conf file value is applied
-        self.assertEqual(29.3, rl.requests_per_device_per_second)
+        # previous conf file value has been retained
+        exp_req_per_dev_per_sec.update({None: 29.3})
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         self.assertEqual([], rl.logger.get_lines_for_level('warning'))
         self.assertEqual([], rl.logger.get_lines_for_level('error'))
@@ -528,7 +710,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                     return_value=debug_logger()):
                 rl = factory(self.swift)
         # conf file value has been applied
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 12.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         lines = rl.logger.get_lines_for_level('info')
         self.assertEqual(['Loaded config file %s, config changed' % conf_path],
@@ -542,7 +727,8 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                         return_value=now + 10000):
             resp1 = req1.get_response(rl)
         self.assertEqual(200, resp1.status_int)
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         lines = rl.logger.get_lines_for_level('info')
         self.assertEqual([], lines)
@@ -557,7 +743,9 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
             resp1 = req1.get_response(rl)
         self.assertEqual(200, resp1.status_int)
         # previous conf file value has been retained
-        self.assertEqual(23.4, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec.update({None: 23.4})
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         lines = rl.logger.get_lines_for_level('info')
         self.assertEqual(['Loaded config file %s, config changed' % conf_path],
@@ -579,7 +767,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         with mock.patch('swift.common.middleware.backend_ratelimit.time.time',
                         return_value=now):
             rl = factory(self.swift)
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 12.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
 
         with open(conf_path, 'w') as fd:
@@ -594,10 +785,14 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
             resp = req.get_response(rl)
         self.assertEqual(200, resp.status_int)
         # no change
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 12.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
 
-    def _do_test_ratelimit(self, method, req_per_sec, rate_buffer):
+    def _do_test_ratelimit(self, method, req_per_sec, rate_buffer,
+                           extra_conf=None):
         # send 20 requests, time increments by 0.01 between each request
         start = time.time()
         fake_time = [start]
@@ -610,6 +805,8 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         # apply a ratelimit
         conf = {'requests_per_device_per_second': req_per_sec,
                 'requests_per_device_rate_buffer': rate_buffer}
+        if extra_conf:
+            conf.update(extra_conf)
         rl = BackendRateLimitMiddleware(app, conf, logger)
         success = defaultdict(int)
         ratelimited = 0
@@ -635,13 +832,13 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                 'backend.ratelimit', 0))
         return success
 
-    def test_ratelimited(self):
+    def test_method_ratelimited(self):
         def do_test_ratelimit(method):
             # no rate-limiting
             success_per_dev = self._do_test_ratelimit(method, 0, 0)
             self.assertEqual([20] * 3, list(success_per_dev.values()))
 
-            # rate-limited
+            # global rate-limited
             success_per_dev = self._do_test_ratelimit(method, 1, 0)
             self.assertEqual([1] * 3, list(success_per_dev.values()))
 
@@ -657,6 +854,20 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
             success_per_dev = self._do_test_ratelimit(method, 10, 1)
             self.assertEqual([12] * 3, list(success_per_dev.values()))
 
+            # method rate-limited
+            extra_conf = {
+                '%s_requests_per_device_per_second' % method.lower(): 1
+            }
+            success_per_dev = self._do_test_ratelimit(method, 0, 0, extra_conf)
+            self.assertEqual([1] * 3, list(success_per_dev.values()))
+
+            # method not rate-limited, global rate limited
+            extra_conf = {
+                '%s_requests_per_device_per_second' % method.lower(): 100
+            }
+            success_per_dev = self._do_test_ratelimit(method, 1, 0, extra_conf)
+            self.assertEqual([1] * 3, list(success_per_dev.values()))
+
         do_test_ratelimit('GET')
         do_test_ratelimit('HEAD')
         do_test_ratelimit('PUT')
@@ -665,7 +876,7 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         do_test_ratelimit('UPDATE')
         do_test_ratelimit('REPLICATE')
 
-    def test_not_ratelimited(self):
+    def test_method_not_ratelimited(self):
         def do_test_no_ratelimit(method):
             # verify no rate-limiting
             success_per_dev = self._do_test_ratelimit(method, 1, 0)
@@ -673,6 +884,15 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
 
         do_test_no_ratelimit('OPTIONS')
         do_test_no_ratelimit('SSYNC')
+
+    def test_no_ratelimiting_configured(self):
+        # verify shortcut path when no ratelimiting is configured
+        with mock.patch(
+                'swift.common.middleware.backend_ratelimit.'
+                'BackendRateLimitMiddleware._is_allowed') as mock_is_allowed:
+            success_per_dev = self._do_test_ratelimit('GET', 0, 0)
+        self.assertEqual([20] * 3, list(success_per_dev.values()))
+        mock_is_allowed.assert_not_called()
 
     def test_unhandled_request(self):
         app = FakeSwift()
