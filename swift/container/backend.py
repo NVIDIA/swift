@@ -1849,7 +1849,7 @@ class ContainerBroker(DatabaseBroker):
         shard_ranges = filter_shard_ranges(shard_ranges, includes,
                                            marker, end_marker)
 
-        if not includes and fill_gaps:
+        if fill_gaps:
             own_shard_range = self._own_shard_range()
             if shard_ranges:
                 last_upper = shard_ranges[-1].upper

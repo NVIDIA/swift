@@ -268,7 +268,7 @@ use = egg:swift#recon
 # bandwidth limit for rsync in kB/s. 0 means unlimited
 # rsync_bwlimit = 0
 #
-# passed to rsync for io op timeout
+# passed to rsync for both io op timeout and connection timeout
 # rsync_io_timeout = 30
 #
 # Allow rsync to compress data which is transmitted to destination node
@@ -292,6 +292,13 @@ use = egg:swift#recon
 #
 # ring_check_interval = 15.0
 # recon_cache_path = /var/cache/swift
+#
+# By default, per-file rsync transfers are logged at debug if successful and
+# error on failure. During large rebalances (which both increase the number
+# of diskfiles transferred and increases the likelihood of failures), this
+# can overwhelm log aggregation while providing little useful insights.
+# Change this to false to disable per-file logging.
+# log_rsync_transfers = true
 #
 # limits how long rsync error log lines are
 # 0 means to log the entire line

@@ -32,6 +32,7 @@ from eventlet import GreenPool, sleep, Queue
 from eventlet.pools import Pool
 
 from swift.common import memcached
+from swift.common.memcached import MemcacheConnectionError
 from swift.common.utils import md5, human_readable
 from mock import patch, MagicMock
 from test.debug_logger import debug_logger
@@ -620,19 +621,27 @@ class TestMemcached(unittest.TestCase):
         self.assertEqual(self.logger.get_lines_for_level('error'), [
             'Error talking to memcached: 1.2.3.4:11211: '
             '[Errno 32] Broken pipe',
-        ] * 11 + [
-            'Error limiting server 1.2.3.4:11211'
+        ] * 10 + [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+            'Error limiting server 1.2.3.4:11211',
+            'All memcached servers error-limited',
         ])
         self.logger.clear()
 
         # continued requests just keep bypassing memcache
         for _ in range(12):
             memcache_client.set('some_key', [1, 2, 3])
-        self.assertEqual(self.logger.get_lines_for_level('error'), [])
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'All memcached servers error-limited',
+        ] * 12)
+        self.logger.clear()
 
         # and get()s are all a "cache miss"
         self.assertIsNone(memcache_client.get('some_key'))
-        self.assertEqual(self.logger.get_lines_for_level('error'), [])
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'All memcached servers error-limited',
+        ])
 
     def test_error_disabled(self):
         memcache_client = memcached.MemcacheRing(
@@ -649,6 +658,44 @@ class TestMemcached(unittest.TestCase):
             'Error talking to memcached: 1.2.3.4:11211: '
             '[Errno 32] Broken pipe',
         ] * 20)
+
+    def test_error_raising(self):
+        memcache_client = memcached.MemcacheRing(
+            ['1.2.3.4:11211'], logger=self.logger, error_limit_time=0)
+        mock1 = ExplodingMockMemcached()
+        memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock1, mock1)] * 20)
+
+        # expect exception when requested...
+        with self.assertRaises(MemcacheConnectionError):
+            memcache_client.set('some_key', [1, 2, 3], raise_on_error=True)
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+        ])
+        self.logger.clear()
+
+        with self.assertRaises(MemcacheConnectionError):
+            memcache_client.get('some_key', raise_on_error=True)
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+        ])
+        self.logger.clear()
+
+        # ...but default is no exception
+        memcache_client.set('some_key', [1, 2, 3])
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+        ])
+        self.logger.clear()
+
+        memcache_client.get('some_key')
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+        ])
 
     def test_error_limiting_custom_config(self):
         def do_calls(time_step, num_calls, **memcache_kwargs):
@@ -671,8 +718,11 @@ class TestMemcached(unittest.TestCase):
         self.assertEqual(self.logger.get_lines_for_level('error'), [
             'Error talking to memcached: 1.2.3.5:11211: '
             '[Errno 32] Broken pipe',
-        ] * 11 + [
-            'Error limiting server 1.2.3.5:11211'
+        ] * 10 + [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+            'Error limiting server 1.2.3.5:11211',
+            'All memcached servers error-limited',
         ])
 
         # with default error_limit_time of 60, one call per 6 secs, error limit
@@ -689,8 +739,11 @@ class TestMemcached(unittest.TestCase):
         self.assertEqual(self.logger.get_lines_for_level('error'), [
             'Error talking to memcached: 1.2.3.5:11211: '
             '[Errno 32] Broken pipe',
-        ] * 11 + [
-            'Error limiting server 1.2.3.5:11211'
+        ] * 10 + [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+            'Error limiting server 1.2.3.5:11211',
+            'All memcached servers error-limited',
         ])
 
         # with error_limit_time of 70, one call per 6 secs, error_limit_count
@@ -699,8 +752,11 @@ class TestMemcached(unittest.TestCase):
         self.assertEqual(self.logger.get_lines_for_level('error'), [
             'Error talking to memcached: 1.2.3.5:11211: '
             '[Errno 32] Broken pipe',
-        ] * 12 + [
-            'Error limiting server 1.2.3.5:11211'
+        ] * 11 + [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+            'Error limiting server 1.2.3.5:11211',
+            'All memcached servers error-limited',
         ])
 
     def test_delete(self):
@@ -806,24 +862,18 @@ class TestMemcached(unittest.TestCase):
 
     def test_serialization(self):
         memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
-                                                 allow_pickle=True,
                                                  logger=self.logger)
         mock = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock, mock)] * 2)
         memcache_client.set('some_key', [1, 2, 3])
         self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
-        memcache_client._allow_pickle = False
-        memcache_client._allow_unpickle = True
-        self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
-        memcache_client._allow_unpickle = False
+        self.assertEqual(len(mock.cache), 1)
+        key = next(iter(mock.cache))
+        self.assertEqual(mock.cache[key][0], b'2')  # JSON_FLAG
+        # Pretend we've got some really old pickle data in there
+        mock.cache[key] = (b'1',) + mock.cache[key][1:]
         self.assertIsNone(memcache_client.get('some_key'))
-        memcache_client.set('some_key', [1, 2, 3])
-        self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
-        memcache_client._allow_unpickle = True
-        self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
-        memcache_client._allow_pickle = True
-        self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
 
     def test_connection_pooling(self):
         with patch('swift.common.memcached.socket') as mock_module:

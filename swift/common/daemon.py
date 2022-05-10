@@ -138,7 +138,7 @@ class DaemonStrategy(object):
 
         def kill_children(*args):
             self.running = False
-            self.logger.info('SIGTERM received')
+            self.logger.notice('SIGTERM received (%s)', os.getpid())
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             os.killpg(0, signal.SIGTERM)
             os._exit(0)
@@ -282,7 +282,7 @@ def run_daemon(klass, conf_file, section_name='', once=False, **kwargs):
         sys.exit(e)
 
     # patch eventlet/logging early
-    utils.eventlet_monkey_patch()
+    utils.monkey_patch()
     eventlet.hubs.use_hub(utils.get_hub())
 
     # once on command line (i.e. daemonize=false) will over-ride config

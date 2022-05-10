@@ -306,6 +306,28 @@ class TestTimestamp(unittest.TestCase):
         for value in test_values:
             self.assertEqual(utils.Timestamp(value).isoformat, expected)
 
+    def test_from_isoformat(self):
+        ts = utils.Timestamp.from_isoformat('2014-06-10T22:47:32.054580')
+        self.assertIsInstance(ts, utils.Timestamp)
+        self.assertEqual(1402440452.05458, float(ts))
+        self.assertEqual('2014-06-10T22:47:32.054580', ts.isoformat)
+
+        ts = utils.Timestamp.from_isoformat('1970-01-01T00:00:00.000000')
+        self.assertIsInstance(ts, utils.Timestamp)
+        self.assertEqual(0.0, float(ts))
+        self.assertEqual('1970-01-01T00:00:00.000000', ts.isoformat)
+
+        ts = utils.Timestamp(1402440452.05458)
+        self.assertIsInstance(ts, utils.Timestamp)
+        self.assertEqual(ts, utils.Timestamp.from_isoformat(ts.isoformat))
+
+    def test_ceil(self):
+        self.assertEqual(0.0, utils.Timestamp(0).ceil())
+        self.assertEqual(1.0, utils.Timestamp(0.00001).ceil())
+        self.assertEqual(1.0, utils.Timestamp(0.000001).ceil())
+        self.assertEqual(12345678.0, utils.Timestamp(12345678.0).ceil())
+        self.assertEqual(12345679.0, utils.Timestamp(12345678.000001).ceil())
+
     def test_not_equal(self):
         ts = '1402436408.91203_0000000000000001'
         test_values = (

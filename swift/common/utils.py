@@ -97,10 +97,8 @@ from swift.common.registry import register_swift_info, get_swift_info # noqa
 
 from logging.handlers import SysLogHandler
 import logging
-# setup notice level logging
+
 NOTICE = 25
-logging.addLevelName(NOTICE, 'NOTICE')
-SysLogHandler.priority_map['NOTICE'] = 'notice'
 
 # These are lazily pulled from libc elsewhere
 _sys_fallocate = None
@@ -533,6 +531,15 @@ def config_read_prefixed_options(conf, prefix_name, defaults):
     return params
 
 
+def logging_monkey_patch():
+    # setup notice level logging
+    logging.addLevelName(NOTICE, 'NOTICE')
+    SysLogHandler.priority_map['NOTICE'] = 'notice'
+    # Trying to log threads while monkey-patched can lead to deadlocks; see
+    # https://bugs.launchpad.net/swift/+bug/1895739
+    logging.logThreads = 0
+
+
 def eventlet_monkey_patch():
     """
     Install the appropriate Eventlet monkey patches.
@@ -543,9 +550,14 @@ def eventlet_monkey_patch():
     #         if thread is monkey-patched.
     eventlet.patcher.monkey_patch(all=False, socket=True, select=True,
                                   thread=True)
-    # Trying to log threads while monkey-patched can lead to deadlocks; see
-    # https://bugs.launchpad.net/swift/+bug/1895739
-    logging.logThreads = 0
+
+
+def monkey_patch():
+    """
+    Apply all swift monkey patching consistently in one place.
+    """
+    eventlet_monkey_patch()
+    logging_monkey_patch()
 
 
 def noop_libc_function(*args):
@@ -1324,6 +1336,15 @@ class Timestamp(object):
 
     @property
     def isoformat(self):
+        """
+        Get an isoformat string representation of the 'normal' part of the
+        Timestamp with microsecond precision and no trailing timezone, for
+        example:
+
+            1970-01-01T00:00:00.000000
+
+        :return: an isoformat string
+        """
         t = float(self.normal)
         if six.PY3:
             # On Python 3, round manually using ROUND_HALF_EVEN rounding
@@ -1349,6 +1370,33 @@ class Timestamp(object):
         if len(isoformat) < len("1970-01-01T00:00:00.000000"):
             isoformat += ".000000"
         return isoformat
+
+    @classmethod
+    def from_isoformat(cls, date_string):
+        """
+        Parse an isoformat string representation of time to a Timestamp object.
+
+        :param date_string: a string formatted as per an Timestamp.isoformat
+            property.
+        :return: an instance of  this class.
+        """
+        start = datetime.datetime.strptime(date_string, "%Y-%m-%dT%H:%M:%S.%f")
+        delta = start - EPOCH
+        # This calculation is based on Python 2.7's Modules/datetimemodule.c,
+        # function delta_to_microseconds(), but written in Python.
+        return cls(delta.total_seconds())
+
+    def ceil(self):
+        """
+        Return the 'normal' part of the timestamp rounded up to the nearest
+        integer number of seconds.
+
+        This value should be used whenever the second-precision Last-Modified
+        time of a resource is required.
+
+        :return: a float value with second precision.
+        """
+        return math.ceil(float(self))
 
     def __eq__(self, other):
         if other is None:
@@ -1494,13 +1542,7 @@ def last_modified_date_to_timestamp(last_modified_date_str):
     Convert a last modified date (like you'd get from a container listing,
     e.g. 2014-02-28T23:22:36.698390) to a float.
     """
-    start = datetime.datetime.strptime(last_modified_date_str,
-                                       '%Y-%m-%dT%H:%M:%S.%f')
-    delta = start - EPOCH
-
-    # This calculation is based on Python 2.7's Modules/datetimemodule.c,
-    # function delta_to_microseconds(), but written in Python.
-    return Timestamp(delta.total_seconds())
+    return Timestamp.from_isoformat(last_modified_date_str)
 
 
 def normalize_delete_at_timestamp(timestamp, high_precision=False):
@@ -6220,9 +6262,27 @@ class PipeMutex(object):
         self.close()
 
 
+class NoopMutex(object):
+    """
+    "Mutex" that doesn't lock anything.
+
+    We only allow our syslog logging to be configured via UDS or UDP, neither
+    of which have the message-interleaving trouble you'd expect from TCP or
+    file handlers.
+    """
+    def acquire(self, blocking=True):
+        pass
+
+    def release(self):
+        pass
+
+
 class ThreadSafeSysLogHandler(SysLogHandler):
     def createLock(self):
-        self.lock = PipeMutex()
+        if config_true_value(os.environ.get('SWIFT_NOOP_LOGGING_MUTEX')):
+            self.lock = NoopMutex()
+        else:
+            self.lock = PipeMutex()
 
 
 def round_robin_iter(its):

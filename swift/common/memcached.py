@@ -45,7 +45,6 @@ http://github.com/memcached/memcached/blob/1.4.2/doc/protocol.txt
 """
 
 import six
-import six.moves.cPickle as pickle
 import json
 import logging
 import random
@@ -67,7 +66,6 @@ IO_TIMEOUT = 2.0
 PICKLE_FLAG = 1
 JSON_FLAG = 2
 NODE_WEIGHT = 50
-PICKLE_PROTOCOL = 2
 TRY_COUNT = 3
 
 # if ERROR_LIMIT_COUNT errors occur in ERROR_LIMIT_TIME seconds, the server
@@ -177,7 +175,7 @@ class MemcacheRing(object):
     def __init__(
             self, servers, connect_timeout=CONN_TIMEOUT,
             io_timeout=IO_TIMEOUT, pool_timeout=POOL_TIMEOUT,
-            tries=TRY_COUNT, allow_pickle=False, allow_unpickle=False,
+            tries=TRY_COUNT,
             max_conns=2, tls_context=None, logger=None,
             error_limit_count=ERROR_LIMIT_COUNT,
             error_limit_time=ERROR_LIMIT_TIME,
@@ -201,8 +199,6 @@ class MemcacheRing(object):
         self._connect_timeout = connect_timeout
         self._io_timeout = io_timeout
         self._pool_timeout = pool_timeout
-        self._allow_pickle = allow_pickle
-        self._allow_unpickle = allow_unpickle or allow_pickle
         if logger is None:
             self.logger = logging.getLogger()
         else:
@@ -259,6 +255,7 @@ class MemcacheRing(object):
         """
         pos = bisect(self._sorted, key)
         served = []
+        any_yielded = False
         while len(served) < self._tries:
             pos = (pos + 1) % len(self._sorted)
             server = self._ring[self._sorted[pos]]
@@ -271,6 +268,7 @@ class MemcacheRing(object):
             try:
                 with MemcachePoolTimeout(self._pool_timeout):
                     fp, sock = self._client_cache[server].get()
+                any_yielded = True
                 yield server, fp, sock
             except MemcachePoolTimeout as e:
                 self._exception_occurred(
@@ -282,34 +280,34 @@ class MemcacheRing(object):
                 # object.
                 self._exception_occurred(
                     server, e, action='connecting', sock=sock)
+        if not any_yielded:
+            self.logger.error('All memcached servers error-limited')
 
     def _return_conn(self, server, fp, sock):
         """Returns a server connection to the pool."""
         self._client_cache[server].put((fp, sock))
 
     def set(self, key, value, serialize=True, time=0,
-            min_compress_len=0):
+            min_compress_len=0, raise_on_error=False):
         """
         Set a key/value pair in memcache
 
         :param key: key
         :param value: value
         :param serialize: if True, value is serialized with JSON before sending
-                          to memcache, or with pickle if configured to use
-                          pickle instead of JSON (to avoid cache poisoning)
+                          to memcache
         :param time: the time to live
         :param min_compress_len: minimum compress length, this parameter was
                                  added to keep the signature compatible with
                                  python-memcached interface. This
                                  implementation ignores it.
+        :param raise_on_error: if True, propagate Timeouts and other errors.
+                               By default, errors are ignored.
         """
         key = md5hash(key)
         timeout = sanitize_timeout(time)
         flags = 0
-        if serialize and self._allow_pickle:
-            value = pickle.dumps(value, PICKLE_PROTOCOL)
-            flags |= PICKLE_FLAG
-        elif serialize:
+        if serialize:
             if isinstance(value, bytes):
                 value = value.decode('utf8')
             value = json.dumps(value).encode('ascii')
@@ -341,17 +339,18 @@ class MemcacheRing(object):
                     return
             except (Exception, Timeout) as e:
                 self._exception_occurred(server, e, sock=sock, fp=fp)
+        if raise_on_error:
+            raise MemcacheConnectionError(
+                "No memcached connections succeeded.")
 
-    def get(self, key, skip_cache_pct=0.0):
+    def get(self, key, raise_on_error=False):
         """
         Gets the object specified by key.  It will also unserialize the object
-        before returning if it is serialized in memcache with JSON, or if it
-        is pickled and unpickling is allowed.
+        before returning if it is serialized in memcache with JSON.
 
         :param key: key
-        :param skip_cache_pct: probability of skipping talking to memcache and
-                               returning None, as though it were a cache miss.
-                               Should be in the range [0.0, 100.0]
+        :param raise_on_error: if True, propagate Timeouts and other errors.
+                               By default, errors are treated as cache misses.
         :returns: value of the key in memcache
         """
         if skip_cache_pct > 0 and random.random() * 100 < skip_cache_pct:
@@ -374,11 +373,8 @@ class MemcacheRing(object):
                             size = int(line[3])
                             value = fp.read(size)
                             if int(line[2]) & PICKLE_FLAG:
-                                if self._allow_unpickle:
-                                    value = pickle.loads(value)
-                                else:
-                                    value = None
-                            elif int(line[2]) & JSON_FLAG:
+                                value = None
+                            if int(line[2]) & JSON_FLAG:
                                 value = json.loads(value)
                             fp.readline()
                         line = fp.readline().strip().split()
@@ -391,6 +387,9 @@ class MemcacheRing(object):
             except (Exception, Timeout) as e:
                 self.logger.increment('memcache.get.error')
                 self._exception_occurred(server, e, sock=sock, fp=fp)
+        if raise_on_error:
+            raise MemcacheConnectionError(
+                "No memcached connections succeeded.")
 
     def incr(self, key, delta=1, time=0):
         """
@@ -492,8 +491,7 @@ class MemcacheRing(object):
         :param server_key: key to use in determining which server in the ring
                             is used
         :param serialize: if True, value is serialized with JSON before sending
-                          to memcache, or with pickle if configured to use
-                          pickle instead of JSON (to avoid cache poisoning)
+                          to memcache.
         :param time: the time to live
         :min_compress_len: minimum compress length, this parameter was added
                            to keep the signature compatible with
@@ -506,10 +504,7 @@ class MemcacheRing(object):
         for key, value in mapping.items():
             key = md5hash(key)
             flags = 0
-            if serialize and self._allow_pickle:
-                value = pickle.dumps(value, PICKLE_PROTOCOL)
-                flags |= PICKLE_FLAG
-            elif serialize:
+            if serialize:
                 if isinstance(value, bytes):
                     value = value.decode('utf8')
                 value = json.dumps(value).encode('ascii')
@@ -553,10 +548,7 @@ class MemcacheRing(object):
                             size = int(line[3])
                             value = fp.read(size)
                             if int(line[2]) & PICKLE_FLAG:
-                                if self._allow_unpickle:
-                                    value = pickle.loads(value)
-                                else:
-                                    value = None
+                                value = None
                             elif int(line[2]) & JSON_FLAG:
                                 value = json.loads(value)
                             responses[line[1]] = value

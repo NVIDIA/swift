@@ -32,6 +32,7 @@ from test.debug_logger import debug_logger
 
 
 class MyDaemon(daemon.Daemon):
+    WORKERS_HEALTHCHECK_INTERVAL = 0
 
     def __init__(self, conf):
         self.conf = conf
@@ -139,6 +140,7 @@ class TestRunDaemon(unittest.TestCase):
         with mock.patch('swift.common.daemon.os') as mock_os:
             func()
         self.assertEqual(mock_os.method_calls, [
+            mock.call.getpid(),
             mock.call.killpg(0, signal.SIGTERM),
             # hard exit because bare except handlers can trap SystemExit
             mock.call._exit(0)
@@ -237,6 +239,7 @@ class TestRunDaemon(unittest.TestCase):
             yield
 
     def test_fork_workers(self):
+        utils.logging_monkey_patch()  # needed to log at notice
         d = MyWorkerDaemon({'workers': 3})
         strategy = daemon.DaemonStrategy(d, d.logger)
         with self.mock_os():
