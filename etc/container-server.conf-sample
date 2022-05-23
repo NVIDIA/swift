@@ -88,7 +88,7 @@ bind_port = 6201
 # strict_locks = false
 
 [pipeline:main]
-pipeline = healthcheck recon container-server
+pipeline = healthcheck recon backend_ratelimit container-server
 
 [app:container-server]
 use = egg:swift#container
@@ -139,6 +139,19 @@ use = egg:swift#healthcheck
 [filter:recon]
 use = egg:swift#recon
 #recon_cache_path = /var/cache/swift
+
+[filter:backend_ratelimit]
+use = egg:swift#backend_ratelimit
+# Config options can optionally be loaded from a separate config file. Config
+# options in this section will be used unless the same option is found in the
+# config file, in which case the config file option will be used. See the
+# backend-ratelimit.conf-sample file for details of available config options.
+# backend_ratelimit_conf_path = /etc/swift/backend-ratelimit.conf
+
+# The minimum interval between attempts to reload the config file while the
+# server is running. A value of 0 means that the file is loaded at start-up but
+# not subsequently reloaded.
+# config_reload_interval = 60
 
 [container-replicator]
 # You can override the default log routing for this app here (don't use set!):

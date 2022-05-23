@@ -42,7 +42,8 @@ from swift.container.sharder import ContainerSharder, sharding_enabled, \
     CleavingContext, DEFAULT_SHARDER_CONF, finalize_shrinking, \
     find_shrinking_candidates, process_compactible_shard_sequences, \
     find_compactible_shard_sequences, is_shrinking_candidate, \
-    is_sharding_candidate, find_paths, rank_paths, ContainerSharderConf
+    is_sharding_candidate, find_paths, rank_paths, ContainerSharderConf, \
+    find_paths_with_gaps
 from swift.common.utils import ShardRange, Timestamp, hash_path, \
     encode_timestamps, parse_db_filename, quorum_size, Everything, md5
 from test import annotate_failure
@@ -3403,8 +3404,9 @@ class TestSharder(BaseTestSharder):
 
         # and then more misplaced updates arrive
         newer_objects = [
-            ['a', self.ts_encoded(), 51, 'text/plain', 'etag_a', 0, 0],
+            ['a-deleted', self.ts_encoded(), 51, 'text/plain', 'etag_a', 1, 0],
             ['z', self.ts_encoded(), 52, 'text/plain', 'etag_z', 0, 0],
+            ['z-deleted', self.ts_encoded(), 52, 'text/plain', 'etag_z', 1, 0],
         ]
         for obj in newer_objects:
             broker.put_object(*obj)
@@ -3420,7 +3422,7 @@ class TestSharder(BaseTestSharder):
             any_order=True
         )
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
-                          'found': 1, 'placed': 2, 'unplaced': 0}
+                          'found': 1, 'placed': 3, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
             1, sharder.logger.get_increment_counts()['misplaced_found'])
@@ -8209,6 +8211,40 @@ class TestSharderFunctions(BaseTestSharder):
                 ranges_0,  # cleaved to m
             ],
             rank_paths(paths, own_sr)
+        )
+
+    def test_find_paths_with_gaps(self):
+        bounds = (
+            # gap
+            ('a', 'f'),
+            ('f', 'm'),  # overlap
+            ('k', 'p'),
+            # gap
+            ('q', 'y')
+            # gap
+        )
+        ranges = self._make_shard_ranges(
+            bounds, ShardRange.ACTIVE,
+            timestamp=next(self.ts_iter), object_count=1)
+        paths_with_gaps = find_paths_with_gaps(ranges)
+        self.assertEqual(3, len(paths_with_gaps))
+        self.assertEqual(
+            [(ShardRange.MIN, ShardRange.MIN),
+             (ShardRange.MIN, 'a'),
+             ('a', 'm')],
+            [(r.lower, r.upper) for r in paths_with_gaps[0]]
+        )
+        self.assertEqual(
+            [('k', 'p'),
+             ('p', 'q'),
+             ('q', 'y')],
+            [(r.lower, r.upper) for r in paths_with_gaps[1]]
+        )
+        self.assertEqual(
+            [('q', 'y'),
+             ('y', ShardRange.MAX),
+             (ShardRange.MAX, ShardRange.MAX)],
+            [(r.lower, r.upper) for r in paths_with_gaps[2]]
         )
 
 

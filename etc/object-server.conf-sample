@@ -22,6 +22,12 @@ bind_port = 6200
 # feature.
 # servers_per_port = 0
 #
+# If running in a container, servers_per_port may not be able to use the
+# bind_ip to lookup the ports in the ring.  You may instead override the port
+# lookup in the ring using the ring_ip.  Any devices/ports associted with the
+# ring_ip will be used when listening on the configured bind_ip address.
+# ring_ip = <bind_ip>
+#
 # Maximum concurrent requests per worker
 # max_clients = 1024
 #
@@ -113,7 +119,7 @@ bind_port = 6200
 # strict_locks = false
 
 [pipeline:main]
-pipeline = healthcheck recon object-server
+pipeline = healthcheck recon backend_ratelimit object-server
 
 [app:object-server]
 use = egg:swift#object
@@ -232,6 +238,19 @@ use = egg:swift#healthcheck
 use = egg:swift#recon
 #recon_cache_path = /var/cache/swift
 #recon_lock_path = /var/lock
+
+[filter:backend_ratelimit]
+use = egg:swift#backend_ratelimit
+# Config options can optionally be loaded from a separate config file. Config
+# options in this section will be used unless the same option is found in the
+# config file, in which case the config file option will be used. See the
+# backend-ratelimit.conf-sample file for details of available config options.
+# backend_ratelimit_conf_path = /etc/swift/backend-ratelimit.conf
+
+# The minimum interval between attempts to reload the config file while the
+# server is running. A value of 0 means that the file is loaded at start-up but
+# not subsequently reloaded.
+# config_reload_interval = 60
 
 [object-replicator]
 # You can override the default log routing for this app here (don't use set!):

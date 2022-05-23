@@ -365,9 +365,13 @@ def non_negative_float(value):
     :raises ValueError: if the value cannot be cast to a float or is negative.
     :return: a float
     """
-    value = float(value)
-    if value < 0:
-        raise ValueError
+    try:
+        value = float(value)
+        if value < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError('Value must be a non-negative float number, not "%s".'
+                         % value)
     return value
 
 
@@ -1765,7 +1769,7 @@ class RateLimitedIterator(object):
         self.iterator = iter(iterable)
         self.elements_per_second = elements_per_second
         self.limit_after = limit_after
-        self.running_time = 0
+        self.rate_limiter = EventletRateLimiter(elements_per_second)
         self.ratelimit_if = ratelimit_if
 
     def __iter__(self):
@@ -1778,8 +1782,7 @@ class RateLimitedIterator(object):
             if self.limit_after > 0:
                 self.limit_after -= 1
             else:
-                self.running_time = ratelimit_sleep(self.running_time,
-                                                    self.elements_per_second)
+                self.rate_limiter.wait()
         return next_value
     __next__ = next
 
@@ -3511,6 +3514,111 @@ def audit_location_generator(devices, datadir, suffix='',
             hook_post_device(os.path.join(devices, device))
 
 
+class AbstractRateLimiter(object):
+    # 1,000 milliseconds = 1 second
+    clock_accuracy = 1000.0
+
+    def __init__(self, max_rate, rate_buffer=5, burst_after_idle=False,
+                 running_time=0):
+        """
+        :param max_rate: The maximum rate per second allowed for the process.
+            Must be > 0 to engage rate-limiting behavior.
+        :param rate_buffer: Number of seconds the rate counter can drop and be
+            allowed to catch up (at a faster than listed rate). A larger number
+            will result in larger spikes in rate but better average accuracy.
+        :param burst_after_idle: If False (the default) then the rate_buffer
+            allowance is lost after the rate limiter has not been called for
+            more than rate_buffer seconds. If True then the rate_buffer
+            allowance is preserved during idle periods which means that a burst
+            of requests may be granted immediately after the idle period.
+        :param running_time: The running time in milliseconds of the next
+            allowable request. Setting this to any time in the past will cause
+            the rate limiter to immediately allow requests; setting this to a
+            future time will cause the rate limiter to deny requests until that
+            time. If ``burst_after_idle`` is True then this can
+            be set to current time (ms) to avoid an initial burst, or set to
+            running_time < (current time - rate_buffer ms) to allow an initial
+            burst.
+        """
+        self.set_max_rate(max_rate)
+        self.set_rate_buffer(rate_buffer)
+        self.burst_after_idle = burst_after_idle
+        self.running_time = running_time
+
+    def set_max_rate(self, max_rate):
+        self.max_rate = max_rate
+        self.time_per_incr = (self.clock_accuracy / self.max_rate
+                              if self.max_rate else 0)
+
+    def set_rate_buffer(self, rate_buffer):
+        self.rate_buffer_ms = rate_buffer * self.clock_accuracy
+
+    def _sleep(self, seconds):
+        # subclasses should override to implement a sleep
+        raise NotImplementedError
+
+    def is_allowed(self, incr_by=1, now=None, block=False):
+        """
+        Check if the calling process is allowed to proceed according to the
+        rate limit.
+
+        :param incr_by: How much to increment the counter.  Useful if you want
+                        to ratelimit 1024 bytes/sec and have differing sizes
+                        of requests. Must be > 0 to engage rate-limiting
+                        behavior.
+        :param now: The time in seconds; defaults to time.time()
+        :param block: if True, the call will sleep until the calling process
+            is allowed to proceed; otherwise the call returns immediately.
+        :return: True if the the calling process is allowed to proceed, False
+            otherwise.
+        """
+        if self.max_rate <= 0 or incr_by <= 0:
+            return True
+
+        now = now or time.time()
+        # Convert seconds to milliseconds
+        now = now * self.clock_accuracy
+
+        # Calculate time per request in milliseconds
+        time_per_request = self.time_per_incr * float(incr_by)
+
+        # Convert rate_buffer to milliseconds and compare
+        if now - self.running_time > self.rate_buffer_ms:
+            self.running_time = now
+            if self.burst_after_idle:
+                self.running_time -= self.rate_buffer_ms
+
+        if now >= self.running_time:
+            self.running_time += time_per_request
+            allowed = True
+        elif block:
+            sleep_time = (self.running_time - now) / self.clock_accuracy
+            # increment running time before sleeping in case the sleep allows
+            # another thread to inspect the rate limiter state
+            self.running_time += time_per_request
+            # Convert diff to a floating point number of seconds and sleep
+            self._sleep(sleep_time)
+            allowed = True
+        else:
+            allowed = False
+
+        return allowed
+
+    def wait(self, incr_by=1, now=None):
+        self.is_allowed(incr_by=incr_by, now=now, block=True)
+
+
+class EventletRateLimiter(AbstractRateLimiter):
+    def __init__(self, max_rate, rate_buffer=5, running_time=0,
+                 burst_after_idle=False):
+        super(EventletRateLimiter, self).__init__(
+            max_rate, rate_buffer=rate_buffer, running_time=running_time,
+            burst_after_idle=burst_after_idle)
+
+    def _sleep(self, seconds):
+        eventlet.sleep(seconds)
+
+
 def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
     """
     Will eventlet.sleep() for the appropriate time so that the max_rate
@@ -3531,30 +3639,18 @@ def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
                         A larger number will result in larger spikes in rate
                         but better average accuracy. Must be > 0 to engage
                         rate-limiting behavior.
+    :return: The absolute time for the next interval in milliseconds; note
+        that time could have passed well beyond that point, but the next call
+        will catch that and skip the sleep.
     """
-    if max_rate <= 0 or incr_by <= 0:
-        return running_time
-
-    # 1,000 milliseconds = 1 second
-    clock_accuracy = 1000.0
-
-    # Convert seconds to milliseconds
-    now = time.time() * clock_accuracy
-
-    # Calculate time per request in milliseconds
-    time_per_request = clock_accuracy * (float(incr_by) / max_rate)
-
-    # Convert rate_buffer to milliseconds and compare
-    if now - running_time > rate_buffer * clock_accuracy:
-        running_time = now
-    elif running_time - now > time_per_request:
-        # Convert diff back to a floating point number of seconds and sleep
-        eventlet.sleep((running_time - now) / clock_accuracy)
-
-    # Return the absolute time for the next interval in milliseconds; note
-    # that time could have passed well beyond that point, but the next call
-    # will catch that and skip the sleep.
-    return running_time + time_per_request
+    warnings.warn(
+        'ratelimit_sleep() is deprecated; use the ``EventletRateLimiter`` '
+        'class instead.', DeprecationWarning
+    )
+    rate_limit = EventletRateLimiter(max_rate, rate_buffer=rate_buffer,
+                                     running_time=running_time)
+    rate_limit.wait(incr_by=incr_by)
+    return rate_limit.running_time
 
 
 class ContextPool(GreenPool):
