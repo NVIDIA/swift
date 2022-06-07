@@ -81,6 +81,7 @@
                         <choice>
                             <value type="string">Daily</value>
                             <value type="string">Weekly</value>
+                            <value type="string">Unknown</value>
                         </choice>
                     </element>
                 </element>

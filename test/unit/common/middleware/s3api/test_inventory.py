@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-import unittest
 
 from swift.common.middleware.s3api.controllers.inventory import \
     InventoryConfiguration
@@ -146,6 +145,44 @@ class TestInventoryConfiguration(S3ApiTestCase):
             {'Expecting an element Format, got nothing, line 6'},
             set(errors))
 
+    def test_from_json(self):
+        data = {
+            'dest_container': 'd',
+            'period': 'Daily',
+        }
+        config = InventoryConfiguration.from_json(data)
+        self.assertEqual('Daily', config.schedule)
+        self.assertEqual('d', config.dest_bucket)
+        self.assertTrue(config.enabled)
+        self.assertFalse(config.deleted)
+
+        data = {
+            'dest_container': 'd',
+            'period': 7 * 86400,
+            'deleted': True,
+            'unexpected': 'ignored',
+        }
+        config = InventoryConfiguration.from_json(data)
+        self.assertEqual('Weekly', config.schedule)
+        self.assertEqual('d', config.dest_bucket)
+        self.assertTrue(config.enabled)
+        self.assertTrue(config.deleted)
+
+    def test_schedule(self):
+        config = InventoryConfiguration()
+        self.assertEqual('Daily', config.schedule)
+
+        config.schedule = 'daiLY'
+        self.assertEqual('Daily', config.schedule)
+        config.schedule = 86400
+        self.assertEqual('Daily', config.schedule)
+        config.schedule = 'Weekly'
+        self.assertEqual('Weekly', config.schedule)
+        config.schedule = 'weekly'
+        self.assertEqual('Weekly', config.schedule)
+        config.schedule = 7 * 86400
+        self.assertEqual('Weekly', config.schedule)
+
 
 class TestS3ApiInventory(S3ApiTestCase):
     def test_GET_feature_disabled(self):
@@ -178,16 +215,8 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual([call[0] for call in calls], ['HEAD'] * 2)
         self.assertIn(b'The specified configuration does not exist.', body)
 
-    def test_GET_inventory_enabled(self):
+    def _do_test_GET_inventory_enabled(self, config, expected_schedule):
         self.conf['s3_inventory_enabled'] = 'yes'
-        config = {
-            'period': 'Daily',
-            'source': 's3api',
-            'dest_container': 'destination-bucket',
-            'modified_time': 123456.789,
-            'enabled': True,
-            'deleted': False,
-        }
         self.make_app()
         resp_headers = {
             'X-Container-Sysmeta-Inventory-0-Config': json.dumps(config)
@@ -208,7 +237,8 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual([call[0] for call in calls], ['HEAD'] * 2)
         elem = fromstring(body, 'InventoryConfiguration')
         self.assertEqual('true', elem.find('./IsEnabled').text)
-        self.assertEqual('Daily', elem.find('./Schedule/Frequency').text)
+        self.assertEqual(expected_schedule,
+                         elem.find('./Schedule/Frequency').text)
         self.assertEqual(
             'arn:aws:s3:::destination-bucket',
             elem.find('./Destination/S3BucketDestination/Bucket').text)
@@ -216,6 +246,42 @@ class TestS3ApiInventory(S3ApiTestCase):
             'Parquet',
             elem.find('./Destination/S3BucketDestination/Format').text)
         self.assertEqual('Current', elem.find('./IncludedObjectVersions').text)
+
+    def test_GET_inventory_enabled(self):
+        config = {
+            'period': 'Daily',
+            'source': 's3api',
+            'dest_container': 'destination-bucket',
+            'modified_time': 123456.789,
+            'enabled': True,
+            'deleted': False,
+        }
+        self._do_test_GET_inventory_enabled(config, 'Daily')
+
+    def test_GET_inventory_enabled_int_period(self):
+        config = {
+            'period': 86400,
+            'source': 's3api',
+            'dest_container': 'destination-bucket',
+            'modified_time': 123456.789,
+            'enabled': True,
+            'deleted': False,
+        }
+        self._do_test_GET_inventory_enabled(config, 'Daily')
+        config['period'] = '604800'
+        self._do_test_GET_inventory_enabled(config, 'Weekly')
+
+    def test_GET_inventory_int_period_unsupported(self):
+        self.conf['s3_inventory_enabled'] = 'yes'
+        config = {
+            'period': 3600,  # unsupported
+            'source': 's3api',
+            'dest_container': 'destination-bucket',
+            'modified_time': 123456.789,
+            'enabled': True,
+            'deleted': False,
+        }
+        self._do_test_GET_inventory_enabled(config, 'Unknown')
 
     def test_GET_inventory_deleted(self):
         self.conf['s3_inventory_enabled'] = 'yes'
@@ -247,16 +313,8 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual([call[0] for call in calls], ['HEAD'] * 2)
         self.assertIn(b'The specified configuration does not exist.', body)
 
-    def test_GET_inventory_list(self):
+    def _do_test_GET_inventory_list(self, config, expected_schedule):
         self.conf['s3_inventory_enabled'] = 'yes'
-        config = {
-            'period': 'Daily',
-            'source': 's3api',
-            'dest_container': 'arn:aws:s3:::destination-bucket',
-            'modified_time': 123456.789,
-            'enabled': True,
-            'deleted': False,
-        }
         self.make_app()
         resp_headers = {
             'X-Container-Sysmeta-Inventory-0-Config': json.dumps(config)
@@ -280,7 +338,8 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertIsNone(root.find('ContinuationToken'))
         elem = root.find('InventoryConfiguration')
         self.assertEqual('true', elem.find('./IsEnabled').text)
-        self.assertEqual('Daily', elem.find('./Schedule/Frequency').text)
+        self.assertEqual(expected_schedule,
+                         elem.find('./Schedule/Frequency').text)
         self.assertEqual(
             'arn:aws:s3:::destination-bucket',
             elem.find('./Destination/S3BucketDestination/Bucket').text)
@@ -289,6 +348,41 @@ class TestS3ApiInventory(S3ApiTestCase):
             elem.find('./Destination/S3BucketDestination/Format').text)
         self.assertEqual('Current', elem.find('./IncludedObjectVersions').text)
         self.assertEqual('false', root.find('./IsTruncated').text)
+
+    def test_GET_inventory_list(self):
+        config = {
+            'period': 'Daily',
+            'source': 's3api',
+            'dest_container': 'arn:aws:s3:::destination-bucket',
+            'modified_time': 123456.789,
+            'enabled': True,
+            'deleted': False,
+        }
+        self._do_test_GET_inventory_list(config, 'Daily')
+
+    def test_GET_inventory_list_int_period(self):
+        config = {
+            'period': 7 * 86400,
+            'source': 's3api',
+            'dest_container': 'arn:aws:s3:::destination-bucket',
+            'modified_time': 123456.789,
+            'enabled': True,
+            'deleted': False,
+        }
+        self._do_test_GET_inventory_list(config, 'Weekly')
+
+    def test_GET_inventory_list_int_period_unsupported(self):
+        self.conf['s3_inventory_enabled'] = 'yes'
+        self.make_app()
+        config = {
+            'period': 3600,  # unsupported period -> empty list
+            'source': 's3api',
+            'dest_container': 'arn:aws:s3:::destination-bucket',
+            'modified_time': 123456.789,
+            'enabled': True,
+            'deleted': False,
+        }
+        self._do_test_GET_inventory_list(config, 'Unknown')
 
     def test_GET_inventory_list_deleted(self):
         self.conf['s3_inventory_enabled'] = 'yes'
@@ -600,6 +694,11 @@ class TestS3ApiInventory(S3ApiTestCase):
         do_test('PUT', body)
 
         xml = fromstring(SUPPORTED_XML, 'InventoryConfiguration')
+        xml.find('./Schedule/Frequency').text = 'Unknown'
+        body = tostring(xml)
+        do_test('PUT', body)
+
+        xml = fromstring(SUPPORTED_XML, 'InventoryConfiguration')
         xml.find('./Destination/S3BucketDestination/Format').text = 'CSV'
         body = tostring(xml)
         do_test('PUT', body)
@@ -664,7 +763,3 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual('404', do_test('PUT'))
         self.assertEqual('404', do_test('DELETE'))
         self.assertEqual('404', do_test('GET'))
-
-
-if __name__ == '__main__':
-    unittest.main()

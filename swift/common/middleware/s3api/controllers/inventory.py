@@ -67,6 +67,23 @@ class InventoryConfiguration(object):
         self.include_versions = include_versions
         self.deleted = deleted
 
+    @property
+    def schedule(self):
+        return self._schedule
+
+    @schedule.setter
+    def schedule(self, value):
+        value = str(value)
+        if value == '86400':
+            self._schedule = 'Daily'
+        elif value == '604800':
+            self._schedule = 'Weekly'
+        elif value.title() in ('Daily', 'Weekly'):
+            self._schedule = value.title()
+        else:
+            # tolerate other internally managed setting
+            self._schedule = 'Unknown'
+
     @classmethod
     def from_xml(cls, xml, validate=True):
         # load xml and check against s3 api schema...
@@ -80,6 +97,11 @@ class InventoryConfiguration(object):
 
         if validate:
             errors = []
+            # the schema is relaxed to allow swift to return 'Unknown' schedule
+            # in case we have a config with period other than daily or weekly,
+            # but we don't want to accept 'Unknown' from clients
+            if conf.schedule not in ('Daily', 'Weekly'):
+                errors.append('Invalid value for Schedule/Frequency')
             # swift backend does not support some optional config elements...
             for path in cls.unsupported:
                 if config.find(path) is not None:
@@ -181,7 +203,13 @@ class InventoryController(Controller):
         key = 'inventory-%s-config' % inventory_id
         config_data = json.loads(sysmeta.get(key, '{}'))
         if config_data:
-            return InventoryConfiguration.from_json(config_data)
+            try:
+                return InventoryConfiguration.from_json(config_data)
+            except ValueError as err:
+                self.logger.warning(
+                    'invalid inventory config sysmeta for %s: %s',
+                    req.path, err)
+                pass
         return None
 
     @public

@@ -134,7 +134,7 @@ class ObjectReplicator(Daemon):
         self.devices_dir = conf.get('devices', '/srv/node')
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
-        self.bind_ip = conf.get('bind_ip', '0.0.0.0')
+        self.ring_ip = conf.get('ring_ip', conf.get('bind_ip', '0.0.0.0'))
         self.servers_per_port = int(conf.get('servers_per_port', '0') or 0)
         self.port = None if self.servers_per_port else \
             int(conf.get('bind_port', 6200))
@@ -212,17 +212,6 @@ class ObjectReplicator(Daemon):
             worker_index + 1,  # use 1-based indexing for more readable logs
             self.replicator_workers,
             os.getpid()))
-
-    def _get_my_replication_ips(self):
-        my_replication_ips = set()
-        ips = whataremyips()
-        for policy in self.policies:
-            self.load_object_ring(policy)
-            for local_dev in [dev for dev in policy.object_ring.devs
-                              if dev and dev['replication_ip'] in ips and
-                              dev['replication_port'] == self.port]:
-                my_replication_ips.add(local_dev['replication_ip'])
-        return list(my_replication_ips)
 
     def _child_process_reaper(self):
         """
@@ -318,7 +307,7 @@ class ObjectReplicator(Daemon):
         This is the device names, e.g. "sdq" or "d1234" or something, not
         the full ring entries.
         """
-        ips = whataremyips(self.bind_ip)
+        ips = whataremyips(self.ring_ip)
         local_devices = set()
         for policy in self.policies:
             self.load_object_ring(policy)
@@ -912,7 +901,7 @@ class ObjectReplicator(Daemon):
             policies will be returned
         """
         jobs = []
-        ips = whataremyips(self.bind_ip)
+        ips = whataremyips(self.ring_ip)
         for policy in self.policies:
             # Skip replication if next_part_power is set. In this case
             # every object is hard-linked twice, but the replicator can't
@@ -951,7 +940,6 @@ class ObjectReplicator(Daemon):
         self.last_replication_count = 0
         self.replication_cycle = (self.replication_cycle + 1) % 10
         self.partition_times = []
-        self.my_replication_ips = self._get_my_replication_ips()
         self.all_devs_info = set()
         self.handoffs_remaining = 0
 
