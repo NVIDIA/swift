@@ -5613,6 +5613,8 @@ class TestStatsdLogging(unittest.TestCase):
         conf = {'log_statsd_host': 'another.host.com'}
 
         with warnings.catch_warnings(record=True) as cm:
+            if six.PY2:
+                getattr(utils, '__warningregistry__', {}).clear()
             warnings.resetwarnings()
             warnings.simplefilter('always', DeprecationWarning)
             logger = utils.get_logger(
