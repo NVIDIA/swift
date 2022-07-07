@@ -1004,12 +1004,14 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                                  headers=headers, contents=body)
         except DirectClientException as err:
             self.logger.warning(
-                'Failed to put shard ranges to %s:%s/%s: %s',
-                node['ip'], node['port'], node['device'], err.http_status)
+                'Failed to put shard ranges to %s:%s/%s %s/%s: %s',
+                node['ip'], node['port'], node['device'],
+                account, container, err.http_status)
         except (Exception, Timeout) as err:
             self.logger.exception(
-                'Failed to put shard ranges to %s:%s/%s: %s',
-                node['ip'], node['port'], node['device'], err)
+                'Failed to put shard ranges to %s:%s/%s %s/%s: %s',
+                node['ip'], node['port'], node['device'],
+                account, container, err)
         else:
             return True
         return False
@@ -2037,12 +2039,6 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         # now look and deal with misplaced objects.
         self._move_misplaced_objects(broker)
 
-        if broker.is_deleted():
-            # This container is deleted so we can skip it. We still want
-            # deleted containers to go via misplaced items because they may
-            # have new objects sitting in them that may need to move.
-            return
-
         is_leader = node['index'] == 0 and self.auto_shard
         if state in (UNSHARDED, COLLAPSED):
             if is_leader and broker.is_root_container():
@@ -2095,26 +2091,27 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                     self.logger.debug('Remaining in sharding state %s',
                                       quote(broker.path))
 
-        if state == SHARDED and broker.is_root_container():
-            # look for shrink stats
-            self._identify_shrinking_candidate(broker, node)
-            if is_leader:
-                self._find_and_enable_shrinking_candidates(broker)
-                self._find_and_enable_sharding_candidates(broker)
-            for shard_range in broker.get_shard_ranges(
-                    states=[ShardRange.SHARDING]):
-                self._send_shard_ranges(
-                    shard_range.account, shard_range.container,
-                    [shard_range])
+        if not broker.is_deleted():
+            if state == SHARDED and broker.is_root_container():
+                # look for shrink stats
+                self._identify_shrinking_candidate(broker, node)
+                if is_leader:
+                    self._find_and_enable_shrinking_candidates(broker)
+                    self._find_and_enable_sharding_candidates(broker)
+                for shard_range in broker.get_shard_ranges(
+                        states=[ShardRange.SHARDING]):
+                    self._send_shard_ranges(
+                        shard_range.account, shard_range.container,
+                        [shard_range])
 
-        if not broker.is_root_container():
-            # Update the root container with this container's shard range
-            # info; do this even when sharded in case previous attempts
-            # failed; don't do this if there is no own shard range. When
-            # sharding a shard, this is when the root will see the new
-            # shards move to ACTIVE state and the sharded shard
-            # simultaneously become deleted.
-            self._update_root_container(broker)
+            if not broker.is_root_container():
+                # Update the root container with this container's shard range
+                # info; do this even when sharded in case previous attempts
+                # failed; don't do this if there is no own shard range. When
+                # sharding a shard, this is when the root will see the new
+                # shards move to ACTIVE state and the sharded shard
+                # simultaneously become deleted.
+                self._update_root_container(broker)
 
         self.logger.debug('Finished processing %s state %s',
                           quote(broker.path), broker.get_db_state())
