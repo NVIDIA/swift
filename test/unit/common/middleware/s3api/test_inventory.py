@@ -215,7 +215,8 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual([call[0] for call in calls], ['HEAD'] * 2)
         self.assertIn(b'The specified configuration does not exist.', body)
 
-    def _do_test_GET_inventory_enabled(self, config, expected_schedule):
+    def _do_test_GET_inventory_enabled(self, config, expected_schedule,
+                                       exp_dest_bucket):
         self.conf['s3_inventory_enabled'] = 'yes'
         self.make_app()
         resp_headers = {
@@ -240,7 +241,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual(expected_schedule,
                          elem.find('./Schedule/Frequency').text)
         self.assertEqual(
-            'arn:aws:s3:::destination-bucket',
+            'arn:aws:s3:::%s' % exp_dest_bucket,
             elem.find('./Destination/S3BucketDestination/Bucket').text)
         self.assertEqual(
             'Parquet',
@@ -256,7 +257,22 @@ class TestS3ApiInventory(S3ApiTestCase):
             'enabled': True,
             'deleted': False,
         }
-        self._do_test_GET_inventory_enabled(config, 'Daily')
+        self._do_test_GET_inventory_enabled(config, 'Daily',
+                                            'destination-bucket')
+
+    def test_GET_inventory_enabled_default_dest_bucket(self):
+        config = {
+            'period': 'Daily',
+            'source': 's3api',
+            'dest_container': None,
+            'modified_time': 123456.789,
+            'enabled': True,
+            'deleted': False,
+        }
+        self._do_test_GET_inventory_enabled(config, 'Daily', 'bucket')
+
+        config['dest_container'] = ''
+        self._do_test_GET_inventory_enabled(config, 'Daily', 'bucket')
 
     def test_GET_inventory_enabled_int_period(self):
         config = {
@@ -267,9 +283,11 @@ class TestS3ApiInventory(S3ApiTestCase):
             'enabled': True,
             'deleted': False,
         }
-        self._do_test_GET_inventory_enabled(config, 'Daily')
+        self._do_test_GET_inventory_enabled(config, 'Daily',
+                                            'destination-bucket')
         config['period'] = '604800'
-        self._do_test_GET_inventory_enabled(config, 'Weekly')
+        self._do_test_GET_inventory_enabled(config, 'Weekly',
+                                            'destination-bucket')
 
     def test_GET_inventory_int_period_unsupported(self):
         self.conf['s3_inventory_enabled'] = 'yes'
@@ -281,7 +299,8 @@ class TestS3ApiInventory(S3ApiTestCase):
             'enabled': True,
             'deleted': False,
         }
-        self._do_test_GET_inventory_enabled(config, 'Unknown')
+        self._do_test_GET_inventory_enabled(config, 'Unknown',
+                                            'destination-bucket')
 
     def test_GET_inventory_deleted(self):
         self.conf['s3_inventory_enabled'] = 'yes'
@@ -473,7 +492,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             'period': 'Daily',
             'source': 's3api',
             'dest_container': 'destination-bucket',
-            'modified_time': float(ts),
+            'modified_time': int(ts),
             'enabled': True,
             'deleted': False,
         }
@@ -510,7 +529,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             'period': 'Daily',
             'source': 's3api',
             'dest_container': 'd-bucket',
-            'modified_time': float(ts),
+            'modified_time': int(ts),
             'enabled': True,
             'deleted': False,
         }
@@ -546,7 +565,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             'period': 'Daily',
             'source': 's3api',
             'dest_container': 'destination-bucket',
-            'modified_time': float(ts),
+            'modified_time': int(ts),
             'enabled': False,
             'deleted': False,
         }
@@ -608,7 +627,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             'period': 'Daily',
             'source': 's3api',
             'dest_container': 'destination-bucket',
-            'modified_time': float(ts),
+            'modified_time': int(ts),
             'enabled': False,
             'deleted': True,
         }

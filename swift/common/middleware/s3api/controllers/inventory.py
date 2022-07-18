@@ -168,7 +168,7 @@ def check_config_id(req, config=None):
 
 def add_sysmeta_header(req, config):
     config_data = config.to_dict()
-    config_data['modified_time'] = float(req.ensure_x_timestamp())
+    config_data['modified_time'] = float(req.timestamp)
     key = 'X-Container-Sysmeta-Inventory-%s-Config' % config.inventory_id
     req.headers[key] = json.dumps(config_data)
 
@@ -203,6 +203,9 @@ class InventoryController(Controller):
         key = 'inventory-%s-config' % inventory_id
         config_data = json.loads(sysmeta.get(key, '{}'))
         if config_data:
+            if not config_data['dest_container']:
+                # default dest bucket if not configured
+                config_data['dest_container'] = req.container_name
             try:
                 return InventoryConfiguration.from_json(config_data)
             except ValueError as err:
