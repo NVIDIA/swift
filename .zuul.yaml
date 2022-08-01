@@ -311,6 +311,7 @@
     timeout: 5400
     vars:
       s3_acl: yes
+      s3_inventory_enabled: yes
       bindep_profile: test py36
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
@@ -332,6 +333,7 @@
     timeout: 1800
     vars:
       s3_acl: yes
+      s3_inventory_enabled: yes
       bindep_profile: test py36
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
@@ -593,6 +595,7 @@
     description: |
       Functional testing on a FIPS enabled Centos 8 system
     vars:
+      nslookup_target: 'opendev.org'
       enable_fips: true
 
 - job:
@@ -603,6 +606,7 @@
       Functional encryption testing on a FIPS enabled
       Centos 8 system
     vars:
+      nslookup_target: 'opendev.org'
       enable_fips: true
 
 - job:
@@ -612,6 +616,7 @@
     description: |
       Functional EC testing on a FIPS enabled Centos 8 system
     vars:
+      nslookup_target: 'opendev.org'
       enable_fips: true
 
 - project-template:

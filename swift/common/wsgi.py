@@ -1065,7 +1065,7 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
     :param allow_modify_pipeline: Boolean for whether the server should have
                                   an opportunity to change its own pipeline.
                                   Defaults to True
-    :param check_config: if False (the default) then load and validate the
+    :param test_config: if False (the default) then load and validate the
         config and if successful then continue to run the server; if True then
         load and validate the config but do not run the server.
     :returns: 0 if successful, nonzero otherwise

@@ -1906,12 +1906,12 @@ class TestHandoffsOnly(unittest.TestCase):
         self.assertEqual(
             self.logger.get_lines_for_level('warning'),
             [('Starting replication pass with handoffs_only and/or '
-              'handoffs_delete enabled. This '
-              'mode is not intended for normal operation; use '
+              'handoffs_delete enabled. These '
+              'modes are not intended for normal operation; use '
               'these options with care.'),
              ('Finished replication pass with handoffs_only and/or '
               'handoffs_delete enabled. If these are no longer required, '
-              'disable it.')])
+              'disable them.')])
 
     def test_skips_primary_partitions(self):
         replicator = TestReplicator({
@@ -2213,10 +2213,10 @@ class TestReplicatorSync(unittest.TestCase):
         for node in self._ring.devs:
             daemon = self._run_once(node)
             if node['device'] == 'sdc':
-                self.assertEqual(daemon._local_device_ids, set())
+                self.assertEqual(daemon._local_device_ids, {})
             else:
                 self.assertEqual(daemon._local_device_ids,
-                                 set([node['id']]))
+                                 {node['id']: node})
 
     def test_clean_up_after_deleted_brokers(self):
         broker = self._get_broker('a', 'c', node_index=0)

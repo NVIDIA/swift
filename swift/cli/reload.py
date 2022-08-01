@@ -37,9 +37,7 @@ import six
 from swift.common.manager import get_child_pids
 
 
-# TODO: think more about exit codes
-EXIT_BAD_PID = 2
-EXIT_BAD_CONFIG = 1
+EXIT_BAD_PID = 2  # similar to argparse exiting 2 on an unknown arg
 EXIT_RELOAD_FAILED = 1
 EXIT_RELOAD_TIMEOUT = 128 + errno.ETIMEDOUT
 
@@ -96,7 +94,7 @@ def main(args=None):
         subprocess.check_call(cmd.split() + ["--test-config"])
     except subprocess.CalledProcessError:
         print("Failed to validate config", file=sys.stderr)
-        exit(EXIT_BAD_CONFIG)
+        exit(EXIT_RELOAD_FAILED)
 
     try:
         original_children = get_child_pids(args.pid)
@@ -129,7 +127,7 @@ def main(args=None):
     except subprocess.CalledProcessError:
         # This could pop during any of the calls to get_child_pids
         print("Process seems to have died!", file=sys.stderr)
-        exit(EXIT_RELOAD_TIMEOUT)
+        exit(EXIT_RELOAD_FAILED)
 
     print("Reloaded %s" % script)
 

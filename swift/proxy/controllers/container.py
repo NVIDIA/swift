@@ -402,9 +402,14 @@ class ContainerController(Controller):
             # allows misplaced objects below the expected shard range to be
             # included in the listing.
             last_name = ''
+            last_name_was_subdir = False
             if objects:
-                last_name = objects[-1].get('name',
-                                            objects[-1].get('subdir', u''))
+                last_name_was_subdir = 'subdir' in objects[-1]
+                if last_name_was_subdir:
+                    last_name = objects[-1]['subdir']
+                else:
+                    last_name = objects[-1]['name']
+
                 if six.PY2:
                     last_name = last_name.encode('utf8')
                 params['marker'] = str_to_wsgi(last_name)
@@ -445,14 +450,10 @@ class ContainerController(Controller):
                     if just_past < shard_range:
                         continue
 
-            if delimiter and last_name.endswith(delimiter):
-                if reverse:
-                    if str(shard_range.lower).startswith(last_name):
-                        continue
-                else:
-                    if str(shard_range.upper).startswith(last_name) and \
-                            shard_range.upper != last_name:
-                        continue
+            if last_name_was_subdir and str(
+                shard_range.lower if reverse else shard_range.upper
+            ).startswith(last_name):
+                continue
 
             self.logger.debug(
                 'Getting listing part %d from shard %s %s with %s',

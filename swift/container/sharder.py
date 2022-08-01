@@ -31,7 +31,6 @@ from swift.common import internal_client
 from swift.common.constraints import check_drive, AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common.direct_client import (direct_put_container,
                                         DirectClientException)
-from swift.common.exceptions import DeviceUnavailable
 from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER
 from swift.common.ring.utils import is_local_device
 from swift.common.swob import str_to_wsgi
@@ -499,6 +498,48 @@ def rank_paths(paths, shard_range_to_span):
 
 
 class CleavingContext(object):
+    """
+    Encapsulates metadata associated with the process of cleaving a retiring
+    DB. This metadata includes:
+
+      * ``ref``: The unique part of the key that is used when persisting a
+        serialized ``CleavingContext`` as sysmeta in the DB. The unique part of
+        the key is based off the DB id. This ensures that each context is
+        associated with a specific DB file. The unique part of the key is
+        included in the ``CleavingContext`` but should not be modified by any
+        caller.
+
+      * ``cursor``: the upper bound of the last shard range to have been
+        cleaved from the retiring DB.
+
+      * ``max_row``: the retiring DB's max row; this is updated to the value of
+        the retiring DB's ``max_row`` every time a ``CleavingContext`` is
+        loaded for that DB, and may change during the process of cleaving the
+        DB.
+
+      * ``cleave_to_row``: the value of ``max_row`` at the moment when cleaving
+        starts for the DB. When cleaving completes (i.e. the cleave cursor has
+        reached the upper bound of the cleaving namespace), ``cleave_to_row``
+        is compared to the current ``max_row``: if the two values are not equal
+        then rows have been added to the DB which may not have been cleaved, in
+        which case the ``CleavingContext`` is ``reset`` and cleaving is
+        re-started.
+
+      * ``last_cleave_to_row``: the minimum DB row from which cleaving should
+        select objects to cleave; this is initially set to None i.e. all rows
+        should be cleaved. If the ``CleavingContext`` is ``reset`` then the
+        ``last_cleave_to_row`` is set to the current value of
+        ``cleave_to_row``, which in turn is set to the current value of
+        ``max_row`` by a subsequent call to ``start``. The repeated cleaving
+        therefore only selects objects in rows greater than the
+        ``last_cleave_to_row``, rather than cleaving the whole DB again.
+
+      * ``ranges_done``: the number of shard ranges that have been cleaved from
+        the retiring DB.
+
+      * ``ranges_todo``: the number of shard ranges that are yet to be
+        cleaved from the retiring DB.
+    """
     def __init__(self, ref, cursor='', max_row=None, cleave_to_row=None,
                  last_cleave_to_row=None, cleaving_done=False,
                  misplaced_done=False, ranges_done=0, ranges_todo=0):
@@ -552,9 +593,9 @@ class CleavingContext(object):
     @classmethod
     def load_all(cls, broker):
         """
-        Returns all cleaving contexts stored in the broker.
+        Returns all cleaving contexts stored in the broker's DB.
 
-        :param broker:
+        :param broker: an instance of :class:`ContainerBroker`
         :return: list of tuples of (CleavingContext, timestamp)
         """
         brokers = broker.get_brokers()
@@ -574,17 +615,11 @@ class CleavingContext(object):
     @classmethod
     def load(cls, broker):
         """
-        Returns a context dict for tracking the progress of cleaving this
-        broker's retiring DB. The context is persisted in sysmeta using a key
-        that is based off the retiring db id and max row. This form of
-        key ensures that a cleaving context is only loaded for a db that
-        matches the id and max row when the context was created; if a db is
-        modified such that its max row changes then a different context, or no
-        context, will be loaded.
+        Returns a CleavingContext tracking the cleaving progress of the given
+        broker's DB.
 
-        :return: A dict to which cleave progress metadata may be added. The
-            dict initially has a key ``ref`` which should not be modified by
-            any caller.
+        :param broker: an instances of :class:`ContainerBroker`
+        :return: An instance of :class:`CleavingContext`.
         """
         brokers = broker.get_brokers()
         ref = cls._make_ref(brokers[0])
@@ -595,6 +630,12 @@ class CleavingContext(object):
         return cls(**data)
 
     def store(self, broker):
+        """
+        Persists the serialized ``CleavingContext`` as sysmeta in the given
+        broker's DB.
+
+        :param broker: an instances of :class:`ContainerBroker`
+        """
         broker.set_sharding_sysmeta('Context-' + self.ref,
                                     json.dumps(dict(self)))
 
@@ -813,11 +854,15 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         else:
             self.stats['sharding'][category][key] = max(current, value)
 
-    def _increment_stat(self, category, key, step=1, statsd=False):
-        self.stats['sharding'][category][key] += step
-        if statsd:
-            statsd_key = '%s_%s' % (category, key)
-            self.logger.increment(statsd_key)
+    def _increment_stat(self, category, key, statsd=False):
+        self._update_stat(category, key, step=1, statsd=statsd)
+
+    def _update_stat(self, category, key, step=1, statsd=False):
+        if step:
+            self.stats['sharding'][category][key] += step
+            if statsd:
+                statsd_key = '%s_%s' % (category, key)
+                self.logger.update_stats(statsd_key, step)
 
     def _make_stats_info(self, broker, node, own_shard_range):
         try:
@@ -1008,12 +1053,12 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             self.logger.warning(
                 'Failed to put shard ranges to %s:%s/%s %s/%s: %s',
                 node['ip'], node['port'], node['device'],
-                account, container, err.http_status)
+                quote(account), quote(container), err.http_status)
         except (Exception, Timeout) as err:
             self.logger.exception(
                 'Failed to put shard ranges to %s:%s/%s %s/%s: %s',
                 node['ip'], node['port'], node['device'],
-                account, container, err)
+                quote(account), quote(container), err)
         else:
             return True
         return False
@@ -1049,20 +1094,19 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         :param shard_range: a :class:`~swift.common.utils.ShardRange`
         :param root_path: the path of the shard's root container
         :param policy_index: the storage policy index
-        :returns: a tuple of ``(part, broker, node_id)`` where ``part`` is the
-            shard container's partition, ``broker`` is an instance of
+        :returns: a tuple of ``(part, broker, node_id, put_timestamp)`` where
+            ``part`` is the shard container's partition,
+            ``broker`` is an instance of
             :class:`~swift.container.backend.ContainerBroker`,
-            ``node_id`` is the id of the selected node.
+            ``node_id`` is the id of the selected node,
+            ``put_timestamp`` is the put_timestamp if the broker needed to
+            be initialized.
         """
         part = self.ring.get_part(shard_range.account, shard_range.container)
         node = self.find_local_handoff_for_part(part)
-        put_timestamp = Timestamp.now().internal
-        if not node:
-            raise DeviceUnavailable(
-                'No mounted devices found suitable for creating shard broker '
-                'for %s in partition %s' % (quote(shard_range.name), part))
 
-        shard_broker = ContainerBroker.create_broker(
+        put_timestamp = Timestamp.now().internal
+        shard_broker, initialized = ContainerBroker.create_broker(
             os.path.join(self.root, node['device']), part, shard_range.account,
             shard_range.container, epoch=shard_range.epoch,
             storage_policy_index=policy_index, put_timestamp=put_timestamp)
@@ -1082,6 +1126,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             'X-Container-Sysmeta-Sharding':
                 ('True', Timestamp.now().internal)})
 
+        put_timestamp = put_timestamp if initialized else None
         return part, shard_broker, node['id'], put_timestamp
 
     def _audit_root_container(self, broker):
@@ -1110,8 +1155,8 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             overlaps = find_overlapping_ranges(shard_ranges)
             if overlaps:
                 self._increment_stat('audit_root', 'has_overlap')
-                self._increment_stat('audit_root', 'num_overlap',
-                                     step=len(overlaps))
+                self._update_stat('audit_root', 'num_overlap',
+                                  step=len(overlaps))
                 all_overlaps = ', '.join(
                     [' '.join(['%s-%s' % (sr.lower, sr.upper)
                                for sr in overlapping_ranges])
@@ -1424,8 +1469,11 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                 continue
 
             if dest_shard_range not in dest_brokers:
-                part, dest_broker, node_id, _junk = self._get_shard_broker(
-                    dest_shard_range, src_broker.root_path, policy_index)
+                part, dest_broker, node_id, put_timestamp = \
+                    self._get_shard_broker(
+                        dest_shard_range, src_broker.root_path, policy_index)
+                stat = 'db_exists' if put_timestamp is None else 'db_created'
+                self._increment_stat('misplaced', stat, statsd=True)
                 # save the broker info that was sampled prior to the *first*
                 # yielded objects for this destination
                 destination = {'part': part,
@@ -1450,8 +1498,8 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             success &= self._replicate_and_delete(
                 src_broker, dest_shard_range, **dest_args)
 
-        self._increment_stat('misplaced', 'placed', step=placed)
-        self._increment_stat('misplaced', 'unplaced', step=unplaced)
+        self._update_stat('misplaced', 'placed', step=placed, statsd=True)
+        self._update_stat('misplaced', 'unplaced', step=unplaced, statsd=True)
         return success, placed, unplaced
 
     def _make_shard_range_fetcher(self, broker, src_shard_range):
@@ -1553,7 +1601,8 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             self._increment_stat('misplaced', 'found', statsd=True)
             self.logger.debug('Placed %s misplaced objects (%s unplaced)',
                               num_placed, num_unplaced)
-        self._increment_stat('misplaced', 'success' if success else 'failure')
+        self._increment_stat('misplaced', 'success' if success else 'failure',
+                             statsd=True)
         self.logger.debug('Finished handling misplaced objects')
         return success
 
@@ -1601,7 +1650,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         num_found = len(shard_ranges)
         self.logger.info(
             "Completed scan for shard ranges: %d found", num_found)
-        self._increment_stat('scanned', 'found', step=num_found)
+        self._update_stat('scanned', 'found', step=num_found)
         self._min_stat('scanned', 'min_time', round(elapsed / num_found, 3))
         self._max_stat('scanned', 'max_time', round(elapsed / num_found, 3))
 
@@ -1790,18 +1839,14 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                          quote(shard_range.name), shard_range)
         self._increment_stat('cleaved', 'attempted')
         policy_index = broker.storage_policy_index
-        try:
-            shard_part, shard_broker, node_id, put_timestamp = \
-                self._get_shard_broker(shard_range, broker.root_path,
-                                       policy_index)
-        except DeviceUnavailable as duex:
-            self.logger.warning(str(duex))
-            self._increment_stat('cleaved', 'failure', statsd=True)
-            return CLEAVE_FAILED
-        else:
-            return self._cleave_shard_broker(
-                broker, cleaving_context, shard_range, own_shard_range,
-                shard_broker, put_timestamp, shard_part, node_id)
+        shard_part, shard_broker, node_id, put_timestamp = \
+            self._get_shard_broker(shard_range, broker.root_path,
+                                   policy_index)
+        stat = 'db_exists' if put_timestamp is None else 'db_created'
+        self._increment_stat('cleaved', stat, statsd=True)
+        return self._cleave_shard_broker(
+            broker, cleaving_context, shard_range, own_shard_range,
+            shard_broker, put_timestamp, shard_part, node_id)
 
     def _cleave(self, broker):
         # Returns True if misplaced objects have been moved and the entire
@@ -2033,8 +2078,10 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
     def _process_broker(self, broker, node, part):
         broker.get_info()  # make sure account/container are populated
         state = broker.get_db_state()
-        self.logger.debug('Starting processing %s state %s',
-                          quote(broker.path), state)
+        is_deleted = broker.is_deleted()
+        self.logger.debug('Starting processing %s state %s%s',
+                          quote(broker.path), state,
+                          ' (deleted)' if is_deleted else '')
 
         if not self._audit_container(broker):
             return
@@ -2042,7 +2089,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         # now look and deal with misplaced objects.
         self._move_misplaced_objects(broker)
 
-        is_leader = node['index'] == 0 and self.auto_shard
+        is_leader = node['index'] == 0 and self.auto_shard and not is_deleted
         if state in (UNSHARDED, COLLAPSED):
             if is_leader and broker.is_root_container():
                 # bootstrap sharding of root container
@@ -2116,8 +2163,9 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                 # simultaneously become deleted.
                 self._update_root_container(broker)
 
-        self.logger.debug('Finished processing %s state %s',
-                          quote(broker.path), broker.get_db_state())
+        self.logger.debug('Finished processing %s state %s%s',
+                          quote(broker.path), broker.get_db_state(),
+                          ' (deleted)' if is_deleted else '')
 
     def _one_shard_cycle(self, devices_to_shard, partitions_to_shard):
         """
@@ -2141,7 +2189,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             self.logger.info('(Override partitions: %s)',
                              ', '.join(str(p) for p in partitions_to_shard))
         self._zero_stats()
-        self._local_device_ids = set()
+        self._local_device_ids = {}
         dirs = []
         self.ips = whataremyips(self.bind_ip)
         for node in self.ring.devs:
@@ -2152,7 +2200,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             if os.path.isdir(datadir):
                 # Populate self._local_device_ids so we can find devices for
                 # shard containers later
-                self._local_device_ids.add(node['id'])
+                self._local_device_ids[node['id']] = node
                 if node['device'] not in devices_to_shard:
                     continue
                 part_filt = self._partition_dir_filter(

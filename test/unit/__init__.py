@@ -280,6 +280,7 @@ class FakeRing(Ring):
                 'zone': x % 3,
                 'region': x % 2,
                 'id': x,
+                'weight': 1,
             }
             self.add_node(dev)
 

@@ -432,13 +432,11 @@ class TestSharder(BaseTestSharder):
             sharder._increment_stat('visited', 'failure')
             sharder._increment_stat('visited', 'completed')
             sharder._increment_stat('cleaved', 'success')
-            sharder._increment_stat('scanned', 'found', step=4)
         expected = {'success': 2,
                     'failure': 1,
                     'completed': 1}
         self._assert_stats(expected, sharder, 'visited')
         self._assert_stats({'success': 1}, sharder, 'cleaved')
-        self._assert_stats({'found': 4}, sharder, 'scanned')
 
     def test_increment_stats_with_statsd(self):
         with self._mock_sharder() as sharder:
@@ -451,10 +449,22 @@ class TestSharder(BaseTestSharder):
                     'failure': 2,
                     'completed': 1}
         self._assert_stats(expected, sharder, 'visited')
-        counts = sharder.logger.get_increment_counts()
+        counts = sharder.logger.get_stats_counts()
         self.assertEqual(2, counts.get('visited_success'))
         self.assertEqual(1, counts.get('visited_failure'))
         self.assertIsNone(counts.get('visited_completed'))
+
+    def test_update_stat(self):
+        with self._mock_sharder() as sharder:
+            sharder._update_stat('scanned', 'found', step=4)
+        self._assert_stats({'found': 4}, sharder, 'scanned')
+        with self._mock_sharder() as sharder:
+            sharder._update_stat('scanned', 'found', step=4)
+            sharder._update_stat('misplaced', 'placed', step=456, statsd=True)
+        self._assert_stats({'found': 4}, sharder, 'scanned')
+        self._assert_stats({'placed': 456}, sharder, 'misplaced')
+        self.assertEqual({'misplaced_placed': 456},
+                         sharder.logger.get_stats_counts())
 
     def test_run_forever(self):
         conf = {'recon_cache_path': self.tempdir,
@@ -682,14 +692,14 @@ class TestSharder(BaseTestSharder):
             with mock.patch('eventlet.sleep'), mock.patch.object(
                     sharder, '_process_broker'
             ) as mock_process_broker:
-                sharder._local_device_ids = {'stale_node_id'}
+                sharder._local_device_ids = {'stale_node_id': {}}
                 sharder._one_shard_cycle(Everything(), Everything())
 
             lines = sharder.logger.get_lines_for_level('warning')
             expected = 'Skipping %s as it is not mounted' % \
                 unmounted_dev['device']
             self.assertIn(expected, lines[0])
-            self.assertEqual(device_ids, sharder._local_device_ids)
+            self.assertEqual(device_ids, set(sharder._local_device_ids.keys()))
             self.assertEqual(2, mock_process_broker.call_count)
             processed_paths = [call[0][0].path
                                for call in mock_process_broker.call_args_list]
@@ -741,14 +751,14 @@ class TestSharder(BaseTestSharder):
             with mock.patch('eventlet.sleep'), mock.patch.object(
                     sharder, '_process_broker', side_effect=mock_processing
             ) as mock_process_broker:
-                sharder._local_device_ids = {'stale_node_id'}
+                sharder._local_device_ids = {'stale_node_id': {}}
                 sharder._one_shard_cycle(Everything(), Everything())
 
             lines = sharder.logger.get_lines_for_level('warning')
             expected = 'Skipping %s as it is not mounted' % \
                 unmounted_dev['device']
             self.assertIn(expected, lines[0])
-            self.assertEqual(device_ids, sharder._local_device_ids)
+            self.assertEqual(device_ids, set(sharder._local_device_ids.keys()))
             self.assertEqual(3, mock_process_broker.call_count)
             processed_paths = [call[0][0].path
                                for call in mock_process_broker.call_args_list]
@@ -799,10 +809,10 @@ class TestSharder(BaseTestSharder):
             with mock.patch('eventlet.sleep'), mock.patch.object(
                     sharder, '_process_broker'
             ) as mock_process_broker:
-                sharder._local_device_ids = {999}
+                sharder._local_device_ids = {999: {}}
                 sharder._one_shard_cycle(Everything(), Everything())
 
-            self.assertEqual(device_ids, sharder._local_device_ids)
+            self.assertEqual(device_ids, set(sharder._local_device_ids.keys()))
             self.assertEqual(3, mock_process_broker.call_count)
             processed_paths = [call[0][0].path
                                for call in mock_process_broker.call_args_list]
@@ -826,7 +836,7 @@ class TestSharder(BaseTestSharder):
             with mock.patch('eventlet.sleep'), mock.patch.object(
                     sharder, '_process_broker'
             ) as mock_process_broker:
-                sharder._local_device_ids = {999}
+                sharder._local_device_ids = {999: {}}
                 sharder._one_shard_cycle(Everything(), Everything())
 
             expected_in_progress_stats = {
@@ -866,7 +876,7 @@ class TestSharder(BaseTestSharder):
             with mock.patch('eventlet.sleep'), \
                     mock.patch.object(sharder, '_process_broker') \
                     as mock_process_broker, mock_timestamp_now(ts_now):
-                sharder._local_device_ids = {999}
+                sharder._local_device_ids = {999: {}}
                 sharder._one_shard_cycle(Everything(), Everything())
 
             expected_in_progress_stats = {
@@ -896,7 +906,7 @@ class TestSharder(BaseTestSharder):
             with mock.patch('eventlet.sleep'), \
                     mock.patch.object(sharder, '_process_broker') \
                     as mock_process_broker, mock_timestamp_now(ts_now):
-                sharder._local_device_ids = {999}
+                sharder._local_device_ids = {999: {}}
                 sharder._one_shard_cycle(Everything(), Everything())
             self._assert_stats(
                 expected_in_progress_stats, sharder, 'sharding_in_progress')
@@ -908,7 +918,7 @@ class TestSharder(BaseTestSharder):
             with mock.patch('eventlet.sleep'), \
                     mock.patch.object(sharder, '_process_broker') \
                     as mock_process_broker, mock_timestamp_now(ts_now):
-                sharder._local_device_ids = {999}
+                sharder._local_device_ids = {999: {}}
                 sharder._one_shard_cycle(Everything(), Everything())
 
             expected_in_progress_stats = {
@@ -1005,7 +1015,8 @@ class TestSharder(BaseTestSharder):
                     'swift.common.db_replicator.ring.Ring',
                     return_value=fake_ring):
                 sharder = ContainerSharder(conf, logger=self.logger)
-                sharder._local_device_ids = {0, 1, 2}
+                sharder._local_device_ids = {dev['id']: dev
+                                             for dev in fake_ring.devs}
                 sharder._replicate_object = mock.MagicMock(
                     return_value=(True, [True] * sharder.ring.replica_count))
                 yield sharder
@@ -1243,11 +1254,16 @@ class TestSharder(BaseTestSharder):
             self.assertFalse(sharder._cleave(broker))
 
         expected = {'attempted': 1, 'success': 1, 'failure': 0,
-                    'min_time': mock.ANY, 'max_time': mock.ANY}
+                    'min_time': mock.ANY, 'max_time': mock.ANY,
+                    'db_created': 1, 'db_exists': 0}
         stats = self._assert_stats(expected, sharder, 'cleaved')
         self.assertIsInstance(stats['min_time'], float)
         self.assertIsInstance(stats['max_time'], float)
         self.assertLessEqual(stats['min_time'], stats['max_time'])
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts().get('cleaved_db_created'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('cleaved_db_exists'))
         self.assertEqual(SHARDING, broker.get_db_state())
         sharder._replicate_object.assert_called_once_with(
             0, expected_shard_dbs[0], 0)
@@ -1305,6 +1321,15 @@ class TestSharder(BaseTestSharder):
         sharder._replicate_object.assert_called_once_with(
             0, expected_shard_dbs[1], 0)
 
+        expected = {'attempted': 1, 'success': 0, 'failure': 1,
+                    'min_time': mock.ANY, 'max_time': mock.ANY,
+                    'db_created': 1, 'db_exists': 0}
+        self._assert_stats(expected, sharder, 'cleaved')
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts().get('cleaved_db_created'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('cleaved_db_exists'))
+
         # cleaving state is unchanged
         updated_shard_ranges = broker.get_shard_ranges()
         self.assertEqual(4, len(updated_shard_ranges))
@@ -1333,11 +1358,16 @@ class TestSharder(BaseTestSharder):
             self.assertFalse(sharder._cleave(broker))
 
         expected = {'attempted': 2, 'success': 2, 'failure': 0,
-                    'min_time': mock.ANY, 'max_time': mock.ANY}
+                    'min_time': mock.ANY, 'max_time': mock.ANY,
+                    'db_created': 1, 'db_exists': 1}
         stats = self._assert_stats(expected, sharder, 'cleaved')
         self.assertIsInstance(stats['min_time'], float)
         self.assertIsInstance(stats['max_time'], float)
         self.assertLessEqual(stats['min_time'], stats['max_time'])
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts().get('cleaved_db_created'))
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts().get('cleaved_db_exists'))
 
         self.assertEqual(SHARDING, broker.get_db_state())
         sharder._replicate_object.assert_has_calls(
@@ -1394,11 +1424,16 @@ class TestSharder(BaseTestSharder):
             self.assertFalse(sharder._cleave(broker))
 
         expected = {'attempted': 1, 'success': 1, 'failure': 0,
-                    'min_time': mock.ANY, 'max_time': mock.ANY}
+                    'min_time': mock.ANY, 'max_time': mock.ANY,
+                    'db_created': 1, 'db_exists': 0}
         stats = self._assert_stats(expected, sharder, 'cleaved')
         self.assertIsInstance(stats['min_time'], float)
         self.assertIsInstance(stats['max_time'], float)
         self.assertLessEqual(stats['min_time'], stats['max_time'])
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts().get('cleaved_db_created'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('cleaved_db_exists'))
 
         self.assertEqual(SHARDING, broker.get_db_state())
         sharder._replicate_object.assert_called_once_with(
@@ -1462,11 +1497,16 @@ class TestSharder(BaseTestSharder):
             self.assertTrue(sharder._cleave(broker))
 
         expected = {'attempted': 1, 'success': 1, 'failure': 0,
-                    'min_time': mock.ANY, 'max_time': mock.ANY}
+                    'min_time': mock.ANY, 'max_time': mock.ANY,
+                    'db_created': 1, 'db_exists': 0}
         stats = self._assert_stats(expected, sharder, 'cleaved')
         self.assertIsInstance(stats['min_time'], float)
         self.assertIsInstance(stats['max_time'], float)
         self.assertLessEqual(stats['min_time'], stats['max_time'])
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts().get('cleaved_db_created'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('cleaved_db_exists'))
 
         sharder._replicate_object.assert_called_once_with(
             0, expected_shard_dbs[4], 0)
@@ -3297,10 +3337,19 @@ class TestSharder(BaseTestSharder):
             sharder._move_misplaced_objects(broker)
         sharder._replicate_object.assert_not_called()
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
-                          'found': 0, 'placed': 0, 'unplaced': 0}
+                          'found': 0, 'placed': 0, 'unplaced': 0,
+                          'db_created': 0, 'db_exists': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_increment_counts().get('misplaced_found'))
+            sharder.logger.get_stats_counts().get('misplaced_found'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_placed'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_created'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
 
         # sharding - no misplaced objects
         self.assertTrue(broker.set_sharding_state())
@@ -3309,7 +3358,15 @@ class TestSharder(BaseTestSharder):
         sharder._replicate_object.assert_not_called()
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_increment_counts().get('misplaced_found'))
+            sharder.logger.get_stats_counts().get('misplaced_found'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_placed'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_created'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
 
         # pretend we cleaved up to end of second shard range
         context = CleavingContext.load(broker)
@@ -3320,7 +3377,15 @@ class TestSharder(BaseTestSharder):
         sharder._replicate_object.assert_not_called()
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_increment_counts().get('misplaced_found'))
+            sharder.logger.get_stats_counts().get('misplaced_found'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_placed'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_created'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
 
         # sharding - misplaced objects
         for obj in objects:
@@ -3333,7 +3398,15 @@ class TestSharder(BaseTestSharder):
         sharder._replicate_object.assert_not_called()
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_increment_counts().get('misplaced_found'))
+            sharder.logger.get_stats_counts().get('misplaced_found'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_placed'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_created'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
         self.assertFalse(os.path.exists(expected_shard_dbs[0]))
         self.assertFalse(os.path.exists(expected_shard_dbs[1]))
         self.assertFalse(os.path.exists(expected_shard_dbs[2]))
@@ -3349,10 +3422,18 @@ class TestSharder(BaseTestSharder):
         sharder._replicate_object.assert_called_once_with(
             0, expected_shard_dbs[1], 0)
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
-                          'found': 1, 'placed': 2, 'unplaced': 0}
+                          'found': 1, 'placed': 2, 'unplaced': 0,
+                          'db_created': 1, 'db_exists': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
+        self.assertEqual(
+            2, sharder.logger.get_stats_counts()['misplaced_placed'])
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts()['misplaced_db_created'])
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
+
         # check misplaced objects were moved
         self._check_objects(objects[:2], expected_shard_dbs[1])
         # ... and removed from the source db
@@ -3379,7 +3460,8 @@ class TestSharder(BaseTestSharder):
         with self._mock_sharder(conf={'cleave_row_batch_size': 2}) as sharder:
             sharder._move_misplaced_objects(broker)
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
-                          'found': 1, 'placed': 4, 'unplaced': 0}
+                          'found': 1, 'placed': 4, 'unplaced': 0,
+                          'db_created': 3, 'db_exists': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         sharder._replicate_object.assert_has_calls(
             [mock.call(0, db, 0) for db in expected_shard_dbs[2:4]],
@@ -3387,7 +3469,13 @@ class TestSharder(BaseTestSharder):
         )
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
+        self.assertEqual(
+            4, sharder.logger.get_stats_counts()['misplaced_placed'])
+        self.assertEqual(
+            3, sharder.logger.get_stats_counts()['misplaced_db_created'])
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
 
         # check misplaced objects were moved
         self._check_objects(new_objects, expected_shard_dbs[0])
@@ -3404,10 +3492,17 @@ class TestSharder(BaseTestSharder):
             sharder._move_misplaced_objects(broker)
         sharder._replicate_object.assert_not_called()
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
-                          'found': 0, 'placed': 0, 'unplaced': 0}
+                          'found': 0, 'placed': 0, 'unplaced': 0,
+                          'db_created': 0, 'db_exists': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_increment_counts().get('misplaced_found'))
+            sharder.logger.get_stats_counts().get('misplaced_found'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_placed'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_created'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
 
         # and then more misplaced updates arrive
         newer_objects = [
@@ -3428,11 +3523,21 @@ class TestSharder(BaseTestSharder):
              for db in (expected_shard_dbs[0], expected_shard_dbs[-1])],
             any_order=True
         )
+        # shard broker for first shard range was already created but not
+        # removed due to mocked _replicate_object so expect one created and one
+        # existed db stat...
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
-                          'found': 1, 'placed': 3, 'unplaced': 0}
+                          'found': 1, 'placed': 3, 'unplaced': 0,
+                          'db_created': 1, 'db_exists': 1}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
+        self.assertEqual(
+            3, sharder.logger.get_stats_counts()['misplaced_placed'])
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts()['misplaced_db_created'])
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts()['misplaced_db_exists'])
 
         # check new misplaced objects were moved
         self._check_objects(newer_objects[:1] + new_objects,
@@ -3623,7 +3728,7 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 4, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
         # check misplaced objects were moved
         self._check_objects(objects[:2], expected_dbs[1])
         self._check_objects(objects[2:3], expected_dbs[2])
@@ -3656,7 +3761,7 @@ class TestSharder(BaseTestSharder):
                           'placed': 4, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
         # check misplaced objects were moved to shard dbs
         self._check_objects(objects[:2], expected_dbs[1])
         self._check_objects(objects[2:3], expected_dbs[2])
@@ -3689,7 +3794,7 @@ class TestSharder(BaseTestSharder):
                           'placed': 4, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
         # check misplaced objects were moved to shard dbs
         self._check_objects(objects[:2], expected_dbs[1])
         self._check_objects(objects[2:3], expected_dbs[2])
@@ -3722,7 +3827,7 @@ class TestSharder(BaseTestSharder):
                           'placed': 4, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
         # check misplaced objects were moved to shard dbs
         self._check_objects(objects[:2], expected_dbs[1])
         self._check_objects(objects[2:3], expected_dbs[2])
@@ -3775,8 +3880,16 @@ class TestSharder(BaseTestSharder):
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
                           'found': 0, 'placed': 0, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts().get('misplaced_success'))
         self.assertFalse(
-            sharder.logger.get_increment_counts().get('misplaced_found'))
+            sharder.logger.get_stats_counts().get('misplaced_failure'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_found'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_placed'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
 
         # now put objects
@@ -3803,8 +3916,16 @@ class TestSharder(BaseTestSharder):
         expected_stats = {'attempted': 1, 'success': 0, 'failure': 1,
                           'found': 1, 'placed': 2, 'unplaced': 2}
         self._assert_stats(expected_stats, sharder, 'misplaced')
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_success'))
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts().get('misplaced_failure'))
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
+        self.assertEqual(
+            2, sharder.logger.get_stats_counts().get('misplaced_placed'))
+        self.assertEqual(
+            2, sharder.logger.get_stats_counts().get('misplaced_unplaced'))
         # some misplaced objects could not be moved...
         warning_lines = sharder.logger.get_lines_for_level('warning')
         self.assertIn(
@@ -3840,7 +3961,15 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 2, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts().get('misplaced_success'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_failure'))
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
+        self.assertEqual(
+            2, sharder.logger.get_stats_counts().get('misplaced_placed'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
 
         # check misplaced objects were moved
@@ -3863,9 +3992,17 @@ class TestSharder(BaseTestSharder):
         expected_stats = {'attempted': 1, 'success': 1, 'failure': 0,
                           'found': 0, 'placed': 0, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts().get('misplaced_success'))
         self.assertFalse(
-            sharder.logger.get_increment_counts().get('misplaced_found'))
+            sharder.logger.get_stats_counts().get('misplaced_failure'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_found'))
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_placed'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
 
         # and then more misplaced updates arrive
         new_objects = [
@@ -3899,7 +4036,15 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 2, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts().get('misplaced_success'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_failure'))
+        self.assertEqual(
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
+        self.assertEqual(
+            2, sharder.logger.get_stats_counts().get('misplaced_placed'))
+        self.assertFalse(
+            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
 
         # check new misplaced objects were moved
@@ -3986,7 +4131,7 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 1, 'unplaced': 2}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
         warning_lines = sharder.logger.get_lines_for_level('warning')
         self.assertIn(
             'Failed to find destination for at least 2 misplaced objects',
@@ -4021,7 +4166,7 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 2, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
 
         # check misplaced objects were moved
@@ -4072,7 +4217,7 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 5, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
 
         # check *all* the misplaced objects were moved
@@ -4128,7 +4273,7 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 2, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
 
         # check new misplaced objects were moved
         self._check_objects(objects[:1], expected_shard_dbs[0])
@@ -4155,7 +4300,7 @@ class TestSharder(BaseTestSharder):
         )
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
 
         # check older misplaced objects were not merged to shard brokers
         self._check_objects(objects[:1], expected_shard_dbs[0])
@@ -4194,7 +4339,7 @@ class TestSharder(BaseTestSharder):
         )
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_increment_counts()['misplaced_found'])
+            1, sharder.logger.get_stats_counts()['misplaced_found'])
 
         # check only the newer misplaced object was moved
         self._check_objects([newer_object], expected_shard_dbs[0])
@@ -4932,6 +5077,83 @@ class TestSharder(BaseTestSharder):
         self._check_process_broker_sharding_others(ShardRange.SHRINKING)
         self._check_process_broker_sharding_others(ShardRange.SHARDED)
 
+    def test_process_broker_leader_auto_shard(self):
+        # verify conditions for acting as auto-shard leader
+        broker = self._make_broker(put_timestamp=next(self.ts_iter).internal)
+        objects = [
+            ['obj%3d' % i, self.ts_encoded(), i, 'text/plain',
+             'etag%s' % i, 0] for i in range(10)]
+        for obj in objects:
+            broker.put_object(*obj)
+        self.assertEqual(10, broker.get_info()['object_count'])
+        node = {'ip': '1.2.3.4', 'port': 6040, 'device': 'sda5', 'id': '2',
+                'index': 0}
+
+        def do_process(conf):
+            with self._mock_sharder(conf) as sharder:
+                with mock_timestamp_now():
+                    # we're not testing rest of the process here so prevent any
+                    # attempt to progress shard range states
+                    sharder._create_shard_containers = lambda *args: 0
+                    sharder._process_broker(broker, node, 99)
+
+        # auto shard disabled
+        conf = {'shard_container_threshold': 10,
+                'rows_per_shard': 5,
+                'shrink_threshold': 1,
+                'auto_shard': False}
+        do_process(conf)
+        self.assertEqual(UNSHARDED, broker.get_db_state())
+        own_sr = broker.get_own_shard_range(no_default=True)
+        self.assertIsNone(own_sr)
+
+        # auto shard enabled, not node 0
+        conf['auto_shard'] = True
+        node['index'] = 1
+        do_process(conf)
+        self.assertEqual(UNSHARDED, broker.get_db_state())
+        own_sr = broker.get_own_shard_range(no_default=True)
+        self.assertIsNone(own_sr)
+
+        # auto shard enabled, node 0 -> start sharding
+        node['index'] = 0
+        do_process(conf)
+        self.assertEqual(SHARDING, broker.get_db_state())
+        own_sr = broker.get_own_shard_range(no_default=True)
+        self.assertIsNotNone(own_sr)
+        self.assertEqual(ShardRange.SHARDING, own_sr.state)
+        self.assertEqual(own_sr.epoch.normal,
+                         parse_db_filename(broker.db_file)[1])
+        self.assertEqual(2, len(broker.get_shard_ranges()))
+
+    def test_process_broker_leader_auto_shard_deleted_db(self):
+        # verify no auto-shard leader if broker is deleted
+        conf = {'shard_container_threshold': 10,
+                'rows_per_shard': 5,
+                'shrink_threshold': 1,
+                'auto_shard': True}
+        broker = self._make_broker(put_timestamp=next(self.ts_iter).internal)
+        broker.delete_db(next(self.ts_iter).internal)
+        self.assertTrue(broker.is_deleted())  # sanity check
+        node = {'ip': '1.2.3.4', 'port': 6040, 'device': 'sda5', 'id': '2',
+                'index': 0}
+
+        with self._mock_sharder(conf) as sharder:
+            with mock_timestamp_now():
+                with mock.patch.object(
+                        sharder, '_find_and_enable_sharding_candidates'
+                ) as mock_find_and_enable:
+                    sharder._process_broker(broker, node, 99)
+
+        self.assertEqual(UNSHARDED, broker.get_db_state())
+        own_sr = broker.get_own_shard_range(no_default=True)
+        self.assertIsNone(own_sr)
+        # this is the only concrete assertion that verifies the leader actions
+        # are not taken; no shard ranges would actually be found for an empty
+        # deleted db so there's no other way to differentiate from an undeleted
+        # db being processed...
+        mock_find_and_enable.assert_not_called()
+
     def check_shard_ranges_sent(self, broker, expected_sent):
         bodies = []
         servers = []
@@ -5485,9 +5707,10 @@ class TestSharder(BaseTestSharder):
         self.assertEqual([], self.logger.get_lines_for_level('warning'))
 
         # advance time
-        with mock.patch('swift.container.sharder.time.time') as fake_time, \
-                self._mock_sharder() as sharder:
-            fake_time.return_value = 6048000 + float(delete_ts)
+        future_time = 6048000 + float(delete_ts)
+        with mock.patch(
+                'swift.container.sharder.time.time',
+                return_value=future_time), self._mock_sharder() as sharder:
             sharder._audit_container(broker)
         message = 'Reclaimable db stuck waiting for shrinking: %s (%s)' % (
             broker.db_file, broker.path)
@@ -5501,9 +5724,9 @@ class TestSharder(BaseTestSharder):
         broker.merge_shard_ranges(shard_ranges)
 
         # no more warning
-        with mock.patch('swift.container.sharder.time.time') as fake_time, \
-                self._mock_sharder() as sharder:
-            fake_time.return_value = 6048000 + float(delete_ts)
+        with mock.patch(
+                'swift.container.sharder.time.time',
+                return_value=future_time), self._mock_sharder() as sharder:
             sharder._audit_container(broker)
         self.assertEqual([], self.logger.get_lines_for_level('warning'))
 
@@ -6030,7 +6253,7 @@ class TestSharder(BaseTestSharder):
             with mock.patch.object(
                     sharder, '_process_broker') as mock_process_broker:
                 sharder.run_once()
-        self.assertEqual(dev_ids, set(sharder._local_device_ids))
+        self.assertEqual(dev_ids, set(sharder._local_device_ids.keys()))
         self.assertEqual(set(container_data),
                          set((call[0][0].path, call[0][1]['id'], call[0][2])
                              for call in mock_process_broker.call_args_list))
@@ -6042,7 +6265,7 @@ class TestSharder(BaseTestSharder):
             with mock.patch.object(
                     sharder, '_process_broker') as mock_process_broker:
                 sharder.run_once(partitions='0')
-        self.assertEqual(dev_ids, set(sharder._local_device_ids))
+        self.assertEqual(dev_ids, set(sharder._local_device_ids.keys()))
         self.assertEqual(set([container_data[0]]),
                          set((call[0][0].path, call[0][1]['id'], call[0][2])
                              for call in mock_process_broker.call_args_list))
@@ -6054,7 +6277,7 @@ class TestSharder(BaseTestSharder):
             with mock.patch.object(
                     sharder, '_process_broker') as mock_process_broker:
                 sharder.run_once(partitions='2,0')
-        self.assertEqual(dev_ids, set(sharder._local_device_ids))
+        self.assertEqual(dev_ids, set(sharder._local_device_ids.keys()))
         self.assertEqual(set([container_data[0], container_data[2]]),
                          set((call[0][0].path, call[0][1]['id'], call[0][2])
                              for call in mock_process_broker.call_args_list))
@@ -6066,7 +6289,7 @@ class TestSharder(BaseTestSharder):
             with mock.patch.object(
                     sharder, '_process_broker') as mock_process_broker:
                 sharder.run_once(partitions='2,0', devices='sdc')
-        self.assertEqual(dev_ids, set(sharder._local_device_ids))
+        self.assertEqual(dev_ids, set(sharder._local_device_ids.keys()))
         self.assertEqual(set([container_data[2]]),
                          set((call[0][0].path, call[0][1]['id'], call[0][2])
                              for call in mock_process_broker.call_args_list))
@@ -6078,7 +6301,7 @@ class TestSharder(BaseTestSharder):
             with mock.patch.object(
                     sharder, '_process_broker') as mock_process_broker:
                 sharder.run_once(devices='sdb,sdc')
-        self.assertEqual(dev_ids, set(sharder._local_device_ids))
+        self.assertEqual(dev_ids, set(sharder._local_device_ids.keys()))
         self.assertEqual(set(container_data[1:]),
                          set((call[0][0].path, call[0][1]['id'], call[0][2])
                              for call in mock_process_broker.call_args_list))
@@ -6383,6 +6606,56 @@ class TestSharder(BaseTestSharder):
                 ]}
             self._assert_recon_stats(expected_shrinking_candidates_data,
                                      sharder, 'shrinking_candidates')
+
+    @mock.patch('swift.common.ring.ring.Ring.get_part_nodes', return_value=[])
+    @mock.patch('swift.common.ring.ring.Ring.get_more_nodes', return_value=[])
+    def test_get_shard_broker_no_local_handoff_for_part(
+            self, mock_part_nodes, mock_more_nodes):
+        broker = self._make_broker()
+        broker.enable_sharding(Timestamp.now())
+
+        shard_bounds = (('', 'd'), ('d', 'x'), ('x', ''))
+        shard_ranges = self._make_shard_ranges(
+            shard_bounds, state=ShardRange.CREATED)
+
+        broker.merge_shard_ranges(shard_ranges)
+        self.assertTrue(broker.set_sharding_state())
+
+        # first, let's assume there local_handoff_for_part fails because the
+        # node we're on is at zero weight for all disks. So it wont appear in
+        # the replica2part2dev table, meaning we wont get a node back.
+        # in this case, we'll fall back to one of our own devices which we
+        # determine from the ring.devs not the replica2part2dev table.
+        with self._mock_sharder() as sharder:
+            local_dev_ids = {dev['id']: dev for dev in sharder.ring.devs[-1:]}
+            sharder._local_device_ids = local_dev_ids
+            part, shard_broker, node_id, _ = sharder._get_shard_broker(
+                shard_ranges[0], broker.root_path, 0)
+            self.assertIn(node_id, local_dev_ids)
+
+        # if there are more then 1 local_dev_id it'll randomly pick one
+        selected_node_ids = set()
+        for _ in range(10):
+            with self._mock_sharder() as sharder:
+                local_dev_ids = {dev['id']: dev
+                                 for dev in sharder.ring.devs[-2:]}
+                sharder._local_device_ids = local_dev_ids
+                part, shard_broker, node_id, _ = sharder._get_shard_broker(
+                    shard_ranges[0], broker.root_path, 0)
+                self.assertIn(node_id, local_dev_ids)
+                selected_node_ids.add(node_id)
+            if len(selected_node_ids) == 2:
+                break
+        self.assertEqual(len(selected_node_ids), 2)
+
+        # If there are also no local_dev_ids, then we'll get the RuntimeError
+        with self._mock_sharder() as sharder:
+            sharder._local_device_ids = {}
+            with self.assertRaises(RuntimeError) as dev_err:
+                sharder._get_shard_broker(shard_ranges[0], broker.root_path, 0)
+
+        expected_error_string = 'Cannot find local handoff; no local devices'
+        self.assertEqual(str(dev_err.exception), expected_error_string)
 
 
 class TestShardingHelpers(unittest.TestCase):
