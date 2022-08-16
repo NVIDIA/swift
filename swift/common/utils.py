@@ -1301,7 +1301,7 @@ class Timestamp(object):
         """
         Get an isoformat string representation of the 'normal' part of the
         Timestamp with microsecond precision and no trailing timezone, for
-        example:
+        example::
 
             1970-01-01T00:00:00.000000
 
@@ -2534,12 +2534,12 @@ def get_hub():
     Another note about epoll: it's hard to use when forking. epoll works
     like so:
 
-       * create an epoll instance: efd = epoll_create(...)
+    * create an epoll instance: ``efd = epoll_create(...)``
 
-       * register file descriptors of interest with epoll_ctl(efd,
-             EPOLL_CTL_ADD, fd, ...)
+    * register file descriptors of interest with
+      ``epoll_ctl(efd, EPOLL_CTL_ADD, fd, ...)``
 
-       * wait for events with epoll_wait(efd, ...)
+    * wait for events with ``epoll_wait(efd, ...)``
 
     If you fork, you and all your child processes end up using the same
     epoll instance, and everyone becomes confused. It is possible to use
@@ -6324,6 +6324,22 @@ class NoopMutex(object):
     of which have the message-interleaving trouble you'd expect from TCP or
     file handlers.
     """
+    def __init__(self):
+        # Usually, it's an error to have multiple greenthreads all waiting
+        # to write to the same file descriptor. It's often a sign of inadequate
+        # concurrency control; for example, if you have two greenthreads
+        # trying to use the same memcache connection, they'll end up writing
+        # interleaved garbage to the socket or stealing part of each others'
+        # responses.
+        #
+        # In this case, we have multiple greenthreads waiting on the same
+        # (logging) file descriptor by design. So, similar to the PipeMutex,
+        # we must turn off eventlet's multiple-waiter detection.
+        #
+        # It would be better to turn off multiple-reader detection for only
+        # the logging socket fd, but eventlet does not support that.
+        eventlet.debug.hub_prevent_multiple_readers(False)
+
     def acquire(self, blocking=True):
         pass
 
@@ -6495,7 +6511,7 @@ def make_db_file_path(db_path, epoch):
 def get_db_files(db_path):
     """
     Given the path to a db file, return a sorted list of all valid db files
-    that actually exist in that path's dir. A valid db filename has the form:
+    that actually exist in that path's dir. A valid db filename has the form::
 
         <hash>[_<epoch>].db
 
