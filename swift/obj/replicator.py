@@ -41,7 +41,8 @@ from swift.common.daemon import Daemon
 from swift.common.http import HTTP_OK, HTTP_INSUFFICIENT_STORAGE
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.obj import ssync_sender
-from swift.obj.diskfile import get_data_dir, get_tmp_dir, DiskFileRouter
+from swift.obj.diskfile import get_data_dir, get_tmp_dir, DiskFileRouter, \
+    invalidate_hash
 from swift.common.storage_policy import POLICIES, REPL_POLICY
 from swift.common.exceptions import PartitionLockTimeout
 
@@ -401,6 +402,7 @@ class ObjectReplicator(Daemon):
             return 1  # failure response code
 
         total_time = time.time() - start_time
+        logged_line = False
         for result in results.decode('utf8').split('\n'):
             if result == '':
                 continue
@@ -408,6 +410,7 @@ class ObjectReplicator(Daemon):
                 continue
             if result.startswith('<') and not self.log_rsync_transfers:
                 continue
+            logged_line = True
             if not ret_val:
                 self.logger.debug(result)
             else:
@@ -418,7 +421,7 @@ class ObjectReplicator(Daemon):
                     'Bad rsync return code: %(ret)d <- %(args)s' %
                     {'args': str(args), 'ret': ret_val}))
         else:
-            log_method = self.logger.info if results else self.logger.debug
+            log_method = self.logger.info if logged_line else self.logger.debug
             log_method(
                 "Successful rsync of %(src)s to %(dst)s (%(time).03f)",
                 {'src': args[-2][:-3] + '...', 'dst': args[-1],
@@ -615,17 +618,20 @@ class ObjectReplicator(Daemon):
             self.logger.timing_since('partition.delete.timing', begin)
 
     def delete_suffixes(self, part_path, suffixes):
-        self.logger.info("Removing %s suffixes from partition: %s",
-                         len(suffixes), part_path)
+        self.logger.debug("Removing %s suffixes from partition: %s",
+                          len(suffixes), part_path)
         for suffix in suffixes:
+            suffix_dir = os.path.join(part_path, suffix)
             try:
-                tpool.execute(shutil.rmtree, os.path.join(part_path, suffix))
+                tpool.execute(shutil.rmtree, suffix_dir)
             except OSError as e:
                 if e.errno not in (errno.ENOENT, errno.ENOTEMPTY,
                                    errno.ENODATA):
                     # Don't worry if there was a race to create or delete,
                     # or some disk corruption that happened after the sync
                     raise
+            else:
+                invalidate_hash(suffix_dir, removed=True)
 
     def delete_partition(self, path):
         self.logger.info("Removing partition: %s", path)
