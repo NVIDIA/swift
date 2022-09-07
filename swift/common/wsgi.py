@@ -431,39 +431,42 @@ class SwiftHttpProtocol(wsgi.HttpProtocol):
         # fix it ourselves later.
         self.__raw_path_info = None
 
-        if not six.PY2:
-            # request lines *should* be ascii per the RFC, but historically
-            # we've allowed (and even have func tests that use) arbitrary
-            # bytes. This breaks on py3 (see https://bugs.python.org/issue33973
-            # ) but the work-around is simple: munge the request line to be
-            # properly quoted.
-            if self.raw_requestline.count(b' ') >= 2:
-                parts = self.raw_requestline.split(b' ', 2)
-                path, q, query = parts[1].partition(b'?')
-                self.__raw_path_info = path
-                # unquote first, so we don't over-quote something
-                # that was *correctly* quoted
-                path = wsgi_to_bytes(wsgi_quote(wsgi_unquote(
-                    bytes_to_wsgi(path))))
-                query = b'&'.join(
-                    sep.join([
-                        wsgi_to_bytes(wsgi_quote_plus(wsgi_unquote_plus(
-                            bytes_to_wsgi(key)))),
-                        wsgi_to_bytes(wsgi_quote_plus(wsgi_unquote_plus(
-                            bytes_to_wsgi(val))))
-                    ])
-                    for part in query.split(b'&')
-                    for key, sep, val in (part.partition(b'='), ))
-                parts[1] = path + q + query
-                self.raw_requestline = b' '.join(parts)
-            # else, mangled protocol, most likely; let base class deal with it
+        # request lines *should* be ascii per the RFC, but historically
+        # we've allowed (and even have func tests that use) arbitrary
+        # bytes. This breaks on py3 (see https://bugs.python.org/issue33973
+        # ) but the work-around is simple: munge the request line to be
+        # properly quoted.
+        if self.raw_requestline.count(b' ') >= 2:
+            parts = self.raw_requestline.split(b' ', 2)
+            path, q, query = parts[1].partition(b'?')
+            if path.startswith((b'http://', b'https://')):
+                host, sep, rest = path.partition(b'//')[2].partition(b'/')
+                if sep:
+                    path = b'/' + rest
+            self.__raw_path_info = path
+            # unquote first, so we don't over-quote something
+            # that was *correctly* quoted
+            path = wsgi_to_bytes(wsgi_quote(wsgi_unquote(
+                bytes_to_wsgi(path))))
+            query = b'&'.join(
+                sep.join([
+                    wsgi_to_bytes(wsgi_quote_plus(wsgi_unquote_plus(
+                        bytes_to_wsgi(key)))),
+                    wsgi_to_bytes(wsgi_quote_plus(wsgi_unquote_plus(
+                        bytes_to_wsgi(val))))
+                ])
+                for part in query.split(b'&')
+                for key, sep, val in (part.partition(b'='), ))
+            parts[1] = path + q + query
+            self.raw_requestline = b' '.join(parts)
+        # else, mangled protocol, most likely; let base class deal with it
         return wsgi.HttpProtocol.parse_request(self)
 
-    if not six.PY2:
-        def get_environ(self, *args, **kwargs):
-            environ = wsgi.HttpProtocol.get_environ(self, *args, **kwargs)
-            environ['RAW_PATH_INFO'] = bytes_to_wsgi(
-                self.__raw_path_info)
+    def get_environ(self, *args, **kwargs):
+        environ = wsgi.HttpProtocol.get_environ(self, *args, **kwargs)
+        environ['RAW_PATH_INFO'] = bytes_to_wsgi(
+            self.__raw_path_info)
+        if not six.PY2:
             header_payload = self.headers.get_payload()
             if isinstance(header_payload, list) and len(header_payload) == 1:
                 header_payload = header_payload[0].get_payload()
@@ -506,7 +509,7 @@ class SwiftHttpProtocol(wsgi.HttpProtocol):
                     environ['wsgi.input'].wfile = self.wfile
                     environ['wsgi.input'].wfile_line = \
                         b'HTTP/1.1 100 Continue\r\n'
-            return environ
+        return environ
 
     def _read_request_line(self):
         # Note this is not a new-style class, so super() won't work
