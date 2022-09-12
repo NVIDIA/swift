@@ -177,18 +177,17 @@ class InventoryController(Controller):
     def __init__(self, app, conf, logger, **kwargs):
         super(InventoryController, self).__init__(app, conf, logger, **kwargs)
 
-    def check_path(self, req):
-        if req.account:
-            path = '/'.join([req.account, req.container_name])
-        else:
-            path = req.container_name
-
+    def check_allowed_path(self, req):
+        path = '/'.join([req.access_key, req.container_name])
         for allowed in self.conf.s3_inventory_allowed_paths:
             if (path == allowed
                     or (allowed.endswith('*')
                         and path.startswith(allowed[:-1]))):
                 break
         else:
+            self.logger.debug(
+                'Inventory configuration disallowed: no match for %s in %s',
+                path, str(self.conf.s3_inventory_allowed_paths))
             raise InvalidRequest(
                 'Inventory configuration is not supported for this bucket')
 
@@ -196,7 +195,6 @@ class InventoryController(Controller):
         if not (req.conf.s3_inventory_enabled and req.is_bucket_request):
             # Handle Object ACL
             raise S3NotImplemented()
-        self.check_path(req)
 
     def config_from_sysmeta(self, req, inventory_id):
         sysmeta = req.get_container_info(self.app).get('sysmeta', {})
@@ -221,6 +219,7 @@ class InventoryController(Controller):
         Handles PUT inventory configuration
         """
         self.check_req(req)
+        self.check_allowed_path(req)
 
         xml = req.xml(MAX_PUT_INVENTORY_BODY_SIZE)
         try:
@@ -248,6 +247,8 @@ class InventoryController(Controller):
         Handles DELETE inventory configuration
         """
         self.check_req(req)
+        self.check_allowed_path(req)
+
         # note: no need to validate the id - if it is not the supported id then
         # we'll just return 404
         config_id = req.params.get('id')

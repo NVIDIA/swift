@@ -2735,6 +2735,36 @@ class TestReplicatedObjectController(
                       headers.split(b'\r\n'))
 
     @unpatch_policies
+    def test_HEAD_absolute_uri(self):
+        prolis = _test_sockets[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile('rwb')
+
+        # sanity, this resource is created in setup
+        path = b'/v1/a'
+        fd.write(b'HEAD %s HTTP/1.1\r\n'
+                 b'Host: localhost\r\n'
+                 b'Connection: keep-alive\r\n'
+                 b'X-Storage-Token: t\r\n'
+                 b'\r\n' % (path,))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = b'HTTP/1.1 204'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        # RFC says we should accept this, too
+        abs_path = b'http://saio.example.com:8080/v1/a'
+        fd.write(b'HEAD %s HTTP/1.1\r\n'
+                 b'Host: localhost\r\n'
+                 b'Connection: keep-alive\r\n'
+                 b'X-Storage-Token: t\r\n'
+                 b'\r\n' % (abs_path,))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = b'HTTP/1.1 204'
+        self.assertEqual(headers[:len(exp)], exp)
+
+    @unpatch_policies
     def test_GET_short_read(self):
         prolis = _test_sockets[0]
         prosrv = _test_servers[0]
@@ -7433,6 +7463,43 @@ class BaseTestECObjectController(BaseTestObjectController):
                 break
             gotten_obj += buf
         self.assertEqual(gotten_obj, obj)
+        error_lines = prosrv.logger.get_lines_for_level('error')
+        warn_lines = prosrv.logger.get_lines_for_level('warning')
+        self.assertEqual(len(error_lines), 0)  # sanity
+        self.assertEqual(len(warn_lines), 0)  # sanity
+
+    def test_GET_ec_deleted(self):
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+
+        container_name = 'ec_deleted'
+        self.put_container(self.ec_policy.name, container_name)
+
+        # delete container
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile('rwb')
+        fd.write(('DELETE /v1/a/%s HTTP/1.1\r\n'
+                  'Host: localhost\r\n'
+                  'Connection: close\r\n'
+                  '\r\n' % container_name).encode('ascii'))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = b'HTTP/1.1 20'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        # download from deleted container
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile('rwb')
+        fd.write(('GET /v1/a/%s/no-object-there HTTP/1.1\r\n'
+                  'Host: localhost\r\n'
+                  'Connection: close\r\n'
+                  'X-Storage-Token: t\r\n'
+                  '\r\n' % container_name).encode('ascii'))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = b'HTTP/1.1 404'
+        self.assertEqual(headers[:len(exp)], exp)
+
         error_lines = prosrv.logger.get_lines_for_level('error')
         warn_lines = prosrv.logger.get_lines_for_level('warning')
         self.assertEqual(len(error_lines), 0)  # sanity

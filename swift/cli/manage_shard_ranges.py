@@ -168,7 +168,8 @@ from six.moves import input
 
 from swift.common.utils import Timestamp, get_logger, ShardRange, readconf, \
     ShardRangeList, non_negative_int, config_positive_int_value
-from swift.container.backend import ContainerBroker, UNSHARDED
+from swift.container.backend import ContainerBroker, UNSHARDED, \
+    sift_shard_ranges
 from swift.container.sharder import make_shard_ranges, sharding_enabled, \
     CleavingContext, process_compactible_shard_sequences, \
     find_compactible_shard_sequences, find_overlapping_ranges, \
@@ -427,6 +428,61 @@ def delete_shard_ranges(broker, args):
     return EXIT_SUCCESS
 
 
+def combine_shard_ranges(new_shard_ranges, existing_shard_ranges):
+    """
+    Combines new and existing shard ranges based on most recent state.
+
+    :param new_shard_ranges: a list of ShardRange instances.
+    :param existing_shard_ranges: a list of ShardRange instances.
+    :return: a list of ShardRange instances.
+    """
+    new_shard_ranges = [dict(sr) for sr in new_shard_ranges]
+    existing_shard_ranges = [dict(sr) for sr in existing_shard_ranges]
+    to_add, to_delete = sift_shard_ranges(
+        new_shard_ranges,
+        dict((sr['name'], sr) for sr in existing_shard_ranges))
+    result = [ShardRange.from_dict(existing)
+              for existing in existing_shard_ranges
+              if existing['name'] not in to_delete]
+    result.extend([ShardRange.from_dict(sr) for sr in to_add])
+    return sorted([sr for sr in result if not sr.deleted],
+                  key=ShardRange.sort_key)
+
+
+def merge_shard_ranges(broker, args):
+    _check_own_shard_range(broker, args)
+    shard_data = _load_and_validate_shard_data(args, require_index=False)
+    new_shard_ranges = ShardRangeList([ShardRange.from_dict(sr)
+                                       for sr in shard_data])
+    new_shard_ranges.sort(key=ShardRange.sort_key)
+
+    # do some checks before merging...
+    existing_shard_ranges = ShardRangeList(
+        broker.get_shard_ranges(include_deleted=True))
+    outcome = combine_shard_ranges(new_shard_ranges, existing_shard_ranges)
+    if args.verbose:
+        print('This change will result in the following shard ranges in the '
+              'affected namespace:')
+        print(json.dumps([dict(sr) for sr in outcome], indent=2))
+    overlaps = find_overlapping_ranges(outcome)
+    if overlaps:
+        print('WARNING: this change will result in shard ranges overlaps!')
+    paths_with_gaps = find_paths_with_gaps(outcome)
+    gaps = [gap for start_path, gap, end_path in paths_with_gaps
+            if existing_shard_ranges.includes(gap)]
+    if gaps:
+        print('WARNING: this change will result in shard ranges gaps!')
+
+    if not _proceed(args):
+        return EXIT_USER_QUIT
+
+    with broker.updated_timeout(args.replace_timeout):
+        broker.merge_shard_ranges(new_shard_ranges)
+    print('Injected %d shard ranges.' % len(new_shard_ranges))
+    print('Run container-replicator to replicate them to other nodes.')
+    return EXIT_SUCCESS
+
+
 def _replace_shard_ranges(broker, args, shard_data, timeout=0):
     own_shard_range = _check_own_shard_range(broker, args)
     shard_ranges = make_shard_ranges(
@@ -564,9 +620,25 @@ def compact_shard_ranges(broker, args):
     return EXIT_SUCCESS
 
 
-def _remove_young_overlapping_ranges(acceptor_path, overlapping_donors, args):
-    # For range shard repair subcommand, check possible parent-children
-    # relationship between acceptors and donors.
+def _remove_illegal_overlapping_donors(
+        acceptor_path, overlapping_donors, args):
+    # Check parent-children relationship in overlaps between acceptors and
+    # donors, remove any overlapping parent or child shard range from donors.
+    # Note: we can use set() here, since shard range object is hashed by
+    # id and all shard ranges in overlapping_donors are unique already.
+    parent_child_donors = set()
+    for acceptor in acceptor_path:
+        parent_child_donors.update(
+            [donor for donor in overlapping_donors
+                if acceptor.is_child_of(donor) or donor.is_child_of(acceptor)])
+    if parent_child_donors:
+        overlapping_donors = ShardRangeList(
+            [sr for sr in overlapping_donors
+                if sr not in parent_child_donors])
+        print('%d donor shards ignored due to parent-child relationship '
+              'checks' % len(parent_child_donors))
+
+    # Check minimum age requirement in overlaps between acceptors and donors.
     if args.min_shard_age == 0:
         return acceptor_path, overlapping_donors
     ts_now = Timestamp.now()
@@ -583,18 +655,18 @@ def _remove_young_overlapping_ranges(acceptor_path, overlapping_donors, args):
         return acceptor_path, None
     # Remove those overlapping donors whose overlapping acceptors were created
     # within age limit.
-    possible_parent_donors = set()
+    donors_with_young_overlap_acceptor = set()
     for acceptor_sr in acceptor_path:
         if float(acceptor_sr.timestamp) + args.min_shard_age < float(ts_now):
             continue
-        possible_parent_donors.update([sr for sr in qualified_donors
-                                       if acceptor_sr.overlaps(sr)])
-    if possible_parent_donors:
+        donors_with_young_overlap_acceptor.update(
+            [sr for sr in qualified_donors if acceptor_sr.overlaps(sr)])
+    if donors_with_young_overlap_acceptor:
         qualified_donors = ShardRangeList(
             [sr for sr in qualified_donors
-             if sr not in possible_parent_donors])
+             if sr not in donors_with_young_overlap_acceptor])
         print('%d donor shards ignored due to existence of overlapping young '
-              'acceptors' % len(possible_parent_donors))
+              'acceptors' % len(donors_with_young_overlap_acceptor))
 
     return acceptor_path, qualified_donors
 
@@ -649,7 +721,7 @@ def _find_overlapping_donors(shard_ranges, own_sr, args):
             'Isolated cleaved and/or active shard ranges in donor ranges',
             acceptor_path, overlapping_donors)
 
-    return _remove_young_overlapping_ranges(
+    return _remove_illegal_overlapping_donors(
         acceptor_path, overlapping_donors, args)
 
 
@@ -956,6 +1028,22 @@ def _make_parser():
     info_parser = subparsers.add_parser(
         'info', help='Print container db info')
     info_parser.set_defaults(func=db_info)
+
+    # merge
+    merge_parser = subparsers.add_parser(
+        'merge',
+        help='Merge shard range(s) from file with existing shard ranges. This '
+             'subcommand should only be used if you are confident that you '
+             'know what you are doing. Shard ranges should not typically be '
+             'modified in this way.')
+    merge_parser.add_argument('input', metavar='input_file',
+                              type=str, help='Name of file')
+    merge_parser.add_argument(
+        '--replace-timeout', type=int, default=600,
+        help='Minimum DB timeout to use when merging shard ranges.')
+    _add_account_prefix_arg(merge_parser)
+    _add_prompt_args(merge_parser)
+    merge_parser.set_defaults(func=merge_shard_ranges)
 
     # replace
     replace_parser = subparsers.add_parser(

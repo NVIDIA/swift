@@ -680,10 +680,15 @@ use = egg:swift#s3api
 # configuration API can be enabled.
 # s3_inventory_enabled = false
 
-# Specifies a restricted list of <account/container> paths for which
-# inventories are allowed to be configured. The value should be a comma
-# separated list; any entry ending with '*' will match any path starting with
-# that entry. The default allows all paths.
+# Specifies a restricted list of paths for which inventory configurations are
+# allowed to be created or deleted. The value should be a comma separated list;
+# any entry ending with '*' will match any path starting with that entry. Each
+# path should have the form <access_key_id>/<bucket_name>. Note that
+# access_key_id is used in the path rather than account name. Depending on the
+# auth middleware in use, the access_key_id may differ from the account name
+# e.g. the account "AUTH_foo" might have access_key_id "foo". The default
+# allows all paths. This option does not restrict getting or listing inventory
+# configurations on any path.
 # s3_inventory_allowed_paths = *
 
 [filter:s3token]

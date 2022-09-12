@@ -737,29 +737,125 @@ class TestS3ApiInventory(S3ApiTestCase):
         body = tostring(xml)
         do_test('PUT', body)
 
-    def test_allowed_paths(self):
+    def test_PUT_allowed_paths(self):
         self.conf['s3_inventory_enabled'] = 'yes'
-        self.swift.register(
-            'POST', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
 
-        def do_test(method, allowed_paths):
-            self.conf['s3_inventory_allowed_paths'] = allowed_paths
+        def do_test(allowed_paths):
+            if allowed_paths is not None:
+                self.conf['s3_inventory_allowed_paths'] = allowed_paths
             self.make_app()
+            self.swift.register(
+                'POST', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
             req = Request.blank(
                 '/bucket?inventory&id=0',
-                environ={'REQUEST_METHOD': method},
+                environ={'REQUEST_METHOD': 'PUT'},
                 headers={'Authorization': 'AWS test:tester:hmac',
                          'Date': self.get_date_header()},
                 body=SUPPORTED_XML)
             status, headers, body = self.call_s3api(req)
             return status.split()[0]
 
-        self.assertEqual('400', do_test('PUT', 'bucketX'))
-        self.assertEqual('400', do_test('PUT', 'bucketX*'))
-        self.assertEqual('204', do_test('PUT', 'bucket'))
-        self.assertEqual('204', do_test('PUT', 'buck*'))
-        self.assertEqual('204', do_test('PUT', 'b*'))
-        self.assertEqual('204', do_test('PUT', '*'))
+        self.assertEqual('400', do_test('test:tester/bucketX'))
+        self.assertEqual('400', do_test('test:tester/bucketX*'))
+        self.assertEqual('400', do_test('/bucket'))
+        self.assertEqual('400', do_test('/bucket*'))
+        self.assertEqual('400', do_test('/*'))
+        self.assertEqual('400', do_test('bucket'))
+        self.assertEqual('400', do_test('bucket*'))
+        self.assertEqual('400', do_test(''))
+        self.assertEqual('204', do_test('test:tester/bucket'))
+        self.assertEqual('204', do_test('test:tester/buck*'))
+        self.assertEqual('204', do_test('test:tester/b*'))
+        self.assertEqual('204', do_test('*'))
+        self.assertEqual('204', do_test(None))
+
+    def test_DELETE_allowed_paths(self):
+        self.conf['s3_inventory_enabled'] = 'yes'
+        config = {
+            'period': 'Daily',
+            'source': 's3api',
+            'dest_container': 'arn:aws:s3:::destination-bucket',
+            'modified_time': 123456.789,
+            'enabled': True,
+            'deleted': False,
+        }
+        resp_headers = {
+            'X-Container-Sysmeta-Inventory-0-Config': json.dumps(config)
+        }
+
+        def do_test(allowed_paths):
+            if allowed_paths is not None:
+                self.conf['s3_inventory_allowed_paths'] = allowed_paths
+            self.make_app()
+            self.swift.register(
+                'HEAD', '/v1/AUTH_test/bucket', HTTPNoContent, resp_headers,
+                None)
+            self.swift.register(
+                'POST', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
+            req = Request.blank(
+                '/bucket?inventory&id=0',
+                environ={'REQUEST_METHOD': 'DELETE'},
+                headers={'Authorization': 'AWS test:tester:hmac',
+                         'Date': self.get_date_header()},
+                body=SUPPORTED_XML)
+            status, headers, body = self.call_s3api(req)
+            return status.split()[0]
+
+        self.assertEqual('400', do_test('test:tester/bucketX'))
+        self.assertEqual('400', do_test('test:tester/bucketX*'))
+        self.assertEqual('400', do_test('/bucket'))
+        self.assertEqual('400', do_test('/bucket*'))
+        self.assertEqual('400', do_test('/*'))
+        self.assertEqual('400', do_test('bucket'))
+        self.assertEqual('400', do_test('bucket*'))
+        self.assertEqual('400', do_test('test:tester/bucketX*'))
+        self.assertEqual('400', do_test(''))
+        self.assertEqual('204', do_test('test:tester/bucket'))
+        self.assertEqual('204', do_test('test:tester/buck*'))
+        self.assertEqual('204', do_test('test:tester/b*'))
+        self.assertEqual('204', do_test('test:teste*'))
+        self.assertEqual('204', do_test('*'))
+        self.assertEqual('204', do_test(None))
+
+    def test_GET_allowed_paths(self):
+        self.conf['s3_inventory_enabled'] = 'yes'
+        config = {
+            'period': 'Daily',
+            'source': 's3api',
+            'dest_container': 'arn:aws:s3:::destination-bucket',
+            'modified_time': 123456.789,
+            'enabled': True,
+            'deleted': False,
+        }
+        resp_headers = {
+            'X-Container-Sysmeta-Inventory-0-Config': json.dumps(config)
+        }
+
+        def do_test(allowed_paths):
+            if allowed_paths is not None:
+                self.conf['s3_inventory_allowed_paths'] = allowed_paths
+            self.make_app()
+            self.swift.register(
+                'HEAD', '/v1/AUTH_test/bucket', HTTPNoContent, resp_headers,
+                None)
+            req = Request.blank(
+                '/bucket?inventory&id=0',
+                environ={'REQUEST_METHOD': 'GET'},
+                headers={'Authorization': 'AWS test:tester:hmac',
+                         'Date': self.get_date_header()},
+                body=SUPPORTED_XML)
+            status, headers, body = self.call_s3api(req)
+            return status.split()[0]
+
+        # GETs are allowed regardless of allowed_paths
+        self.assertEqual('200', do_test('test:tester/bucketX'))
+        self.assertEqual('200', do_test('test:tester/bucketX*'))
+        self.assertEqual('200', do_test('test:tester/bucket'))
+        self.assertEqual('200', do_test('test:tester/buck*'))
+        self.assertEqual('200', do_test('test:tester/b*'))
+        self.assertEqual('200', do_test('*'))
+        self.assertEqual('200', do_test(''))
+        self.assertEqual('200', do_test(None))
 
     def test_bucket_does_not_exist_404(self):
         self.conf['s3_inventory_enabled'] = 'yes'
