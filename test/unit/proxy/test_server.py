@@ -4255,7 +4255,10 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'object.shard_updating.backend.200': 1}, stats)
+            self.assertEqual(
+                {'container.shard_listing.cache.disabled.200': 2,
+                 'object.shard_updating.cache.disabled.200': 1},
+                stats)
             backend_requests = fake_conn.requests
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
@@ -4348,8 +4351,9 @@ class TestReplicatedObjectController(
             stats = self.app.logger.get_increment_counts()
             self.assertEqual({'account.info.cache.miss': 1,
                               'container.info.cache.miss': 1,
-                              'object.shard_updating.cache.miss': 1,
-                              'object.shard_updating.backend.200': 1}, stats)
+                              'container.shard_listing.cache.disabled.200': 2,
+                              'object.shard_updating.cache.miss.200': 1},
+                             stats)
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
             backend_requests = fake_conn.requests
@@ -4449,6 +4453,7 @@ class TestReplicatedObjectController(
             stats = self.app.logger.get_increment_counts()
             self.assertEqual({'account.info.cache.miss': 1,
                               'container.info.cache.miss': 1,
+                              'container.shard_listing.cache.disabled.200': 1,
                               'object.shard_updating.cache.hit': 1}, stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
@@ -4462,6 +4467,100 @@ class TestReplicatedObjectController(
                 container_request, method='HEAD', path='/sda/0/a/c')
 
             # infocache gets populated from memcache
+            cache_key = 'shard-updating/a/c'
+            self.assertIn(cache_key, req.environ.get('swift.infocache'))
+            self.assertEqual(req.environ['swift.infocache'][cache_key],
+                             tuple(dict(sr) for sr in shard_ranges))
+
+            # make sure backend requests included expected container headers
+            container_headers = {}
+
+            for request in backend_requests[2:]:
+                req_headers = request['headers']
+                device = req_headers['x-container-device']
+                container_headers[device] = req_headers['x-container-host']
+                expectations = {
+                    'method': method,
+                    'path': '/0/a/c/o',
+                    'headers': {
+                        'X-Container-Partition': '0',
+                        'Host': 'localhost:80',
+                        'Referer': '%s http://localhost/v1/a/c/o' % method,
+                        'X-Backend-Storage-Policy-Index': '1',
+                        'X-Backend-Quoted-Container-Path': shard_ranges[1].name
+                    },
+                }
+                self._check_request(request, **expectations)
+
+            expected = {}
+            for i, device in enumerate(['sda', 'sdb', 'sdc']):
+                expected[device] = '10.0.0.%d:100%d' % (i, i)
+            self.assertEqual(container_headers, expected)
+
+        do_test('POST', 'sharding')
+        do_test('POST', 'sharded')
+        do_test('DELETE', 'sharding')
+        do_test('DELETE', 'sharded')
+        do_test('PUT', 'sharding')
+        do_test('PUT', 'sharded')
+
+    @patch_policies([
+        StoragePolicy(0, 'zero', is_default=True, object_ring=FakeRing()),
+        StoragePolicy(1, 'one', object_ring=FakeRing()),
+    ])
+    def test_backend_headers_update_shard_container_with_live_infocache(self):
+        # verify that when container is sharded the backend container update is
+        # directed to the shard container
+        # reset the router post patch_policies
+        self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
+        self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
+        self.app.recheck_updating_shard_ranges = 3600
+
+        def do_test(method, sharding_state):
+            self.app.logger.clear()  # clean capture state
+            shard_ranges = [
+                utils.ShardRange(
+                    '.shards_a/c_not_used', utils.Timestamp.now(), '', 'l'),
+                utils.ShardRange(
+                    '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u'),
+                utils.ShardRange(
+                    '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
+            ]
+            infocache = {
+                'shard-updating/a/c':
+                tuple(dict(shard_range) for shard_range in shard_ranges)}
+            req = Request.blank('/v1/a/c/o', {'swift.infocache': infocache},
+                                method=method, body='',
+                                headers={'Content-Type': 'text/plain'})
+
+            # we want the container_info response to say policy index of 1 and
+            # sharding state
+            # acc HEAD, cont HEAD, obj POSTs
+            status_codes = (200, 200, 202, 202, 202)
+            resp_headers = {'X-Backend-Storage-Policy-Index': 1,
+                            'x-backend-sharding-state': sharding_state,
+                            'X-Backend-Record-Type': 'shard'}
+            with mocked_http_conn(*status_codes,
+                                  headers=resp_headers) as fake_conn:
+                resp = req.get_response(self.app)
+
+            # verify request hitted infocache.
+            self.assertEqual(resp.status_int, 202)
+            stats = self.app.logger.get_increment_counts()
+            self.assertEqual({'container.shard_listing.cache.disabled.200': 1,
+                              'object.shard_updating.infocache.hit': 1}, stats)
+            # verify statsd prefix is not mutated
+            self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
+
+            backend_requests = fake_conn.requests
+            account_request = backend_requests[0]
+            self._check_request(
+                account_request, method='HEAD', path='/sda/0/a')
+            container_request = backend_requests[1]
+            self._check_request(
+                container_request, method='HEAD', path='/sda/0/a/c')
+
+            # verify content in infocache.
             cache_key = 'shard-updating/a/c'
             self.assertIn(cache_key, req.environ.get('swift.infocache'))
             self.assertEqual(req.environ['swift.infocache'][cache_key],
@@ -4545,6 +4644,7 @@ class TestReplicatedObjectController(
             stats = self.app.logger.get_increment_counts()
             self.assertEqual({'account.info.cache.miss': 1,
                               'container.info.cache.miss': 1,
+                              'container.shard_listing.cache.disabled.200': 1,
                               'object.shard_updating.cache.hit': 1}, stats)
 
             # cached shard ranges are still there
@@ -4587,9 +4687,9 @@ class TestReplicatedObjectController(
                               'account.info.cache.hit': 1,
                               'container.info.cache.miss': 1,
                               'container.info.cache.hit': 1,
-                              'object.shard_updating.cache.skip': 1,
-                              'object.shard_updating.cache.hit': 1,
-                              'object.shard_updating.backend.200': 1}, stats)
+                              'container.shard_listing.cache.disabled.200': 2,
+                              'object.shard_updating.cache.skip.200': 1,
+                              'object.shard_updating.cache.hit': 1}, stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
@@ -4651,10 +4751,10 @@ class TestReplicatedObjectController(
                 'account.info.cache.miss': 1,
                 'container.info.cache.hit': 2,
                 'container.info.cache.miss': 1,
-                'object.shard_updating.cache.skip': 1,
+                'container.shard_listing.cache.disabled.200': 3,
+                'object.shard_updating.cache.skip.200': 1,
                 'object.shard_updating.cache.hit': 1,
-                'object.shard_updating.cache.error': 1,
-                'object.shard_updating.backend.200': 2})
+                'object.shard_updating.cache.error.200': 1})
 
         do_test('POST', 'sharding')
         do_test('POST', 'sharded')
@@ -4691,7 +4791,9 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'object.shard_updating.backend.404': 1}, stats)
+            self.assertEqual(
+                {'object.shard_updating.cache.disabled.404': 1},
+                stats)
 
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]
