@@ -494,6 +494,8 @@ def config_read_prefixed_options(conf, prefix_name, defaults):
 
 
 def logging_monkey_patch():
+    # explicitly patch the logging lock
+    logging._lock = logging.threading.RLock()
     # setup notice level logging
     logging.addLevelName(NOTICE, 'NOTICE')
     SysLogHandler.priority_map['NOTICE'] = 'notice'
