@@ -743,9 +743,10 @@ class Application(object):
 
         return ok
 
-    def iter_nodes(self, ring, partition, logger, node_iter=None, policy=None):
+    def iter_nodes(self, ring, partition, logger, node_iter=None, policy=None,
+                   request=None):
         return NodeIter(self, ring, partition, logger, node_iter=node_iter,
-                        policy=policy)
+                        policy=policy, request=request)
 
     def exception_occurred(self, node, typ, additional_info,
                            **kwargs):
