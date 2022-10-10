@@ -1615,3 +1615,49 @@ class TestNodeIter(BaseTest):
         for node in node_iter:
             nodes.append(node)
         self.assertEqual(17, len(nodes))
+
+    def test_annotate_node_with_use_replication(self):
+        ring = FakeRing(replicas=8, max_more_nodes=20)
+        policy = StoragePolicy(0, 'ec', object_ring=ring)
+
+        node_iter = NodeIter(self.app, policy.object_ring, 0, self.logger,
+                             policy=policy)
+        for node in node_iter:
+            self.assertIn('use_replication', node)
+            self.assertFalse(node['use_replication'])
+
+        req = Request.blank('a/c')
+        node_iter = NodeIter(self.app, policy.object_ring, 0, self.logger,
+                             policy=policy, request=req)
+        for node in node_iter:
+            self.assertIn('use_replication', node)
+            self.assertFalse(node['use_replication'])
+
+        req = Request.blank(
+            'a/c', headers={'x-backend-use-replication-network': 'False'})
+        node_iter = NodeIter(self.app, policy.object_ring, 0, self.logger,
+                             policy=policy, request=req)
+        for node in node_iter:
+            self.assertIn('use_replication', node)
+            self.assertFalse(node['use_replication'])
+
+        req = Request.blank(
+            'a/c', headers={'x-backend-use-replication-network': 'yes'})
+        node_iter = NodeIter(self.app, policy.object_ring, 0, self.logger,
+                             policy=policy, request=req)
+        for node in node_iter:
+            self.assertIn('use_replication', node)
+            self.assertTrue(node['use_replication'])
+
+    def test_iter_does_not_mutate_supplied_nodes(self):
+        ring = FakeRing(replicas=8, max_more_nodes=20)
+        policy = StoragePolicy(0, 'ec', object_ring=ring)
+        other_iter = ring.get_part_nodes(0)
+        node_iter = NodeIter(self.app, policy.object_ring, 0, self.logger,
+                             policy=policy, node_iter=iter(other_iter))
+        nodes = list(node_iter)
+        self.assertEqual(len(other_iter), len(nodes))
+        for node in nodes:
+            self.assertIn('use_replication', node)
+            self.assertFalse(node['use_replication'])
+        self.assertEqual(other_iter, ring.get_part_nodes(0))
