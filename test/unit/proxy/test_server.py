@@ -248,7 +248,7 @@ class TestController(unittest.TestCase):
         self.account_ring = FakeRing()
         self.container_ring = FakeRing()
         self.memcache = FakeMemcache()
-        app = proxy_server.Application(None,
+        app = proxy_server.Application(None, logger=debug_logger(),
                                        account_ring=self.account_ring,
                                        container_ring=self.container_ring)
         self.controller = swift.proxy.controllers.Controller(app)
@@ -1165,6 +1165,56 @@ class TestProxyServer(unittest.TestCase):
         self.assertIn('admin_key', path_parts)
 
         self.assertEqual(controller.__name__, 'InfoController')
+
+    def test_exception_occurred_replication_ip_port_logging(self):
+        logger = debug_logger('test')
+        app = proxy_server.Application(
+            {},
+            account_ring=FakeRing(separate_replication=True),
+            container_ring=FakeRing(separate_replication=True),
+            logger=logger)
+        app.sort_nodes = lambda nodes, policy: nodes
+        part = app.container_ring.get_part('a', 'c')
+        nodes = app.container_ring.get_part_nodes(part)
+        self.assertNotEqual(nodes[0]['ip'], nodes[0]['replication_ip'])
+        self.assertEqual(0, sum([node_error_count(app, node)
+                                 for node in nodes]))  # sanity
+
+        # no use_replication header...
+        req = Request.blank('/v1/a/c')
+        with mocked_http_conn(200, 503, 200) as mocked_conn:
+            req.get_response(app)
+
+        expected = [(n['ip'], n['port']) for n in nodes[:2]]
+        actual = [(req['ip'], req['port']) for req in mocked_conn.requests[1:]]
+        self.assertEqual(expected, actual)
+        line = logger.get_lines_for_level('error')[-1]
+        self.assertIn('Container Server', line)
+        self.assertIn('%s:%s/%s' % (nodes[0]['ip'],
+                                    nodes[0]['port'],
+                                    nodes[0]['device']), line)
+        self.assertEqual(1, sum([node_error_count(app, node)
+                                 for node in nodes]))
+        annotated_nodes = [dict(node, use_replication=True) for node in nodes]
+        self.assertEqual(0, sum([node_error_count(app, node)
+                                 for node in annotated_nodes]))
+
+        logger.clear()
+        req = Request.blank(
+            '/v1/a/c',
+            headers={'x-backend-use-replication-network': True})
+        with mocked_http_conn(200, 503, 200):
+            req.get_response(app)
+        line = logger.get_lines_for_level('error')[-1]
+        self.assertIn('Container Server', line)
+        self.assertIn('%s:%s/%s' % (nodes[0]['replication_ip'],
+                                    nodes[0]['replication_port'],
+                                    nodes[0]['device']), line)
+        self.assertEqual(1, sum([node_error_count(app, node)
+                                 for node in nodes]))
+        annotated_nodes = [dict(node, use_replication=True) for node in nodes]
+        self.assertEqual(1, sum([node_error_count(app, node)
+                                 for node in annotated_nodes]))
 
     def test_exception_occurred(self):
         def do_test(additional_info):
@@ -5480,25 +5530,60 @@ class TestReplicatedObjectController(
             self.assertEqual(len(first_nodes), 6)
             self.assertEqual(len(second_nodes), 7)
 
-    def test_iter_nodes_with_custom_node_iter(self):
+    def test_iter_nodes_without_replication_network(self):
         object_ring = self.app.get_object_ring(None)
-        node_list = [dict(id=n, ip='1.2.3.4', port=n, device='D')
+        node_list = [dict(id=n, ip='1.2.3.4', port=n, device='D',
+                          use_replication=False)
                      for n in range(10)]
+        expected = [dict(n) for n in node_list]
         with mock.patch.object(self.app, 'sort_nodes',
                                lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 3):
             got_nodes = list(self.app.iter_nodes(object_ring, 0, self.logger,
-                                                 node_iter=iter(node_list)))
-        self.assertEqual(node_list[:3], got_nodes)
+                                                 node_iter=iter(node_list),
+                                                 request=None))
+        self.assertEqual(expected[:3], got_nodes)
 
+        req = Request.blank('/v1/a/c')
+        node_list = [dict(id=n, ip='1.2.3.4', port=n, device='D')
+                     for n in range(10)]
         with mock.patch.object(self.app, 'sort_nodes',
                                lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 1000000):
             got_nodes = list(self.app.iter_nodes(object_ring, 0, self.logger,
-                                                 node_iter=iter(node_list)))
-        self.assertEqual(node_list, got_nodes)
+                                                 node_iter=iter(node_list),
+                                                 request=req))
+        self.assertEqual(expected, got_nodes)
+
+    def test_iter_nodes_with_replication_network(self):
+        object_ring = self.app.get_object_ring(None)
+        node_list = [dict(id=n, ip='1.2.3.4', port=n, device='D',
+                          use_replication=False)
+                     for n in range(10)]
+        req = Request.blank(
+            '/v1/a/c', headers={'x-backend-use-replication-network': 'true'})
+        with mock.patch.object(self.app, 'sort_nodes',
+                               lambda n, *args, **kwargs: n), \
+                mock.patch.object(self.app, 'request_node_count',
+                                  lambda r: 3):
+            got_nodes = list(self.app.iter_nodes(object_ring, 0, self.logger,
+                                                 node_iter=iter(node_list),
+                                                 request=req))
+        expected = [dict(n, use_replication=True) for n in node_list]
+        self.assertEqual(expected[:3], got_nodes)
+        req = Request.blank(
+            '/v1/a/c', headers={'x-backend-use-replication-network': 'false'})
+        expected = [dict(n, use_replication=False) for n in node_list]
+        with mock.patch.object(self.app, 'sort_nodes',
+                               lambda n, *args, **kwargs: n), \
+                mock.patch.object(self.app, 'request_node_count',
+                                  lambda r: 13):
+            got_nodes = list(self.app.iter_nodes(object_ring, 0, self.logger,
+                                                 node_iter=iter(node_list),
+                                                 request=req))
+        self.assertEqual(expected, got_nodes)
 
     def test_best_response_sets_headers(self):
         controller = ReplicatedObjectController(
