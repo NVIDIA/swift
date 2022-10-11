@@ -75,7 +75,7 @@ def main(args=None):
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("pid", type=int,
                         help="server PID which should be reloaded")
-    parser.add_argument("-t", "--timeout", type=float, default=30.0,
+    parser.add_argument("-t", "--timeout", type=float, default=300.0,
                         help="max time to wait for reload to complete")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="display more information as the process reloads")
