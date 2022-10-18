@@ -6491,7 +6491,8 @@ class NoopMutex(object):
 
 class ThreadSafeSysLogHandler(SysLogHandler):
     def createLock(self):
-        if config_true_value(os.environ.get('SWIFT_NOOP_LOGGING_MUTEX')):
+        if config_true_value(os.environ.get(
+                'SWIFT_NOOP_LOGGING_MUTEX') or 'true'):
             self.lock = NoopMutex()
         else:
             self.lock = PipeMutex()
