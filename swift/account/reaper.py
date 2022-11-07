@@ -35,7 +35,7 @@ from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER
 from swift.common.ring import Ring
 from swift.common.ring.utils import is_local_device
 from swift.common.utils import get_logger, whataremyips, config_true_value, \
-    Timestamp, md5
+    Timestamp, md5, node_to_string
 from swift.common.daemon import Daemon
 from swift.common.storage_policy import POLICIES, PolicyError
 
@@ -382,15 +382,14 @@ class AccountReaper(Daemon):
             except ClientException as err:
                 if self.logger.getEffectiveLevel() <= DEBUG:
                     self.logger.exception(
-                        'Exception with %(ip)s:%(port)s/%(device)s', node)
+                        'Exception with %s', node_to_string(node))
                 self.stats_return_codes[err.http_status // 100] = \
                     self.stats_return_codes.get(err.http_status // 100, 0) + 1
                 self.logger.increment(
                     'return_codes.%d' % (err.http_status // 100,))
             except (Timeout, socket.error):
                 self.logger.error(
-                    'Timeout Exception with %(ip)s:%(port)s/%(device)s',
-                    node)
+                    'Timeout Exception with %s', node_to_string(node))
             if not objects:
                 break
             try:
@@ -432,7 +431,7 @@ class AccountReaper(Daemon):
             except ClientException as err:
                 if self.logger.getEffectiveLevel() <= DEBUG:
                     self.logger.exception(
-                        'Exception with %(ip)s:%(port)s/%(device)s', node)
+                        'Exception with %s', node_to_string(node))
                 failures += 1
                 self.logger.increment('containers_failures')
                 self.stats_return_codes[err.http_status // 100] = \
@@ -441,8 +440,7 @@ class AccountReaper(Daemon):
                     'return_codes.%d' % (err.http_status // 100,))
             except (Timeout, socket.error):
                 self.logger.error(
-                    'Timeout Exception with %(ip)s:%(port)s/%(device)s',
-                    node)
+                    'Timeout Exception with %s', node_to_string(node))
                 failures += 1
                 self.logger.increment('containers_failures')
         if successes > failures:
@@ -509,7 +507,7 @@ class AccountReaper(Daemon):
             except ClientException as err:
                 if self.logger.getEffectiveLevel() <= DEBUG:
                     self.logger.exception(
-                        'Exception with %(ip)s:%(port)s/%(device)s', node)
+                        'Exception with %s', node_to_string(node))
                 failures += 1
                 self.logger.increment('objects_failures')
                 self.stats_return_codes[err.http_status // 100] = \
@@ -520,8 +518,7 @@ class AccountReaper(Daemon):
                 failures += 1
                 self.logger.increment('objects_failures')
                 self.logger.error(
-                    'Timeout Exception with %(ip)s:%(port)s/%(device)s',
-                    node)
+                    'Timeout Exception with %s', node_to_string(node))
             if successes > failures:
                 self.stats_objects_deleted += 1
                 self.logger.increment('objects_deleted')

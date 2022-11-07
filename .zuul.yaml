@@ -1,6 +1,7 @@
 - job:
     name: swift-tox-base
-    parent: openstack-tox-py27
+    parent: openstack-tox-py310
+    nodeset: ubuntu-jammy
     description: |
       Base job for swift-tox jobs.
 
@@ -14,6 +15,7 @@
 - job:
     name: swift-tox-py27
     parent: swift-tox-base
+    nodeset: ubuntu-bionic
     description: |
       Run unit-tests for swift under cPython version 2.7.
 
@@ -22,6 +24,7 @@
       tools/test-setup.sh.
     vars:
       tox_envlist: py27
+      python_version: 2.7
       tox_environment:
         NOSE_COVER_HTML: 1
         NOSE_COVER_HTML_DIR: '{toxinidir}/cover'
@@ -29,8 +32,11 @@
 
 - job:
     name: swift-tox-py27-centos-7
-    parent: swift-tox-py27
+    parent: openstack-tox-py27
     nodeset: centos-7
+    vars:
+      tox_environment:
+        TMPDIR: '{{ ansible_env.HOME }}/xfstmp'
 
 - job:
     name: swift-tox-py36
@@ -45,6 +51,7 @@
     vars:
       tox_envlist: py36
       bindep_profile: test py36
+      python_version: 3.6
       tox_environment:
         NOSE_COVER_HTML: 1
         NOSE_COVER_HTML_DIR: '{toxinidir}/cover'
@@ -131,6 +138,7 @@
 - job:
     name: swift-tox-func-py27
     parent: swift-tox-base
+    nodeset: ubuntu-bionic
     description: |
       Run functional tests for swift under cPython version 2.7.
 
@@ -139,6 +147,8 @@
       tools/test-setup.sh.
     vars:
       tox_envlist: func
+      bindep_profile: test py27
+      python_version: 2.7
 
 - job:
     name: swift-tox-func-py38
@@ -225,12 +235,13 @@
 
 - job:
     name: swift-tox-func-py27-centos-7
-    parent: swift-tox-func-py27
-    nodeset: centos-7
+    parent: swift-tox-py27-centos-7
+    vars:
+      tox_envlist: func
 
 - job:
     name: swift-tox-func-encryption-py27
-    parent: swift-tox-base
+    parent: swift-tox-func-py27
     description: |
       Run functional tests for swift under cPython version 2.7.
 
@@ -242,12 +253,13 @@
 
 - job:
     name: swift-tox-func-encryption-py27-centos-7
-    parent: swift-tox-func-encryption-py27
-    nodeset: centos-7
+    parent: swift-tox-func-py27-centos-7
+    vars:
+      tox_envlist: func-encryption
 
 - job:
     name: swift-tox-func-ec-py27
-    parent: swift-tox-base
+    parent: swift-tox-func-py27
     description: |
       Run functional tests for swift under cPython version 2.7.
 
@@ -259,8 +271,9 @@
 
 - job:
     name: swift-tox-func-ec-py27-centos-7
-    parent: swift-tox-func-ec-py27
-    nodeset: centos-7
+    parent: swift-tox-func-py27-centos-7
+    vars:
+      tox_envlist: func-ec
 
 - job:
     name: swift-dsvm-functional
@@ -347,15 +360,31 @@
 
 - job:
     name: swift-probetests-centos-7
-    parent: unittests
+    parent: swift-probetests-centos-8-stream
     nodeset: centos-7
     description: |
       Setup a SAIO dev environment and run Swift's probe tests
       under Python 2.
-    timeout: 7200
     vars:
       bindep_profile: test py27
+      ensure_pip_from_packages: False
+      ensure_pip_from_packages_with_python2: False
+      ensure_pip_from_upstream: True
+      ensure_pip_from_upstream_interpreters:
+        - python2
+      ensure_pip_from_upstream_url: "https://bootstrap.pypa.io/pip/2.7/get-pip.py"
+
+- job:
+    name: swift-probetests-centos-8-stream
+    parent: unittests
+    nodeset: centos-8-stream
+    description: |
+      Setup a SAIO dev environment and run Swift's probe tests
+      under Python 3.
+    timeout: 7200
+    vars:
       s3_acl: yes
+      bindep_profile: test py36
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
@@ -363,16 +392,6 @@
       - tools/playbooks/saio_single_node_setup/add_s3api.yaml
     run: tools/playbooks/probetests/run.yaml
     post-run: tools/playbooks/probetests/post.yaml
-
-- job:
-    name: swift-probetests-centos-8-stream
-    parent: swift-probetests-centos-7
-    nodeset: centos-8-stream
-    description: |
-      Setup a SAIO dev environment and run Swift's probe tests
-      under Python 3.
-    vars:
-      bindep_profile: test py36
 
 - job:
     name: swift-probetests-centos-8-stream-arm64
