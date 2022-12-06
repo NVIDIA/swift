@@ -1,3 +1,18 @@
+# Copyright (c) 2022 NVIDIA
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import mock
 import signal
 import six
@@ -30,10 +45,11 @@ class TestValidateManagerPid(unittest.TestCase):
         ])
 
     def test_ps_error(self, mock_check_output, mock_stderr):
-        mock_check_output.side_effect = subprocess.CalledProcessError(137, 'ps')
+        mock_check_output.side_effect = subprocess.CalledProcessError(
+            137, 'ps')
         with self.assertRaises(SystemExit) as caught:
             reload.validate_manager_pid(123)
-        self.assertEqual(caught.exception.args, (2,))
+        self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
         kw = {} if six.PY2 else {'encoding': 'utf-8'}
         self.assertEqual(mock_check_output.mock_calls, [
             mock.call(['ps', '-p', '123', '--no-headers', '-o',
@@ -46,7 +62,7 @@ class TestValidateManagerPid(unittest.TestCase):
         mock_check_output.return_value = ('123  34  56  /usr/bin/rsync\n\n')
         with self.assertRaises(SystemExit) as caught:
             reload.validate_manager_pid(56)
-        self.assertEqual(caught.exception.args, (2,))
+        self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
         kw = {} if six.PY2 else {'encoding': 'utf-8'}
         self.assertEqual(mock_check_output.mock_calls, [
             mock.call(['ps', '-p', '56', '--no-headers', '-o',
@@ -59,7 +75,7 @@ class TestValidateManagerPid(unittest.TestCase):
         mock_check_output.return_value = ('123  34  56  /usr/bin/python\n\n')
         with self.assertRaises(SystemExit) as caught:
             reload.validate_manager_pid(56)
-        self.assertEqual(caught.exception.args, (2,))
+        self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
         kw = {} if six.PY2 else {'encoding': 'utf-8'}
         self.assertEqual(mock_check_output.mock_calls, [
             mock.call(['ps', '-p', '56', '--no-headers', '-o',
@@ -77,7 +93,7 @@ class TestValidateManagerPid(unittest.TestCase):
         mock_check_output.return_value = ('123  34  56  %s\n\n' % cmdline)
         with self.assertRaises(SystemExit) as caught:
             reload.validate_manager_pid(56)
-        self.assertEqual(caught.exception.args, (2,))
+        self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
         kw = {} if six.PY2 else {'encoding': 'utf-8'}
         self.assertEqual(mock_check_output.mock_calls, [
             mock.call(['ps', '-p', '56', '--no-headers', '-o',
@@ -136,7 +152,7 @@ class TestMain(unittest.TestCase):
         ]
         with self.assertRaises(SystemExit) as caught:
             reload.main(['123'])
-        self.assertEqual(caught.exception.args, (238,))
+        self.assertEqual(caught.exception.args, (reload.EXIT_RELOAD_TIMEOUT,))
         self.assertEqual(self.mock_check_call.mock_calls, [
             mock.call(['cmdline', '--test-config']),
         ])
@@ -150,7 +166,7 @@ class TestMain(unittest.TestCase):
         self.mock_validate.return_value = ('cmdline', 'swift-ring-builder')
         with self.assertRaises(SystemExit) as caught:
             reload.main(['123'])
-        self.assertEqual(caught.exception.args, (2,))
+        self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
         self.assertEqual(self.mock_stderr.getvalue(),
                          'Process does not support config checks: '
                          'swift-ring-builder\n')
@@ -162,6 +178,7 @@ class TestMain(unittest.TestCase):
             2, 'swift-object-server')
         with self.assertRaises(SystemExit) as caught:
             reload.main(['123'])
+        self.assertEqual(caught.exception.args, (reload.EXIT_RELOAD_FAILED,))
         self.assertEqual(self.mock_check_call.mock_calls, [
             mock.call(['cmdline', '--test-config']),
         ])
@@ -170,7 +187,7 @@ class TestMain(unittest.TestCase):
     def test_needs_pid(self):
         with self.assertRaises(SystemExit) as caught:
             reload.main([])
-        self.assertEqual(caught.exception.args, (2,))
+        self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
         msg = 'usage: \nSafely reload WSGI servers'
         self.assertEqual(self.mock_stderr.getvalue()[:len(msg)], msg)
         if six.PY2:

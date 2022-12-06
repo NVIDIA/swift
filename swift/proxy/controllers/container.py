@@ -103,14 +103,15 @@ class ContainerController(Controller):
         concurrency = self.app.container_ring.replica_count \
             if self.app.get_policy_options(None).concurrent_gets else 1
         node_iter = self.app.iter_nodes(self.app.container_ring, part,
-                                        self.logger)
+                                        self.logger, request=req)
         resp = self.GETorHEAD_base(
             req, 'Container', node_iter, part,
             req.swift_entity_path, concurrency)
         return resp
 
-    def _filter_resp_shard_ranges(self, req, cached_ranges):
-        # filter returned shard ranges according to request constraints
+    def _make_shard_ranges_response_body(self, req, shard_range_dicts):
+        # filter shard ranges according to request constraints and return a
+        # serialised list of shard ranges
         marker = get_param(req, 'marker', '')
         end_marker = get_param(req, 'end_marker')
         includes = get_param(req, 'includes')
@@ -119,29 +120,26 @@ class ContainerController(Controller):
             marker, end_marker = end_marker, marker
         shard_ranges = [
             ShardRange.from_dict(shard_range)
-            for shard_range in cached_ranges]
+            for shard_range in shard_range_dicts]
         shard_ranges = filter_shard_ranges(shard_ranges, includes, marker,
                                            end_marker)
         if reverse:
             shard_ranges.reverse()
         return json.dumps([dict(sr) for sr in shard_ranges]).encode('ascii')
 
-    def _translate_resp_from_cache(self, req, info):
-        headers = headers_from_container_info(info)
-        if not (info and headers and is_success(info['status']) and
-                info.get('sharding_state') == 'sharded'):
-            # when container info from InfoCache is None or not right, return
-            # cache state as 'miss'.
-            return None, 'miss'
-        # container is sharded so we may have the shard ranges cached
+    def _get_shard_ranges_from_cache(self, req, headers):
         infocache = req.environ.setdefault('swift.infocache', {})
         memcache = cache_from_env(req.environ, True)
         cache_key = get_cache_key(self.account_name,
                                   self.container_name,
                                   shard='listing')
-        cached_ranges = infocache.get(cache_key)
-        if cached_ranges:
+
+        resp_body = None
+        cached_range_dicts = infocache.get(cache_key)
+        if cached_range_dicts:
             cache_state = 'infocache_hit'
+            resp_body = self._make_shard_ranges_response_body(
+                req, cached_range_dicts)
         elif memcache:
             skip_chance = \
                 self.app.container_listing_shard_ranges_skip_cache
@@ -149,51 +147,67 @@ class ContainerController(Controller):
                 cache_state = 'skip'
             else:
                 try:
-                    cached_ranges = memcache.get(
+                    cached_range_dicts = memcache.get(
                         cache_key, raise_on_error=True)
-                    cache_state = 'hit' if cached_ranges else 'miss'
+                    if cached_range_dicts:
+                        cache_state = 'hit'
+                        resp_body = self._make_shard_ranges_response_body(
+                            req, cached_range_dicts)
+                    else:
+                        cache_state = 'miss'
                 except MemcacheConnectionError:
                     cache_state = 'error'
 
-        if not cached_ranges:
-            return None, cache_state
-        infocache[cache_key] = tuple(cached_ranges)
-        # shard ranges can be returned from cache
-        self.logger.debug('Found %d shards in cache for %s',
-                          len(cached_ranges), req.path_qs)
-        headers.update({'x-backend-record-type': 'shard',
-                        'x-backend-cached-results': 'true'})
-        shard_range_body = self._filter_resp_shard_ranges(
-            req, cached_ranges)
-        # mimic GetOrHeadHandler.get_working_response...
-        # note: server sets charset with content_type but proxy
-        # GETorHEAD_base does not, so don't set it here either
-        resp = Response(request=req, body=shard_range_body)
-        update_headers(resp, headers)
-        resp.last_modified = Timestamp(
-            headers['x-put-timestamp']).ceil()
-        resp.environ['swift_x_timestamp'] = headers.get(
-            'x-timestamp')
-        resp.accept_ranges = 'bytes'
-        resp.content_type = 'application/json'
+        if resp_body is None:
+            resp = None
+        else:
+            # shard ranges can be returned from cache
+            infocache[cache_key] = tuple(cached_range_dicts)
+            self.logger.debug('Found %d shards in cache for %s',
+                              len(cached_range_dicts), req.path_qs)
+            headers.update({'x-backend-record-type': 'shard',
+                            'x-backend-cached-results': 'true'})
+            # mimic GetOrHeadHandler.get_working_response...
+            # note: server sets charset with content_type but proxy
+            # GETorHEAD_base does not, so don't set it here either
+            resp = Response(request=req, body=resp_body)
+            update_headers(resp, headers)
+            resp.last_modified = Timestamp(headers['x-put-timestamp']).ceil()
+            resp.environ['swift_x_timestamp'] = headers.get('x-timestamp')
+            resp.accept_ranges = 'bytes'
+            resp.content_type = 'application/json'
+
         return resp, cache_state
 
-    def _GET_using_cache(self, req, info):
-        # It may be possible to fulfil the request from cache: we only reach
-        # here if request record_type is 'shard' or 'auto', so if the container
-        # state is 'sharded' then look for cached shard ranges. However, if
-        # X-Newest is true then we always fetch from the backend servers.
-        if config_true_value(req.headers.get('x-newest', False)):
-            cache_state = 'force_skip'
-            self.logger.debug(
-                'Skipping shard cache lookup (x-newest) for %s', req.path_qs)
-        else:
-            resp, cache_state = self._translate_resp_from_cache(req, info)
-            if resp:
-                return resp, cache_state
+    def _store_shard_ranges_in_cache(self, req, resp):
+        # parse shard ranges returned from backend, store them in infocache and
+        # memcache, and return a list of dicts
+        cache_key = get_cache_key(self.account_name, self.container_name,
+                                  shard='listing')
+        data = self._parse_listing_response(req, resp)
+        backend_shard_ranges = self._parse_shard_ranges(req, data, resp)
+        if backend_shard_ranges is None:
+            return None
 
-        # The request was not fulfilled from cache so send to the backend
-        # server, but instruct the backend server to ignore name constraints in
+        cached_range_dicts = [dict(sr) for sr in backend_shard_ranges]
+        if resp.headers.get('x-backend-sharding-state') == 'sharded':
+            # cache in infocache even if no shard ranges returned; this
+            # is unexpected but use that result for this request
+            infocache = req.environ.setdefault('swift.infocache', {})
+            infocache[cache_key] = tuple(cached_range_dicts)
+            memcache = cache_from_env(req.environ, True)
+            if memcache and cached_range_dicts:
+                # cache in memcache only if shard ranges as expected
+                self.logger.debug('Caching %d shards for %s',
+                                  len(cached_range_dicts), req.path_qs)
+                memcache.set(cache_key, cached_range_dicts,
+                             time=self.app.recheck_listing_shard_ranges)
+        return cached_range_dicts
+
+    def _get_shard_ranges_from_backend(self, req):
+        # Make a backend request for shard ranges. The response is cached and
+        # then returned as a list of dicts.
+        # Note: We instruct the backend server to ignore name constraints in
         # request params if returning shard ranges so that the response can
         # potentially be cached. Only do this if the container state is
         # 'sharded'. We don't attempt to cache shard ranges for a 'sharding'
@@ -218,32 +232,11 @@ class ContainerController(Controller):
         if (resp_record_type == 'shard' and
                 sharding_state == 'sharded' and
                 complete_listing):
-            # backend returned unfiltered listing state shard ranges so parse
-            # them and replace response body with filtered listing
-            cache_key = get_cache_key(self.account_name, self.container_name,
-                                      shard='listing')
-            data = self._parse_listing_response(req, resp)
-            backend_shard_ranges = self._parse_shard_ranges(req, data, resp)
-            if backend_shard_ranges is not None:
-                cached_ranges = [dict(sr) for sr in backend_shard_ranges]
-                if resp.headers.get('x-backend-sharding-state') == 'sharded':
-                    # cache in infocache even if no shard ranges returned; this
-                    # is unexpected but use that result for this request
-                    infocache = req.environ.setdefault('swift.infocache', {})
-                    infocache[cache_key] = tuple(cached_ranges)
-                    memcache = cache_from_env(req.environ, True)
-                    if memcache and cached_ranges:
-                        # cache in memcache only if shard ranges as expected
-                        self.logger.debug('Caching %d shards for %s',
-                                          len(cached_ranges), req.path_qs)
-                        memcache.set(
-                            cache_key, cached_ranges,
-                            time=self.app.recheck_listing_shard_ranges)
-
-                # filter returned shard ranges according to request constraints
-                resp.body = self._filter_resp_shard_ranges(req, cached_ranges)
-
-        return resp, cache_state
+            cached_range_dicts = self._store_shard_ranges_in_cache(req, resp)
+            if cached_range_dicts:
+                resp.body = self._make_shard_ranges_response_body(
+                    req, cached_range_dicts)
+        return resp
 
     def _record_shard_listing_cache_metrics(
             self, cache_state, resp, resp_record_type, info):
@@ -281,6 +274,28 @@ class ContainerController(Controller):
         if should_record:
             record_cache_op_metrics(
                 self.logger, 'shard_listing', cache_state, resp)
+
+    def _GET_using_cache(self, req, info):
+        # It may be possible to fulfil the request from cache: we only reach
+        # here if request record_type is 'shard' or 'auto', so if the container
+        # state is 'sharded' then look for cached shard ranges. However, if
+        # X-Newest is true then we always fetch from the backend servers.
+        headers = headers_from_container_info(info)
+        if config_true_value(req.headers.get('x-newest', False)):
+            cache_state = 'force_skip'
+            self.logger.debug(
+                'Skipping shard cache lookup (x-newest) for %s', req.path_qs)
+        elif (headers and info and is_success(info['status']) and
+                info.get('sharding_state') == 'sharded'):
+            # container is sharded so we may have the shard ranges cached;
+            # only use cached values if all required backend headers available
+            resp, cache_state = self._get_shard_ranges_from_cache(req, headers)
+            if resp:
+                return resp, cache_state
+        else:
+            cache_state = 'miss'
+        # The request was not fulfilled from cache so send to backend server
+        return self._get_shard_ranges_from_backend(req), cache_state
 
     def GETorHEAD(self, req):
         """Handler for HTTP GET/HEAD requests."""

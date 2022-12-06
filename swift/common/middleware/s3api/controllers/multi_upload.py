@@ -83,7 +83,6 @@ from swift.common.middleware.s3api.s3response import InvalidArgument, \
     InvalidPart, BucketAlreadyExists, EntityTooSmall, InvalidPartOrder, \
     InvalidRequest, HTTPOk, HTTPNoContent, NoSuchKey, NoSuchUpload, \
     NoSuchBucket, BucketAlreadyOwnedByYou
-from swift.common.middleware.s3api.exception import BadSwiftRequest
 from swift.common.middleware.s3api.utils import unique_id, \
     MULTIUPLOAD_SUFFIX, S3Timestamp, sysmeta_header
 from swift.common.middleware.s3api.etree import Element, SubElement, \
@@ -708,11 +707,15 @@ class UploadController(Controller):
                 previous_number = part_number
 
                 etag = normalize_etag(part_elem.find('./ETag').text)
+                if etag is None:
+                    raise InvalidPart(upload_id=upload_id,
+                                      part_number=part_number,
+                                      e_tag=etag)
                 if len(etag) != 32 or any(c not in '0123456789abcdef'
                                           for c in etag):
                     raise InvalidPart(upload_id=upload_id,
-                                      part_number=part_number)
-
+                                      part_number=part_number,
+                                      e_tag=etag)
                 manifest.append({
                     'path': '/%s/%s/%s/%d' % (
                         wsgi_to_str(container), wsgi_to_str(req.object_name),
@@ -801,8 +804,8 @@ class UploadController(Controller):
                                 status=body['Response Status'],
                                 msg='\n'.join(': '.join(err)
                                               for err in body['Errors']))
-                except BadSwiftRequest as e:
-                    msg = str(e)
+                except InvalidRequest as err_resp:
+                    msg = err_resp._msg
                     if too_small_message in msg:
                         raise EntityTooSmall(msg)
                     elif ', Etag Mismatch' in msg:

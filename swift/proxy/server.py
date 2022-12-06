@@ -28,7 +28,7 @@ from eventlet import Timeout
 
 from swift import __canonical_version__ as swift_version
 from swift.common import constraints
-from swift.common.http import is_server_error
+from swift.common.http import is_server_error, HTTP_INSUFFICIENT_STORAGE
 from swift.common.storage_policy import POLICIES
 from swift.common.ring import Ring
 from swift.common.error_limiter import ErrorLimiter
@@ -659,8 +659,9 @@ class Application(object):
         """
         limited = self.error_limiter.is_limited(node)
         if limited:
+            self.logger.increment('error_limiter.is_limited')
             self.logger.debug(
-                'Node error limited: %s', node_to_string(node))
+                'Node is error limited: %s', node_to_string(node))
         return limited
 
     def error_limit(self, node, msg):
@@ -674,8 +675,24 @@ class Application(object):
         :param msg: error message
         """
         self.error_limiter.limit(node)
-        self.logger.error('%(msg)s %(node)s',
-                          {'msg': msg, 'node': node_to_string(node)})
+        self.logger.increment('error_limiter.forced_limit')
+        self.logger.error(
+            'Node will be error limited for %.2fs: %s, error: %s',
+            self.error_limiter.suppression_interval, node_to_string(node),
+            msg)
+
+    def _error_increment(self, node):
+        """
+        Call increment() on error limiter once, emit metrics and log if error
+        suppression will be triggered.
+
+        :param node: dictionary of node to handle errors for
+        """
+        if self.error_limiter.increment(node):
+            self.logger.increment('error_limiter.incremented_limit')
+            self.logger.error(
+                'Node will be error limited for %.2fs: %s',
+                self.error_limiter.suppression_interval, node_to_string(node))
 
     def error_occurred(self, node, msg):
         """
@@ -684,15 +701,54 @@ class Application(object):
         :param node: dictionary of node to handle errors for
         :param msg: error message
         """
-        self.error_limiter.increment(node)
         if isinstance(msg, bytes):
             msg = msg.decode('utf-8')
         self.logger.error('%(msg)s %(node)s',
                           {'msg': msg, 'node': node_to_string(node)})
+        self._error_increment(node)
 
-    def iter_nodes(self, ring, partition, logger, node_iter=None, policy=None):
+    def check_response(self, node, server_type, response, method, path,
+                       body=None):
+        """
+        Check response for error status codes and update error limiters as
+        required.
+
+        :param node: a dict describing a node
+        :param server_type: the type of server from which the response was
+            received (e.g. 'Object').
+        :param response: an instance of HTTPResponse.
+        :param method: the request method.
+        :param path: the request path.
+        :param body: an optional response body. If given, up to 1024 of the
+            start of the body will be included in any log message.
+        :return True: if the response status code is less than 500, False
+            otherwise.
+        """
+        ok = False
+        if response.status == HTTP_INSUFFICIENT_STORAGE:
+            self.error_limit(node, 'ERROR Insufficient Storage')
+        elif is_server_error(response.status):
+            values = {'status': response.status,
+                      'method': method,
+                      'path': path,
+                      'type': server_type}
+            if body is None:
+                fmt = 'ERROR %(status)d Trying to %(method)s ' \
+                      '%(path)s From %(type)s Server'
+            else:
+                fmt = 'ERROR %(status)d %(body)s Trying to %(method)s ' \
+                      '%(path)s From %(type)s Server'
+                values['body'] = body[:1024]
+            self.error_occurred(node, fmt % values)
+        else:
+            ok = True
+
+        return ok
+
+    def iter_nodes(self, ring, partition, logger, node_iter=None, policy=None,
+                   request=None):
         return NodeIter(self, ring, partition, logger, node_iter=node_iter,
-                        policy=policy)
+                        policy=policy, request=request)
 
     def exception_occurred(self, node, typ, additional_info,
                            **kwargs):
@@ -703,7 +759,6 @@ class Application(object):
         :param typ: server type
         :param additional_info: additional information to log
         """
-        self.error_limiter.increment(node)
         if 'level' in kwargs:
             log = functools.partial(self.logger.log, kwargs.pop('level'))
             if 'exc_info' not in kwargs:
@@ -717,6 +772,7 @@ class Application(object):
             {'type': typ, 'node': node_to_string(node),
              'info': additional_info},
             **kwargs)
+        self._error_increment(node)
 
     def modify_wsgi_pipeline(self, pipe):
         """

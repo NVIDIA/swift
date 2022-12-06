@@ -175,7 +175,7 @@ class BaseObjectController(Controller):
             self.account_name, self.container_name, self.object_name)
 
     def iter_nodes_local_first(self, ring, partition, policy=None,
-                               local_handoffs_first=False):
+                               local_handoffs_first=False, request=None):
         """
         Yields nodes for a ring partition.
 
@@ -197,7 +197,7 @@ class BaseObjectController(Controller):
         is_local = policy_options.write_affinity_is_local_fn
         if is_local is None:
             return self.app.iter_nodes(ring, partition, self.logger,
-                                       policy=policy)
+                                       policy=policy, request=request)
 
         primary_nodes = ring.get_part_nodes(partition)
         handoff_nodes = ring.get_more_nodes(partition)
@@ -231,7 +231,8 @@ class BaseObjectController(Controller):
         )
 
         return self.app.iter_nodes(ring, partition, self.logger,
-                                   node_iter=node_iter, policy=policy)
+                                   node_iter=node_iter, policy=policy,
+                                   request=request)
 
     def GETorHEAD(self, req):
         """Handle HTTP GET or HEAD requests."""
@@ -251,7 +252,7 @@ class BaseObjectController(Controller):
         partition = obj_ring.get_part(
             self.account_name, self.container_name, self.object_name)
         node_iter = self.app.iter_nodes(obj_ring, partition, self.logger,
-                                        policy=policy)
+                                        policy=policy, request=req)
 
         resp = self._get_or_head_response(req, node_iter, partition, policy)
 
@@ -478,18 +479,9 @@ class BaseObjectController(Controller):
             else:
                 body = b''
             bodies.append(body)
-            if response.status == HTTP_INSUFFICIENT_STORAGE:
+            if not self.app.check_response(putter.node, 'Object', response,
+                                           req.method, req.path, body):
                 putter.failed = True
-                self.app.error_limit(putter.node,
-                                     'ERROR Insufficient Storage')
-            elif response.status >= HTTP_INTERNAL_SERVER_ERROR:
-                putter.failed = True
-                self.app.error_occurred(
-                    putter.node,
-                    'ERROR %(status)d %(body)s From Object Server '
-                    're: %(path)s' %
-                    {'status': response.status,
-                     'body': body[:1024], 'path': req.path})
             elif is_success(response.status):
                 etags.add(normalize_etag(response.getheader('etag')))
 
@@ -644,7 +636,8 @@ class BaseObjectController(Controller):
         """
         obj_ring = policy.object_ring
         node_iter = GreenthreadSafeIterator(
-            self.iter_nodes_local_first(obj_ring, partition, policy=policy))
+            self.iter_nodes_local_first(obj_ring, partition, policy=policy,
+                                        request=req))
         pile = GreenPile(len(nodes))
 
         for nheaders in outgoing_headers:
@@ -845,7 +838,8 @@ class BaseObjectController(Controller):
                 local_handoffs = len(nodes) - len(local_primaries)
             node_count += local_handoffs
             node_iterator = self.iter_nodes_local_first(
-                obj_ring, partition, policy=policy, local_handoffs_first=True
+                obj_ring, partition, policy=policy, local_handoffs_first=True,
+                request=req
             )
 
         headers = self._backend_requests(
@@ -2796,15 +2790,8 @@ class ECFragGetter(object):
             self.body = possible_source.read()
             conn.close()
 
-            if possible_source.status == HTTP_INSUFFICIENT_STORAGE:
-                self.app.error_limit(node, 'ERROR Insufficient Storage')
-            elif is_server_error(possible_source.status):
-                self.app.error_occurred(
-                    node, 'ERROR %(status)d %(body)s '
-                          'From Object Server' %
-                    {'status': possible_source.status,
-                     'body': self.body[:1024]})
-            else:
+            if self.app.check_response(node, 'Object', possible_source, 'GET',
+                                       self.path):
                 self.logger.debug(
                     'Ignoring %s from primary' % possible_source.status)
 

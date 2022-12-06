@@ -56,7 +56,7 @@ from test.debug_logger import debug_logger
 from test.unit import (
     connect_tcp, readuntil2crlfs, fake_http_connect, FakeRing, FakeMemcache,
     patch_policies, write_fake_ring, mocked_http_conn, DEFAULT_TEST_EC_TYPE,
-    make_timestamp_iter, skip_if_no_xattrs)
+    make_timestamp_iter, skip_if_no_xattrs, FakeHTTPResponse)
 from test.unit.helpers import setup_servers, teardown_servers
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers.obj import ReplicatedObjectController
@@ -70,7 +70,8 @@ from swift.common.exceptions import ChunkReadTimeout, DiskFileNotExist, \
 from swift.common import utils, constraints, registry
 from swift.common.utils import hash_path, storage_directory, \
     parse_content_type, parse_mime_headers, StatsdClient, \
-    iter_multipart_mime_documents, public, mkdirs, NullLogger, md5
+    iter_multipart_mime_documents, public, mkdirs, NullLogger, md5, \
+    node_to_string
 from swift.common.wsgi import loadapp, ConfigString, SwiftHttpProtocol
 from swift.proxy.controllers import base as proxy_base
 from swift.proxy.controllers.base import get_cache_key, cors_validation, \
@@ -246,7 +247,7 @@ class TestController(unittest.TestCase):
         self.account_ring = FakeRing()
         self.container_ring = FakeRing()
         self.memcache = FakeMemcache()
-        app = proxy_server.Application(None,
+        app = proxy_server.Application(None, logger=debug_logger(),
                                        account_ring=self.account_ring,
                                        container_ring=self.container_ring)
         self.controller = swift.proxy.controllers.Controller(app)
@@ -1164,35 +1165,100 @@ class TestProxyServer(unittest.TestCase):
 
         self.assertEqual(controller.__name__, 'InfoController')
 
+    def test_exception_occurred_replication_ip_port_logging(self):
+        logger = debug_logger('test')
+        app = proxy_server.Application(
+            {},
+            account_ring=FakeRing(separate_replication=True),
+            container_ring=FakeRing(separate_replication=True),
+            logger=logger)
+        app.sort_nodes = lambda nodes, policy: nodes
+        part = app.container_ring.get_part('a', 'c')
+        nodes = app.container_ring.get_part_nodes(part)
+        self.assertNotEqual(nodes[0]['ip'], nodes[0]['replication_ip'])
+        self.assertEqual(0, sum([node_error_count(app, node)
+                                 for node in nodes]))  # sanity
+
+        # no use_replication header...
+        req = Request.blank('/v1/a/c')
+        with mocked_http_conn(200, 503, 200) as mocked_conn:
+            req.get_response(app)
+
+        expected = [(n['ip'], n['port']) for n in nodes[:2]]
+        actual = [(req['ip'], req['port']) for req in mocked_conn.requests[1:]]
+        self.assertEqual(expected, actual)
+        line = logger.get_lines_for_level('error')[-1]
+        self.assertIn('Container Server', line)
+        self.assertIn('%s:%s/%s' % (nodes[0]['ip'],
+                                    nodes[0]['port'],
+                                    nodes[0]['device']), line)
+        self.assertEqual(1, sum([node_error_count(app, node)
+                                 for node in nodes]))
+        annotated_nodes = [dict(node, use_replication=True) for node in nodes]
+        self.assertEqual(0, sum([node_error_count(app, node)
+                                 for node in annotated_nodes]))
+
+        logger.clear()
+        req = Request.blank(
+            '/v1/a/c',
+            headers={'x-backend-use-replication-network': True})
+        with mocked_http_conn(200, 503, 200):
+            req.get_response(app)
+        line = logger.get_lines_for_level('error')[-1]
+        self.assertIn('Container Server', line)
+        self.assertIn('%s:%s/%s' % (nodes[0]['replication_ip'],
+                                    nodes[0]['replication_port'],
+                                    nodes[0]['device']), line)
+        self.assertEqual(1, sum([node_error_count(app, node)
+                                 for node in nodes]))
+        annotated_nodes = [dict(node, use_replication=True) for node in nodes]
+        self.assertEqual(1, sum([node_error_count(app, node)
+                                 for node in annotated_nodes]))
+
     def test_exception_occurred(self):
         def do_test(additional_info):
             logger = debug_logger('test')
-            app = proxy_server.Application({},
-                                           account_ring=FakeRing(),
-                                           container_ring=FakeRing(),
-                                           logger=logger)
+            suppression_limit = 10
+            app = proxy_server.Application(
+                {'error_suppression_limit': suppression_limit},
+                account_ring=FakeRing(),
+                container_ring=FakeRing(),
+                logger=logger)
             node = app.container_ring.get_part_nodes(0)[0]
             node_key = app.error_limiter.node_key(node)
             self.assertNotIn(node_key, app.error_limiter.stats)  # sanity
-            try:
-                raise Exception('kaboom1!')
-            except Exception as err:
-                caught_exc = err
-                app.exception_occurred(node, 'server-type', additional_info)
 
-            self.assertEqual(1, node_error_count(app, node))
-            line = logger.get_lines_for_level('error')[-1]
-            self.assertIn('server-type server', line)
             if six.PY2:
-                self.assertIn(additional_info.decode('utf8'), line)
+                expected_info = additional_info.decode('utf8')
             else:
-                self.assertIn(additional_info, line)
-            self.assertIn(node['ip'], line)
-            self.assertIn(str(node['port']), line)
-            self.assertIn(node['device'], line)
-            log_args, log_kwargs = logger.log_dict['error'][-1]
-            self.assertTrue(log_kwargs['exc_info'])
-            self.assertIs(caught_exc, log_kwargs['exc_info'][1])
+                expected_info = additional_info
+
+            incremented_limit_samples = []
+            for i in range(suppression_limit + 1):
+                try:
+                    raise Exception('kaboom1!')
+                except Exception as err:
+                    caught_exc = err
+                    app.exception_occurred(
+                        node, 'server-type', additional_info)
+                self.assertEqual(i + 1, node_error_count(app, node))
+                line = logger.get_lines_for_level('error')[i]
+                self.assertIn('server-type server', line)
+                self.assertIn(expected_info, line)
+                self.assertIn(node['ip'], line)
+                self.assertIn(str(node['port']), line)
+                self.assertIn(node['device'], line)
+                log_args, log_kwargs = logger.log_dict['error'][i]
+                self.assertTrue(log_kwargs['exc_info'])
+                self.assertIs(caught_exc, log_kwargs['exc_info'][1])
+                incremented_limit_samples.append(
+                    logger.get_increment_counts().get(
+                        'error_limiter.incremented_limit', 0))
+            self.assertEqual([0] * 10 + [1], incremented_limit_samples)
+            self.assertEqual(
+                ('Node will be error limited for 60.00s: %s' %
+                 node_to_string(node)),
+                logger.get_lines_for_level('error')[suppression_limit + 1])
 
         do_test('success')
         do_test('succès')
@@ -1201,25 +1267,50 @@ class TestProxyServer(unittest.TestCase):
     def test_error_occurred(self):
         def do_test(msg):
             logger = debug_logger('test')
-            app = proxy_server.Application({},
-                                           account_ring=FakeRing(),
-                                           container_ring=FakeRing(),
-                                           logger=logger)
+            suppression_limit = 10
+            app = proxy_server.Application(
+                {'error_suppression_limit': suppression_limit},
+                account_ring=FakeRing(),
+                container_ring=FakeRing(),
+                logger=logger)
             node = app.container_ring.get_part_nodes(0)[0]
             node_key = app.error_limiter.node_key(node)
             self.assertNotIn(node_key, app.error_limiter.stats)  # sanity
 
-            app.error_occurred(node, msg)
-
-            self.assertEqual(1, node_error_count(app, node))
-            line = logger.get_lines_for_level('error')[-1]
             if six.PY2:
-                self.assertIn(msg.decode('utf8'), line)
+                expected_msg = msg.decode('utf8')
             else:
-                self.assertIn(msg, line)
-            self.assertIn(node['ip'], line)
-            self.assertIn(str(node['port']), line)
-            self.assertIn(node['device'], line)
+                expected_msg = msg
+            incremented_limit_samples = []
+            for i in range(suppression_limit + 1):
+                app.error_occurred(node, msg)
+                self.assertEqual(i + 1, node_error_count(app, node))
+                line = logger.get_lines_for_level('error')[i]
+                self.assertIn(expected_msg, line)
+                self.assertIn(node_to_string(node), line)
+                incremented_limit_samples.append(
+                    logger.get_increment_counts().get(
+                        'error_limiter.incremented_limit', 0))
+
+            self.assertEqual([0] * 10 + [1], incremented_limit_samples)
+            self.assertEqual(
+                ('Node will be error limited for 60.00s: %s' %
+                 node_to_string(node)),
+                logger.get_lines_for_level('error')[-1])
+
+            # error limiting is extended if another error occurs
+            app.error_occurred(node, msg)
+            self.assertEqual(suppression_limit + 2,
+                             node_error_count(app, node))
+            line = logger.get_lines_for_level('error')[-2]
+            self.assertIn(expected_msg, line)
+            self.assertIn(node_to_string(node), line)
+            self.assertEqual(2, logger.get_increment_counts().get(
+                'error_limiter.incremented_limit', 0))
+            self.assertEqual(
+                ('Node will be error limited for 60.00s: %s' %
+                 node_to_string(node)),
+                logger.get_lines_for_level('error')[-1])
 
         do_test('success')
         do_test('succès')
@@ -1287,6 +1378,76 @@ class TestProxyServer(unittest.TestCase):
         self.assertTrue(log_kwargs['exc_info'])
         self.assertIs(log_kwargs['exc_info'][1], expected_err)
         self.assertEqual(4, node_error_count(app, node))
+
+    def test_check_response_200(self):
+        app = proxy_server.Application({},
+                                       account_ring=FakeRing(),
+                                       container_ring=FakeRing(),
+                                       logger=debug_logger())
+        node = app.container_ring.get_part_nodes(1)[0]
+        resp = FakeHTTPResponse(Response())
+        ret = app.check_response(node, 'Container', resp, 'PUT', '/v1/a/c')
+        self.assertTrue(ret)
+        error_lines = app.logger.get_lines_for_level('error')
+        self.assertFalse(error_lines)
+        self.assertEqual(0, node_error_count(app, node))
+
+    def test_check_response_507(self):
+        app = proxy_server.Application({},
+                                       account_ring=FakeRing(),
+                                       container_ring=FakeRing(),
+                                       logger=debug_logger())
+        node = app.container_ring.get_part_nodes(1)[0]
+        resp = FakeHTTPResponse(Response(status=507))
+        ret = app.check_response(node, 'Container', resp, 'PUT', '/v1/a/c')
+        self.assertFalse(ret)
+        error_lines = app.logger.get_lines_for_level('error')
+        self.assertEqual(1, len(error_lines))
+        self.assertEqual(
+            'Node will be error limited for 60.00s: 10.0.0.0:1000/sda, '
+            'error: ERROR Insufficient Storage', error_lines[0])
+        self.assertEqual(11, node_error_count(app, node))
+        self.assertTrue(app.error_limited(node))
+
+        app.logger.clear()
+        ret = app.check_response(node, 'Account', resp, 'PUT', '/v1/a/c',
+                                 body='full')
+        self.assertFalse(ret)
+        error_lines = app.logger.get_lines_for_level('error')
+        self.assertEqual(1, len(error_lines))
+        self.assertEqual(
+            'Node will be error limited for 60.00s: 10.0.0.0:1000/sda, '
+            'error: ERROR Insufficient Storage', error_lines[0])
+        self.assertEqual(11, node_error_count(app, node))
+        self.assertTrue(app.error_limited(node))
+
+    def test_check_response_503(self):
+        app = proxy_server.Application({},
+                                       account_ring=FakeRing(),
+                                       container_ring=FakeRing(),
+                                       logger=debug_logger())
+        node = app.container_ring.get_part_nodes(1)[0]
+        resp = FakeHTTPResponse(Response(status=503))
+        app.logger.clear()
+        ret = app.check_response(node, 'Container', resp, 'PUT', '/v1/a/c')
+        self.assertFalse(ret)
+        error_lines = app.logger.get_lines_for_level('error')
+        self.assertEqual(1, len(error_lines))
+        self.assertEqual('ERROR 503 Trying to PUT /v1/a/c From Container '
+                         'Server 10.0.0.0:1000/sda', error_lines[0])
+        self.assertEqual(1, node_error_count(app, node))
+        self.assertFalse(app.error_limited(node))
+
+        app.logger.clear()
+        ret = app.check_response(node, 'Object', resp, 'GET', '/v1/a/c/o',
+                                 body='full')
+        self.assertFalse(ret)
+        error_lines = app.logger.get_lines_for_level('error')
+        self.assertEqual(1, len(error_lines))
+        self.assertEqual('ERROR 503 full Trying to GET /v1/a/c/o From Object '
+                         'Server 10.0.0.0:1000/sda', error_lines[0])
+        self.assertEqual(2, node_error_count(app, node))
+        self.assertFalse(app.error_limited(node))
 
     def test_valid_api_version(self):
         app = proxy_server.Application({},
@@ -3369,8 +3530,20 @@ class TestReplicatedObjectController(
             controller = \
                 ReplicatedObjectController(
                     self.app, 'a', 'c', 'o.jpg')
-            self.app.error_limit(
-                object_ring.get_part_nodes(1)[0], 'test')
+            error_node = object_ring.get_part_nodes(1)[0]
+            self.app.error_limit(error_node, 'test')
+            self.assertEqual(
+                1, self.logger.get_increment_counts().get(
+                    'error_limiter.forced_limit', 0))
+            line = self.logger.get_lines_for_level('error')[-1]
+            self.assertEqual(
+                ('Node will be error limited for 60.00s: %s, error: %s'
+                 % (node_to_string(error_node), 'test')), line)
+
+            # no error limited checking yet.
+            self.assertEqual(
+                0, self.logger.get_increment_counts().get(
+                    'error_limiter.is_limited', 0))
             set_http_connect(200, 200,        # account, container
                              201, 201, 201,   # 3 working backends
                              give_connect=test_connect)
@@ -3379,6 +3552,10 @@ class TestReplicatedObjectController(
             req.body = 'a'
             res = controller.PUT(req)
             self.assertTrue(res.status.startswith('201 '))
+            # error limited happened during PUT.
+            self.assertEqual(
+                1, self.logger.get_increment_counts().get(
+                    'error_limiter.is_limited', 0))
 
         # this is kind of a hokey test, but in FakeRing, the port is even when
         # the region is 0, and odd when the region is 1, so this test asserts
@@ -5235,8 +5412,9 @@ class TestReplicatedObjectController(
                 self.assertEqual(
                     self.app.logger.get_lines_for_level('warning'), [
                         'Handoff requested (5)'])
-                self.assertEqual(self.app.logger.get_increments(),
-                                 ['handoff_count'])
+                self.assertEqual(
+                    self.app.logger.get_increments(),
+                    ['error_limiter.is_limited', 'handoff_count'])
 
                 # two error-limited primary nodes -> two handoff warnings
                 self.app.log_handoffs = True
@@ -5257,9 +5435,9 @@ class TestReplicatedObjectController(
                         'Handoff requested (5)',
                         'Handoff requested (6)',
                     ])
-                self.assertEqual(self.app.logger.get_increments(),
-                                 ['handoff_count',
-                                  'handoff_count'])
+                stats = self.app.logger.get_increment_counts()
+                self.assertEqual(2, stats.get('error_limiter.is_limited', 0))
+                self.assertEqual(2, stats.get('handoff_count', 0))
 
                 # all error-limited primary nodes -> four handoff warnings,
                 # plus a handoff-all metric
@@ -5284,12 +5462,10 @@ class TestReplicatedObjectController(
                         'Handoff requested (9)',
                         'Handoff requested (10)',
                     ])
-                self.assertEqual(self.app.logger.get_increments(),
-                                 ['handoff_count',
-                                  'handoff_count',
-                                  'handoff_count',
-                                  'handoff_count',
-                                  'handoff_all_count'])
+                stats = self.app.logger.get_increment_counts()
+                self.assertEqual(4, stats.get('error_limiter.is_limited', 0))
+                self.assertEqual(4, stats.get('handoff_count', 0))
+                self.assertEqual(1, stats.get('handoff_all_count', 0))
 
             finally:
                 object_ring.max_more_nodes = 0
@@ -5321,10 +5497,34 @@ class TestReplicatedObjectController(
                 object_ring, 0, self.logger))
             self.assertIn(first_nodes[0], second_nodes)
 
+            self.assertEqual(
+                0, self.logger.get_increment_counts().get(
+                    'error_limiter.is_limited', 0))
+            self.assertEqual(
+                0, self.logger.get_increment_counts().get(
+                    'error_limiter.forced_limit', 0))
+
             self.app.error_limit(first_nodes[0], 'test')
+            self.assertEqual(
+                1, self.logger.get_increment_counts().get(
+                    'error_limiter.forced_limit', 0))
+            line = self.logger.get_lines_for_level('error')[-1]
+            self.assertEqual(
+                ('Node will be error limited for 60.00s: %s, error: %s'
+                 % (node_to_string(first_nodes[0]), 'test')), line)
+
             second_nodes = list(self.app.iter_nodes(
                 object_ring, 0, self.logger))
             self.assertNotIn(first_nodes[0], second_nodes)
+            self.assertEqual(
+                1, self.logger.get_increment_counts().get(
+                    'error_limiter.is_limited', 0))
+            third_nodes = list(self.app.iter_nodes(
+                object_ring, 0, self.logger))
+            self.assertNotIn(first_nodes[0], third_nodes)
+            self.assertEqual(
+                2, self.logger.get_increment_counts().get(
+                    'error_limiter.is_limited', 0))
 
     def test_iter_nodes_gives_extra_if_error_limited_inline(self):
         object_ring = self.app.get_object_ring(None)
@@ -5343,25 +5543,60 @@ class TestReplicatedObjectController(
             self.assertEqual(len(first_nodes), 6)
             self.assertEqual(len(second_nodes), 7)
 
-    def test_iter_nodes_with_custom_node_iter(self):
+    def test_iter_nodes_without_replication_network(self):
         object_ring = self.app.get_object_ring(None)
-        node_list = [dict(id=n, ip='1.2.3.4', port=n, device='D')
+        node_list = [dict(id=n, ip='1.2.3.4', port=n, device='D',
+                          use_replication=False)
                      for n in range(10)]
+        expected = [dict(n) for n in node_list]
         with mock.patch.object(self.app, 'sort_nodes',
                                lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 3):
             got_nodes = list(self.app.iter_nodes(object_ring, 0, self.logger,
-                                                 node_iter=iter(node_list)))
-        self.assertEqual(node_list[:3], got_nodes)
+                                                 node_iter=iter(node_list),
+                                                 request=None))
+        self.assertEqual(expected[:3], got_nodes)
 
+        req = Request.blank('/v1/a/c')
+        node_list = [dict(id=n, ip='1.2.3.4', port=n, device='D')
+                     for n in range(10)]
         with mock.patch.object(self.app, 'sort_nodes',
                                lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 1000000):
             got_nodes = list(self.app.iter_nodes(object_ring, 0, self.logger,
-                                                 node_iter=iter(node_list)))
-        self.assertEqual(node_list, got_nodes)
+                                                 node_iter=iter(node_list),
+                                                 request=req))
+        self.assertEqual(expected, got_nodes)
+
+    def test_iter_nodes_with_replication_network(self):
+        object_ring = self.app.get_object_ring(None)
+        node_list = [dict(id=n, ip='1.2.3.4', port=n, device='D',
+                          use_replication=False)
+                     for n in range(10)]
+        req = Request.blank(
+            '/v1/a/c', headers={'x-backend-use-replication-network': 'true'})
+        with mock.patch.object(self.app, 'sort_nodes',
+                               lambda n, *args, **kwargs: n), \
+                mock.patch.object(self.app, 'request_node_count',
+                                  lambda r: 3):
+            got_nodes = list(self.app.iter_nodes(object_ring, 0, self.logger,
+                                                 node_iter=iter(node_list),
+                                                 request=req))
+        expected = [dict(n, use_replication=True) for n in node_list]
+        self.assertEqual(expected[:3], got_nodes)
+        req = Request.blank(
+            '/v1/a/c', headers={'x-backend-use-replication-network': 'false'})
+        expected = [dict(n, use_replication=False) for n in node_list]
+        with mock.patch.object(self.app, 'sort_nodes',
+                               lambda n, *args, **kwargs: n), \
+                mock.patch.object(self.app, 'request_node_count',
+                                  lambda r: 13):
+            got_nodes = list(self.app.iter_nodes(object_ring, 0, self.logger,
+                                                 node_iter=iter(node_list),
+                                                 request=req))
+        self.assertEqual(expected, got_nodes)
 
     def test_best_response_sets_headers(self):
         controller = ReplicatedObjectController(

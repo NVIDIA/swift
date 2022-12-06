@@ -47,6 +47,7 @@ from swift.proxy.controllers.base import \
     get_container_info as _real_get_container_info
 from swift.common.storage_policy import POLICIES, ECDriverError, \
     StoragePolicy, ECStoragePolicy
+from swift.common.swob import Request
 from test.debug_logger import debug_logger
 from test.unit import (
     FakeRing, fake_http_connect, patch_policies, SlowBody, FakeStatus,
@@ -219,8 +220,10 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
 
+        for node in all_nodes:
+            node['use_replication'] = False
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1))
+            object_ring, 1, request=None))
 
         self.maxDiff = None
 
@@ -244,6 +247,8 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
 
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
+        for node in all_nodes:
+            node['use_replication'] = False
 
         # limit to the number we're going to look at in this request
         nodes_requested = self.app.request_node_count(object_ring.replicas)
@@ -267,6 +272,21 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         self.assertEqual(sorted(all_nodes, key=lambda dev: dev['id']),
                          sorted(local_first_nodes, key=lambda dev: dev['id']))
 
+        for node in all_nodes:
+            node['use_replication'] = True
+
+        req = Request.blank(
+            '/v1/a/c', headers={'x-backend-use-replication-network': 'yes'})
+        local_first_nodes = list(controller.iter_nodes_local_first(
+            object_ring, 1, request=req))
+        self.assertEqual([1] * (self.replicas() + 1), [
+            node['region'] for node in local_first_nodes[
+                :self.replicas() + 1]])
+        # we don't skip any nodes
+        self.assertEqual(len(all_nodes), len(local_first_nodes))
+        self.assertEqual(sorted(all_nodes, key=lambda dev: dev['id']),
+                         sorted(local_first_nodes, key=lambda dev: dev['id']))
+
     def test_iter_nodes_local_first_best_effort(self):
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
@@ -277,6 +297,8 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         object_ring = self.policy.object_ring
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
+        for node in all_nodes:
+            node['use_replication'] = False
 
         local_first_nodes = list(controller.iter_nodes_local_first(
             object_ring, 1))
@@ -307,6 +329,8 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         object_ring = policy.object_ring
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
+        for node in all_nodes:
+            node['use_replication'] = False
 
         local_first_nodes = list(controller.iter_nodes_local_first(
             object_ring, 1, local_handoffs_first=True))
@@ -326,12 +350,14 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         primary_nodes = object_ring.get_part_nodes(1)
         handoff_nodes_iter = object_ring.get_more_nodes(1)
         all_nodes = primary_nodes + list(handoff_nodes_iter)
+        for node in all_nodes:
+            node['use_replication'] = False
         handoff_nodes_iter = object_ring.get_more_nodes(1)
         local_handoffs = [n for n in handoff_nodes_iter if
                           policy_conf.write_affinity_is_local_fn(n)]
 
         prefered_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, local_handoffs_first=True))
+            object_ring, 1, local_handoffs_first=True, request=None))
 
         self.assertEqual(len(all_nodes), self.replicas() +
                          POLICIES.default.object_ring.max_more_nodes)
@@ -362,12 +388,16 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         primary_nodes = object_ring.get_part_nodes(1)
         handoff_nodes_iter = object_ring.get_more_nodes(1)
         all_nodes = primary_nodes + list(handoff_nodes_iter)
+        for node in all_nodes:
+            node['use_replication'] = False
         handoff_nodes_iter = object_ring.get_more_nodes(1)
         local_handoffs = [n for n in handoff_nodes_iter if
                           policy_conf.write_affinity_is_local_fn(n)]
+        for node in local_handoffs:
+            node['use_replication'] = False
 
         prefered_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, local_handoffs_first=True))
+            object_ring, 1, local_handoffs_first=True, request=None))
 
         self.assertEqual(len(all_nodes), self.replicas() +
                          POLICIES.default.object_ring.max_more_nodes)
@@ -991,7 +1021,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
 
         # finally, create the local_first_nodes iter and flatten it out
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, policy))
+            object_ring, 1, policy, request=None))
 
         # check that the required number of local nodes were moved up the order
         node_regions = [node['region'] for node in local_first_nodes]
@@ -1365,10 +1395,14 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         req, log_lines = do_test((201, (100, 500), 201))
         if six.PY3:
             # We allow the b'' in logs because we want to see bad characters.
-            self.assertIn("ERROR 500 b'' From Object Server", log_lines[0])
+            self.assertIn(
+                "ERROR 500 b'' Trying to PUT /v1/AUTH_kilroy/%ED%88%8E/"
+                "%E9%90%89 From Object Server", log_lines[0])
             self.assertIn(req.path, log_lines[0])
         else:
-            self.assertIn('ERROR 500  From Object Server', log_lines[0])
+            self.assertIn(
+                'ERROR 500  Trying to PUT /v1/AUTH_kilroy/%ED%88%8E/%E9%90%89 '
+                'From Object Server', log_lines[0])
             self.assertIn(req.path.decode('utf-8'), log_lines[0])
 
     def test_DELETE_errors(self):
@@ -2557,7 +2591,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
         safe_iter = utils.GreenthreadSafeIterator(self.app.iter_nodes(
-            self.policy.object_ring, 0, self.logger, policy=self.policy))
+            self.policy.object_ring, 0, self.logger, policy=self.policy,
+            request=None))
         controller._fragment_GET_request = lambda *a, **k: next(safe_iter)
         pile = utils.GreenAsyncPile(self.policy.ec_ndata)
         for i in range(self.policy.ec_ndata):

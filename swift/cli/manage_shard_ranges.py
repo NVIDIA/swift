@@ -168,13 +168,12 @@ from six.moves import input
 
 from swift.common.utils import Timestamp, get_logger, ShardRange, readconf, \
     ShardRangeList, non_negative_int, config_positive_int_value
-from swift.container.backend import ContainerBroker, UNSHARDED, \
-    sift_shard_ranges
+from swift.container.backend import ContainerBroker, UNSHARDED
 from swift.container.sharder import make_shard_ranges, sharding_enabled, \
     CleavingContext, process_compactible_shard_sequences, \
     find_compactible_shard_sequences, find_overlapping_ranges, \
     find_paths, rank_paths, finalize_shrinking, DEFAULT_SHARDER_CONF, \
-    ContainerSharderConf, find_paths_with_gaps
+    ContainerSharderConf, find_paths_with_gaps, combine_shard_ranges
 
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
@@ -234,8 +233,11 @@ def _proceed(args):
     elif args.yes:
         choice = 'yes'
     else:
-        choice = input('Do you want to apply these changes to the container '
-                       'DB? [yes/N]')
+        try:
+            choice = input('Do you want to apply these changes to the '
+                           'container DB? [yes/N]')
+        except (EOFError, KeyboardInterrupt):
+            choice = 'no'
     if choice != 'yes':
         print('No changes applied')
 
@@ -405,9 +407,13 @@ def delete_shard_ranges(broker, args):
             print('  - %d existing shard ranges have started sharding' %
                   [sr.state != ShardRange.FOUND
                    for sr in shard_ranges].count(True))
-        choice = input('Do you want to show the existing ranges [s], '
-                       'delete the existing ranges [yes] '
-                       'or quit without deleting [q]? ')
+        try:
+            choice = input('Do you want to show the existing ranges [s], '
+                           'delete the existing ranges [yes] '
+                           'or quit without deleting [q]? ')
+        except (EOFError, KeyboardInterrupt):
+            choice = 'q'
+
         if choice == 's':
             show_shard_ranges(broker, args)
             continue
@@ -426,27 +432,6 @@ def delete_shard_ranges(broker, args):
     broker.merge_shard_ranges(shard_ranges)
     print('Deleted %s existing shard ranges.' % len(shard_ranges))
     return EXIT_SUCCESS
-
-
-def combine_shard_ranges(new_shard_ranges, existing_shard_ranges):
-    """
-    Combines new and existing shard ranges based on most recent state.
-
-    :param new_shard_ranges: a list of ShardRange instances.
-    :param existing_shard_ranges: a list of ShardRange instances.
-    :return: a list of ShardRange instances.
-    """
-    new_shard_ranges = [dict(sr) for sr in new_shard_ranges]
-    existing_shard_ranges = [dict(sr) for sr in existing_shard_ranges]
-    to_add, to_delete = sift_shard_ranges(
-        new_shard_ranges,
-        dict((sr['name'], sr) for sr in existing_shard_ranges))
-    result = [ShardRange.from_dict(existing)
-              for existing in existing_shard_ranges
-              if existing['name'] not in to_delete]
-    result.extend([ShardRange.from_dict(sr) for sr in to_add])
-    return sorted([sr for sr in result if not sr.deleted],
-                  key=ShardRange.sort_key)
 
 
 def merge_shard_ranges(broker, args):

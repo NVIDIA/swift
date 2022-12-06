@@ -40,7 +40,7 @@ from swift.common.utils import get_logger, config_true_value, \
     Everything, config_auto_int_value, ShardRangeList, config_percent_value
 from swift.container.backend import ContainerBroker, \
     RECORD_TYPE_SHARD, UNSHARDED, SHARDING, SHARDED, COLLAPSED, \
-    SHARD_UPDATE_STATES
+    SHARD_UPDATE_STATES, sift_shard_ranges
 from swift.container.replicator import ContainerReplicator
 
 
@@ -101,7 +101,7 @@ def _find_discontinuity(paths, start):
     return longest_start_path, longest_end_path
 
 
-def find_paths_with_gaps(shard_ranges):
+def find_paths_with_gaps(shard_ranges, within_range=None):
     """
     Find gaps in the shard ranges and pairs of shard range paths that lead to
     and from those gaps. For each gap a single pair of adjacent paths is
@@ -109,6 +109,9 @@ def find_paths_with_gaps(shard_ranges):
     entire namespace with no overlaps.
 
     :param shard_ranges: a list of instances of ShardRange.
+    :param within_range: an optional ShardRange that constrains the search
+        space; the method will only return gaps within this range. The default
+        is the entire namespace.
     :return: A list of tuples of ``(start_path, gap_range, end_path)`` where
         ``start_path`` is a list of ShardRanges leading to the gap,
         ``gap_range`` is a ShardRange synthesized to describe the namespace
@@ -119,6 +122,7 @@ def find_paths_with_gaps(shard_ranges):
         namespace.
     """
     timestamp = Timestamp.now()
+    within_range = within_range or ShardRange('entire/namespace', timestamp)
     shard_ranges = ShardRangeList(shard_ranges)
     # note: find_paths results do not include shrinking ranges
     paths = find_paths(shard_ranges)
@@ -149,23 +153,60 @@ def find_paths_with_gaps(shard_ranges):
                                timestamp,
                                lower=start_path.upper,
                                upper=end_path.lower)
-        paths_with_gaps.append((start_path, gap_range, end_path))
+        if gap_range.overlaps(within_range):
+            paths_with_gaps.append((start_path, gap_range, end_path))
     return paths_with_gaps
 
 
-def find_overlapping_ranges(shard_ranges):
+def _is_parent_or_child(shard_range, other, time_period):
+    """
+    Test if shard range ``shard_range`` is the parent or a child of another
+    shard range ``other`` within past time period ``time_period``. This method
+    is limited to work only within the scope of the same user-facing account
+    (with and without shard prefix).
+
+    :param shard_range: an instance of ``ShardRange``.
+    :param other: an instance of ``ShardRange``.
+    :param time_period: the specified past time period in seconds. Value of
+        0 means all time in the past.
+    :return: True if ``shard_range`` is the parent or a child of ``other``
+        within past time period, False otherwise, assuming that they are within
+         the same account.
+    """
+    exclude_age = (time.time() - float(time_period)) if time_period > 0 else 0
+    if shard_range.is_child_of(other) and shard_range.timestamp >= exclude_age:
+        return True
+    if other.is_child_of(shard_range) and other.timestamp >= exclude_age:
+        return True
+    return False
+
+
+def find_overlapping_ranges(
+        shard_ranges, exclude_parent_child=False, time_period=0):
     """
     Find all pairs of overlapping ranges in the given list.
 
     :param shard_ranges: A list of :class:`~swift.utils.ShardRange`
+    :param exclude_parent_child: If True then overlapping pairs that have a
+        parent-child relationship within the past time period
+        ``time_period`` are excluded from the returned set. Default is
+        False.
+    :param time_period: the specified past time period in seconds. Value of
+        0 means all time in the past.
     :return: a set of tuples, each tuple containing ranges that overlap with
         each other.
     """
     result = set()
     for i, shard_range in enumerate(shard_ranges):
-        overlapping = [
-            sr for sr in shard_ranges[i + 1:]
-            if shard_range.name != sr.name and shard_range.overlaps(sr)]
+        if exclude_parent_child:
+            overlapping = [
+                sr for sr in shard_ranges[i + 1:]
+                if shard_range.name != sr.name and shard_range.overlaps(sr) and
+                not _is_parent_or_child(shard_range, sr, time_period)]
+        else:
+            overlapping = [
+                sr for sr in shard_ranges[i + 1:]
+                if shard_range.name != sr.name and shard_range.overlaps(sr)]
         if overlapping:
             overlapping.append(shard_range)
             overlapping.sort(key=ShardRange.sort_key)
@@ -495,6 +536,27 @@ def rank_paths(paths, shard_range_to_span):
 
     paths.sort(key=sort_key, reverse=True)
     return paths
+
+
+def combine_shard_ranges(new_shard_ranges, existing_shard_ranges):
+    """
+    Combines new and existing shard ranges based on most recent state.
+
+    :param new_shard_ranges: a list of ShardRange instances.
+    :param existing_shard_ranges: a list of ShardRange instances.
+    :return: a list of ShardRange instances.
+    """
+    new_shard_ranges = [dict(sr) for sr in new_shard_ranges]
+    existing_shard_ranges = [dict(sr) for sr in existing_shard_ranges]
+    to_add, to_delete = sift_shard_ranges(
+        new_shard_ranges,
+        dict((sr['name'], sr) for sr in existing_shard_ranges))
+    result = [ShardRange.from_dict(existing)
+              for existing in existing_shard_ranges
+              if existing['name'] not in to_delete]
+    result.extend([ShardRange.from_dict(sr) for sr in to_add])
+    return sorted([sr for sr in result if not sr.deleted],
+                  key=ShardRange.sort_key)
 
 
 class CleavingContext(object):
@@ -918,9 +980,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         if db_state not in (UNSHARDED, SHARDING, SHARDED):
             return
         own_shard_range = broker.get_own_shard_range()
-        if own_shard_range.state not in (
-                ShardRange.SHARDING, ShardRange.SHARDED,
-                ShardRange.SHRINKING, ShardRange.SHRUNK):
+        if own_shard_range.state not in ShardRange.CLEAVING_STATES:
             return
 
         if db_state == SHARDED:
@@ -1161,7 +1221,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         warnings = []
         own_shard_range = broker.get_own_shard_range()
 
-        if own_shard_range.state in (ShardRange.SHARDING, ShardRange.SHARDED):
+        if own_shard_range.state in ShardRange.SHARDING_STATES:
             shard_ranges = [sr for sr in broker.get_shard_ranges()
                             if sr.state != ShardRange.SHRINKING]
             paths_with_gaps = find_paths_with_gaps(shard_ranges)
@@ -1177,7 +1237,18 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                 # allow multiple shards in that state
                 continue
             shard_ranges = broker.get_shard_ranges(states=state)
-            overlaps = find_overlapping_ranges(shard_ranges)
+            # Transient overlaps can occur during the period immediately after
+            # sharding if a root learns about new child shards before it learns
+            # that the parent has sharded. These overlaps are normally
+            # corrected as an up-to-date version of the parent shard range is
+            # replicated to the root. Parent-child overlaps are therefore
+            # ignored for a reclaim age after the child was created. After
+            # that, parent-child overlaps may indicate that there is
+            # permanently stale parent shard range data, perhaps from a node
+            # that has been offline, so these are reported.
+            overlaps = find_overlapping_ranges(
+                shard_ranges, exclude_parent_child=True,
+                time_period=self.reclaim_age)
             if overlaps:
                 self._increment_stat('audit_root', 'has_overlap')
                 self._update_stat('audit_root', 'num_overlap',
@@ -1247,9 +1318,8 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                 own_shard_range = broker.get_own_shard_range()
                 if (orig_own_shard_range != own_shard_range or
                         orig_own_shard_range.state != own_shard_range.state):
-                    self.logger.info(
-                        'Updated own shard range from %s to %s',
-                        orig_own_shard_range, own_shard_range)
+                    self.logger.info('Updated own shard range from %s to %s',
+                                     orig_own_shard_range, own_shard_range)
             elif shard_range.is_child_of(own_shard_range):
                 children_shard_ranges.append(shard_range)
             else:
@@ -1264,19 +1334,70 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                               len(children_shard_ranges))
             broker.merge_shard_ranges(children_shard_ranges)
 
-        if (other_shard_ranges and
-                own_shard_range.state in ShardRange.SHRINKING_STATES):
-            # If own_shard_range state is shrinking, save off *all* shards
-            # returned because these may contain shards into which this
-            # shard is to shrink itself; shrinking is the only case when we
-            # want to learn about *other* shard ranges from the root.
-            # We need to include shrunk state too, because one replica of a
-            # shard may already have moved the own_shard_range state to
-            # shrunk while another replica may still be in the process of
-            # shrinking.
-            self.logger.debug('Updating %s other shard range(s) from root',
-                              len(other_shard_ranges))
-            broker.merge_shard_ranges(other_shard_ranges)
+        if (other_shard_ranges
+                and own_shard_range.state in ShardRange.CLEAVING_STATES
+                and not broker.is_sharded()):
+            # Other shard ranges returned from the root may need to be merged
+            # for the purposes of sharding or shrinking this shard:
+            #
+            # Shrinking states: If the up-to-date state is shrinking, the
+            # shards fetched from root may contain shards into which this shard
+            # is to shrink itself. Shrinking is initiated by modifying multiple
+            # neighboring shard range states *in the root*, rather than
+            # modifying a shard directly. We therefore need to learn about
+            # *other* neighboring shard ranges from the root, possibly
+            # including the root itself. We need to include shrunk state too,
+            # because one replica of a shard may already have moved the
+            # own_shard_range state to shrunk while another replica may still
+            # be in the process of shrinking.
+            #
+            # Sharding states: Normally a shard will shard to its own children.
+            # However, in some circumstances a shard may need to shard to other
+            # non-children sub-shards. For example, a shard range repair may
+            # cause a child sub-shard to be deleted and its namespace covered
+            # by another 'acceptor' shard.
+            #
+            # Therefore, if the up-to-date own_shard_range state indicates that
+            # sharding or shrinking is in progress, then other shard ranges
+            # will be merged, with the following caveats: we never expect a
+            # shard to shard to any ancestor shard range including the root,
+            # but containers might ultimately *shrink* to root; we never want
+            # to cleave to a container that is itself sharding or shrinking;
+            # the merged shard ranges should not result in gaps or overlaps in
+            # the namespace of this shard.
+            #
+            # Note: the search for ancestors is guaranteed to find the parent
+            # and root *if they are present*, but if any ancestor is missing
+            # then there is a chance that older generations in the
+            # other_shard_ranges will not be filtered and could be merged. That
+            # is only a problem if they are somehow still in ACTIVE state, and
+            # no overlap is detected, so the ancestor is merged.
+            ancestor_names = [
+                sr.name for sr in own_shard_range.find_ancestors(shard_ranges)]
+            filtered_other_shard_ranges = [
+                sr for sr in other_shard_ranges
+                if (sr.name not in ancestor_names
+                    and (sr.state not in ShardRange.CLEAVING_STATES
+                         or sr.deleted))
+            ]
+            if own_shard_range.state in ShardRange.SHRINKING_STATES:
+                root_shard_range = own_shard_range.find_root(
+                    other_shard_ranges)
+                if (root_shard_range and
+                        root_shard_range.state == ShardRange.ACTIVE):
+                    filtered_other_shard_ranges.append(root_shard_range)
+            existing_shard_ranges = broker.get_shard_ranges()
+            combined_shard_ranges = combine_shard_ranges(
+                filtered_other_shard_ranges, existing_shard_ranges)
+            overlaps = find_overlapping_ranges(combined_shard_ranges)
+            paths_with_gaps = find_paths_with_gaps(
+                combined_shard_ranges, own_shard_range)
+            if not (overlaps or paths_with_gaps):
+                # only merge if shard ranges appear to be *good*
+                self.logger.debug(
+                    'Updating %s other shard range(s) from root',
+                    len(filtered_other_shard_ranges))
+                broker.merge_shard_ranges(filtered_other_shard_ranges)
 
         return own_shard_range, own_shard_range_from_root
 
@@ -2170,10 +2291,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                     broker, shard_ranges=[broker.get_own_shard_range()])
 
             own_shard_range = broker.get_own_shard_range()
-            if own_shard_range.state in (ShardRange.SHARDING,
-                                         ShardRange.SHRINKING,
-                                         ShardRange.SHARDED,
-                                         ShardRange.SHRUNK):
+            if own_shard_range.state in ShardRange.CLEAVING_STATES:
                 if broker.get_shard_ranges():
                     # container has been given shard ranges rather than
                     # found them e.g. via replication or a shrink event,

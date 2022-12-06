@@ -55,7 +55,7 @@ from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_informational, is_success, is_redirection, \
     is_server_error, HTTP_OK, HTTP_PARTIAL_CONTENT, HTTP_MULTIPLE_CHOICES, \
     HTTP_BAD_REQUEST, HTTP_NOT_FOUND, HTTP_SERVICE_UNAVAILABLE, \
-    HTTP_INSUFFICIENT_STORAGE, HTTP_UNAUTHORIZED, HTTP_CONTINUE, HTTP_GONE
+    HTTP_UNAUTHORIZED, HTTP_CONTINUE, HTTP_GONE
 from swift.common.swob import Request, Response, Range, \
     HTTPException, HTTPRequestedRangeNotSatisfiable, HTTPServiceUnavailable, \
     status_map, wsgi_to_str, str_to_wsgi, wsgi_quote, wsgi_unquote, \
@@ -64,9 +64,8 @@ from swift.common.request_helpers import strip_sys_meta_prefix, \
     strip_user_meta_prefix, is_user_meta, is_sys_meta, is_sys_or_user_meta, \
     http_response_to_document_iters, is_object_transient_sysmeta, \
     strip_object_transient_sysmeta_prefix, get_ip_port, get_user_meta_prefix, \
-    get_sys_meta_prefix
+    get_sys_meta_prefix, is_use_replication_network
 from swift.common.storage_policy import POLICIES
-
 
 DEFAULT_RECHECK_ACCOUNT_EXISTENCE = 60  # seconds
 DEFAULT_RECHECK_CONTAINER_EXISTENCE = 60  # seconds
@@ -1499,15 +1498,9 @@ class GetOrHeadHandler(object):
                 ts = Timestamp(hdrs.get('X-Backend-Timestamp', 0))
                 if ts > self.latest_404_timestamp:
                     self.latest_404_timestamp = ts
-            if possible_source.status == HTTP_INSUFFICIENT_STORAGE:
-                self.app.error_limit(node, 'ERROR Insufficient Storage')
-            elif is_server_error(possible_source.status):
-                self.app.error_occurred(
-                    node, ('ERROR %(status)d %(body)s '
-                           'From %(type)s Server') %
-                    {'status': possible_source.status,
-                     'body': self.bodies[-1][:1024],
-                     'type': self.server_type})
+            self.app.check_response(node, self.server_type, possible_source,
+                                    self.req_method, self.path,
+                                    self.bodies[-1])
         return False
 
     def _get_source_and_node(self):
@@ -1644,15 +1637,18 @@ class NodeIter(object):
         want to filter or reorder the nodes.
     :param policy: an instance of :class:`BaseStoragePolicy`. This should be
         None for an account or container ring.
-    :param logger: a logger instance; defaults to the app logger
+    :param request: if, and only if, a ``request`` is given then yielded nodes
+        will be annotated with a ``use_replication = True|False`` item based
+        on the ``request`` headers
     """
 
     def __init__(self, app, ring, partition, logger, node_iter=None,
-                 policy=None):
+                 policy=None, request=None):
         self.app = app
         self.ring = ring
         self.partition = partition
         self.logger = logger
+        self.request = request
 
         part_nodes = ring.get_part_nodes(partition)
         if node_iter is None:
@@ -1733,13 +1729,27 @@ class NodeIter(object):
                     if self.nodes_left <= 0:
                         return
 
+    def _annotate_node(self, node):
+        """
+        Helper function to set use_replication dict value for a node by looking
+        up the header value for x-backend-use-replication-network.
+
+        :param node: node dictionary from the ring or node_iter.
+        :returns: node dictionary with replication network enabled/disabled
+        """
+        # nodes may have come from a ring or a node_iter passed to the
+        # constructor: be careful not to mutate them!
+        return dict(node, use_replication=is_use_replication_network(
+            self.request.headers if self.request else None))
+
     def next(self):
+        node = None
         if self._node_provider:
             # give node provider the opportunity to inject a node
             node = self._node_provider()
-            if node:
-                return node
-        return next(self._node_iter)
+        if not node:
+            node = next(self._node_iter)
+        return self._annotate_node(node)
 
     def __next__(self):
         return self.next()
@@ -1942,21 +1952,12 @@ class Controller(object):
                         conn.send(body)
                 with Timeout(self.app.node_timeout):
                     resp = conn.getresponse()
-                    if not is_informational(resp.status) and \
-                            not is_server_error(resp.status):
+                    if (self.app.check_response(node, self.server_type, resp,
+                                                method, path)
+                            and not is_informational(resp.status)):
                         return resp.status, resp.reason, resp.getheaders(), \
                             resp.read()
-                    elif resp.status == HTTP_INSUFFICIENT_STORAGE:
-                        self.app.error_limit(node,
-                                             'ERROR Insufficient Storage')
-                    elif is_server_error(resp.status):
-                        msg = ('ERROR %(status)d Trying to '
-                               '%(method)s %(path)s From %(type)s Server')
-                        self.app.error_occurred(node, msg % {
-                            'status': resp.status,
-                            'method': method,
-                            'path': path,
-                            'type': self.server_type})
+
             except (Exception, Timeout):
                 self.app.exception_occurred(
                     node, self.server_type,
@@ -1987,7 +1988,8 @@ class Controller(object):
         :returns: a swob.Response object
         """
         nodes = GreenthreadSafeIterator(
-            node_iterator or self.app.iter_nodes(ring, part, self.logger)
+            node_iterator or self.app.iter_nodes(ring, part, self.logger,
+                                                 request=req)
         )
         node_number = node_count or len(ring.get_part_nodes(part))
         pile = GreenAsyncPile(node_number)
