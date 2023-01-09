@@ -35,14 +35,19 @@
     - name: install python modules with pip
       pip: name={{ item }} state=present extra_args='--upgrade'
       with_items:
-        - crudini
-        - eventlet
-        - nose
-        - pyeclib
-        - python-swiftclient
         # For some reason, pip on py2 isn't smart enough to prevent us
-        # trying to install a too-new mock??
+        # trying to install a too-new mock or attrs??
         - 'mock<4'
+        - 'attrs<22.1.0'
+        # crudini pulls in iniparse which can conflict with distro-installed
+        # packages on centos7
+        - 'crudini<0.9.4'
+        # Order matters; install constrained versions *first*, then unconstrained
+        - eventlet
+        - pyeclib
+        - pytest
+        - pytest-cov
+        - python-swiftclient
         # this is duplicated from test-requirements.txt
         - 'boto3>=1.9'
 
