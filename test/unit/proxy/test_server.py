@@ -71,7 +71,7 @@ from swift.common import utils, constraints, registry
 from swift.common.utils import hash_path, storage_directory, \
     parse_content_type, parse_mime_headers, StatsdClient, \
     iter_multipart_mime_documents, public, mkdirs, NullLogger, md5, \
-    node_to_string
+    node_to_string, NamespaceBoundList
 from swift.common.wsgi import loadapp, ConfigString
 from swift.common.http_protocol import SwiftHttpProtocol
 from swift.proxy.controllers import base as proxy_base
@@ -4368,13 +4368,17 @@ class TestReplicatedObjectController(
                 params={'states': 'updating'},
                 headers={'X-Backend-Record-Type': 'shard'})
 
-            cache_key = 'shard-updating/a/c'
+            cache_key = 'shard-updating-v2/a/c'
             self.assertIn(cache_key, req.environ['swift.cache'].store)
-            self.assertEqual(req.environ['swift.cache'].store[cache_key],
-                             [dict(sr) for sr in shard_ranges])
+            cached_namespaces = NamespaceBoundList.from_namespaces(
+                shard_ranges)
+            self.assertEqual(
+                req.environ['swift.cache'].store[cache_key],
+                cached_namespaces.bounds)
             self.assertIn(cache_key, req.environ.get('swift.infocache'))
-            self.assertEqual(req.environ['swift.infocache'][cache_key],
-                             tuple(dict(sr) for sr in shard_ranges))
+            self.assertEqual(
+                req.environ['swift.infocache'][cache_key].bounds,
+                cached_namespaces.bounds)
 
             # make sure backend requests included expected container headers
             container_headers = {}
@@ -4431,8 +4435,11 @@ class TestReplicatedObjectController(
                     '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
             ]
             cache = FakeMemcache()
-            cache.set('shard-updating/a/c', tuple(
-                dict(shard_range) for shard_range in shard_ranges))
+            cache.set(
+                'shard-updating-v2/a/c',
+                tuple(
+                    shard_range.lower_bound_in_list()
+                    for shard_range in shard_ranges))
             req = Request.blank('/v1/a/c/o', {'swift.cache': cache},
                                 method=method, body='',
                                 headers={'Content-Type': 'text/plain'})
@@ -4465,10 +4472,11 @@ class TestReplicatedObjectController(
                 container_request, method='HEAD', path='/sda/0/a/c')
 
             # infocache gets populated from memcache
-            cache_key = 'shard-updating/a/c'
+            cache_key = 'shard-updating-v2/a/c'
             self.assertIn(cache_key, req.environ.get('swift.infocache'))
-            self.assertEqual(req.environ['swift.infocache'][cache_key],
-                             tuple(dict(sr) for sr in shard_ranges))
+            self.assertEqual(
+                req.environ['swift.infocache'][cache_key].bounds,
+                NamespaceBoundList.from_namespaces(shard_ranges).bounds)
 
             # make sure backend requests included expected container headers
             container_headers = {}
@@ -4525,8 +4533,8 @@ class TestReplicatedObjectController(
                     '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
             ]
             infocache = {
-                'shard-updating/a/c':
-                tuple(dict(shard_range) for shard_range in shard_ranges)}
+                'shard-updating-v2/a/c':
+                NamespaceBoundList.from_namespaces(shard_ranges)}
             req = Request.blank('/v1/a/c/o', {'swift.infocache': infocache},
                                 method=method, body='',
                                 headers={'Content-Type': 'text/plain'})
@@ -4558,10 +4566,11 @@ class TestReplicatedObjectController(
                 container_request, method='HEAD', path='/sda/0/a/c')
 
             # verify content in infocache.
-            cache_key = 'shard-updating/a/c'
+            cache_key = 'shard-updating-v2/a/c'
             self.assertIn(cache_key, req.environ.get('swift.infocache'))
-            self.assertEqual(req.environ['swift.infocache'][cache_key],
-                             tuple(dict(sr) for sr in shard_ranges))
+            self.assertEqual(
+                req.environ['swift.infocache'][cache_key].bounds,
+                NamespaceBoundList.from_namespaces(shard_ranges).bounds)
 
             # make sure backend requests included expected container headers
             container_headers = {}
@@ -4619,8 +4628,9 @@ class TestReplicatedObjectController(
                     '.shards_a/c_no_way', utils.Timestamp.now(), 'u', ''),
             ]
             cache = FakeMemcache()
-            cache.set('shard-updating/a/c', tuple(
-                dict(shard_range) for shard_range in cached_shard_ranges))
+            cache.set(
+                'shard-updating-v2/a/c',
+                tuple(sr.lower_bound_in_list() for sr in cached_shard_ranges))
 
             # sanity check: we can get the old shard from cache
             req = Request.blank(
@@ -4634,7 +4644,7 @@ class TestReplicatedObjectController(
                             'x-backend-sharding-state': sharding_state,
                             'X-Backend-Record-Type': 'shard'}
             with mock.patch('random.random', return_value=1), \
-                 mocked_http_conn(*status_codes, headers=resp_headers):
+                    mocked_http_conn(*status_codes, headers=resp_headers):
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
@@ -4644,13 +4654,17 @@ class TestReplicatedObjectController(
                               'object.shard_updating.cache.hit': 1}, stats)
 
             # cached shard ranges are still there
-            cache_key = 'shard-updating/a/c'
+            cache_key = 'shard-updating-v2/a/c'
             self.assertIn(cache_key, req.environ['swift.cache'].store)
-            self.assertEqual(req.environ['swift.cache'].store[cache_key],
-                             [dict(sr) for sr in cached_shard_ranges])
+            cached_namespaces = NamespaceBoundList.from_namespaces(
+                cached_shard_ranges)
+            self.assertEqual(
+                req.environ['swift.cache'].store[cache_key],
+                cached_namespaces.bounds)
             self.assertIn(cache_key, req.environ.get('swift.infocache'))
-            self.assertEqual(req.environ['swift.infocache'][cache_key],
-                             tuple(dict(sr) for sr in cached_shard_ranges))
+            self.assertEqual(
+                req.environ['swift.infocache'][cache_key].bounds,
+                cached_namespaces.bounds)
 
             # ...but we have some chance to skip cache
             req = Request.blank(
@@ -4673,8 +4687,8 @@ class TestReplicatedObjectController(
                 dict(shard_range)
                 for shard_range in shard_ranges]).encode('ascii')
             with mock.patch('random.random', return_value=0), \
-                 mocked_http_conn(*status_codes, headers=resp_headers,
-                                  body=body) as fake_conn:
+                mocked_http_conn(*status_codes, headers=resp_headers,
+                                 body=body) as fake_conn:
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
@@ -4696,13 +4710,17 @@ class TestReplicatedObjectController(
                 headers={'X-Backend-Record-Type': 'shard'})
 
             # and skipping cache will refresh it
-            cache_key = 'shard-updating/a/c'
+            cache_key = 'shard-updating-v2/a/c'
             self.assertIn(cache_key, req.environ['swift.cache'].store)
-            self.assertEqual(req.environ['swift.cache'].store[cache_key],
-                             [dict(sr) for sr in shard_ranges])
+            cached_namespaces = NamespaceBoundList.from_namespaces(
+                shard_ranges)
+            self.assertEqual(
+                req.environ['swift.cache'].store[cache_key],
+                cached_namespaces.bounds)
             self.assertIn(cache_key, req.environ.get('swift.infocache'))
-            self.assertEqual(req.environ['swift.infocache'][cache_key],
-                             tuple(dict(sr) for sr in shard_ranges))
+            self.assertEqual(
+                req.environ['swift.infocache'][cache_key].bounds,
+                cached_namespaces.bounds)
 
             # make sure backend requests included expected container headers
             container_headers = {}
@@ -4803,7 +4821,7 @@ class TestReplicatedObjectController(
                 headers={'X-Backend-Record-Type': 'shard'})
 
             # infocache does not get populated from memcache
-            cache_key = 'shard-updating/a/c'
+            cache_key = 'shard-updating-v2/a/c'
             self.assertNotIn(cache_key, req.environ.get('swift.infocache'))
 
             # make sure backend requests included expected container headers
