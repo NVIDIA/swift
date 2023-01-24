@@ -4255,8 +4255,7 @@ class TestReplicatedObjectController(
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
             self.assertEqual(
-                {'container.shard_listing.cache.disabled.200': 2,
-                 'object.shard_updating.cache.disabled.200': 1},
+                {'object.shard_updating.cache.disabled.200': 1},
                 stats)
             backend_requests = fake_conn.requests
             # verify statsd prefix is not mutated
@@ -4353,7 +4352,6 @@ class TestReplicatedObjectController(
             stats = self.app.logger.get_increment_counts()
             self.assertEqual({'account.info.cache.miss': 1,
                               'container.info.cache.miss': 1,
-                              'container.shard_listing.cache.disabled.200': 2,
                               'object.shard_updating.cache.miss.200': 1},
                              stats)
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
@@ -4555,8 +4553,7 @@ class TestReplicatedObjectController(
             # verify request hitted infocache.
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.get_increment_counts()
-            self.assertEqual({'container.shard_listing.cache.disabled.200': 1,
-                              'object.shard_updating.infocache.hit': 1}, stats)
+            self.assertEqual({'object.shard_updating.infocache.hit': 1}, stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
@@ -4695,7 +4692,6 @@ class TestReplicatedObjectController(
                               'account.info.cache.hit': 1,
                               'container.info.cache.miss': 1,
                               'container.info.cache.hit': 1,
-                              'container.shard_listing.cache.disabled.200': 2,
                               'object.shard_updating.cache.skip.200': 1,
                               'object.shard_updating.cache.hit': 1}, stats)
             # verify statsd prefix is not mutated
@@ -4759,7 +4755,6 @@ class TestReplicatedObjectController(
                 'account.info.cache.miss': 1,
                 'container.info.cache.hit': 2,
                 'container.info.cache.miss': 1,
-                'container.shard_listing.cache.disabled.200': 3,
                 'object.shard_updating.cache.skip.200': 1,
                 'object.shard_updating.cache.hit': 1,
                 'object.shard_updating.cache.error.200': 1})
@@ -10097,32 +10092,6 @@ class TestContainerController(unittest.TestCase):
                                     environ={'REQUEST_METHOD': meth})
                 resp = getattr(controller, meth)(req)
                 self.assertEqual(resp.status_int, 404)
-
-    def test_put_locking(self):
-
-        class MockMemcache(FakeMemcache):
-
-            def __init__(self, allow_lock=None):
-                self.allow_lock = allow_lock
-                super(MockMemcache, self).__init__()
-
-            @contextmanager
-            def soft_lock(self, key, timeout=0, retries=5):
-                if self.allow_lock:
-                    yield True
-                else:
-                    raise NotImplementedError
-
-        with save_globals():
-            controller = proxy_server.ContainerController(self.app, 'account',
-                                                          'container')
-            self.app.memcache = MockMemcache(allow_lock=True)
-            set_http_connect(200, 201, 201, 201,
-                             missing_container=True)
-            req = Request.blank('/v1/a/c', environ={'REQUEST_METHOD': 'PUT'})
-            self.app.update_request(req)
-            res = controller.PUT(req)
-            self.assertEqual(res.status_int, 201)
 
     def test_error_limiting(self):
         with save_globals():

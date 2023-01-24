@@ -2619,7 +2619,7 @@ class TestContainerController(TestRingBase):
         self.assertEqual(
             [x[0][0] for x in self.logger.logger.log_dict['increment']],
             ['container.info.cache.miss',
-             'container.shard_listing.cache.miss.200'])
+             'container.shard_listing.cache.bypass.200'])
 
         # container is sharded and proxy has that state cached, but
         # no shard ranges cached; expect a cache miss and write-back
@@ -3064,7 +3064,7 @@ class TestContainerController(TestRingBase):
         self.assertEqual('sharded',
                          self.memcache.calls[2][1][1]['sharding_state'])
         self.assertEqual({'container.info.cache.miss': 1,
-                          'container.shard_listing.cache.miss.200': 1},
+                          'container.shard_listing.cache.bypass.200': 1},
                          self.logger.get_increment_counts())
         return resp
 
@@ -3331,7 +3331,7 @@ class TestContainerController(TestRingBase):
         self.assertEqual(resp.headers.get('X-Backend-Sharding-State'),
                          self.memcache.calls[1][1][1]['sharding_state'])
         self.assertEqual({'container.info.cache.miss': 1,
-                          'container.shard_listing.cache.miss.200': 1},
+                          'container.shard_listing.cache.bypass.200': 1},
                          self.logger.get_increment_counts())
         self.memcache.delete_all()
 

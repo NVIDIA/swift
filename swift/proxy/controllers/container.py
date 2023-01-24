@@ -270,6 +270,9 @@ class ContainerController(Controller):
             # sharded, but we assume info was correct and increment the failure
             # metrics.
             should_record = True
+        # else:
+        #  The request failed, but in the absence of info we cannot assume
+        #  the container is sharded, so we don't increment the metric.
 
         if should_record:
             record_cache_op_metrics(
@@ -287,14 +290,18 @@ class ContainerController(Controller):
                 'Skipping shard cache lookup (x-newest) for %s', req.path_qs)
         elif (headers and info and is_success(info['status']) and
                 info.get('sharding_state') == 'sharded'):
-            # container is sharded so we may have the shard ranges cached;
-            # only use cached values if all required backend headers available
+            # container is sharded so we may have the shard ranges cached; only
+            # use cached values if all required backend headers available.
             resp, cache_state = self._get_shard_ranges_from_cache(req, headers)
             if resp:
                 return resp, cache_state
         else:
-            cache_state = 'miss'
-        # The request was not fulfilled from cache so send to backend server
+            # container metadata didn't support a cache lookup, this could be
+            # the case that container metadata was not in cache and we don't
+            # know if the container was sharded, or the case that the sharding
+            # state in metadata indicates the container was unsharded.
+            cache_state = 'bypass'
+        # The request was not fulfilled from cache so send to backend server.
         return self._get_shard_ranges_from_backend(req), cache_state
 
     def GETorHEAD(self, req):
@@ -339,6 +346,7 @@ class ContainerController(Controller):
             info = None
             may_get_listing_shards = False
 
+        sr_cache_state = None
         if (may_get_listing_shards and
                 self.app.recheck_listing_shard_ranges > 0
                 and memcache
@@ -349,14 +357,17 @@ class ContainerController(Controller):
             # to the proxy (it is used from sharder to container servers) but
             # it is included in the conditions just in case because we don't
             # cache deleted shard ranges.
-            resp, cache_state = self._GET_using_cache(req, info)
+            resp, sr_cache_state = self._GET_using_cache(req, info)
         else:
             resp = self._GETorHEAD_from_backend(req)
-            cache_state = 'disabled'
+            if may_get_listing_shards and (
+                    not self.app.recheck_listing_shard_ranges or not memcache):
+                sr_cache_state = 'disabled'
 
         resp_record_type = resp.headers.get('X-Backend-Record-Type', '')
-        self._record_shard_listing_cache_metrics(
-            cache_state, resp, resp_record_type, info)
+        if sr_cache_state:
+            self._record_shard_listing_cache_metrics(
+                sr_cache_state, resp, resp_record_type, info)
 
         if all((req.method == "GET", record_type == 'auto',
                resp_record_type.lower() == 'shard')):
