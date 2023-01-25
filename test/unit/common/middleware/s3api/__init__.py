@@ -93,7 +93,7 @@ class S3ApiTestCase(unittest.TestCase):
         # note: self.conf has no __file__ key so check_pipeline will be skipped
         # when constructing self.s3api
         self.s3api = filter_factory({}, **self.conf)(self.app)
-        self.logger = self.s3api.logger = self.swift.logger = debug_logger()
+        self.s3api.logger = self.swift.logger = debug_logger()
 
         self.swift.register('HEAD', '/v1/AUTH_test',
                             swob.HTTPOk, {}, None)
