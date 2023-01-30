@@ -916,6 +916,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         self.stats['sharding'] = defaultdict(lambda: defaultdict(int))
         self.sharding_candidates = []
         self.shrinking_candidates = []
+        self.big_candidates = []
 
     def _append_stat(self, category, key, value):
         if not self.stats['sharding'][category][key]:
@@ -985,6 +986,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             # tool is used with the current max_shrinking, max_expanding
             # settings.
             shrink_candidate['compactible_ranges'] = compactible_ranges
+            shrink_candidate.update(self._get_state_count(broker))
             self.shrinking_candidates.append(shrink_candidate)
 
     def _transform_candidate_stats(self, category, candidates, sort_keys):
@@ -994,6 +996,18 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             category['top'] = candidates[:self.recon_candidates_limit]
         else:
             category['top'] = candidates
+
+    def _get_state_count(self, broker):
+        states = [ShardRange.FOUND, ShardRange.CREATED,
+                  ShardRange.CLEAVED, ShardRange.ACTIVE,
+                  ShardRange.SHRINKING]
+        shard_ranges = broker.get_shard_ranges(states=states)
+        state_count = {}
+        for state in states:
+            state_count[ShardRange.STATES[state]] = 0
+        for shard_range in shard_ranges:
+            state_count[shard_range.state_text] += 1
+        return state_count
 
     def _record_sharding_progress(self, broker, node, error):
         db_state = broker.get_db_state()
@@ -1018,14 +1032,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         info = self._make_stats_info(broker, node, own_shard_range)
         info['state'] = own_shard_range.state_text
         info['db_state'] = broker.get_db_state()
-        states = [ShardRange.FOUND, ShardRange.CREATED,
-                  ShardRange.CLEAVED, ShardRange.ACTIVE]
-        shard_ranges = broker.get_shard_ranges(states=states)
-        state_count = {}
-        for state in states:
-            state_count[ShardRange.STATES[state]] = 0
-        for shard_range in shard_ranges:
-            state_count[shard_range.state_text] += 1
+        state_count = self._get_state_count(broker)
         info.update(state_count)
         info['error'] = error and str(error)
         self._append_stat('sharding_in_progress', 'all', info)
@@ -1081,6 +1088,11 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         category = self.stats['sharding']['shrinking_candidates']
         self._transform_candidate_stats(category, self.shrinking_candidates,
                                         sort_keys=('compactible_ranges',))
+
+        # And now track the biggest
+        category = self.stats['sharding']['biggest_candidates']
+        self._transform_candidate_stats(category, self.big_candidates,
+                                        sort_keys=('active',))
 
         dump_recon_cache(
             {'sharding_stats': self.stats,
@@ -1235,7 +1247,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         put_timestamp = put_timestamp if initialized else None
         return part, shard_broker, node['id'], put_timestamp
 
-    def _audit_root_container(self, broker):
+    def _audit_root_container(self, broker, node):
         # This is the root container, and therefore the tome of knowledge,
         # all we can do is check there is nothing screwy with the ranges
         self._increment_stat('audit_root', 'attempted')
@@ -1281,6 +1293,24 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                 warnings.append(
                     'overlapping ranges in state %r: %s' %
                     (ShardRange.STATES[state], all_overlaps))
+
+            # Collect the biggest root container on a cycle
+            if state == ShardRange.ACTIVE:
+                if len(self.big_candidates) >= self.recon_candidates_limit:
+                    if self.big_candidates[-1]['active'] < len(shard_ranges):
+                        self.big_candidates[-1] = self._make_stats_info(
+                            broker, node, own_shard_range)
+                        self.big_candidates[-1].update(
+                            self._get_state_count(broker))
+                        self.big_candidates.sort(key=itemgetter("active"),
+                                                 reverse=True)
+                else:
+                    self.big_candidates.append(self._make_stats_info(
+                        broker, node, own_shard_range))
+                    self.big_candidates[-1].update(
+                        self._get_state_count(broker))
+                    self.big_candidates.sort(key=itemgetter("active"),
+                                             reverse=True)
 
         # We've seen a case in production where the roots own_shard_range
         # epoch is reset to None, and state set to ACTIVE (like re-defaulted)
@@ -1509,7 +1539,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             if is_done or is_stale:
                 context.delete(broker)
 
-    def _audit_container(self, broker):
+    def _audit_container(self, broker, node):
         if broker.is_deleted():
             if broker.is_old_enough_to_reclaim(time.time(), self.reclaim_age) \
                     and not broker.is_empty_enough_to_reclaim():
@@ -1522,7 +1552,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             return True
         self._audit_cleave_contexts(broker)
         if broker.is_root_container():
-            return self._audit_root_container(broker)
+            return self._audit_root_container(broker, node)
         return self._audit_shard_container(broker)
 
     def yield_objects(self, broker, src_shard_range, since_row=None,
@@ -2322,7 +2352,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                           quote(broker.path), state,
                           ' (deleted)' if is_deleted else '')
 
-        if not self._audit_container(broker):
+        if not self._audit_container(broker, node):
             return
 
         # now look and deal with misplaced objects.
