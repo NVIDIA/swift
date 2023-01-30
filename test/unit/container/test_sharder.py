@@ -484,6 +484,7 @@ class TestSharder(BaseTestSharder):
                          sharder.logger.get_stats_counts())
 
     def test_run_forever(self):
+        self.maxDiff = None
         conf = {'recon_cache_path': self.tempdir,
                 'devices': self.tempdir}
         with self._mock_sharder(conf) as sharder:
@@ -510,6 +511,7 @@ class TestSharder(BaseTestSharder):
                 'audit_root': {'attempted': 5, 'success': 4, 'failure': 1,
                                'num_overlap': 0, "has_overlap": 0},
                 'audit_shard': {'attempted': 2, 'success': 2, 'failure': 0},
+                'biggest_candidates': {'found': 0, 'top': []},
             }
             # NB these are time increments not absolute times...
             fake_periods = [1, 2, 3, 3600, 4, 15, 15, 0]
@@ -803,6 +805,7 @@ class TestSharder(BaseTestSharder):
                          'path': brokers[0].db_file, 'root': 'a/c0',
                          'node_index': 0,
                          'found': 1, 'created': 2, 'cleaved': 1, 'active': 1,
+                         'shrinking': 0,
                          'state': 'sharding', 'db_state': 'unsharded',
                          'error': None},
                         {'object_count': 10, 'account': 'a', 'container': 'c1',
@@ -811,6 +814,7 @@ class TestSharder(BaseTestSharder):
                          'path': brokers[1].db_file, 'root': 'a/c1',
                          'node_index': 1,
                          'found': 0, 'created': 2, 'cleaved': 1, 'active': 2,
+                         'shrinking': 0,
                          'state': 'sharding', 'db_state': 'unsharded',
                          'error': 'kapow!'}]}
             self._assert_stats(
@@ -863,6 +867,7 @@ class TestSharder(BaseTestSharder):
                          'path': brokers[0].db_file, 'root': 'a/c0',
                          'node_index': 0,
                          'found': 1, 'created': 0, 'cleaved': 3, 'active': 1,
+                         'shrinking': 0,
                          'state': 'sharding', 'db_state': 'sharding',
                          'error': None},
                         {'object_count': 0, 'account': 'a', 'container': 'c1',
@@ -871,6 +876,7 @@ class TestSharder(BaseTestSharder):
                          'path': brokers[1].db_file, 'root': 'a/c1',
                          'node_index': 1,
                          'found': 0, 'created': 2, 'cleaved': 1, 'active': 2,
+                         'shrinking': 0,
                          'state': 'sharding', 'db_state': 'unsharded',
                          'error': None}]}
             self._assert_stats(
@@ -903,6 +909,7 @@ class TestSharder(BaseTestSharder):
                          'path': brokers[0].db_file, 'root': 'a/c0',
                          'node_index': 0,
                          'found': 0, 'created': 0, 'cleaved': 4, 'active': 1,
+                         'shrinking': 0,
                          'state': 'sharded', 'db_state': 'sharded',
                          'error': None},
                         {'object_count': 0, 'account': 'a', 'container': 'c1',
@@ -911,6 +918,7 @@ class TestSharder(BaseTestSharder):
                          'path': brokers[1].db_file, 'root': 'a/c1',
                          'node_index': 1,
                          'found': 0, 'created': 2, 'cleaved': 1, 'active': 2,
+                         'shrinking': 0,
                          'state': 'sharding', 'db_state': 'unsharded',
                          'error': None}]}
             self._assert_stats(
@@ -945,6 +953,7 @@ class TestSharder(BaseTestSharder):
                          'path': brokers[1].db_file, 'root': 'a/c1',
                          'node_index': 1,
                          'found': 0, 'created': 2, 'cleaved': 1, 'active': 2,
+                         'shrinking': 0,
                          'state': 'sharding', 'db_state': 'unsharded',
                          'error': None}]}
             self._assert_stats(
@@ -5675,7 +5684,7 @@ class TestSharder(BaseTestSharder):
         with self._mock_sharder() as sharder:
             with mock.patch.object(
                     sharder, '_audit_shard_container') as mocked:
-                sharder._audit_container(broker)
+                sharder._audit_container(broker, {})
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
         self.assertFalse(sharder.logger.get_lines_for_level('error'))
         self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0},
@@ -5690,7 +5699,7 @@ class TestSharder(BaseTestSharder):
         with self._mock_sharder() as sharder:
             with mock.patch.object(
                     sharder, '_audit_shard_container') as mocked:
-                sharder._audit_container(broker)
+                sharder._audit_container(broker, {})
         lines = sharder.logger.get_lines_for_level('warning')
 
         self.assertIn("own_shard_range reset to None should be %s"
@@ -5704,7 +5713,7 @@ class TestSharder(BaseTestSharder):
         with self._mock_sharder() as sharder:
             with mock.patch.object(
                     sharder, '_audit_shard_container') as mocked:
-                sharder._audit_container(broker)
+                sharder._audit_container(broker, {})
         self._assert_stats(expected_stats, sharder, 'audit_root')
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
         self.assertFalse(sharder.logger.get_lines_for_level('error'))
@@ -5734,7 +5743,7 @@ class TestSharder(BaseTestSharder):
             with self._mock_sharder() as sharder:
                 with mock.patch.object(
                         sharder, '_audit_shard_container') as mocked:
-                    sharder._audit_container(broker)
+                    sharder._audit_container(broker, {})
             lines = sharder.logger.get_lines_for_level('warning')
             assert_overlap_warning(lines[0], state_text)
             self.assertFalse(lines[1:])
@@ -5749,7 +5758,7 @@ class TestSharder(BaseTestSharder):
         with self._mock_sharder() as sharder:
             with mock.patch.object(
                     sharder, '_audit_shard_container') as mocked:
-                sharder._audit_container(broker)
+                sharder._audit_container(broker, {})
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
         self.assertFalse(sharder.logger.get_lines_for_level('error'))
         self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0,
@@ -5766,7 +5775,7 @@ class TestSharder(BaseTestSharder):
             with self._mock_sharder() as sharder:
                 with mock.patch.object(
                         sharder, '_audit_shard_container') as mocked:
-                    sharder._audit_container(broker)
+                    sharder._audit_container(broker, {})
             self.assertFalse(sharder.logger.get_lines_for_level('warning'))
             self.assertFalse(sharder.logger.get_lines_for_level('error'))
             self._assert_stats({'attempted': 1, 'success': 1, 'failure': 0,
@@ -5795,7 +5804,7 @@ class TestSharder(BaseTestSharder):
                 with self._mock_sharder() as sharder:
                     with mock.patch.object(
                             sharder, '_audit_shard_container') as mocked:
-                        sharder._audit_container(broker)
+                        sharder._audit_container(broker, {})
                 lines = sharder.logger.get_lines_for_level('warning')
                 assert_missing_warning(lines[0])
                 assert_overlap_warning(lines[0], 'active')
@@ -5814,6 +5823,122 @@ class TestSharder(BaseTestSharder):
             timestamp=next(self.ts_iter))
         broker.merge_shard_ranges(shrinking_shard_ranges)
         check_missing()
+
+    def test_audit_root_container_adds_biggest_shards(self):
+        brokers = [self._make_broker(container="c-%d" % c)
+                   for c in range(10)]
+        active_sizes = (2, 10, 5, 8, 4, 11, 7, 3, 8, 9)
+
+        # set the different broker active shard sizes
+        for broker, active_size in zip(brokers, active_sizes):
+            shard_bounds = [
+                (str(x), str(y)) for x, y in zip(
+                    [''] + list(range(active_size - 1)),
+                    list(range(active_size - 1)) + [''])]
+            shard_ranges = self._make_shard_ranges(
+                shard_bounds, ShardRange.ACTIVE, timestamp=next(self.ts_iter))
+            broker.merge_shard_ranges(shard_ranges)
+
+        expected_stats = {'attempted': 10, 'success': 10, 'failure': 0,
+                          'has_overlap': 0, 'num_overlap': 0}
+        expected_brokers = [brokers[5], brokers[1], brokers[9], brokers[3],
+                            brokers[8]]
+        conf = {'recon_cache_path': self.tempdir}
+        with self._mock_sharder(conf=conf) as sharder:
+            with mock.patch.object(
+                    sharder, '_audit_shard_container') as mocked:
+                for broker in brokers:
+                    sharder._audit_container(broker, {})
+        self._assert_stats(expected_stats, sharder, 'audit_root')
+        self.assertFalse(sharder.logger.get_lines_for_level('warning'))
+        self.assertFalse(sharder.logger.get_lines_for_level('error'))
+        mocked.assert_not_called()
+
+        for candidate, exp_broker in zip(sharder.big_candidates,
+                                         expected_brokers):
+            self.assertEqual(candidate['account'], exp_broker.account)
+            self.assertEqual(candidate['container'], exp_broker.container)
+            self.assertEqual(candidate['active'],
+                             len(exp_broker.get_shard_ranges(
+                                 states=[ShardRange.ACTIVE])))
+            self.assertEqual(candidate['path'], exp_broker.db_file)
+
+        expected_recon = {
+            'found': 5,
+            'top': [
+                {
+                    'account': 'a',
+                    'container': 'c-5',
+                    'file_size': mock.ANY,
+                    'meta_timestamp': mock.ANY,
+                    'node_index': None,
+                    'object_count': 0,
+                    'path': mock.ANY,
+                    'root': 'a/c-5',
+                    'found': 0,
+                    'created': 0,
+                    'cleaved': 0,
+                    'active': 11,
+                    'shrinking': 0},
+                {
+                    'account': 'a',
+                    'container': 'c-1',
+                    'file_size': mock.ANY,
+                    'meta_timestamp': mock.ANY,
+                    'node_index': None,
+                    'object_count': 0,
+                    'path': mock.ANY,
+                    'root': 'a/c-1',
+                    'found': 0,
+                    'created': 0,
+                    'cleaved': 0,
+                    'active': 10,
+                    'shrinking': 0},
+                {
+                    'account': 'a',
+                    'container': 'c-9',
+                    'file_size': mock.ANY,
+                    'meta_timestamp': mock.ANY,
+                    'node_index': None,
+                    'object_count': 0,
+                    'path': mock.ANY,
+                    'root': 'a/c-9',
+                    'found': 0,
+                    'created': 0,
+                    'cleaved': 0,
+                    'active': 9,
+                    'shrinking': 0},
+                {
+                    'account': 'a',
+                    'container': 'c-3',
+                    'file_size': mock.ANY,
+                    'meta_timestamp': mock.ANY,
+                    'node_index': None,
+                    'object_count': 0,
+                    'path': mock.ANY,
+                    'root': 'a/c-3',
+                    'found': 0,
+                    'created': 0,
+                    'cleaved': 0,
+                    'active': 8,
+                    'shrinking': 0},
+                {
+                    'account': 'a',
+                    'container': 'c-8',
+                    'file_size': mock.ANY,
+                    'meta_timestamp': mock.ANY,
+                    'node_index': None,
+                    'object_count': 0,
+                    'path': mock.ANY,
+                    'root': 'a/c-8',
+                    'found': 0,
+                    'created': 0,
+                    'cleaved': 0,
+                    'active': 8,
+                    'shrinking': 0}]}
+        sharder._report_stats()
+        self._assert_recon_stats(expected_recon, sharder,
+                                 "biggest_candidates")
 
     def test_audit_root_container_with_parent_child_overlapping(self):
         # Test '_audit_root_container' when overlapping shard ranges are
@@ -5850,7 +5975,7 @@ class TestSharder(BaseTestSharder):
             with self._mock_sharder() as sharder:
                 with mock.patch.object(
                         sharder, '_audit_shard_container') as mocked:
-                    sharder._audit_container(broker)
+                    sharder._audit_container(broker, {})
         self._assert_stats(expected_stats, sharder, 'audit_root')
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
         self.assertFalse(sharder.logger.get_lines_for_level('error'))
@@ -5864,7 +5989,7 @@ class TestSharder(BaseTestSharder):
             with self._mock_sharder() as sharder:
                 with mock.patch.object(
                         sharder, '_audit_shard_container') as mocked:
-                    sharder._audit_container(broker)
+                    sharder._audit_container(broker, {})
         lines = sharder.logger.get_lines_for_level('warning')
         self.assertIn('Audit failed for root', lines[0])
         self.assertFalse(lines[1:])
@@ -5880,14 +6005,14 @@ class TestSharder(BaseTestSharder):
         broker.merge_shard_ranges(shard_ranges)
         self.assertTrue(broker.is_root_container())
         with self._mock_sharder() as sharder:
-            sharder._audit_container(broker)
+            sharder._audit_container(broker, {})
         self.assertEqual([], self.logger.get_lines_for_level('warning'))
 
         # delete it
         delete_ts = next(self.ts_iter)
         broker.delete_db(delete_ts.internal)
         with self._mock_sharder() as sharder:
-            sharder._audit_container(broker)
+            sharder._audit_container(broker, {})
         self.assertEqual([], self.logger.get_lines_for_level('warning'))
 
         # advance time
@@ -5895,7 +6020,7 @@ class TestSharder(BaseTestSharder):
         with mock.patch(
                 'swift.container.sharder.time.time',
                 return_value=future_time), self._mock_sharder() as sharder:
-            sharder._audit_container(broker)
+            sharder._audit_container(broker, {})
         message = 'Reclaimable db stuck waiting for shrinking: %s (%s)' % (
             broker.db_file, broker.path)
         self.assertEqual([message], self.logger.get_lines_for_level('warning'))
@@ -5911,7 +6036,7 @@ class TestSharder(BaseTestSharder):
         with mock.patch(
                 'swift.container.sharder.time.time',
                 return_value=future_time), self._mock_sharder() as sharder:
-            sharder._audit_container(broker)
+            sharder._audit_container(broker, {})
         self.assertEqual([], self.logger.get_lines_for_level('warning'))
 
     def call_audit_container(self, broker, shard_ranges, exc=None):
@@ -5930,7 +6055,7 @@ class TestSharder(BaseTestSharder):
                 mock_swift.make_path = (lambda a, c:
                                         '/v1/%s/%s' % (a, c))
                 sharder.reclaim_age = 0
-                sharder._audit_container(broker)
+                sharder._audit_container(broker, {})
         mocked.assert_not_called()
         return sharder, mock_swift
 
@@ -7601,7 +7726,9 @@ class TestSharder(BaseTestSharder):
                         'path': brokers[C3].db_file,
                         'root': brokers[C3].path,
                         'node_index': 0,
-                        'compactible_ranges': 3
+                        'compactible_ranges': 3,
+                        'active': 7, 'cleaved': 0, 'created': 0, 'found': 0,
+                        'shrinking': 0
                     }, {
                         'object_count': 2500000,
                         'account': brokers[C2].account,
@@ -7611,7 +7738,9 @@ class TestSharder(BaseTestSharder):
                         'path': brokers[C2].db_file,
                         'root': brokers[C2].path,
                         'node_index': 0,
-                        'compactible_ranges': 2
+                        'compactible_ranges': 2,
+                        'active': 7, 'cleaved': 0, 'created': 0, 'found': 0,
+                        'shrinking': 0
                     }, {
                         'object_count': 2999999,
                         'account': brokers[C1].account,
@@ -7621,7 +7750,9 @@ class TestSharder(BaseTestSharder):
                         'path': brokers[C1].db_file,
                         'root': brokers[C1].path,
                         'node_index': 0,
-                        'compactible_ranges': 1
+                        'compactible_ranges': 1,
+                        'active': 7, 'cleaved': 0, 'created': 0, 'found': 0,
+                        'shrinking': 0
                     }
                 ]}
             self._assert_recon_stats(expected_shrinking_candidates_data,
@@ -7663,7 +7794,9 @@ class TestSharder(BaseTestSharder):
                         'path': brokers[C3].db_file,
                         'root': brokers[C3].path,
                         'node_index': 0,
-                        'compactible_ranges': 3
+                        'compactible_ranges': 3,
+                        'active': 7, 'cleaved': 0, 'created': 0, 'found': 0,
+                        'shrinking': 0
                     }, {
                         'object_count': mock.ANY,
                         'account': brokers[C1].account,
@@ -7673,7 +7806,9 @@ class TestSharder(BaseTestSharder):
                         'path': brokers[C1].db_file,
                         'root': brokers[C1].path,
                         'node_index': 0,
-                        'compactible_ranges': 1
+                        'compactible_ranges': 1,
+                        'active': 7, 'cleaved': 0, 'created': 0, 'found': 0,
+                        'shrinking': 0
                     }
                 ]}
             self._assert_recon_stats(expected_shrinking_candidates_data,
@@ -7699,7 +7834,9 @@ class TestSharder(BaseTestSharder):
                         'path': brokers[C1].db_file,
                         'root': brokers[C1].path,
                         'node_index': 0,
-                        'compactible_ranges': 1
+                        'compactible_ranges': 1,
+                        'active': 7, 'cleaved': 0, 'created': 0, 'found': 0,
+                        'shrinking': 0
                     }
                 ]}
             self._assert_recon_stats(expected_shrinking_candidates_data,
@@ -7732,7 +7869,9 @@ class TestSharder(BaseTestSharder):
                         'path': brokers[C3].db_file,
                         'root': brokers[C3].path,
                         'node_index': 0,
-                        'compactible_ranges': 2
+                        'compactible_ranges': 2,
+                        'active': 4, 'cleaved': 0, 'created': 0, 'found': 0,
+                        'shrinking': 0
                     }, {
                         'object_count': mock.ANY,
                         'account': brokers[C1].account,
@@ -7742,7 +7881,9 @@ class TestSharder(BaseTestSharder):
                         'path': brokers[C1].db_file,
                         'root': brokers[C1].path,
                         'node_index': 0,
-                        'compactible_ranges': 1
+                        'compactible_ranges': 1,
+                        'active': 7, 'cleaved': 0, 'created': 0, 'found': 0,
+                        'shrinking': 0
                     }
                 ]}
             self._assert_recon_stats(expected_shrinking_candidates_data,
