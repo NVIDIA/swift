@@ -2378,6 +2378,7 @@ class TestUtils(unittest.TestCase):
                          '127.0.1.1:6400/sdb')
         dev['use_replication'] = True
         self.assertEqual(utils.node_to_string(dev), '127.0.1.1:6400/sdb')
+        # Node dict takes precedence
         self.assertEqual(utils.node_to_string(dev, replication=False),
                          '127.0.1.1:6400/sdb')
 
@@ -4957,6 +4958,9 @@ cluster_dfw1 = http://dfw1.host/v1/
                        'X-Backend-Redirect-Timestamp': '-1'})
         self.assertIn('Invalid timestamp', str(exc))
 
+    @unittest.skipIf(sys.version_info >= (3, 8),
+                     'pkg_resources loading is only available on python 3.7 '
+                     'and earlier')
     @mock.patch('pkg_resources.load_entry_point')
     def test_load_pkg_resource(self, mock_driver):
         tests = {
@@ -4979,6 +4983,59 @@ cluster_dfw1 = http://dfw1.host/v1/
             args = ('swift.diskfile', 'nog:swift#replication.fs')
             utils.load_pkg_resource(*args)
         self.assertEqual("Unhandled URI scheme: 'nog'", str(cm.exception))
+
+    @unittest.skipIf(sys.version_info < (3, 8),
+                     'importlib loading is only available on python 3.8 '
+                     'and later')
+    @mock.patch('importlib.metadata.distribution')
+    def test_load_pkg_resource_importlib(self, mock_driver):
+        import importlib.metadata
+        repl_obj = object()
+        ec_obj = object()
+        other_obj = object()
+        mock_driver.return_value.entry_points = [
+            importlib.metadata.EntryPoint(group='swift.diskfile',
+                                          name='replication.fs',
+                                          value=repl_obj),
+            importlib.metadata.EntryPoint(group='swift.diskfile',
+                                          name='erasure_coding.fs',
+                                          value=ec_obj),
+            importlib.metadata.EntryPoint(group='swift.section',
+                                          name='thing.other',
+                                          value=other_obj),
+        ]
+        for ep in mock_driver.return_value.entry_points:
+            ep.load = lambda ep=ep: ep.value
+        tests = {
+            ('swift.diskfile', 'egg:swift#replication.fs'): repl_obj,
+            ('swift.diskfile', 'egg:swift#erasure_coding.fs'): ec_obj,
+            ('swift.section', 'egg:swift#thing.other'): other_obj,
+            ('swift.section', 'swift#thing.other'): other_obj,
+            ('swift.section', 'thing.other'): other_obj,
+        }
+        for args, expected in tests.items():
+            self.assertIs(expected, utils.load_pkg_resource(*args))
+            self.assertEqual(mock_driver.mock_calls, [mock.call('swift')])
+            mock_driver.reset_mock()
+
+        with self.assertRaises(TypeError) as cm:
+            args = ('swift.diskfile', 'nog:swift#replication.fs')
+            utils.load_pkg_resource(*args)
+        self.assertEqual("Unhandled URI scheme: 'nog'", str(cm.exception))
+
+        with self.assertRaises(ImportError) as cm:
+            args = ('swift.diskfile', 'other.fs')
+            utils.load_pkg_resource(*args)
+        self.assertEqual(
+            "Entry point ('swift.diskfile', 'other.fs') not found",
+            str(cm.exception))
+
+        with self.assertRaises(ImportError) as cm:
+            args = ('swift.missing', 'thing.other')
+            utils.load_pkg_resource(*args)
+        self.assertEqual(
+            "Entry point ('swift.missing', 'thing.other') not found",
+            str(cm.exception))
 
     @with_tempdir
     def test_systemd_notify(self, tempdir):
@@ -5981,6 +6038,7 @@ class UnsafeXrange(object):
     """
     Like range(limit), but with extra context switching to screw things up.
     """
+
     def __init__(self, upper_bound):
         self.current = 0
         self.concurrent_calls = 0
@@ -8325,6 +8383,85 @@ class TestShardName(unittest.TestCase):
             utils.ShardName.create('a', 'root', 'hash', 'bad', '0')
         with self.assertRaises(ValueError):
             utils.ShardName.create('a', 'root', None, '1235678', 'bad')
+
+
+class TestNamespace(unittest.TestCase):
+    def test_total_ordering(self):
+        a_start_ns = utils.Namespace('a/-a', '', 'a')
+        a_atob_ns = utils.Namespace('a/a-b', 'a', 'b')
+        a_atof_ns = utils.Namespace('a/a-f', 'a', 'f')
+        a_ftol_ns = utils.Namespace('a/f-l', 'f', 'l')
+        a_ltor_ns = utils.Namespace('a/l-r', 'l', 'r')
+        a_rtoz_ns = utils.Namespace('a/r-z', 'r', 'z')
+        a_end_ns = utils.Namespace('a/z-', 'z', '')
+        b_start_ns = utils.Namespace('b/-a', '', 'a')
+        self.assertEqual(a_start_ns, b_start_ns)
+        self.assertNotEqual(a_start_ns, a_atob_ns)
+        self.assertLess(a_start_ns, a_atob_ns)
+        self.assertLess(a_atof_ns, a_ftol_ns)
+        self.assertLess(a_ftol_ns, a_ltor_ns)
+        self.assertLess(a_ltor_ns, a_rtoz_ns)
+        self.assertLess(a_rtoz_ns, a_end_ns)
+        self.assertLessEqual(a_start_ns, a_atof_ns)
+        self.assertLessEqual(a_atof_ns, a_rtoz_ns)
+        self.assertGreater(a_end_ns, a_atof_ns)
+        self.assertGreater(a_rtoz_ns, a_ftol_ns)
+        self.assertGreater(a_end_ns, a_start_ns)
+        self.assertGreaterEqual(a_end_ns, a_atof_ns)
+        self.assertGreaterEqual(a_rtoz_ns, a_start_ns)
+
+
+class TestNamespaceBoundList(unittest.TestCase):
+    def test_functions(self):
+        start = ['', 'a/-a']
+        start_ns = utils.Namespace('a/-a', '', 'a')
+        atof = ['a', 'a/a-f']
+        atof_ns = utils.Namespace('a/a-f', 'a', 'f')
+        ftol = ['f', 'a/f-l']
+        ftol_ns = utils.Namespace('a/f-l', 'f', 'l')
+        ltor = ['l', 'a/l-r']
+        ltor_ns = utils.Namespace('a/l-r', 'l', 'r')
+        rtoz = ['r', 'a/r-z']
+        rtoz_ns = utils.Namespace('a/r-z', 'r', 'z')
+        end = ['z', 'a/z-']
+        end_ns = utils.Namespace('a/z-', 'z', '')
+        lowerbounds = [start, atof, ftol, ltor, rtoz, end]
+        namespace_list = utils.NamespaceBoundList(lowerbounds)
+
+        # test 'get_namespace'
+        self.assertEqual(namespace_list.get_namespace('1'), start_ns)
+        self.assertEqual(namespace_list.get_namespace('a'), start_ns)
+        self.assertEqual(namespace_list.get_namespace('b'), atof_ns)
+        self.assertEqual(namespace_list.get_namespace('f'), atof_ns)
+        self.assertEqual(namespace_list.get_namespace('f\x00'), ftol_ns)
+        self.assertEqual(namespace_list.get_namespace('l'), ftol_ns)
+        self.assertEqual(namespace_list.get_namespace('x'), rtoz_ns)
+        self.assertEqual(namespace_list.get_namespace('r'), ltor_ns)
+        self.assertEqual(namespace_list.get_namespace('}'), end_ns)
+
+        # test 'from_namespaces'
+        namespaces_list = utils.NamespaceBoundList.from_namespaces(None)
+        self.assertEqual(namespaces_list, None)
+        namespaces = [start_ns, atof_ns, ftol_ns, ltor_ns, rtoz_ns, end_ns]
+        namespace_list = utils.NamespaceBoundList.from_namespaces(namespaces)
+        self.assertEqual(namespace_list.get_namespace('1'), start_ns)
+        self.assertEqual(namespace_list.get_namespace('l'), ftol_ns)
+        self.assertEqual(namespace_list.get_namespace('x'), rtoz_ns)
+        self.assertEqual(namespace_list.get_namespace('r'), ltor_ns)
+        self.assertEqual(namespace_list.get_namespace('}'), end_ns)
+        self.assertEqual(namespace_list.bounds, lowerbounds)
+        overlap_f_ns = utils.Namespace('a/-f', '', 'f')
+        overlapping_namespaces = [start_ns, atof_ns, overlap_f_ns,
+                                  ftol_ns, ltor_ns, rtoz_ns, end_ns]
+        namespace_list = utils.NamespaceBoundList.from_namespaces(
+            overlapping_namespaces)
+        self.assertEqual(namespace_list.bounds, lowerbounds)
+        overlap_l_ns = utils.Namespace('a/a-l', 'a', 'l')
+        overlapping_namespaces = [start_ns, atof_ns, ftol_ns,
+                                  overlap_l_ns, ltor_ns, rtoz_ns, end_ns]
+        namespace_list = utils.NamespaceBoundList.from_namespaces(
+            overlapping_namespaces)
+        self.assertEqual(namespace_list.bounds, lowerbounds)
 
 
 class TestShardRange(unittest.TestCase):

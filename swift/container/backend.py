@@ -61,6 +61,12 @@ SHARD_AUDITING_STATES = [ShardRange.CREATED, ShardRange.CLEAVED,
                          ShardRange.ACTIVE, ShardRange.SHARDING,
                          ShardRange.SHARDED, ShardRange.SHRINKING,
                          ShardRange.SHRUNK]
+# shard's may not be fully populated while in the FOUND and CREATED
+# state, so shards should only update their own shard range's object
+# stats when they are in the following states
+SHARD_UPDATE_STAT_STATES = [ShardRange.CLEAVED, ShardRange.ACTIVE,
+                            ShardRange.SHARDING, ShardRange.SHARDED,
+                            ShardRange.SHRINKING, ShardRange.SHRUNK]
 
 # attribute names in order used when transforming shard ranges from dicts to
 # tuples and vice-versa
@@ -373,17 +379,15 @@ class ContainerBroker(DatabaseBroker):
     db_contains_type = 'object'
     db_reclaim_timestamp = 'created_at'
     delete_meta_whitelist = ['x-container-sysmeta-shard-quoted-root',
-                             'x-container-sysmeta-shard-root']
+                             'x-container-sysmeta-shard-root',
+                             'x-container-sysmeta-sharding']
 
     def __init__(self, db_file, timeout=BROKER_TIMEOUT, logger=None,
                  account=None, container=None, pending_timeout=None,
                  stale_reads_ok=False, skip_commits=False,
                  force_db_file=False):
         self._init_db_file = db_file
-        if db_file == ':memory:':
-            base_db_file = db_file
-        else:
-            base_db_file = make_db_file_path(db_file, None)
+        base_db_file = make_db_file_path(db_file, None)
         super(ContainerBroker, self).__init__(
             base_db_file, timeout, logger, account, container, pending_timeout,
             stale_reads_ok, skip_commits=skip_commits)
@@ -433,8 +437,6 @@ class ContainerBroker(DatabaseBroker):
         """
         Returns the current state of on disk db files.
         """
-        if self._db_file == ':memory:':
-            return UNSHARDED
         if not self.db_files:
             return NOTFOUND
         if len(self.db_files) > 1:
@@ -475,8 +477,6 @@ class ContainerBroker(DatabaseBroker):
         """
         Reloads the cached list of valid on disk db files for this broker.
         """
-        if self._db_file == ':memory:':
-            return
         # reset connection so the next access will use the correct DB file
         self.conn = None
         self._db_files = get_db_files(self._init_db_file)
@@ -883,7 +883,7 @@ class ContainerBroker(DatabaseBroker):
         :returns: a tuple, in the form (info, is_deleted) info is a dict as
                   returned by get_info and is_deleted is a boolean.
         """
-        if self.db_file != ':memory:' and not os.path.exists(self.db_file):
+        if not os.path.exists(self.db_file):
             return {}, True
         info = self.get_info()
         return info, self._is_deleted_info(**info)
@@ -2351,10 +2351,14 @@ class ContainerBroker(DatabaseBroker):
                     # object_count
                     shard_size = object_count - progress
 
-            # NB shard ranges are created with a non-zero object count so that
-            # the apparent container object count remains constant, and the
-            # container is non-deletable while shards have been found but not
-            # yet cleaved
+            # NB shard ranges are created with a non-zero object count for a
+            # few reasons:
+            #  1. so that the apparent container object count remains
+            #     consistent;
+            #  2. the container is non-deletable while shards have been found
+            #     but not yet cleaved; and
+            #  3. So we have a rough idea of size of the shards should be
+            #     while cleaving.
             found_ranges.append(
                 {'index': index,
                  'lower': str(last_shard_upper),

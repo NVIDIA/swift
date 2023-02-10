@@ -605,7 +605,10 @@ def get_cache_key(account, container=None, obj=None, shard=None):
             raise ValueError('Shard cache key requires account and container')
         if obj:
             raise ValueError('Shard cache key cannot have obj')
-        cache_key = 'shard-%s/%s/%s' % (shard, account, container)
+        if shard == 'updating':
+            cache_key = 'shard-%s-v2/%s/%s' % (shard, account, container)
+        else:
+            cache_key = 'shard-%s/%s/%s' % (shard, account, container)
     elif obj:
         if not (account and container):
             raise ValueError('Object cache key requires account and container')
@@ -1634,6 +1637,8 @@ class NodeIter(object):
     :param ring: ring to get yield nodes from
     :param partition: ring partition to yield nodes for
     :param logger: a logger instance
+    :param request: yielded nodes will be annotated with `use_replication`
+        based on the `request` headers.
     :param node_iter: optional iterable of nodes to try. Useful if you
         want to filter or reorder the nodes.
     :param policy: an instance of :class:`BaseStoragePolicy`. This should be
@@ -1643,8 +1648,8 @@ class NodeIter(object):
         on the ``request`` headers
     """
 
-    def __init__(self, app, ring, partition, logger, node_iter=None,
-                 policy=None, request=None):
+    def __init__(self, app, ring, partition, logger, request, node_iter=None,
+                 policy=None):
         self.app = app
         self.ring = ring
         self.partition = partition
@@ -1741,7 +1746,7 @@ class NodeIter(object):
         # nodes may have come from a ring or a node_iter passed to the
         # constructor: be careful not to mutate them!
         return dict(node, use_replication=is_use_replication_network(
-            self.request.headers if self.request else None))
+            self.request.headers))
 
     def next(self):
         node = None
@@ -1989,8 +1994,7 @@ class Controller(object):
         :returns: a swob.Response object
         """
         nodes = GreenthreadSafeIterator(
-            node_iterator or self.app.iter_nodes(ring, part, self.logger,
-                                                 request=req)
+            node_iterator or self.app.iter_nodes(ring, part, self.logger, req)
         )
         node_number = node_count or len(ring.get_part_nodes(part))
         pile = GreenAsyncPile(node_number)

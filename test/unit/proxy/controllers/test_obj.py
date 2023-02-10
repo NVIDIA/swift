@@ -223,7 +223,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         for node in all_nodes:
             node['use_replication'] = False
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, request=None))
+            object_ring, 1, Request.blank('')))
 
         self.maxDiff = None
 
@@ -261,7 +261,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
 
         # finally, create the local_first_nodes iter and flatten it out
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1))
+            object_ring, 1, Request.blank('')))
 
         # the local nodes move up in the ordering
         self.assertEqual([1] * (self.replicas() + 1), [
@@ -301,7 +301,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             node['use_replication'] = False
 
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1))
+            object_ring, 1, request=Request.blank('')))
 
         # we won't have quite enough local nodes...
         self.assertEqual(len(all_nodes), self.replicas() +
@@ -333,7 +333,8 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             node['use_replication'] = False
 
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, local_handoffs_first=True))
+            object_ring, 1, local_handoffs_first=True,
+            request=Request.blank('')))
 
         self.maxDiff = None
 
@@ -357,7 +358,8 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                           policy_conf.write_affinity_is_local_fn(n)]
 
         prefered_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, local_handoffs_first=True, request=None))
+            object_ring, 1, local_handoffs_first=True,
+            request=Request.blank('')))
 
         self.assertEqual(len(all_nodes), self.replicas() +
                          POLICIES.default.object_ring.max_more_nodes)
@@ -397,7 +399,8 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             node['use_replication'] = False
 
         prefered_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, local_handoffs_first=True, request=None))
+            object_ring, 1, local_handoffs_first=True,
+            request=Request.blank('')))
 
         self.assertEqual(len(all_nodes), self.replicas() +
                          POLICIES.default.object_ring.max_more_nodes)
@@ -1021,7 +1024,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
 
         # finally, create the local_first_nodes iter and flatten it out
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, policy, request=None))
+            object_ring, 1, Request.blank(''), policy))
 
         # check that the required number of local nodes were moved up the order
         node_regions = [node['region'] for node in local_first_nodes]
@@ -1634,6 +1637,31 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
+
+    def test_HEAD_error_limit_supression_count(self):
+        def do_test(primary_codes, expected, clear_stats=True):
+            if clear_stats:
+                self.app.error_limiter.stats.clear()
+            random.shuffle(primary_codes)
+            handoff_codes = [404] * self.obj_ring.max_more_nodes
+            with set_http_connect(*primary_codes + handoff_codes):
+                req = swift.common.swob.Request.blank(
+                    '/v1/a/c/o', method='HEAD')
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, expected)
+
+        policy_opts = self.app.get_policy_options(None)
+        policy_opts.rebalance_missing_suppression_count = 1
+        # even with disks unmounted you can run with suppression_count = 1
+        do_test([507, 404, 404], 404)
+        # error limiting can make things wonky
+        do_test([404, 404], 404, clear_stats=False)
+        # and it gets a little dicy rebooting nodes
+        do_test([Timeout(), 404], 503, clear_stats=False)
+        do_test([507, Timeout(), 404], 503)
+        # unless you turn it off
+        policy_opts.rebalance_missing_suppression_count = 0
+        do_test([507, Timeout(), 404], 404)
 
     def test_GET_primaries_error_during_rebalance(self):
         def do_test(primary_codes, expected, include_timestamp=False):
@@ -2592,7 +2620,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             self.app, 'a', 'c', 'o')
         safe_iter = utils.GreenthreadSafeIterator(self.app.iter_nodes(
             self.policy.object_ring, 0, self.logger, policy=self.policy,
-            request=None))
+            request=Request.blank('')))
         controller._fragment_GET_request = lambda *a, **k: next(safe_iter)
         pile = utils.GreenAsyncPile(self.policy.ec_ndata)
         for i in range(self.policy.ec_ndata):

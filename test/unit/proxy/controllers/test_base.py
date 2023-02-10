@@ -475,7 +475,7 @@ class TestFuncs(BaseTest):
         self.assertEqual(get_cache_key("account", "cont", shard="listing"),
                          'shard-listing/account/cont')
         self.assertEqual(get_cache_key("account", "cont", shard="updating"),
-                         'shard-updating/account/cont')
+                         'shard-updating-v2/account/cont')
         self.assertRaises(ValueError,
                           get_cache_key, "account", shard="listing")
         self.assertRaises(ValueError,
@@ -1547,7 +1547,8 @@ class TestNodeIter(BaseTest):
     def test_iter_default_fake_ring(self):
         for ring in (self.account_ring, self.container_ring):
             self.assertEqual(ring.replica_count, 3.0)
-            node_iter = NodeIter(self.app, ring, 0, self.logger)
+            node_iter = NodeIter(self.app, ring, 0, self.logger,
+                                 request=Request.blank(''))
             self.assertEqual(6, node_iter.nodes_left)
             self.assertEqual(3, node_iter.primaries_left)
             count = 0
@@ -1562,7 +1563,7 @@ class TestNodeIter(BaseTest):
         ring = FakeRing(replicas=3, max_more_nodes=20)  # handoffs available
         policy = StoragePolicy(0, 'zero', object_ring=ring)
         node_iter = NodeIter(self.app, policy.object_ring, 0, self.logger,
-                             policy=policy)
+                             policy=policy, request=Request.blank(''))
         self.assertEqual(6, node_iter.nodes_left)
         self.assertEqual(3, node_iter.primaries_left)
         primary_indexes = set()
@@ -1586,11 +1587,11 @@ class TestNodeIter(BaseTest):
 
         # sanity
         node_iter = NodeIter(self.app, policy.object_ring, 0, self.logger,
-                             policy=policy)
+                             policy=policy, request=Request.blank(''))
         self.assertEqual(16, len([n for n in node_iter]))
 
         node_iter = NodeIter(self.app, policy.object_ring, 0, self.logger,
-                             policy=policy)
+                             policy=policy, request=Request.blank(''))
         self.assertEqual(16, node_iter.nodes_left)
         self.assertEqual(8, node_iter.primaries_left)
         pile = GreenAsyncPile(5)
@@ -1621,7 +1622,7 @@ class TestNodeIter(BaseTest):
         policy = StoragePolicy(0, 'ec', object_ring=ring)
 
         node_iter = NodeIter(self.app, policy.object_ring, 0, self.logger,
-                             policy=policy)
+                             policy=policy, request=Request.blank(''))
         for node in node_iter:
             self.assertIn('use_replication', node)
             self.assertFalse(node['use_replication'])
@@ -1654,7 +1655,8 @@ class TestNodeIter(BaseTest):
         policy = StoragePolicy(0, 'ec', object_ring=ring)
         other_iter = ring.get_part_nodes(0)
         node_iter = NodeIter(self.app, policy.object_ring, 0, self.logger,
-                             policy=policy, node_iter=iter(other_iter))
+                             policy=policy, node_iter=iter(other_iter),
+                             request=Request.blank(''))
         nodes = list(node_iter)
         self.assertEqual(len(other_iter), len(nodes))
         for node in nodes:
