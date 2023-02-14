@@ -118,6 +118,8 @@ class ProtocolTest(unittest.TestCase):
             makefile=lambda mode, bufsize: rfile if 'r' in mode else wfile,
             getsockname=lambda *a: addr
         )
+        if six.PY2:
+            rfile._sock = fake_tcp_socket
         fake_listen_socket = mock.Mock(
             accept=mock.MagicMock(
                 side_effect=[[fake_tcp_socket, addr],
