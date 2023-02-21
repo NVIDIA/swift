@@ -738,6 +738,65 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         self.assertEqual(resp.status_int, 400)
         self.assertEqual(b'X-Delete-At in past', resp.body)
 
+    def _test_x_open_expired(self, method, headers=None):
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method=method, headers=headers)
+        codes = [404] * (self.obj_ring.replicas +
+                         self.obj_ring.max_more_nodes)
+        with mocked_http_conn(*codes) as fake_conn:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+        return fake_conn.requests
+
+    def test_x_open_expired(self):
+        for method in ('GET', 'HEAD'):
+            requests = self._test_x_open_expired(method)
+            for r in requests:
+                self.assertNotIn('X-Open-Expired', r['headers'])
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+            requests = self._test_x_open_expired(
+                method, headers={'X-Open-Expired': 'true'})
+            for r in requests:
+                self.assertEqual(r['headers']['X-Open-Expired'], 'true')
+                self.assertEqual(r['headers']['X-Backend-Open-Expired'],
+                                 'true')
+
+            requests = self._test_x_open_expired(
+                method, headers={'X-Open-Expired': 'false'})
+            for r in requests:
+                self.assertEqual(r['headers']['X-Open-Expired'], 'false')
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+        # we don't support x-open-expired on PUT
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='PUT', headers={
+                'Content-Length': '0',
+                'X-Open-Expired': 'true'})
+        codes = [201] * self.obj_ring.replicas
+        expect_headers = {
+            'X-Obj-Metadata-Footer': 'yes',
+            'X-Obj-Multiphase-Commit': 'yes'
+        }
+        with mocked_http_conn(
+                *codes, expect_headers=expect_headers) as fake_conn:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 201)
+        for r in fake_conn.requests:
+            self.assertEqual(r['headers']['X-Open-Expired'], 'true')
+            self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+        # we don't support x-open-expired on POST (yet?)
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='POST', headers={'X-Open-Expired': 'true'})
+        codes = [202] * self.obj_ring.replicas
+        with mocked_http_conn(*codes) as fake_conn:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 202)
+        for r in fake_conn.requests:
+            self.assertEqual(r['headers']['X-Open-Expired'], 'true')
+            self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD')
         with set_http_connect(200):
