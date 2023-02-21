@@ -6555,6 +6555,21 @@ class TestObjectController(BaseTestCase):
             self.assertEqual(resp.status_int, 200)
             self.assertEqual(expected_body, resp.body)
 
+        # ...or x-backend-open-expired is sent
+        expected = {
+            'GET': b'TEST',
+            'HEAD': b'',
+        }
+        for meth, expected_body in expected.items():
+            req = Request.blank(
+                '/sda1/p/a/c/o', method=meth,
+                headers={'X-Timestamp':
+                         normalize_timestamp(delete_at_timestamp + 1),
+                         'x-backend-open-expired': 'True'})
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(expected_body, resp.body)
+
     def test_HEAD_but_expired(self):
         # We have an object that expires in the future
         now = time()
@@ -6593,6 +6608,23 @@ class TestObjectController(BaseTestCase):
         self.assertEqual(resp.headers['X-Backend-Timestamp'],
                          utils.Timestamp(now))
 
+        # It should be accessible with x-backend-open-expired
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(
+                delete_at_timestamp + 2), 'x-backend-open-expired': 'true'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(
+                delete_at_timestamp + 3)})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 404)
+
     def test_POST_but_expired(self):
         now = time()
         delete_at_timestamp = int(now + 100)
@@ -6626,6 +6658,16 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 202)
 
+        # object has not expired yet
+        the_time = now + 1
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'X-Backend-Open-Expired': 'true'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+
         # You cannot POST to an expired object
         now += 2
         recreate_test_object(now)
@@ -6650,6 +6692,18 @@ class TestObjectController(BaseTestCase):
                      'x-delete-at': str(delete_at_timestamp + 100)})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 202)
+
+        now += 2
+        recreate_test_object(now)
+        the_time = delete_at_timestamp + 2
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-backend-open-expired': 'true'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+
         # ...so the object becomes accessible again even without an
         # x-backend-replication header
         the_time = delete_at_timestamp + 3
@@ -6660,6 +6714,40 @@ class TestObjectController(BaseTestCase):
                      'x-delete-at': str(delete_at_timestamp + 101)})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 202)
+
+        the_time = delete_at_timestamp + 103
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(the_time)})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 404)
+
+        the_time = delete_at_timestamp + 104
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-backend-open-expired': 'true'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+
+        the_time = delete_at_timestamp + 105
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-backend-open-expired': 'true'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+
+        the_time = delete_at_timestamp + 105
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'X-Timestamp': normalize_timestamp(the_time)})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 404)
 
     def test_DELETE_can_skip_updating_expirer_queue(self):
         policy = POLICIES.get_by_index(0)
