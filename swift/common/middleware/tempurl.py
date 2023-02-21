@@ -326,7 +326,7 @@ DISALLOWED_INCOMING_HEADERS = 'x-object-manifest x-symlink-target'
 #: delimited list of header names and names can optionally end with '*' to
 #: indicate a prefix match. DEFAULT_INCOMING_ALLOW_HEADERS is a list of
 #: exceptions to these removals.
-DEFAULT_INCOMING_REMOVE_HEADERS = 'x-timestamp'
+DEFAULT_INCOMING_REMOVE_HEADERS = 'x-timestamp x-open-expired'
 
 #: Default headers as exceptions to DEFAULT_INCOMING_REMOVE_HEADERS. Simply a
 #: whitespace delimited list of header names and names can optionally end with

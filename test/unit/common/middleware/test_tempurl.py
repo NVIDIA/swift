@@ -1042,7 +1042,8 @@ class TestTempURL(unittest.TestCase):
 
     def test_removed_incoming_header(self):
         self.tempurl = tempurl.filter_factory({
-            'incoming_remove_headers': 'x-remove-this'})(self.auth)
+            'incoming_remove_headers': 'x-remove-this x-open-expired'
+        })(self.auth)
         method = 'GET'
         expires = int(time() + 86400)
         path = '/v1/a/c/o'
@@ -1051,12 +1052,13 @@ class TestTempURL(unittest.TestCase):
         sig = hmac.new(key, hmac_body, hashlib.sha256).hexdigest()
         req = self._make_request(
             path, keys=[key],
-            headers={'x-remove-this': 'value'},
+            headers={'x-remove-this': 'value', 'x-open-expired': 'true'},
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 404)
         self.assertNotIn('x-remove-this', self.app.request.headers)
+        self.assertNotIn('x-open-expired', self.app.request.headers)
 
     def test_removed_incoming_headers_match(self):
         self.tempurl = tempurl.filter_factory({
@@ -1669,7 +1671,7 @@ class TestSwiftInfo(unittest.TestCase):
         self.assertEqual(set(info['methods']),
                          set(('GET', 'HEAD', 'PUT', 'POST', 'DELETE')))
         self.assertEqual(set(info['incoming_remove_headers']),
-                         set(('x-timestamp',)))
+                         set(('x-timestamp', 'x-open-expired',)))
         self.assertEqual(set(info['incoming_allow_headers']), set())
         self.assertEqual(set(info['outgoing_remove_headers']),
                          set(('x-object-meta-*',)))
@@ -1709,7 +1711,7 @@ class TestSwiftInfo(unittest.TestCase):
         self.assertEqual(set(info['methods']),
                          set(('GET', 'HEAD', 'PUT', 'POST', 'DELETE')))
         self.assertEqual(set(info['incoming_remove_headers']),
-                         set(('x-timestamp',)))
+                         set(('x-timestamp', 'x-open-expired',)))
         self.assertEqual(set(info['incoming_allow_headers']), set())
         self.assertEqual(set(info['outgoing_remove_headers']),
                          set(('x-object-meta-*',)))
