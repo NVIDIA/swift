@@ -993,3 +993,16 @@ def get_ip_port(node, headers):
     """
     return select_ip_port(
         node, use_replication=is_use_replication_network(headers))
+
+
+def is_open_expired(app, req):
+    """
+    Helper function to check if a request with the header 'x-open-expired'
+    can access an object object that has not yet been reaped by the
+    object-expirer based on the enable_open_expired global config.
+
+    :param app: the application instance
+    :param req: request object
+    """
+    return (config_true_value(app.enable_open_expired) and
+            config_true_value(req.headers.get('x-open-expired')))
