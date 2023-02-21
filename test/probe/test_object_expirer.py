@@ -20,12 +20,13 @@ import unittest
 
 from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.manager import Manager
-from swift.common.utils import Timestamp
+from swift.common.utils import Timestamp, config_true_value
 
 from test.probe.common import ReplProbeTest, ENABLED_POLICIES
 from test.probe.brain import BrainSplitter
 
 from swiftclient import client
+from swiftclient.exceptions import ClientException
 
 
 class TestObjectExpirer(ReplProbeTest):
@@ -270,6 +271,158 @@ class TestObjectExpirer(ReplProbeTest):
                 'Expected 200 for HEAD object but got %s' % e.resp.status)
 
         self.assertIn('x-object-meta-expired', metadata)
+
+    def test_open_expired_enabled(self):
+
+        # When the global configuration option enable_open_expired is set to
+        # true, the client should be able to access expired objects that have
+        # not yet been reaped using the x-open-expired flag. However, after
+        # they have been reaped, it should return 404.
+
+        enable_open_expired = config_true_value(
+            self.cluster_info['swift'].get('enable_open_expired')
+        )
+
+        if not enable_open_expired:
+            raise unittest.SkipTest(
+                "enable_open_expired is disabled in this swift cluster")
+
+        def put_object(headers):
+            # use swift client to PUT objects
+            headers['Content-Length'] = '0'
+            try:
+                client.put_object(self.url, self.token,
+                                     self.container_name, self.object_name,
+                                     headers=headers)
+            except ClientException as e:
+                self.fail(
+                    'Expected 201 for PUT object but got %s' % e.http_status)
+
+        def head_object(headers):
+            # use swift client to HEAD objects
+            return client.head_object(self.url, self.token,
+                                      self.container_name, self.object_name,
+                                      headers=headers)
+
+        obj_brain = BrainSplitter(self.url, self.token, self.container_name,
+                                  self.object_name, 'object', self.policy)
+
+        obj_brain.put_container()
+
+        now = time.time()
+        delete_at = int(now + 2)
+        put_object(headers={'X-Delete-At': str(delete_at),
+                            'X-Timestamp': Timestamp(now).normal})
+
+        # sanity: check that the object was created
+        try:
+            head_object(headers={})
+        except ClientException as e:
+            self.fail(
+                'Expected 200 for HEAD object but got %s' % e.http_status)
+
+        # make sure auto-created containers get in the account listing
+        Manager(['container-updater']).once()
+
+        # sleep until after expired but not reaped
+        while time.time() <= delete_at:
+            time.sleep(0.1)
+
+        # should get a 404, object is expired
+        with self.assertRaises(ClientException) as e:
+            head_object(headers={})
+            self.assertEqual(e.exception.http_status, 404)
+
+        # since enable_open_expired is enabled, ensure object can be accessed
+        # with x-open-expired header
+        try:
+            head_object(headers={'X-Open-Expired': True})
+        except ClientException as e:
+            self.fail(
+                'Expected 200 for HEAD object but got %s' % e.http_status)
+
+        # expirer runs to reap the object
+        self.expirer.once()
+
+        # should get a 404 even with x-open-expired since object is reaped
+        with self.assertRaises(ClientException) as e:
+            head_object(headers={'X-Open-Expired': True})
+            self.assertEqual(e.exception.http_status, 404)
+
+    def test_open_expired_disabled(self):
+
+        # When the global configuration option enable_open_expired is set to
+        # false or not configured, the client should not be able to access
+        # expired objects that have not yet been reaped using the x-open-expired
+        # flag.
+
+        enable_open_expired = config_true_value(
+            self.cluster_info['swift'].get('enable_open_expired')
+        )
+
+        if enable_open_expired:
+            raise unittest.SkipTest(
+                "enable_open_expired is enabled in this swift cluster")
+
+        def put_object(headers):
+            # use swift client to PUT objects
+            headers['Content-Length'] = '0'
+            try:
+                client.put_object(self.url, self.token,
+                                     self.container_name, self.object_name,
+                                     headers=headers)
+            except ClientException as e:
+                self.fail(
+                    'Expected 201 for PUT object but got %s' % e.http_status)
+
+        def head_object(headers):
+            # use swift client to HEAD objects
+            return client.head_object(self.url, self.token,
+                                      self.container_name, self.object_name,
+                                      headers=headers)
+
+        obj_brain = BrainSplitter(self.url, self.token, self.container_name,
+                                  self.object_name, 'object', self.policy)
+
+        obj_brain.put_container()
+
+        now = time.time()
+        delete_at = int(now + 2)
+        put_object(headers={'X-Delete-At': str(delete_at),
+                            'X-Timestamp': Timestamp(now).normal})
+
+        # sanity: check that the object was created
+        try:
+            head_object(headers={})
+        except ClientException as e:
+            self.fail(
+                'Expected 200 for HEAD object but got %s' % e.http_status)
+
+        # make sure auto-created containers get in the account listing
+        Manager(['container-updater']).once()
+
+        # sleep until after expired
+        while time.time() <= delete_at:
+            time.sleep(0.1)
+
+        # should get a 404, object is expired
+        with self.assertRaises(ClientException) as e:
+            head_object(headers={})
+            self.assertEqual(e.exception.http_status, 404)
+
+        # since enable_open_expired is disabled, should get 404 even
+        # with x-open-expired header
+        with self.assertRaises(ClientException) as e:
+            head_object(headers={'X-Open-Expired': True})
+            self.assertEqual(e.exception.http_status, 404)
+
+        # expirer runs to reap the object
+        self.expirer.once()
+
+        # should get a 404 with x-open-expired since object is reaped
+        with self.assertRaises(ClientException) as e:
+            head_object(headers={'X-Open-Expired': True})
+            self.assertEqual(e.exception.http_status, 404)
 
     def _test_expirer_delete_outdated_object_version(self, object_exists):
         # This test simulates a case where the expirer tries to delete
