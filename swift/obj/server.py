@@ -1075,12 +1075,15 @@ class ObjectController(BaseStorageServer):
         req_timestamp = valid_timestamp(request)
         frag_prefs = safe_json_loads(
             request.headers.get('X-Backend-Fragment-Preferences'))
+        x_backend_open_expired = config_true_value(
+            request.headers.get('x-backend-open-expired', 'false'))
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
                 policy=policy, frag_prefs=frag_prefs,
                 open_expired=config_true_value(
-                    request.headers.get('x-backend-replication', 'false')))
+                    request.headers.get('x-backend-replication',
+                                        'false')) or x_backend_open_expired)
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
@@ -1150,12 +1153,15 @@ class ObjectController(BaseStorageServer):
         req_timestamp = valid_timestamp(request)
         frag_prefs = safe_json_loads(
             request.headers.get('X-Backend-Fragment-Preferences'))
+        x_backend_open_expired = config_true_value(
+            request.headers.get('x-backend-open-expired', 'false'))
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
                 policy=policy, frag_prefs=frag_prefs,
                 open_expired=config_true_value(
-                    request.headers.get('x-backend-replication', 'false')))
+                    request.headers.get('x-backend-replication',
+                                        'false')) or x_backend_open_expired)
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:

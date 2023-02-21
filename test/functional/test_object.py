@@ -465,6 +465,67 @@ class TestObject(unittest.TestCase):
         resp.read()
         self.assertEqual(resp.status, 201)
 
+    def test_x_open_expired(self):
+        def put(url, token, parsed, conn):
+            dt = datetime.datetime.now()
+            epoch = time.mktime(dt.timetuple())
+            delete_time = str(int(epoch) + 2)
+            conn.request(
+                'PUT',
+                '%s/%s/%s' % (parsed.path, self.container, 'x_delete_at'),
+                '',
+                {'X-Auth-Token': token,
+                 'Content-Length': '0',
+                 'X-Delete-At': delete_time})
+            return check_response(conn)
+        resp = retry(put)
+        resp.read()
+        self.assertEqual(resp.status, 201)
+
+        def get(url, token, parsed, conn):
+            conn.request(
+                'GET',
+                '%s/%s/%s' % (parsed.path, self.container, 'x_delete_at'),
+                '',
+                {'X-Auth-Token': token})
+            return check_response(conn)
+
+        def get_with_x_open_expired(url, token, parsed, conn):
+            conn.request(
+                'GET',
+                '%s/%s/%s' % (parsed.path, self.container, 'x_delete_at'),
+                '',
+                {'X-Auth-Token': token, 'X-Open-Expired': True})
+            return check_response(conn)
+
+        resp = retry(get)
+        resp.read()
+        count = 0
+        while resp.status == 200 and count < 10:
+            resp = retry(get)
+            resp.read()
+            count += 1
+            time.sleep(1)
+
+        # check to see object has expired
+        self.assertEqual(resp.status, 404)
+
+        resp = retry(get_with_x_open_expired)
+        resp.read()
+        # read the expired object with magic x-open-expired header
+        self.assertEqual(resp.status, 200)
+
+        resp = retry(get)
+        resp.read()
+        # verify object is still expired
+        self.assertEqual(resp.status, 404)
+
+        # To avoid an error when the object deletion in tearDown(),
+        # the object is added again.
+        resp = retry(put)
+        resp.read()
+        self.assertEqual(resp.status, 201)
+
     def test_non_integer_x_delete_after(self):
         def put(url, token, parsed, conn):
             conn.request('PUT', '%s/%s/%s' % (parsed.path, self.container,
