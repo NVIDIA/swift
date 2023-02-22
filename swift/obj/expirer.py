@@ -114,6 +114,22 @@ class ObjectExpirer(Daemon):
         # marker will be retried before it is abandoned.  It is not coupled
         # with the tombstone reclaim age in the consistency engine.
         self.reclaim_age = int(conf.get('reclaim_age', 604800))
+        self.acct_grace_periods = {}
+        for conf_key in conf:
+            grace_period_prefix = "grace_period_"
+            if not conf_key.startswith(grace_period_prefix):
+                continue
+            account = conf_key[len(grace_period_prefix):]
+            gp = None
+            try:
+                gp = float(conf.get(conf_key))
+            except ValueError:
+                pass
+            if not gp or gp < 0:
+                raise ValueError(
+                    'grace_period_%s must be a float '
+                    'greater than or equal to 0' % account)
+            self.acct_grace_periods[account] = gp
 
     def read_conf_for_queue_access(self, swift):
         if self.conf.get('auto_create_account_prefix'):
@@ -260,6 +276,12 @@ class ObjectExpirer(Daemon):
                 break
             yield task_container
 
+    def get_grace_period(self, target_account):
+        try:
+            return self.acct_grace_periods[target_account]
+        except KeyError:
+            return 0.0
+
     def iter_task_to_expire(self, task_account_container_list,
                             my_index, divisor):
         """
@@ -281,10 +303,17 @@ class ObjectExpirer(Daemon):
                     self.logger.exception('Unexcepted error handling task %r' %
                                           task_object)
                     continue
-                if delete_timestamp > Timestamp.now():
-                    # we shouldn't yield the object that doesn't reach
-                    # the expiration date yet.
-                    break
+                grace_period = self.get_grace_period(target_account)
+                cutoff = time() - grace_period
+                if delete_timestamp > Timestamp(cutoff):
+                    if grace_period:
+                        # we shouldn't yield the object if it's target_account
+                        # is under configured grace_period
+                        continue
+                    else:
+                        # we shouldn't yield ANY more objects that can't reach
+                        # the expiration date yet.
+                        break
 
                 # Only one expirer daemon assigned for one task
                 if self.hash_mod('%s/%s' % (task_container, task_object),
