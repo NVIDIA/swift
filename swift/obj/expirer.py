@@ -30,7 +30,7 @@ from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.middleware.s3api.utils import sysmeta_header
 from swift.common.utils import get_logger, dump_recon_cache, split_path, \
     Timestamp, config_true_value, normalize_delete_at_timestamp, \
-    RateLimitedIterator, md5
+    RateLimitedIterator, md5, non_negative_float
 from swift.common.http import HTTP_NOT_FOUND, HTTP_CONFLICT, \
     HTTP_PRECONDITION_FAILED
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
@@ -66,6 +66,47 @@ def parse_task_obj(task_obj):
     target_account, target_container, target_obj = \
         split_path('/' + target_path, 3, 3, True)
     return timestamp, target_account, target_container, target_obj
+
+
+def read_conf_for_grace_periods(conf):
+    grace_periods = {}
+    for conf_key in conf:
+        grace_period_prefix = "grace_period_"
+        if not conf_key.startswith(grace_period_prefix):
+            continue
+        grace_period_key = conf_key[len(grace_period_prefix):]
+        if grace_period_key.strip('/') != grace_period_key:
+            raise ValueError(
+                '%s '
+                'should be in the form grace_period_<account> '
+                'or grace_period_<account>/<container> '
+                '(leading or trailing "/" is not allowed)' % conf_key)
+        try:
+            # If split_path fails, have multiple '/' or
+            # account name is invalid
+            account, container = split_path(
+                '/' + grace_period_key, 1, 2
+            )
+        except ValueError:
+            raise ValueError(
+                '%s '
+                'should be in the form grace_period_<account> '
+                'or grace_period_<account>/<container> '
+                '(at most one "/" is allowed)' % conf_key)
+        try:
+            grace_periods[(account, container)] = non_negative_float(
+                conf.get(conf_key)
+            )
+        except ValueError:
+            raise ValueError(
+                '%s must be a float '
+                'greater than or equal to 0' % conf_key)
+    return grace_periods
+
+
+def get_grace_period(grace_periods, target_account, target_container):
+    return grace_periods.get((target_account, target_container),
+                             grace_periods.get((target_account, None), 0.0))
 
 
 class ObjectExpirer(Daemon):
@@ -114,6 +155,8 @@ class ObjectExpirer(Daemon):
         # marker will be retried before it is abandoned.  It is not coupled
         # with the tombstone reclaim age in the consistency engine.
         self.reclaim_age = int(conf.get('reclaim_age', 604800))
+
+        self.grace_periods = read_conf_for_grace_periods(conf)
 
     def read_conf_for_queue_access(self, swift):
         self.expiring_objects_account = AUTO_CREATE_ACCOUNT_PREFIX + \
@@ -248,6 +291,10 @@ class ObjectExpirer(Daemon):
                 break
             yield task_container
 
+    def get_grace_period(self, target_account, target_container):
+        return get_grace_period(self.grace_periods, target_account,
+                                target_container)
+
     def iter_task_to_expire(self, task_account_container_list,
                             my_index, divisor):
         """
@@ -269,10 +316,16 @@ class ObjectExpirer(Daemon):
                     self.logger.exception('Unexcepted error handling task %r' %
                                           task_object)
                     continue
+                grace_period = self.get_grace_period(target_account,
+                                                     target_container)
+
                 if delete_timestamp > Timestamp.now():
-                    # we shouldn't yield the object that doesn't reach
+                    # we shouldn't yield ANY more objects that can't reach
                     # the expiration date yet.
                     break
+                if delete_timestamp > Timestamp(time() - grace_period):
+                    # we shouldn't yield the object during its grace period
+                    continue
 
                 # Only one expirer daemon assigned for one task
                 if self.hash_mod('%s/%s' % (task_container, task_object),
