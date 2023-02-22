@@ -746,4 +746,15 @@ ionice_priority               None                            I/O scheduling pri
                                                               priority of the process. Work only with
                                                               ionice_class.
                                                               Ignored if IOPRIO_CLASS_IDLE is set.
+grace_period_<ACCT>           0.0                             A dynamic configuration option for
+                                                              setting account level grace periods.
+                                                              The grace period is configured for
+                                                              the account with the name placed in
+                                                              <ACCT>.
+grace_period_<ACCT>/<CNTR>    0.0                             A dynamic configuration option for
+                                                              setting container level grace periods.
+                                                              The grace period is configured for
+                                                              the container with the account name
+                                                              placed in <ACCT> and the container
+                                                              name in <CNTR>.
 ============================= =============================== ==========================================
