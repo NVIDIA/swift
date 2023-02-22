@@ -55,6 +55,47 @@ it will then look for and use the ``/etc/swift/object-expirer.conf`` config.
 The latter config file is considered deprecated and is searched for to aid
 in cluster upgrades.
 
+Account and Container Level Grace Period Support
+------------------------------------------------
+
+Swift's expiring object ``x-delete-at`` feature can be used to have the cluster
+delete user's objects automatically on their behalf when they no longer want
+them stored in their account. In some cases it may be necessary to "intervene"
+in the expected expiration process to prevent accidental or premature data loss
+if an object marked for expiration should NOT be deleted immediately when it
+expires for whatever reason. In these cases ``swift-object-expirer`` offers
+grace periods on accounts and containers, which provide a time period between
+when an object is marked for deletion and when they are actually deleted. When
+this is set in the object expirer config the object expirer leaves expired
+objects on disk (and in container listings) for the length of the grace period.
+After the grace_period has passed objects will be deleted as normal.
+
+The grace period can be set either at a per-account level or a per-container
+level. When set at a per-account level, the object expirer will only delete
+objects within the account after the grace period. A per-container level grace
+period works similarly for containers and overrides a per-account grace period.
+
+Grace periods are set in the ``[object-expirer]`` section in either the
+object-server or object-expirer config files. They are configured with
+dynamic config option names prefixed with ``grace_period_<ACCT>`` for
+per-account grace periods and ``grace_period_<ACCT>/<CNTR>`` for
+per-container grace periods, with the grace period value in seconds.
+
+Here is an example of grace period configs in ``object-expirer``
+section in the ``object-server.conf``::
+
+    [object-expirer]
+    grace_period_AUTH_test = 300.0
+    grace_period_AUTH_test2 = 86400.0
+    grace_period_AUTH_test/test = 0.0
+    grace_period_AUTH_test/test2 = 600.0
+
+.. note::
+    A per-container grace period does not require a per-account grace period
+    but overrides the per-account grace period for the same account if it
+    exists. By default, no grace_period is configured for any accounts or
+    containers.
+
 Upgrading impact: General Task Queue vs Legacy Queue
 ----------------------------------------------------
 
