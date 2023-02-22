@@ -295,6 +295,63 @@ class TestObjectExpirer(TestCase):
             x.get_process_values(vals)
         self.assertEqual(str(ctx.exception), expected_msg)
 
+    def test_init_grace_period(self):
+        conf = {}
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.acct_grace_periods, {})
+        # there is no global grace_period
+        conf = {
+            'grace_period': 0.0,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.acct_grace_periods, {})
+        conf = {
+            'grace_period_a': 1.0,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.acct_grace_periods, {'a': 1.0})
+
+        # test configure multi-account grace_period
+        conf = {
+            'grace_period_a': 1.0,
+            'grace_period_b': '259200.0',
+            'grace_period_AUTH_aBC': 999,
+            'grace_period_AUTH_aB😀C': 555,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.acct_grace_periods, {
+            'a': 1.0,
+            'b': 259200.0,
+            'AUTH_aBC': 999,
+            'AUTH_aB😀C': 555,
+        })
+
+        # negative tests
+        conf = {
+            'grace_period_a': -1.0,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_a must be a float greater than or equal to 0',
+            str(ctx.exception))
+        conf = {
+            'grace_period_a': '-259200.0'
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_a must be a float greater than or equal to 0',
+            str(ctx.exception))
+        conf = {
+            'grace_period_a': 'foo'
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_a must be a float greater than or equal to 0',
+            str(ctx.exception))
+
     def test_init_concurrency_too_small(self):
         conf = {
             'concurrency': 0,
@@ -756,6 +813,76 @@ class TestObjectExpirer(TestCase):
             list(x.iter_task_to_expire(
                 task_account_container_list, my_index, divisor)),
             expected)
+
+    def test_iter_task_to_expire_with_grace(self):
+        aco_dict = {
+            '.expiring_objects': {
+                self.past_time: [
+                    # tasks well past ready for execution
+                    {'name': self.past_time + '-a0/c0/o0'},
+                    {'name': self.past_time + '-a1/c1/o1'},
+                ],
+                self.just_past_time: [
+                    # tasks only just ready for execution
+                    {'name': self.just_past_time + '-a0/c0/o0'},
+                    {'name': self.just_past_time + '-a1/c1/o1'},
+                ],
+            }
+        }
+        fake_swift = FakeInternalClient(aco_dict)
+        # sanity, no accounts configured with grace period
+        x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                  swift=fake_swift)
+        # ... we expect ALL tasks to yield
+        expected = [
+            self.make_task(self.past_time, target_path)
+            for target_path in (
+                swob.wsgi_to_str(tgt) for tgt in (
+                    'a0/c0/o0',
+                    'a1/c1/o1',
+                )
+            )
+        ] + [
+            self.make_task(self.just_past_time, target_path)
+            for target_path in (
+                swob.wsgi_to_str(tgt) for tgt in (
+                    'a0/c0/o0',
+                    'a1/c1/o1',
+                )
+            )
+        ]
+        task_account_container_list = [
+            ('.expiring_objects', self.past_time),
+            ('.expiring_objects', self.just_past_time),
+        ]
+        observed = list(x.iter_task_to_expire(
+            task_account_container_list, 0, 1))
+        self.assertEqual(expected, observed)
+
+        # configure grace for account a1
+        self.conf['grace_period_a1'] = 300.0
+        x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                  swift=fake_swift)
+        # ... and we don't expect *recent* a1 tasks
+        expected = [
+            self.make_task(self.past_time, target_path)
+            for target_path in (
+                swob.wsgi_to_str(tgt) for tgt in (
+                    'a0/c0/o0',
+                    'a1/c1/o1',
+                )
+            )
+        ] + [
+            self.make_task(self.just_past_time, target_path)
+            for target_path in (
+                swob.wsgi_to_str(tgt) for tgt in (
+                    'a0/c0/o0',
+                )
+            )
+        ]
+        observed = list(x.iter_task_to_expire(
+            task_account_container_list, 0, 1))
+        self.assertEqual(expected, observed)
 
     def test_run_once_unicode_problem(self):
         requests = []
