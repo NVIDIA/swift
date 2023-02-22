@@ -72,6 +72,22 @@
 # queue.
 # reclaim_age = 604800
 #
+# The expirer can be tuned to leave expired objects on disk (and in container
+# listings) for a per-account or per-container grace_period.
+# After the grace_period has passed objects will be deleted as normal.
+# You may configure this grace period in seconds with dynamic config
+# option names prefixed with grace_period_<ACCT> for per-account grace periods
+# and grace_period_<ACCT>/<CNTR> for per-container grace periods.
+# The grace period should be a float value greater than or equal to zero.
+# A per-container grace period does not require a per-account grace period
+# but overrides the per-account grace period for the same account if it exists.
+# For example:
+# grace_period_AUTH_test = 300.0
+# grace_period_AUTH_test2 = 86400.0
+# grace_period_AUTH_test/test = 400.0
+# grace_period_AUTH_test/test2 = 600.0
+# N.B. By default no grace_period is configured for any accounts or containers.
+#
 # recon_cache_path = /var/cache/swift
 #
 # You can set scheduling priority of processes. Niceness values range from -20
