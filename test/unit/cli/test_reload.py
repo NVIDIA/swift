@@ -24,84 +24,89 @@ from swift.cli import reload
 
 
 @mock.patch('sys.stderr', new_callable=StringIO)
-@mock.patch('subprocess.check_output')
 class TestValidateManagerPid(unittest.TestCase):
-    def test_good(self, mock_check_output, mock_stderr):
-        cmdline = (
-            '/usr/local/bin/python3.9 '
-            '/usr/local/bin/swift-proxy-server '
-            '/etc/swift/proxy-server.conf '
-            'some extra args'
-        )
-        mock_check_output.return_value = ('123  1  123  %s\n\n' % cmdline)
-        self.assertEqual(reload.validate_manager_pid(123), (
-            cmdline,
-            'swift-proxy-server',
-        ))
-        kw = {} if six.PY2 else {'encoding': 'utf-8'}
-        self.assertEqual(mock_check_output.mock_calls, [
-            mock.call(['ps', '-p', '123', '--no-headers', '-o',
-                       'sid,ppid,pid,cmd'], **kw),
-        ])
+    def test_good(self, mock_stderr):
+        cmd_args = [
+            '/usr/local/bin/python3.9',
+            '/usr/local/bin/swift-proxy-server',
+            '/etc/swift/proxy-server.conf',
+            'some',
+            'extra',
+            'args',
+        ]
+        with mock.patch.object(reload, 'open', mock.mock_open(
+            read_data='\x00'.join(cmd_args) + '\x00'
+        )) as mock_open, mock.patch('os.getsid', return_value=123):
+            self.assertEqual(reload.validate_manager_pid(123), (
+                cmd_args,
+                'swift-proxy-server',
+            ))
+        self.assertEqual(mock_open.mock_calls[0],
+                         mock.call('/proc/123/cmdline', 'r'))
 
-    def test_ps_error(self, mock_check_output, mock_stderr):
-        mock_check_output.side_effect = subprocess.CalledProcessError(
-            137, 'ps')
-        with self.assertRaises(SystemExit) as caught:
+    def test_open_error(self, mock_stderr):
+        with mock.patch.object(reload, 'open', side_effect=OSError), \
+                self.assertRaises(SystemExit) as caught:
             reload.validate_manager_pid(123)
         self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
-        kw = {} if six.PY2 else {'encoding': 'utf-8'}
-        self.assertEqual(mock_check_output.mock_calls, [
-            mock.call(['ps', '-p', '123', '--no-headers', '-o',
-                       'sid,ppid,pid,cmd'], **kw),
-        ])
         self.assertEqual(mock_stderr.getvalue(),
                          'Failed to get process information for 123\n')
 
-    def test_non_python(self, mock_check_output, mock_stderr):
-        mock_check_output.return_value = ('123  34  56  /usr/bin/rsync\n\n')
-        with self.assertRaises(SystemExit) as caught:
+    def test_non_python(self, mock_stderr):
+        with mock.patch.object(reload, 'open', mock.mock_open(
+            read_data='/usr/bin/rsync\x00'
+        )), mock.patch('os.getsid', return_value=56), \
+                self.assertRaises(SystemExit) as caught:
             reload.validate_manager_pid(56)
         self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
-        kw = {} if six.PY2 else {'encoding': 'utf-8'}
-        self.assertEqual(mock_check_output.mock_calls, [
-            mock.call(['ps', '-p', '56', '--no-headers', '-o',
-                       'sid,ppid,pid,cmd'], **kw),
-        ])
         self.assertEqual(mock_stderr.getvalue(),
                          "Non-swift process: '/usr/bin/rsync'\n")
 
-    def test_non_swift(self, mock_check_output, mock_stderr):
-        mock_check_output.return_value = ('123  34  56  /usr/bin/python\n\n')
-        with self.assertRaises(SystemExit) as caught:
-            reload.validate_manager_pid(56)
+    def test_non_swift(self, mock_stderr):
+        with mock.patch.object(reload, 'open', mock.mock_open(
+            read_data='/usr/bin/python\x00some-script\x00'
+        )), mock.patch('os.getsid', return_value=123), \
+                self.assertRaises(SystemExit) as caught:
+            reload.validate_manager_pid(123)
         self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
-        kw = {} if six.PY2 else {'encoding': 'utf-8'}
-        self.assertEqual(mock_check_output.mock_calls, [
-            mock.call(['ps', '-p', '56', '--no-headers', '-o',
-                       'sid,ppid,pid,cmd'], **kw),
-        ])
         self.assertEqual(mock_stderr.getvalue(),
-                         "Non-swift process: '/usr/bin/python'\n")
+                         "Non-swift process: '/usr/bin/python some-script'\n")
 
-    def test_worker(self, mock_check_output, mock_stderr):
-        cmdline = (
-            '/usr/bin/python3.9 '
-            '/usr/bin/swift-proxy-server '
-            '/etc/swift/proxy-server.conf'
-        )
-        mock_check_output.return_value = ('123  34  56  %s\n\n' % cmdline)
-        with self.assertRaises(SystemExit) as caught:
+    def test_worker(self, mock_stderr):
+        cmd_args = [
+            '/usr/bin/python3.9',
+            '/usr/bin/swift-proxy-server',
+            '/etc/swift/proxy-server.conf',
+        ]
+        with mock.patch.object(reload, 'open', mock.mock_open(
+            read_data='\x00'.join(cmd_args) + '\x00'
+        )) as mock_open, mock.patch('os.getsid', return_value=123), \
+                self.assertRaises(SystemExit) as caught:
             reload.validate_manager_pid(56)
         self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
-        kw = {} if six.PY2 else {'encoding': 'utf-8'}
-        self.assertEqual(mock_check_output.mock_calls, [
-            mock.call(['ps', '-p', '56', '--no-headers', '-o',
-                       'sid,ppid,pid,cmd'], **kw),
-        ])
         self.assertEqual(mock_stderr.getvalue(),
-                         'Process appears to be a worker, not a manager. '
-                         'Did you mean 123?\n')
+                         'Process appears to be a swift-proxy-server worker, '
+                         'not a manager. Did you mean 123?\n')
+        self.assertEqual(mock_open.mock_calls[0],
+                         mock.call('/proc/56/cmdline', 'r'))
+
+    def test_non_server(self, mock_stderr):
+        cmd_args = [
+            '/usr/bin/swift-ring-builder',
+            '/etc/swift/object.builder',
+            'rebalance',
+        ]
+        with mock.patch.object(reload, 'open', mock.mock_open(
+            read_data='\x00'.join(cmd_args) + '\x00'
+        )) as mock_open, mock.patch('os.getsid', return_value=123), \
+                self.assertRaises(SystemExit) as caught:
+            reload.validate_manager_pid(123)
+        self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
+        self.assertEqual(mock_stderr.getvalue(),
+                         'Process does not support config checks: '
+                         'swift-ring-builder\n')
+        self.assertEqual(mock_open.mock_calls[0],
+                         mock.call('/proc/123/cmdline', 'r'))
 
 
 class TestMain(unittest.TestCase):
@@ -127,7 +132,13 @@ class TestMain(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_good(self):
-        self.mock_validate.return_value = ('cmdline', 'swift-proxy-server')
+        self.mock_validate.return_value = (
+            [
+                '/usr/bin/swift-proxy-server',
+                '/etc/swift/proxy-server.conf'
+            ],
+            'swift-proxy-server',
+        )
         self.mock_get_child_pids.side_effect = [
             {'worker1', 'worker2'},
             {'worker1', 'worker2', 'foster parent'},
@@ -135,16 +146,25 @@ class TestMain(unittest.TestCase):
             {'worker1', 'worker2', 'new worker'},
         ]
         self.assertIsNone(reload.main(['123']))
-        self.assertEqual(self.mock_check_call.mock_calls, [
-            mock.call(['cmdline', '--test-config']),
-        ])
+        self.assertEqual(self.mock_check_call.mock_calls, [mock.call([
+            '/usr/bin/swift-proxy-server',
+            '/etc/swift/proxy-server.conf',
+            '--test-config',
+        ])])
         self.assertEqual(self.mock_kill.mock_calls, [
             mock.call(123, signal.SIGUSR1),
         ])
 
     @mock.patch('time.time', side_effect=[1, 10, 100, 400])
     def test_timeout(self, mock_time):
-        self.mock_validate.return_value = ('cmdline', 'swift-proxy-server')
+        self.mock_validate.return_value = (
+            [
+                '/usr/bin/python3',
+                '/usr/bin/swift-proxy-server',
+                '/etc/swift/proxy-server.conf'
+            ],
+            'swift-proxy-server',
+        )
         self.mock_get_child_pids.side_effect = [
             {'worker1', 'worker2'},
             {'worker1', 'worker2', 'foster parent'},
@@ -153,35 +173,38 @@ class TestMain(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             reload.main(['123'])
         self.assertEqual(caught.exception.args, (reload.EXIT_RELOAD_TIMEOUT,))
-        self.assertEqual(self.mock_check_call.mock_calls, [
-            mock.call(['cmdline', '--test-config']),
-        ])
+        self.assertEqual(self.mock_check_call.mock_calls, [mock.call([
+            '/usr/bin/python3',
+            '/usr/bin/swift-proxy-server',
+            '/etc/swift/proxy-server.conf',
+            '--test-config',
+        ])])
         self.assertEqual(self.mock_kill.mock_calls, [
             mock.call(123, signal.SIGUSR1),
         ])
         self.assertEqual(self.mock_stderr.getvalue(),
                          'Timed out reloading swift-proxy-server\n')
 
-    def test_non_server(self):
-        self.mock_validate.return_value = ('cmdline', 'swift-ring-builder')
-        with self.assertRaises(SystemExit) as caught:
-            reload.main(['123'])
-        self.assertEqual(caught.exception.args, (reload.EXIT_BAD_PID,))
-        self.assertEqual(self.mock_stderr.getvalue(),
-                         'Process does not support config checks: '
-                         'swift-ring-builder\n')
-        self.assertEqual(self.mock_kill.mock_calls, [])
-
     def test_check_failed(self):
-        self.mock_validate.return_value = ('cmdline', 'swift-object-server')
+        self.mock_validate.return_value = (
+            [
+                '/usr/bin/python3',
+                '/usr/bin/swift-object-server',
+                '/etc/swift/object-server/1.conf'
+            ],
+            'swift-object-server',
+        )
         self.mock_check_call.side_effect = subprocess.CalledProcessError(
             2, 'swift-object-server')
         with self.assertRaises(SystemExit) as caught:
             reload.main(['123'])
         self.assertEqual(caught.exception.args, (reload.EXIT_RELOAD_FAILED,))
-        self.assertEqual(self.mock_check_call.mock_calls, [
-            mock.call(['cmdline', '--test-config']),
-        ])
+        self.assertEqual(self.mock_check_call.mock_calls, [mock.call([
+            '/usr/bin/python3',
+            '/usr/bin/swift-object-server',
+            '/etc/swift/object-server/1.conf',
+            '--test-config',
+        ])])
         self.assertEqual(self.mock_kill.mock_calls, [])
 
     def test_needs_pid(self):
