@@ -45,8 +45,8 @@ def decode_missing(line):
     parts = line.decode('ascii').split()
     result['object_hash'] = urllib.parse.unquote(parts[0])
     t_data = urllib.parse.unquote(parts[1])
-    result['ts_data'] = Timestamp(t_data)
-    result['ts_meta'] = result['ts_ctype'] = result['ts_data']
+    result['ts_data'] = ts_data = Timestamp(t_data)
+    result['ts_meta'] = result['ts_ctype'] = ts_data
     result['durable'] = True  # default to True in case this key isn't sent
     if len(parts) > 2:
         # allow for a comma separated list of k:v pairs to future-proof
@@ -55,11 +55,11 @@ def decode_missing(line):
             k, v = item.split(':')
             if k == 'm':
                 # ignore ts_data offset when calculating ts_meta
-                result['ts_meta'] = Timestamp(Timestamp(t_data).normal,
+                result['ts_meta'] = Timestamp(ts_data.normal,
                                               delta=int(v, 16))
             elif k == 't':
                 # ignore ts_data offset when calculating ts_ctype
-                result['ts_ctype'] = Timestamp(Timestamp(t_data).normal,
+                result['ts_ctype'] = Timestamp(ts_data.normal,
                                                delta=int(v, 16))
             elif k == 'durable':
                 result['durable'] = utils.config_true_value(v)

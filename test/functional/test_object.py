@@ -20,13 +20,14 @@ import json
 import unittest
 from uuid import uuid4
 import time
+from unittest import SkipTest
 from xml.dom import minidom
 
 import six
 from six.moves import range
 
 from test.functional import check_response, retry, requires_acls, \
-    requires_policies, SkipTest, requires_bulk
+    requires_policies, requires_bulk
 import test.functional as tf
 from swift.common.utils import md5
 
@@ -458,6 +459,67 @@ class TestObject(unittest.TestCase):
             count += 1
             time.sleep(1)
 
+        self.assertEqual(resp.status, 404)
+
+        # To avoid an error when the object deletion in tearDown(),
+        # the object is added again.
+        resp = retry(put)
+        resp.read()
+        self.assertEqual(resp.status, 201)
+
+    def test_x_open_expired(self):
+        def put(url, token, parsed, conn):
+            dt = datetime.datetime.now()
+            epoch = time.mktime(dt.timetuple())
+            delete_time = str(int(epoch) + 2)
+            conn.request(
+                'PUT',
+                '%s/%s/%s' % (parsed.path, self.container, 'x_delete_at'),
+                '',
+                {'X-Auth-Token': token,
+                 'Content-Length': '0',
+                 'X-Delete-At': delete_time})
+            return check_response(conn)
+        resp = retry(put)
+        resp.read()
+        self.assertEqual(resp.status, 201)
+
+        def get(url, token, parsed, conn):
+            conn.request(
+                'GET',
+                '%s/%s/%s' % (parsed.path, self.container, 'x_delete_at'),
+                '',
+                {'X-Auth-Token': token})
+            return check_response(conn)
+
+        def get_with_x_open_expired(url, token, parsed, conn):
+            conn.request(
+                'GET',
+                '%s/%s/%s' % (parsed.path, self.container, 'x_delete_at'),
+                '',
+                {'X-Auth-Token': token, 'X-Open-Expired': True})
+            return check_response(conn)
+
+        resp = retry(get)
+        resp.read()
+        count = 0
+        while resp.status == 200 and count < 10:
+            resp = retry(get)
+            resp.read()
+            count += 1
+            time.sleep(1)
+
+        # check to see object has expired
+        self.assertEqual(resp.status, 404)
+
+        resp = retry(get_with_x_open_expired)
+        resp.read()
+        # read the expired object with magic x-open-expired header
+        self.assertEqual(resp.status, 200)
+
+        resp = retry(get)
+        resp.read()
+        # verify object is still expired
         self.assertEqual(resp.status, 404)
 
         # To avoid an error when the object deletion in tearDown(),
@@ -943,7 +1005,7 @@ class TestObject(unittest.TestCase):
     @requires_acls
     def test_read_only(self):
         if tf.skip3:
-            raise tf.SkipTest
+            raise SkipTest
 
         def get_listing(url, token, parsed, conn):
             conn.request('GET', '%s/%s' % (parsed.path, self.container), '',
@@ -1556,7 +1618,7 @@ class TestObject(unittest.TestCase):
         def put_obj(url, token, parsed, conn, obj):
             conn.request(
                 'PUT', '%s/%s/%s' % (parsed.path, self.container, obj),
-                'test', {'X-Auth-Token': token})
+                'test', {'X-Auth-Token': token, 'X-Object-Meta-Color': 'red'})
             return check_response(conn)
 
         def check_cors(url, token, parsed, conn,
@@ -1590,6 +1652,8 @@ class TestObject(unittest.TestCase):
         headers = dict((k.lower(), v) for k, v in resp.getheaders())
         self.assertEqual(headers.get('access-control-allow-origin'),
                          '*')
+        # Just a pre-flight; this doesn't show up yet
+        self.assertNotIn('access-control-expose-headers', headers)
 
         resp = retry(check_cors,
                      'GET', 'cat', {'Origin': 'http://m.com'})
@@ -1597,6 +1661,8 @@ class TestObject(unittest.TestCase):
         headers = dict((k.lower(), v) for k, v in resp.getheaders())
         self.assertEqual(headers.get('access-control-allow-origin'),
                          '*')
+        self.assertIn('x-object-meta-color', headers.get(
+            'access-control-expose-headers').split(', '))
 
         resp = retry(check_cors,
                      'GET', 'cat', {'Origin': 'http://m.com',
@@ -1605,6 +1671,8 @@ class TestObject(unittest.TestCase):
         headers = dict((k.lower(), v) for k, v in resp.getheaders())
         self.assertEqual(headers.get('access-control-allow-origin'),
                          '*')
+        self.assertIn('x-object-meta-color', headers.get(
+            'access-control-expose-headers').split(', '))
 
         ####################
 

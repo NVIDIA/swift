@@ -96,7 +96,7 @@ from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.linkat import linkat
 
 # For backwards compatability with 3rd party middlewares
-from swift.common.registry import register_swift_info, get_swift_info # noqa
+from swift.common.registry import register_swift_info, get_swift_info  # noqa
 
 from logging.handlers import SysLogHandler
 import logging
@@ -5503,12 +5503,6 @@ class Namespace(object):
                 (value, self.upper))
         self._lower = value
 
-    def lower_bound_in_list(self):
-        """
-        Returns this Namespace's lower bound and name in a list.
-        """
-        return [self.lower_str, str(self.name)]
-
     @property
     def upper(self):
         return self._upper
@@ -5592,9 +5586,10 @@ class NamespaceBoundList(object):
         self.bounds = [] if bounds is None else bounds
 
     @classmethod
-    def from_namespaces(cls, namespaces):
+    def parse(cls, namespaces):
         """
-        Create a NamespaceBoundList from a list of Namespaces.
+        Create a NamespaceBoundList object by parsing a list of Namespaces or
+        shard ranges and only storing the compact bounds list.
 
         Each Namespace in the given list of ``namespaces`` provides the next
         [lower bound, name] list to append to the NamespaceBoundList. The
@@ -5612,17 +5607,17 @@ class NamespaceBoundList(object):
             return None
         bounds = []
         upper = namespaces[0].lower
-        for sr in namespaces:
-            if sr.lower < upper:
+        for ns in namespaces:
+            if ns.lower < upper:
                 # Discard overlapping namespace.
                 # Overlapping namespaces are expected in lists of shard ranges
                 # fetched from the backend. For example, while a parent
                 # container is in the process of sharding, the parent shard
                 # range and its children shard ranges may be returned in the
                 # list of shard ranges. However, the backend sorts the list by
-                # (lower, state, upper) such that the children precede the
-                # parent, and it is the children that we prefer to retain in
-                # the NamespaceBoundList. For example, these namespaces:
+                # (upper, state, lower, name) such that the children precede
+                # the parent, and it is the children that we prefer to retain
+                # in the NamespaceBoundList. For example, these namespaces:
                 #   (a-b, "child1"), (b-c, "child2"), (a-c, "parent")
                 # would result in a NamespaceBoundList:
                 #   (a, "child1"), (b, "child2")
@@ -5639,8 +5634,8 @@ class NamespaceBoundList(object):
                 # versions, an object update lying in a gap would have been
                 # mapped to the root container.)
                 continue
-            bounds.append(sr.lower_bound_in_list())
-            upper = sr.upper
+            bounds.append([ns.lower_str, str(ns.name)])
+            upper = ns.upper
         return cls(bounds)
 
     def get_namespace(self, item):

@@ -76,7 +76,7 @@ def main(args=None):
     parser.add_argument("pid", type=int,
                         help="server PID which should be reloaded")
     wait_group = parser.add_mutually_exclusive_group()
-    wait_group.add_argument("-t", "--timeout", type=float, default=30.0,
+    wait_group.add_argument("-t", "--timeout", type=float, default=300.0,
                             help="max time to wait for reload to complete")
     wait_group.add_argument("-w", "--no-wait",
                             action="store_false", dest="wait",

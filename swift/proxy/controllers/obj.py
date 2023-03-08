@@ -248,6 +248,8 @@ class BaseObjectController(Controller):
         policy = POLICIES.get_by_index(policy_index)
         obj_ring = self.app.get_object_ring(policy_index)
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
+        if 'x-open-expired' in req.headers:
+            req.headers['X-Backend-Open-Expired'] = 'true'
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
             if aresp:
@@ -337,9 +339,8 @@ class BaseObjectController(Controller):
             req, account, container, states='updating', includes=obj)
         record_cache_op_metrics(
             self.logger, 'shard_updating', 'disabled', response)
-        if not shard_ranges:
-            return None
-        return shard_ranges[0]
+        # there will be only one shard range in the list if any
+        return shard_ranges[0] if shard_ranges else None
 
     def _get_update_shard(self, req, account, container, obj):
         """
@@ -376,11 +377,13 @@ class BaseObjectController(Controller):
                 name=namespace.name, timestamp=0, lower=namespace.lower,
                 upper=namespace.upper)
         else:
-            # pull full set of updating shards from backend
+            # pull full set of updating shard ranges from backend
             shard_ranges, response = self._get_shard_ranges(
                 req, account, container, states='updating')
             if shard_ranges:
-                cached_namespaces = NamespaceBoundList.from_namespaces(
+                # only store the list of namespace lower bounds and names into
+                # infocache and memcache.
+                cached_namespaces = NamespaceBoundList.parse(
                     shard_ranges)
                 infocache[cache_key] = cached_namespaces
                 if memcache:

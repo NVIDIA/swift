@@ -513,7 +513,8 @@ class TestController(unittest.TestCase):
 
     def test_get_account_info_returns_values_as_strings(self):
         app = mock.MagicMock()
-        app._pipeline_final_app.account_existence_skip_cache = 0.0
+        app._pipeline_final_app = app
+        app.account_existence_skip_cache = 0.0
         memcache = mock.MagicMock()
         memcache.get = mock.MagicMock()
         memcache.get.return_value = {
@@ -539,7 +540,8 @@ class TestController(unittest.TestCase):
 
     def test_get_container_info_returns_values_as_strings(self):
         app = mock.MagicMock()
-        app._pipeline_final_app.container_existence_skip_cache = 0.0
+        app._pipeline_final_app = app
+        app.container_existence_skip_cache = 0.0
         memcache = mock.MagicMock()
         memcache.get = mock.MagicMock()
         memcache.get.return_value = {
@@ -4371,8 +4373,7 @@ class TestReplicatedObjectController(
 
             cache_key = 'shard-updating-v2/a/c'
             self.assertIn(cache_key, req.environ['swift.cache'].store)
-            cached_namespaces = NamespaceBoundList.from_namespaces(
-                shard_ranges)
+            cached_namespaces = NamespaceBoundList.parse(shard_ranges)
             self.assertEqual(
                 req.environ['swift.cache'].store[cache_key],
                 cached_namespaces.bounds)
@@ -4442,7 +4443,7 @@ class TestReplicatedObjectController(
             cache.set(
                 'shard-updating-v2/a/c',
                 tuple(
-                    shard_range.lower_bound_in_list()
+                    [shard_range.lower_str, str(shard_range.name)]
                     for shard_range in shard_ranges))
             req = Request.blank('/v1/a/c/o', {'swift.cache': cache},
                                 method=method, body='',
@@ -4484,7 +4485,7 @@ class TestReplicatedObjectController(
             self.assertIn(cache_key, req.environ.get('swift.infocache'))
             self.assertEqual(
                 req.environ['swift.infocache'][cache_key].bounds,
-                NamespaceBoundList.from_namespaces(shard_ranges).bounds)
+                NamespaceBoundList.parse(shard_ranges).bounds)
 
             # make sure backend requests included expected container headers
             container_headers = {}
@@ -4542,7 +4543,7 @@ class TestReplicatedObjectController(
             ]
             infocache = {
                 'shard-updating-v2/a/c':
-                NamespaceBoundList.from_namespaces(shard_ranges)}
+                NamespaceBoundList.parse(shard_ranges)}
             req = Request.blank('/v1/a/c/o', {'swift.infocache': infocache},
                                 method=method, body='',
                                 headers={'Content-Type': 'text/plain'})
@@ -4578,7 +4579,7 @@ class TestReplicatedObjectController(
             self.assertIn(cache_key, req.environ.get('swift.infocache'))
             self.assertEqual(
                 req.environ['swift.infocache'][cache_key].bounds,
-                NamespaceBoundList.from_namespaces(shard_ranges).bounds)
+                NamespaceBoundList.parse(shard_ranges).bounds)
 
             # make sure backend requests included expected container headers
             container_headers = {}
@@ -4636,9 +4637,10 @@ class TestReplicatedObjectController(
                     '.shards_a/c_no_way', utils.Timestamp.now(), 'u', ''),
             ]
             cache = FakeMemcache()
-            cache.set(
-                'shard-updating-v2/a/c',
-                tuple(sr.lower_bound_in_list() for sr in cached_shard_ranges))
+            cache.set('shard-updating-v2/a/c',
+                      tuple(
+                          [sr.lower_str, str(sr.name)]
+                          for sr in cached_shard_ranges))
 
             # sanity check: we can get the old shard from cache
             req = Request.blank(
@@ -4665,8 +4667,7 @@ class TestReplicatedObjectController(
             # cached shard ranges are still there
             cache_key = 'shard-updating-v2/a/c'
             self.assertIn(cache_key, req.environ['swift.cache'].store)
-            cached_namespaces = NamespaceBoundList.from_namespaces(
-                cached_shard_ranges)
+            cached_namespaces = NamespaceBoundList.parse(cached_shard_ranges)
             self.assertEqual(
                 req.environ['swift.cache'].store[cache_key],
                 cached_namespaces.bounds)
@@ -4721,8 +4722,7 @@ class TestReplicatedObjectController(
             # and skipping cache will refresh it
             cache_key = 'shard-updating-v2/a/c'
             self.assertIn(cache_key, req.environ['swift.cache'].store)
-            cached_namespaces = NamespaceBoundList.from_namespaces(
-                shard_ranges)
+            cached_namespaces = NamespaceBoundList.parse(shard_ranges)
             self.assertEqual(
                 req.environ['swift.cache'].store[cache_key],
                 cached_namespaces.bounds)

@@ -8439,11 +8439,11 @@ class TestNamespaceBoundList(unittest.TestCase):
         self.assertEqual(namespace_list.get_namespace('r'), ltor_ns)
         self.assertEqual(namespace_list.get_namespace('}'), end_ns)
 
-        # test 'from_namespaces'
-        namespaces_list = utils.NamespaceBoundList.from_namespaces(None)
+        # test 'parse'
+        namespaces_list = utils.NamespaceBoundList.parse(None)
         self.assertEqual(namespaces_list, None)
         namespaces = [start_ns, atof_ns, ftol_ns, ltor_ns, rtoz_ns, end_ns]
-        namespace_list = utils.NamespaceBoundList.from_namespaces(namespaces)
+        namespace_list = utils.NamespaceBoundList.parse(namespaces)
         self.assertEqual(namespace_list.get_namespace('1'), start_ns)
         self.assertEqual(namespace_list.get_namespace('l'), ftol_ns)
         self.assertEqual(namespace_list.get_namespace('x'), rtoz_ns)
@@ -8453,14 +8453,12 @@ class TestNamespaceBoundList(unittest.TestCase):
         overlap_f_ns = utils.Namespace('a/-f', '', 'f')
         overlapping_namespaces = [start_ns, atof_ns, overlap_f_ns,
                                   ftol_ns, ltor_ns, rtoz_ns, end_ns]
-        namespace_list = utils.NamespaceBoundList.from_namespaces(
-            overlapping_namespaces)
+        namespace_list = utils.NamespaceBoundList.parse(overlapping_namespaces)
         self.assertEqual(namespace_list.bounds, lowerbounds)
         overlap_l_ns = utils.Namespace('a/a-l', 'a', 'l')
         overlapping_namespaces = [start_ns, atof_ns, ftol_ns,
                                   overlap_l_ns, ltor_ns, rtoz_ns, end_ns]
-        namespace_list = utils.NamespaceBoundList.from_namespaces(
-            overlapping_namespaces)
+        namespace_list = utils.NamespaceBoundList.parse(overlapping_namespaces)
         self.assertEqual(namespace_list.bounds, lowerbounds)
 
 

@@ -72,6 +72,15 @@
 # queue.
 # reclaim_age = 604800
 #
+# The expirer can be tuned to leave expired objects on disk (and in container
+# listings) for a per-account grace_period.  After the grace_period has passed
+# objects will be expired as normal.  You may configure per account
+# grace_period in seconds with dynamic config option names prefixed with
+# grace_period_<ACCT>, e.g.
+# grace_period_AUTH_test = 300.0
+# grace_period_AUTH_test2 = 86400.0
+# N.B. By default no grace_period is configured for any accounts
+#
 # recon_cache_path = /var/cache/swift
 #
 # You can set scheduling priority of processes. Niceness values range from -20
