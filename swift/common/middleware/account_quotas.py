@@ -18,10 +18,14 @@
 given account quota (in bytes) is exceeded while DELETE requests are still
 allowed.
 
-``account_quotas`` uses the ``x-account-meta-quota-bytes`` metadata entry to
-store the overall account quota. Write requests to this metadata entry are
-only permitted for resellers. There is no overall account quota limit if
-``x-account-meta-quota-bytes`` is not set.
+``account_quotas`` uses the x header prefix of ``x-account-quota-bytes`` to
+control the account quota on a particular account. Write requests to these
+headers are only permitted to resellers.
+
+To set the overall account quota on an account use ``x-account-quota-bytes`` or
+the legecy metadata ``x-account-meta-quota-bytes``. There is no overall account
+quota limit if one of these aren't set. The newer ``x-account-quota-bytes``
+takes precident over the lecacy one.
 
 Additionally, account quotas may be set for each storage policy, using metadata
 of the form ``x-account-quota-bytes-policy-<policy name>``. Again, only
@@ -82,10 +86,15 @@ class AccountQuotaMiddleware(object):
         if request.method in ("POST", "PUT"):
             # account request, so we pay attention to the quotas
             new_quotas = {}
-            new_quotas[None] = request.headers.get(
-                'X-Account-Meta-Quota-Bytes')
+            new_quotas[None] = request.headers.pop(
+                'X-Account-Quota-Bytes', None)
+            if new_quotas[None] is None:
+                # look for legacy global quota
+                new_quotas[None] = request.headers.get(
+                    'X-Account-Meta-Quota-Bytes')
             if request.headers.get(
-                    'X-Remove-Account-Meta-Quota-Bytes'):
+                    'X-Remove-Account-Quota-Bytes', request.headers.get(
+                        'X-Remove-Account-Meta-Quota-Bytes')):
                 new_quotas[None] = 0  # X-Remove dominates if both are present
 
             for policy in POLICIES:
@@ -102,15 +111,26 @@ class AccountQuotaMiddleware(object):
                     return HTTPBadRequest()
                 for idx, quota in new_quotas.items():
                     if idx is None:
-                        continue  # For legacy reasons, it's in user meta
-                    hdr = 'X-Account-Sysmeta-Quota-Bytes-Policy-%d' % idx
-                    request.headers[hdr] = quota
+                        # update legecy and new location
+                        request.headers['X-Account-Meta-Quota-Bytes'] = quota
+                        hdr = 'X-Account-Sysmeta-Quota-Bytes'
+                        request.headers[hdr] = quota
+                    else:
+                        hdr = 'X-Account-Sysmeta-Quota-Bytes-Policy-%d' % idx
+                        request.headers[hdr] = quota
             elif any(quota is not None for quota in new_quotas.values()):
                 # deny quota set for non-reseller
                 return HTTPForbidden()
 
         resp = request.get_response(self.app)
         # Non-resellers can't update quotas, but they *can* see them
+        # Global quota-bytes are saved to and read from both locations, legecy
+        # last.
+        global_value = resp.headers.get(
+            'X-Account-Sysmeta-Quota-Bytes',
+            resp.headers.get('X-Account-Meta-Quota-Bytes'))
+        if global_value:
+            resp.headers['X-Account-Quota-Bytes'] = global_value
         for policy in POLICIES:
             infix = 'Quota-Bytes-Policy'
             value = resp.headers.get('X-Account-Sysmeta-%s-%d' % (
@@ -149,7 +169,8 @@ class AccountQuotaMiddleware(object):
         if not account_info:
             return self.app
         try:
-            quota = int(account_info['meta'].get('quota-bytes', -1))
+            quota = int(account_info['sysmeta'].get(
+                'quota-bytes', account_info['meta'].get('quota-bytes', -1)))
         except ValueError:
             quota = -1
         if quota >= 0:
