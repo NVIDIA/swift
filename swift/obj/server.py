@@ -277,7 +277,8 @@ class ObjectController(BaseStorageServer):
 
     def async_update(self, op, account, container, obj, host, partition,
                      contdevice, headers_out, objdevice, policy,
-                     logger_thread_locals=None, container_path=None):
+                     logger_thread_locals=None, container_path=None,
+                     db_state=None):
         """
         Sends or saves an async update.
 
@@ -299,6 +300,8 @@ class ObjectController(BaseStorageServer):
             to which the update should be sent. If given this path will be used
             instead of constructing a path from the ``account`` and
             ``container`` params.
+        :param db_state: The current database state of the container as
+            supplied to us by the proxy.
         """
         if logger_thread_locals:
             self.logger.thread_locals = logger_thread_locals
@@ -342,7 +345,7 @@ class ObjectController(BaseStorageServer):
                     '%(ip)s:%(port)s/%(dev)s (saving for async update later)',
                     {'ip': ip, 'port': port, 'dev': contdevice})
         data = {'op': op, 'account': account, 'container': container,
-                'obj': obj, 'headers': headers_out}
+                'obj': obj, 'headers': headers_out, 'db_state': db_state}
         if redirect_data:
             self.logger.debug(
                 'Update to %(path)s redirected to %(redirect)s',
@@ -376,6 +379,7 @@ class ObjectController(BaseStorageServer):
         contdevices = [d.strip() for d in
                        headers_in.get('X-Container-Device', '').split(',')]
         contpartition = headers_in.get('X-Container-Partition', '')
+        contdbstate = headers_in.get('X-Container-Db-State', '')
 
         if len(conthosts) != len(contdevices):
             # This shouldn't happen unless there's a bug in the proxy,
@@ -426,7 +430,7 @@ class ObjectController(BaseStorageServer):
                        conthost, contpartition, contdevice, headers_out,
                        objdevice, policy,
                        logger_thread_locals=self.logger.thread_locals,
-                       container_path=contpath)
+                       container_path=contpath, db_state=contdbstate)
             update_greenthreads.append(gt)
         # Wait a little bit to see if the container updates are successful.
         # If we immediately return after firing off the greenthread above, then
