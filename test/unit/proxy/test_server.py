@@ -73,9 +73,11 @@ from swift.common import utils, constraints, registry
 from swift.common.utils import hash_path, storage_directory, \
     parse_content_type, parse_mime_headers, StatsdClient, \
     iter_multipart_mime_documents, public, mkdirs, NullLogger, md5, \
-    node_to_string, NamespaceBoundList
+    node_to_string, NamespaceBoundList, ShardRange
 from swift.common.wsgi import loadapp, ConfigString
 from swift.common.http_protocol import SwiftHttpProtocol
+from swift.container.backend import NOTFOUND, UNSHARDED, SHARDING, SHARDED, \
+    COLLAPSED
 from swift.proxy.controllers import base as proxy_base
 from swift.proxy.controllers.base import get_cache_key, cors_validation, \
     get_account_info, get_container_info
@@ -7308,7 +7310,8 @@ class TestReplicatedObjectController(
                                     **kwargs):
         header_list = kwargs.pop('header_list', ['X-Container-Device',
                                                  'X-Container-Host',
-                                                 'X-Container-Partition'])
+                                                 'X-Container-Partition',
+                                                 'X-Container-Db-State'])
         seen_headers = []
 
         def capture_headers(ipaddr, port, device, partition, method,
@@ -7326,10 +7329,77 @@ class TestReplicatedObjectController(
             resp = controller_call(req)
             self.assertEqual(2, resp.status_int // 100)  # sanity check
 
-            # don't care about the account/container HEADs, so chuck
-            # the first two requests
-            return sorted(seen_headers[2:],
+            if kwargs.get('no_heads', False):
+                results = seen_headers
+            else:
+                # don't care about the account/container HEADs, so chuck
+                # the first two requests
+                results = seen_headers[2:]
+            return sorted(results,
                           key=lambda d: d.get(header_list[0]) or 'z')
+
+    def test_x_container_headers_db_states(self):
+        # let's force the db_states by inserting a crafted container
+        # info into info cache
+        crafted_container_info = {
+            'status': 200, 'read_acl': None, 'write_acl': None,
+            'sync_to': None, 'sync_key': None, 'object_count': 0, 'bytes': 0,
+            'versions': None, 'storage_policy': 0,
+            'cors': {
+                'allow_origin': None, 'expose_headers': None, 'max_age': None},
+            'meta': {}, 'sysmeta': {},
+            'created_at': '1', 'put_timestamp': None,
+            'delete_timestamp': None,
+            'status_changed_at': None
+        }
+        shardrange = ShardRange('.sharded_a/c_something', 0, 'm', 'z')
+
+        # We should always get X-Container-Db-State with the current db_state
+        # and when db_state is either sharding or sharded we should also get
+        # an X-Backend-Quoted-Container-Path with a shard name.
+        for db_state, expect_cont_path in (
+                (NOTFOUND, False), (UNSHARDED, False), (SHARDING, True),
+                (SHARDED, True), (COLLAPSED, False)):
+            crafted_container_info['sharding_state'] = db_state
+            req = Request.blank(
+                '/v1/a/c/o',
+                environ={'REQUEST_METHOD': 'PUT', 'swift.infocache': {}},
+                headers={'Content-Length': '5'}, body='12345')
+            req.environ['swift.infocache']['container/a/c'] = \
+                crafted_container_info
+
+            exp_seen_header_list = [
+                'X-Container-Device', 'X-Container-Host',
+                'X-Container-Partition', 'X-Container-Db-State']
+            expected_headers = [
+                {'X-Container-Host': '10.0.0.0:1000',
+                    'X-Container-Partition': '0',
+                    'X-Container-Device': 'sda',
+                    'X-Container-Db-State': db_state},
+                {'X-Container-Host': '10.0.0.1:1001',
+                    'X-Container-Partition': '0',
+                    'X-Container-Device': 'sdb',
+                    'X-Container-Db-State': db_state},
+                {'X-Container-Host': '10.0.0.2:1002',
+                    'X-Container-Partition': '0',
+                    'X-Container-Device': 'sdc',
+                    'X-Container-Db-State': db_state}]
+            if expect_cont_path:
+                exp_seen_header_list.append('X-Backend-Quoted-Container-Path')
+                for headers in expected_headers:
+                    headers['X-Backend-Quoted-Container-Path'] = \
+                        shardrange.name
+
+            with mock.patch('swift.proxy.controllers.obj.BaseObjectController.'
+                            '_get_update_shard', return_value=shardrange):
+                controller = ReplicatedObjectController(
+                    self.app, 'a', 'c', 'o')
+                seen_headers = self._gather_x_container_headers(
+                    controller.PUT, req,
+                    201, 201, 201,  # PUT PUT PUT
+                    header_list=exp_seen_header_list, no_heads=True)
+
+            self.assertEqual(seen_headers, expected_headers)
 
     def test_PUT_x_container_headers_with_equal_replicas(self):
         req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -7343,13 +7413,16 @@ class TestReplicatedObjectController(
             seen_headers, [
                 {'X-Container-Host': '10.0.0.0:1000',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sda'},
+                 'X-Container-Device': 'sda',
+                 'X-Container-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.1:1001',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sdb'},
+                 'X-Container-Device': 'sdb',
+                 'X-Container-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.2:1002',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sdc'}])
+                 'X-Container-Device': 'sdc',
+                 'X-Container-Db-State': 'unsharded'}])
 
     def test_PUT_x_container_headers_with_fewer_container_replicas(self):
         self.app.container_ring.set_replicas(2)
@@ -7366,13 +7439,16 @@ class TestReplicatedObjectController(
             seen_headers, [
                 {'X-Container-Host': '10.0.0.0:1000',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sda'},
+                 'X-Container-Device': 'sda',
+                 'X-Container-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.1:1001',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sdb'},
+                 'X-Container-Device': 'sdb',
+                 'X-Container-Db-State': 'unsharded'},
                 {'X-Container-Host': None,
                  'X-Container-Partition': None,
-                 'X-Container-Device': None}])
+                 'X-Container-Device': None,
+                 'X-Container-Db-State': None}])
 
     def test_PUT_x_container_headers_with_many_object_replicas(self):
         POLICIES[0].object_ring.set_replicas(11)
@@ -7389,18 +7465,22 @@ class TestReplicatedObjectController(
         self.assertEqual(
             dict(collections.Counter(tuple(sorted(h.items()))
                                      for h in seen_headers)),
-            {(('X-Container-Device', 'sda'),
+            {(('X-Container-Db-State', 'unsharded'),
+              ('X-Container-Device', 'sda'),
               ('X-Container-Host', '10.0.0.0:1000'),
               ('X-Container-Partition', '0')): 3,
-             (('X-Container-Device', 'sdb'),
+             (('X-Container-Db-State', 'unsharded'),
+              ('X-Container-Device', 'sdb'),
               ('X-Container-Host', '10.0.0.1:1001'),
               ('X-Container-Partition', '0')): 2,
-             (('X-Container-Device', 'sdc'),
+             (('X-Container-Db-State', 'unsharded'),
+              ('X-Container-Device', 'sdc'),
               ('X-Container-Host', '10.0.0.2:1002'),
               ('X-Container-Partition', '0')): 2,
-             (('X-Container-Device', None),
+             (('X-Container-Db-State', None),
+              ('X-Container-Device', None),
               ('X-Container-Host', None),
-              ('X-Container-Partition', None)): 4})
+              ('X-Container-Partition', None),): 4})
 
     def test_PUT_x_container_headers_with_more_container_replicas(self):
         self.app.container_ring.set_replicas(4)
@@ -7417,13 +7497,16 @@ class TestReplicatedObjectController(
             seen_headers, [
                 {'X-Container-Host': '10.0.0.0:1000,10.0.0.3:1003',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sda,sdd'},
+                 'X-Container-Device': 'sda,sdd',
+                 'X-Container-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.1:1001',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sdb'},
+                 'X-Container-Device': 'sdb',
+                 'X-Container-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.2:1002',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sdc'}])
+                 'X-Container-Device': 'sdc',
+                 'X-Container-Db-State': 'unsharded'}])
 
     def test_POST_x_container_headers_with_more_container_replicas(self):
         self.app.container_ring.set_replicas(4)
@@ -7441,13 +7524,16 @@ class TestReplicatedObjectController(
             seen_headers, [
                 {'X-Container-Host': '10.0.0.0:1000,10.0.0.3:1003',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sda,sdd'},
+                 'X-Container-Device': 'sda,sdd',
+                 'X-Container-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.1:1001',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sdb'},
+                 'X-Container-Device': 'sdb',
+                 'X-Container-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.2:1002',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sdc'}])
+                 'X-Container-Device': 'sdc',
+                 'X-Container-Db-State': 'unsharded'}])
 
     def test_DELETE_x_container_headers_with_more_container_replicas(self):
         self.app.container_ring.set_replicas(4)
@@ -7461,16 +7547,20 @@ class TestReplicatedObjectController(
             controller.DELETE, req,
             200, 200, 200, 200, 200)   # HEAD HEAD DELETE DELETE DELETE
 
+        self.maxDiff = None
         self.assertEqual(seen_headers, [
             {'X-Container-Host': '10.0.0.0:1000,10.0.0.3:1003',
              'X-Container-Partition': '0',
-             'X-Container-Device': 'sda,sdd'},
+             'X-Container-Device': 'sda,sdd',
+             'X-Container-Db-State': 'unsharded'},
             {'X-Container-Host': '10.0.0.1:1001',
              'X-Container-Partition': '0',
-             'X-Container-Device': 'sdb'},
+             'X-Container-Device': 'sdb',
+             'X-Container-Db-State': 'unsharded'},
             {'X-Container-Host': '10.0.0.2:1002',
              'X-Container-Partition': '0',
-             'X-Container-Device': 'sdc'}
+             'X-Container-Device': 'sdc',
+             'X-Container-Db-State': 'unsharded'}
         ])
 
     @mock.patch('time.time', new=lambda: STATIC_TIME)
