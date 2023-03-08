@@ -737,7 +737,8 @@ class TestObjectUpdater(unittest.TestCase):
                 {'successes': 1, 'unlinks': 1, 'async_pendings': 1})
 
     def _write_async_update(self, dfmanager, timestamp, policy,
-                            headers=None, container_path=None):
+                            headers=None, container_path=None,
+                            db_state='unsharded'):
         # write an async
         account, container, obj = 'a', 'c', 'o'
         op = 'PUT'
@@ -751,8 +752,11 @@ class TestObjectUpdater(unittest.TestCase):
         }
         data = {'op': op, 'account': account, 'container': container,
                 'obj': obj, 'headers': headers_out}
+        if db_state:
+            data['db_state'] = db_state
         if container_path:
             data['container_path'] = container_path
+            data['db_state'] = 'sharded'
         dfmanager.pickle_async_update(self.sda1, account, container, obj,
                                       data, timestamp, policy)
 
