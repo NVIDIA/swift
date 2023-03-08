@@ -969,7 +969,8 @@ class TestObjectController(BaseTestCase):
             'X-Backend-Storage-Policy-Index': int(policy),
             'X-Container-Host': 'chost:cport',
             'X-Container-Partition': 'cpartition',
-            'X-Container-Device': 'cdevice'}
+            'X-Container-Device': 'cdevice',
+            'X-Container-Root-Db-State': 'unsharded'}
         if policy.policy_type == EC_POLICY:
             put_headers.update({
                 'X-Object-Sysmeta-Ec-Frag-Index': '2',
@@ -1007,7 +1008,8 @@ class TestObjectController(BaseTestCase):
         self.assertDictEqual(
             pickle.load(open(async_pending_file_put, 'rb')),
             {'headers': expected_put_headers,
-             'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT'})
+             'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT',
+             'db_state': 'unsharded'})
 
         # POST with newer metadata returns success and container update
         # is expected
@@ -1019,7 +1021,8 @@ class TestObjectController(BaseTestCase):
             'X-Backend-Storage-Policy-Index': int(policy),
             'X-Container-Host': 'chost:cport',
             'X-Container-Partition': 'cpartition',
-            'X-Container-Device': 'cdevice'}
+            'X-Container-Device': 'cdevice',
+            'X-Container-Root-Db-State': 'unsharded'}
         req = Request.blank('/sda1/p/a/c/o',
                             environ={'REQUEST_METHOD': 'POST'},
                             headers=post_headers)
@@ -1036,7 +1039,8 @@ class TestObjectController(BaseTestCase):
         self.assertDictEqual(
             pickle.load(open(async_pending_file_put, 'rb')),
             {'headers': expected_put_headers,
-             'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT'})
+             'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT',
+             'db_state': 'unsharded'})
 
         # check distinct async pending file for POST
         async_pending_file_post = os.path.join(
@@ -1062,7 +1066,8 @@ class TestObjectController(BaseTestCase):
         self.assertDictEqual(
             pickle.load(open(async_pending_file_post, 'rb')),
             {'headers': expected_post_headers,
-             'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT'})
+             'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT',
+             'db_state': 'unsharded'})
 
         # verify that only the POST (most recent) async update gets sent by the
         # object updater, and that both update files are deleted
@@ -1115,13 +1120,15 @@ class TestObjectController(BaseTestCase):
             'X-Backend-Storage-Policy-Index': int(policy),
             'X-Container-Host': 'chost:3200',
             'X-Container-Partition': '99',
-            'X-Container-Device': 'cdevice'}
+            'X-Container-Device': 'cdevice',
+            'X-Container-Root-Db-State': 'unsharded'}
 
         if container_path:
             # the proxy may include either header
             hdr = ('X-Backend-Container-Path' if old_style
                    else 'X-Backend-Quoted-Container-Path')
             put_headers[hdr] = container_path
+            put_headers['X-Container-Root-Db-State'] = 'sharded'
             expected_update_path = '/cdevice/99/%s/o' % container_path
         else:
             expected_update_path = '/cdevice/99/a/c/o'
@@ -1171,7 +1178,8 @@ class TestObjectController(BaseTestCase):
         self.assertEqual(
             {'headers': expected_put_headers,
              'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT',
-             'container_path': '.sharded_a/c_shard_1'},
+             'container_path': '.sharded_a/c_shard_1',
+             'db_state': 'sharded' if container_path else 'unsharded'},
             pickle.load(open(async_pending_file_put, 'rb')))
 
         # when updater is run its first request will be to the redirect
@@ -5918,7 +5926,7 @@ class TestObjectController(BaseTestCase):
                 'PUT', 'a', 'c', 'o', '127.0.0.1:1234', 1, 'sdc1',
                 {'x-timestamp': '1', 'x-out': 'set',
                  'X-Backend-Storage-Policy-Index': int(policy)}, 'sda1',
-                policy)
+                policy, db_state='unsharded')
         finally:
             object_server.http_connect = orig_http_connect
             utils.HASH_PATH_PREFIX = _prefix
@@ -5931,7 +5939,8 @@ class TestObjectController(BaseTestCase):
             {'headers': {'x-timestamp': '1', 'x-out': 'set',
                          'user-agent': 'object-server %s' % os.getpid(),
                          'X-Backend-Storage-Policy-Index': int(policy)},
-             'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT'})
+             'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT',
+             'db_state': 'unsharded'})
 
     def test_async_update_saves_on_non_2xx(self):
         policy = random.choice(list(POLICIES))
@@ -5962,7 +5971,7 @@ class TestObjectController(BaseTestCase):
                     'PUT', 'a', 'c', 'o', '127.0.0.1:1234', 1, 'sdc1',
                     {'x-timestamp': '1', 'x-out': str(status),
                      'X-Backend-Storage-Policy-Index': int(policy)}, 'sda1',
-                    policy)
+                    policy, db_state='unsharded')
                 async_dir = diskfile.get_async_dir(policy)
                 self.assertEqual(
                     pickle.load(open(os.path.join(
@@ -5975,7 +5984,7 @@ class TestObjectController(BaseTestCase):
                                  'X-Backend-Storage-Policy-Index':
                                  int(policy)},
                      'account': 'a', 'container': 'c', 'obj': 'o',
-                     'op': 'PUT'})
+                     'op': 'PUT', 'db_state': 'unsharded'})
         finally:
             object_server.http_connect = orig_http_connect
             utils.HASH_PATH_PREFIX = _prefix
@@ -6202,12 +6211,14 @@ class TestObjectController(BaseTestCase):
                 'X-Container-Host': 'chost:cport',
                 'X-Container-Partition': 'cpartition',
                 'X-Container-Device': 'cdevice',
+                'X-Container-Root-Db-State': 'unsharded',
                 'Content-Type': 'text/plain',
                 'X-Object-Sysmeta-Ec-Frag-Index': 0,
                 'X-Backend-Storage-Policy-Index': int(policy),
             }
             if container_path is not None:
                 headers['X-Backend-Container-Path'] = container_path
+                headers['X-Container-Root-Db-State'] = 'sharded'
 
             req = Request.blank('/sda1/0/a/c/o', method='PUT',
                                 headers=headers, body='')
@@ -6249,9 +6260,12 @@ class TestObjectController(BaseTestCase):
                 'obj': 'o',
                 'account': 'a',
                 'container': 'c',
-                'op': 'PUT'}
+                'op': 'PUT',
+                'db_state': 'unsharded'}
             if expected_container_path:
                 expected_data['container_path'] = expected_container_path
+            if container_path is not None:
+                expected_data['db_state'] = 'sharded'
             self.assertEqual(expected_data, data)
 
         do_test('a_shard/c_shard', 'a_shard/c_shard', 'a_shard/c_shard')
@@ -6292,12 +6306,14 @@ class TestObjectController(BaseTestCase):
                 'X-Container-Host': 'chost:cport',
                 'X-Container-Partition': 'cpartition',
                 'X-Container-Device': 'cdevice',
+                'X-Container-Root-Db-State': 'unsharded',
                 'Content-Type': 'text/plain',
                 'X-Object-Sysmeta-Ec-Frag-Index': 0,
                 'X-Backend-Storage-Policy-Index': int(policy),
             }
             if container_path is not None:
                 headers['X-Backend-Quoted-Container-Path'] = container_path
+                headers['X-Container-Root-Db-State'] = 'sharded'
 
             req = Request.blank('/sda1/0/a/c/o', method='PUT',
                                 headers=headers, body='')
@@ -6339,9 +6355,12 @@ class TestObjectController(BaseTestCase):
                 'obj': 'o',
                 'account': 'a',
                 'container': 'c',
-                'op': 'PUT'}
+                'op': 'PUT',
+                'db_state': 'unsharded'}
             if expected_container_path:
                 expected_data['container_path'] = expected_container_path
+            if container_path is not None:
+                expected_data['db_state'] = 'sharded'
             self.assertEqual(expected_data, data)
 
         do_test('a_shard/c_shard', 'a_shard/c_shard', 'a_shard/c_shard')
@@ -6366,6 +6385,7 @@ class TestObjectController(BaseTestCase):
                      'X-Container-Host': 'chost:cport',
                      'X-Container-Partition': 'cpartition',
                      'X-Container-Device': 'cdevice',
+                     'X-Container-Root-Db-State': 'unsharded',
                      'Content-Type': 'text/plain',
                      'X-Object-Sysmeta-Ec-Frag-Index': 0,
                      'X-Backend-Storage-Policy-Index': int(policy)}, body='')
@@ -6404,7 +6424,8 @@ class TestObjectController(BaseTestCase):
             'obj': 'o',
             'account': 'a',
             'container': 'c',
-            'op': 'PUT'})
+            'op': 'PUT',
+            'db_state': 'unsharded'})
 
     def test_container_update_as_greenthread(self):
         greenthreads = []
@@ -6428,7 +6449,8 @@ class TestObjectController(BaseTestCase):
                      'X-Backend-Storage-Policy-Index': 0,
                      'X-Container-Partition': '20',
                      'X-Container-Host': '1.2.3.4:5',
-                     'X-Container-Device': 'sdb1'})
+                     'X-Container-Device': 'sdb1',
+                     'X-Container-Root-Db-State': 'unsharded'})
         with mock.patch.object(object_server, 'spawn', local_fake_spawn), \
                 mock.patch.object(self.object_controller, 'async_update',
                                   local_fake_async_update):
@@ -6455,7 +6477,8 @@ class TestObjectController(BaseTestCase):
         expected = [('PUT', 'a', 'c', 'o', '1.2.3.4:5', '20', 'sdb1',
                      headers_out, 'sda1', POLICIES[0]),
                     {'logger_thread_locals': (None, None),
-                     'container_path': None}]
+                     'container_path': None,
+                     'db_state': 'unsharded'}]
         self.assertEqual(called_async_update_args, [expected])
 
     def test_container_update_as_greenthread_with_timeout(self):
