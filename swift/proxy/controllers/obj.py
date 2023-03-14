@@ -418,6 +418,8 @@ class BaseObjectController(Controller):
         container_partition, container_nodes, container_path = \
             self._get_update_target(req, container_info)
         req.acl = container_info['write_acl']
+        if config_true_value(req.headers.get('x-open-expired')):
+            req.headers['X-Backend-Open-Expired'] = 'true'
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
             if aresp:
