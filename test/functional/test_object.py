@@ -498,6 +498,20 @@ class TestObject(unittest.TestCase):
                 {'X-Auth-Token': token, 'X-Open-Expired': True})
             return check_response(conn)
 
+        def post_with_x_open_expired(url, token, parsed, conn):
+            dt = datetime.datetime.now()
+            epoch = time.mktime(dt.timetuple())
+            delete_time = str(int(epoch) + 2)
+            conn.request(
+                'POST',
+                '%s/%s/%s' % (parsed.path, self.container, 'x_delete_at'),
+                '',
+                {'X-Auth-Token': token,
+                 'Content-Length': '0',
+                 'X-Delete-At': delete_time,
+                 'X-Open-Expired': True})
+            return check_response(conn)
+
         resp = retry(get)
         resp.read()
         count = 0
@@ -519,6 +533,11 @@ class TestObject(unittest.TestCase):
         resp.read()
         # verify object is still expired
         self.assertEqual(resp.status, 404)
+
+        resp = retry(post_with_x_open_expired)
+        resp.read()
+        # verify object is still expired
+        self.assertEqual(resp.status, 202)
 
         # To avoid an error when the object deletion in tearDown(),
         # the object is added again.

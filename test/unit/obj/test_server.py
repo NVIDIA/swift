@@ -6679,6 +6679,33 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 404)
 
+        # You can POST to an expired object with an x-open-expired header
+        now += 2
+        recreate_test_object(now)
+        the_time = delete_at_timestamp + 1
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-backend-open-expired': 'true',
+                     'x-delete-at': str(delete_at_timestamp + 70)})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 202)
+
+        # You cannot POST to an expired object with an x-open-expired header
+        # if the x_delete_at value is in the past
+        now += 2
+        recreate_test_object(now)
+        the_time = delete_at_timestamp + 1
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-backend-open-expired': 'true',
+                     'x-delete-at': str(delete_at_timestamp - 50)})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 400)
+
         # ...unless sending an x-backend-replication header...which lets you
         # modify x-delete-at
         now += 2
