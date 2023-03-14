@@ -759,7 +759,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             for r in requests:
                 self.assertEqual(r['headers']['X-Open-Expired'], 'true')
                 self.assertEqual(r['headers']['X-Backend-Open-Expired'],
-                                 'true')
+                                 'True')
 
             requests = self._test_x_open_expired(
                 method, headers={'X-Open-Expired': 'false'})
@@ -785,16 +785,15 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             self.assertEqual(r['headers']['X-Open-Expired'], 'true')
             self.assertNotIn('X-Backend-Open-Expired', r['headers'])
 
-        # we don't support x-open-expired on POST (yet?)
         req = swift.common.swob.Request.blank(
-            '/v1/a/c/o', method='POST', headers={'X-Open-Expired': 'true'})
+            '/v1/a/c/o', method='POST', headers={'X-Open-Expired': 'True'})
         codes = [202] * self.obj_ring.replicas
         with mocked_http_conn(*codes) as fake_conn:
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 202)
         for r in fake_conn.requests:
-            self.assertEqual(r['headers']['X-Open-Expired'], 'true')
-            self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+            self.assertEqual(r['headers']['X-Open-Expired'], 'True')
+            self.assertIn('X-Backend-Open-Expired', r['headers'])
 
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD')
@@ -1847,6 +1846,54 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
             self.assertIn('X-Delete-At-Device', given_headers)
             self.assertIn('X-Delete-At-Partition', given_headers)
             self.assertIn('X-Delete-At-Container', given_headers)
+
+    def test_POST_delete_at_with_x_open_expired(self):
+        t = str(int(time.time() + 30))
+        t_later = str(int(time.time() + 300))
+        req_put = swob.Request.blank('/v1/a/c/o', method='PUT', body=b'',
+                                     headers={'Content-Type': 'foo/bar',
+                                              'X-Delete-At': t,
+                                              'X-Timestamp':
+                                                  utils.Timestamp.now().normal,
+                                              })
+
+        req_post = swob.Request.blank('/v1/a/c/o', method='POST', body=b'',
+                                      headers={'Content-Type': 'foo/bar',
+                                               'X-Delete-At': t_later,
+                                               'X-Timestamp':
+                                                   utils.Timestamp.now().normal,
+                                               'X-Open-Expired': True
+                                               })
+
+        post_codes = [202] * self.obj_ring.replicas
+
+        post_headers = []
+
+        def capture_headers(ip, port, device, part, method, path, headers,
+                            **kwargs):
+            if method == 'POST':
+                post_headers.append(headers)
+
+        with set_http_connect(*post_codes, give_connect=capture_headers):
+            resp = req_put.get_response(self.app)
+        self.assertEqual(resp.status_int, 202)
+        self.assertEqual(len(post_headers), 0)
+
+        with set_http_connect(*post_codes, give_connect=capture_headers):
+            resp_post = req_post.get_response(self.app)
+        self.assertEqual(resp_post.status_int, 202)
+        self.assertEqual(len(post_headers), 3)
+
+        for given_headers in post_headers:
+            self.assertIn('X-Delete-At', given_headers)
+            self.assertEqual(given_headers.get('X-Delete-At'),
+                             t_later)
+            self.assertIn('X-Delete-At-Host', given_headers)
+            self.assertIn('X-Delete-At-Device', given_headers)
+            self.assertIn('X-Delete-At-Partition', given_headers)
+            self.assertIn('X-Delete-At-Container', given_headers)
+            self.assertEqual(given_headers.get('X-Backend-Open-Expired'),
+                             'True')
 
     def test_PUT_converts_delete_after_to_delete_at(self):
         req = swob.Request.blank('/v1/a/c/o', method='PUT', body=b'',
