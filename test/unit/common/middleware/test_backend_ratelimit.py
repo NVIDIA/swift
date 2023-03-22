@@ -415,6 +415,29 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
         self.assertEqual([], rl.logger.get_lines_for_level('warning'))
         self.assertEqual([], rl.logger.get_lines_for_level('error'))
 
+    def test_config_file_reload_empty_section(self):
+        # verify that empty section is OK
+        now = time.time()
+        filter_conf = {'swift_dir': self.tempdir,
+                       'requests_per_device_per_second': "1.3",
+                       'requests_per_device_rate_buffer': "2.4"}
+        # create the actual file
+        conf_path = os.path.join(self.tempdir, 'backend-ratelimit.conf')
+        with open(conf_path, 'w') as fd:
+            fd.write('[backend_ratelimit]\n')
+        factory = backend_ratelimit.filter_factory(filter_conf)
+        with mock.patch('swift.common.middleware.backend_ratelimit.time.time',
+                        return_value=now):
+            with mock.patch(
+                    'swift.common.middleware.backend_ratelimit.get_logger',
+                    return_value=debug_logger()):
+                rl = factory(self.swift)
+        # conf file value has been applied
+        self.assertEqual(1.3, rl.requests_per_device_per_second)
+        self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
+        self.assertEqual([], rl.logger.get_lines_for_level('warning'))
+        self.assertEqual([], rl.logger.get_lines_for_level('error'))
+
     def test_config_file_reload_error(self):
         # verify that current config is preserved if reload fails
         now = time.time()

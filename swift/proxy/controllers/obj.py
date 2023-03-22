@@ -248,7 +248,7 @@ class BaseObjectController(Controller):
         policy = POLICIES.get_by_index(policy_index)
         obj_ring = self.app.get_object_ring(policy_index)
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
-        if 'x-open-expired' in req.headers:
+        if config_true_value(req.headers.get('x-open-expired')):
             req.headers['X-Backend-Open-Expired'] = 'true'
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
