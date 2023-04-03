@@ -38,7 +38,8 @@ from swift.common.swob import str_to_wsgi
 from swift.common.utils import get_logger, config_true_value, \
     dump_recon_cache, whataremyips, Timestamp, ShardRange, GreenAsyncPile, \
     config_positive_int_value, quorum_size, parse_override_options, \
-    Everything, config_auto_int_value, ShardRangeList, config_percent_value
+    Everything, config_auto_int_value, ShardRangeList, config_percent_value, \
+    node_to_string
 from swift.container.backend import ContainerBroker, \
     RECORD_TYPE_SHARD, UNSHARDED, SHARDING, SHARDED, COLLAPSED, \
     SHARD_UPDATE_STATES, sift_shard_ranges, SHARD_UPDATE_STAT_STATES
@@ -1088,13 +1089,13 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             # container DB, which predicates sharding starting. But s-m-s-r and
             # auto-sharding do set epoch and then merge, so we use it to tell
             # whether sharding has been taking too long or not.
-            self.warning(broker,
-                         'Cleaving has not completed in %.2f seconds since %s.'
-                         'DB state: %s, own_shard_range state: %s, '
-                         'state count of shard ranges: %s' %
-                         (time.time() - float(own_shard_range.epoch),
-                          own_shard_range.epoch.isoformat, db_state,
-                          own_shard_range.state_text, str(state_count)))
+            self.warning(
+                broker, 'Cleaving has not completed in %.2f seconds since %s. '
+                'DB state: %s, own_shard_range state: %s, state count of '
+                'shard ranges: %s' %
+                (time.time() - float(own_shard_range.epoch),
+                 own_shard_range.epoch.isoformat, db_state,
+                 own_shard_range.state_text, str(state_count)))
 
     def _report_stats(self):
         # report accumulated stats since start of one sharder cycle
@@ -1210,13 +1211,13 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                                  headers=headers, contents=body)
         except DirectClientException as err:
             self.warning(broker,
-                         'Failed to put shard ranges to %s:%s/%s %s/%s: %s',
-                         node['ip'], node['port'], node['device'],
+                         'Failed to put shard ranges to %s %s/%s: %s',
+                         node_to_string(node, replication=True),
                          quote(account), quote(container), err.http_status)
         except (Exception, Timeout) as err:
             self.exception(broker,
-                           'Failed to put shard ranges to %s:%s/%s %s/%s: %s',
-                           node['ip'], node['port'], node['device'],
+                           'Failed to put shard ranges to %s %s/%s: %s',
+                           node_to_string(node, replication=True),
                            quote(account), quote(container), err)
         else:
             return True

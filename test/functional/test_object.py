@@ -484,20 +484,43 @@ class TestObject(unittest.TestCase):
         resp.read()
         self.assertEqual(resp.status, 201)
 
-        def get(url, token, parsed, conn):
+        def get(url, token, parsed, conn, extra_headers=None):
+            headers = {'X-Auth-Token': token}
+            if extra_headers:
+                headers.update(extra_headers)
             conn.request(
                 'GET',
                 '%s/%s/%s' % (parsed.path, self.container, 'x_delete_at'),
                 '',
-                {'X-Auth-Token': token})
+                headers)
             return check_response(conn)
 
-        def get_with_x_open_expired(url, token, parsed, conn):
+        def head(url, token, parsed, conn, extra_headers=None):
+            headers = {'X-Auth-Token': token}
+            if extra_headers:
+                headers.update(extra_headers)
             conn.request(
-                'GET',
+                'HEAD',
                 '%s/%s/%s' % (parsed.path, self.container, 'x_delete_at'),
                 '',
-                {'X-Auth-Token': token, 'X-Open-Expired': True})
+                headers)
+            return check_response(conn)
+
+        def post(url, token, parsed, conn, extra_headers=None):
+            dt = datetime.datetime.now()
+            epoch = time.mktime(dt.timetuple())
+            delete_time = str(int(epoch) + 2)
+            headers = {'X-Auth-Token': token,
+                       'Content-Length': '0',
+                       'X-Delete-At': delete_time
+                       }
+            if extra_headers:
+                headers.update(extra_headers)
+            conn.request(
+                'POST',
+                '%s/%s/%s' % (parsed.path, self.container, 'x_delete_at'),
+                '',
+                headers)
             return check_response(conn)
 
         resp = retry(get)
@@ -512,15 +535,57 @@ class TestObject(unittest.TestCase):
         # check to see object has expired
         self.assertEqual(resp.status, 404)
 
-        resp = retry(get_with_x_open_expired)
+        resp = retry(get, extra_headers={'X-Open-Expired': True})
         resp.read()
         # read the expired object with magic x-open-expired header
+        self.assertEqual(resp.status, 200)
+
+        resp = retry(head, extra_headers={'X-Open-Expired': True})
+        resp.read()
+        # head expired object with magic x-open-expired header
         self.assertEqual(resp.status, 200)
 
         resp = retry(get)
         resp.read()
         # verify object is still expired
         self.assertEqual(resp.status, 404)
+
+        # verify object is still expired if x-open-expire is False
+        resp = retry(get, extra_headers={'X-Open-Expired': False})
+        resp.read()
+        self.assertEqual(resp.status, 404)
+
+        resp = retry(get, extra_headers={'X-Open-Expired': True})
+        resp.read()
+        self.assertEqual(resp.status, 200)
+
+        resp = retry(head, extra_headers={'X-Open-Expired': False})
+        resp.read()
+        self.assertEqual(resp.status, 404)
+
+        resp = retry(head, extra_headers={'X-Open-Expired': True})
+        resp.read()
+        self.assertEqual(resp.status, 200)
+
+        resp = retry(post, extra_headers={'X-Open-Expired': False})
+        resp.read()
+        # verify object is not updated and remains deleted
+        self.assertEqual(resp.status, 404)
+
+        resp = retry(post, extra_headers={'X-Open-Expired': True})
+        resp.read()
+        # verify object is updated with later delete time
+        self.assertEqual(resp.status, 202)
+
+        # verify object is restored and you can do normal GET
+        resp = retry(get)
+        resp.read()
+        self.assertEqual(resp.status, 200)
+
+        # verify object is restored and you can do normal HEAD
+        resp = retry(head)
+        resp.read()
+        self.assertEqual(resp.status, 200)
 
         # To avoid an error when the object deletion in tearDown(),
         # the object is added again.
