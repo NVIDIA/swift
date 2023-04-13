@@ -452,7 +452,7 @@ class ProxyLoggingMiddleware(object):
                     yield chunk
             except GeneratorExit:  # generator was closed before we finished
                 client_disconnect = True
-                raise
+                raise 
             except Exception:
                 start_status = 500
                 raise
