@@ -572,20 +572,24 @@ class TestObject(unittest.TestCase):
         # verify object is not updated and remains deleted
         self.assertEqual(resp.status, 404)
 
-        resp = retry(post, extra_headers={'X-Open-Expired': True})
+        resp = retry(post, extra_headers={'X-Open-Expired': True,
+                                          'X-Object-Meta-Test': 'restored!'})
         resp.read()
-        # verify object is updated with later delete time
         self.assertEqual(resp.status, 202)
 
         # verify object is restored and you can do normal GET
         resp = retry(get)
         resp.read()
         self.assertEqual(resp.status, 200)
+        self.assertIn('X-Object-Meta-Test', resp.headers)
+        self.assertEqual(resp.headers['x-object-meta-test'], 'restored!')
 
         # verify object is restored and you can do normal HEAD
         resp = retry(head)
         resp.read()
         self.assertEqual(resp.status, 200)
+        # verify object is updated with advanced delete time
+        self.assertIn('X-Delete-At', resp.headers)
 
         # To avoid an error when the object deletion in tearDown(),
         # the object is added again.

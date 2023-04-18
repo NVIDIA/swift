@@ -89,7 +89,8 @@ bind_port = 8080
 # client_timeout = 60.0
 #
 # Timeout to use when looking for pipelined requests. Set to zero to disable
-# request pipelining. Defaults to client_timeout.
+# request pipelining. Defaults to client_timeout. Requires eventlet>=0.33.4;
+# with earlier eventlet, any non-zero value is treated as client_timeout.
 # keepalive_timeout =
 #
 # Note: enabling evenlet_debug might reveal sensitive information, for example

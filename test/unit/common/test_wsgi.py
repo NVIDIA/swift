@@ -496,6 +496,7 @@ class TestWSGI(unittest.TestCase):
         config = """
         [DEFAULT]
         client_timeout = 30
+        keepalive_timeout = 10
         max_clients = 1000
         swift_dir = TEMPDIR
 
@@ -535,6 +536,7 @@ class TestWSGI(unittest.TestCase):
         self.assertTrue('custom_pool' in kwargs)
         self.assertEqual(1000, kwargs['custom_pool'].size)
         self.assertEqual(30, kwargs['socket_timeout'])
+        self.assertEqual(10, kwargs['keepalive'])
 
         proto_class = kwargs['protocol']
         self.assertEqual(proto_class, wsgi.SwiftHttpProtocol)
@@ -585,6 +587,7 @@ class TestWSGI(unittest.TestCase):
         self.assertTrue('custom_pool' in kwargs)
         self.assertEqual(10, kwargs['custom_pool'].size)
         self.assertEqual(2.5, kwargs['socket_timeout'])
+        self.assertNotIn('keepalive', kwargs)  # eventlet defaults to True
 
         proto_class = kwargs['protocol']
         self.assertEqual(proto_class, wsgi.SwiftHttpProxiedProtocol)
@@ -594,6 +597,7 @@ class TestWSGI(unittest.TestCase):
         config = """
         [DEFAULT]
         swift_dir = TEMPDIR
+        keepalive_timeout = 0
 
         [pipeline:main]
         pipeline = proxy-server
@@ -623,6 +627,7 @@ class TestWSGI(unittest.TestCase):
         self.assertTrue('protocol' in kwargs)
         self.assertEqual('HTTP/1.0',
                          kwargs['protocol'].default_request_version)
+        self.assertIs(False, kwargs['keepalive'])
 
     def test_run_server_conf_dir(self):
         config_dir = {
@@ -1713,6 +1718,12 @@ class TestPipelineModification(unittest.TestCase):
             self.assertIs(app.app.app, app._pipeline_final_app)
             self.assertIs(app.app.app, app.app._pipeline_final_app)
             self.assertIs(app.app.app, app.app.app._pipeline_final_app)
+            exp_pipeline = [app, app.app, app.app.app]
+            self.assertEqual(exp_pipeline, app._pipeline)
+            self.assertEqual(exp_pipeline, app.app._pipeline)
+            self.assertEqual(exp_pipeline, app.app.app._pipeline)
+            self.assertIs(app._pipeline, app.app._pipeline)
+            self.assertIs(app._pipeline, app.app.app._pipeline)
 
             # make sure you can turn off the pipeline modification if you want
             def blow_up(*_, **__):
