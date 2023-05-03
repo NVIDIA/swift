@@ -2361,9 +2361,13 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             return
 
         # now look and deal with misplaced objects.
+        move_start_ts = time.time()
         self._move_misplaced_objects(broker)
+        self.logger.timing_since(
+            'sharder.sharding.move_misplaced', move_start_ts)
 
         is_leader = node['index'] == 0 and self.auto_shard and not is_deleted
+
         if state in (UNSHARDED, COLLAPSED):
             if is_leader and broker.is_root_container():
                 # bootstrap sharding of root container
@@ -2378,11 +2382,14 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                     # container has been given shard ranges rather than
                     # found them e.g. via replication or a shrink event,
                     # or manually triggered cleaving.
+                    db_start_ts = time.time()
                     if broker.set_sharding_state():
                         state = SHARDING
                         self.info(broker, 'Kick off container cleaving, '
                                           'own shard range in state %r',
                                   own_shard_range.state_text)
+                    self.logger.timing_since(
+                        'sharder.sharding.set_state', db_start_ts)
                 elif is_leader:
                     if broker.set_sharding_state():
                         state = SHARDING
@@ -2393,6 +2400,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                                own_shard_range.state_text)
 
         if state == SHARDING:
+            cleave_start_ts = time.time()
             if is_leader:
                 num_found = self._find_shard_ranges(broker)
             else:
@@ -2407,6 +2415,8 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
 
             # always try to cleave any pending shard ranges
             cleave_complete = self._cleave(broker)
+            self.logger.timing_since(
+                'sharder.sharding.cleave', cleave_start_ts)
 
             if cleave_complete:
                 if self._complete_sharding(broker):
@@ -2414,6 +2424,9 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                     self._increment_stat('visited', 'completed', statsd=True)
                     self.info(broker, 'Completed cleaving, DB set to sharded '
                                       'state')
+                    self.logger.timing_since(
+                        'sharder.sharding.completed',
+                        broker.get_own_shard_range().epoch)
                 else:
                     self.info(broker, 'Completed cleaving, DB remaining in '
                                       'sharding state')
@@ -2421,6 +2434,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         if not broker.is_deleted():
             if state == SHARDED and broker.is_root_container():
                 # look for shrink stats
+                send_start_ts = time.time()
                 self._identify_shrinking_candidate(broker, node)
                 if is_leader:
                     self._find_and_enable_shrinking_candidates(broker)
@@ -2430,6 +2444,8 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                     self._send_shard_ranges(broker, shard_range.account,
                                             shard_range.container,
                                             [shard_range])
+                self.logger.timing_since(
+                    'sharder.sharding.send_sr', send_start_ts)
 
             if not broker.is_root_container():
                 # Update the root container with this container's shard range
@@ -2438,7 +2454,10 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                 # sharding a shard, this is when the root will see the new
                 # shards move to ACTIVE state and the sharded shard
                 # simultaneously become deleted.
+                update_start_ts = time.time()
                 self._update_root_container(broker)
+                self.logger.timing_since(
+                    'sharder.sharding.update_root', update_start_ts)
 
         self.debug(broker,
                    'Finished processing, state %s%s',
