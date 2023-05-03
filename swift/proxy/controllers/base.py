@@ -1854,15 +1854,15 @@ class Controller(object):
             headers.update((k.lower(), v)
                            for k, v in orig_req.headers.items()
                            if k.lower().startswith('x-backend-'))
-        # additional headers can override x-backend-* headers from orig_req
-        if additional:
-            headers.update(additional)
-        if orig_req:
-            if transfer:
-                self.transfer_headers(orig_req.headers, headers)
             referer = orig_req.as_referer()
         else:
             referer = ''
+        # additional headers can override x-backend-* headers from orig_req
+        if additional:
+            headers.update(additional)
+        if orig_req and transfer:
+            # transfer headers from orig_req can override additional headers
+            self.transfer_headers(orig_req.headers, headers)
         headers.setdefault('x-timestamp', Timestamp.now().internal)
         # orig_req and additional headers cannot override the following...
         headers['x-trans-id'] = self.trans_id

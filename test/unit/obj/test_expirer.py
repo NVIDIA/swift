@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # Copyright (c) 2011 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -316,14 +317,14 @@ class TestObjectExpirer(TestCase):
             'grace_period_a': 1.0,
             'grace_period_b': '259200.0',
             'grace_period_AUTH_aBC': 999,
-            'grace_period_AUTH_aB😀C': 555,
+            u'grace_period_AUTH_aBáC': 555,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(x.acct_grace_periods, {
             'a': 1.0,
             'b': 259200.0,
             'AUTH_aBC': 999,
-            'AUTH_aB😀C': 555,
+            u'AUTH_aBáC': 555,
         })
 
         # negative tests

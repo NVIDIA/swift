@@ -39,8 +39,9 @@ else:
 
 import swift
 from swift.common import utils, swob, exceptions
-from swift.common.exceptions import ChunkWriteTimeout
-from swift.common.utils import Timestamp, list_from_csv, md5
+from swift.common.exceptions import ChunkWriteTimeout, ShortReadError, \
+    ChunkReadTimeout
+from swift.common.utils import Timestamp, list_from_csv, md5, FileLikeIter
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers import obj
 from swift.proxy.controllers.base import \
@@ -2505,6 +2506,10 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_disconnect(self):
         self.app.recoverable_node_timeout = 0.01
         self.app.client_timeout = 0.1
+        # Before, we used the default 64k chunk size, so the entire ~16k test
+        # data would come in the first chunk, and the generator should
+        # cleanly exit by the time we reiterate() the response.
+        self.app.object_chunk_size = 10
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-743]
         etag = md5(test_data, usedforsecurity=False).hexdigest()
@@ -2549,6 +2554,17 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             if stats:
                 actual[self.app.error_limiter.node_key(n)] = stats
         self.assertEqual(actual, expected_error_limiting)
+        expected = ["Client disconnected on read of EC frag '/a/c/o'"] * 10
+        self.assertEqual(
+            self.app.logger.get_lines_for_level('warning'),
+            expected)
+        for read_line in self.app.logger.get_lines_for_level('error'):
+            self.assertIn("Trying to read EC fragment during GET (retrying)",
+                          read_line)
+        self.assertEqual(
+            len(self.logger.logger.records['ERROR']), 4,
+            'Expected 4 ERROR lines, got %r' % (
+                self.logger.logger.records['ERROR'], ))
 
     def test_GET_not_found_when_404_newer(self):
         # if proxy receives a 404, it keeps waiting for other connections until
@@ -5026,7 +5042,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         for line in error_lines[:nparity]:
             self.assertIn('retrying', line)
         for line in error_lines[nparity:]:
-            self.assertIn('ChunkReadTimeout (0.01s)', line)
+            self.assertIn('ChunkReadTimeout (0.01s', line)
         for line in self.logger.logger.records['ERROR']:
             self.assertIn(req.headers['x-trans-id'], line)
 
@@ -5059,8 +5075,9 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             resp_body += b''.join(resp.app_iter)
         # we log errors
         log_lines = self.app.logger.get_lines_for_level('error')
+        self.assertTrue(log_lines)
         for line in log_lines:
-            self.assertIn('ChunkWriteTimeout fetching fragments', line)
+            self.assertIn('ChunkWriteTimeout feeding fragments', line)
         # client gets a short read
         self.assertEqual(16051, len(test_data))
         self.assertEqual(8192, len(resp_body))
@@ -5110,7 +5127,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         error_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(ndata, len(error_lines))
         for line in error_lines:
-            self.assertIn('ChunkReadTimeout (0.01s)', line)
+            self.assertIn('ChunkReadTimeout (0.01s', line)
         for line in self.logger.logger.records['ERROR']:
             self.assertIn(req.headers['x-trans-id'], line)
 
@@ -6773,6 +6790,55 @@ class TestNumContainerUpdates(unittest.TestCase):
                 exp, got,
                 "Failed for c_replica=%d, o_replica=%d, o_quorum=%d" % (
                     c_replica, o_replica, o_quorum))
+
+
+@patch_policies(with_ec_default=True)
+class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
+    def setUp(self):
+        super(TestECFragGetter, self).setUp()
+        req = Request.blank(path='/a/c/o')
+        self.getter = obj.ECFragGetter(
+            self.app, req, None, None, self.policy, 'a/c/o',
+            {}, None, self.logger.thread_locals,
+            self.logger)
+
+    def test_iter_bytes_from_response_part(self):
+        part = FileLikeIter([b'some', b'thing'])
+        it = self.getter.iter_bytes_from_response_part(part, nbytes=None)
+        self.assertEqual(b'something', b''.join(it))
+
+    def test_iter_bytes_from_response_part_insufficient_bytes(self):
+        part = FileLikeIter([b'some', b'thing'])
+        it = self.getter.iter_bytes_from_response_part(part, nbytes=100)
+        with mock.patch.object(self.getter, '_dig_for_source_and_node',
+                               return_value=(None, None)):
+            with self.assertRaises(ShortReadError) as cm:
+                b''.join(it)
+        self.assertEqual('Too few bytes; read 9, expecting 100',
+                         str(cm.exception))
+
+    def test_iter_bytes_from_response_part_read_timeout(self):
+        part = FileLikeIter([b'some', b'thing'])
+        self.app.recoverable_node_timeout = 0.05
+        self.app.client_timeout = 0.8
+        it = self.getter.iter_bytes_from_response_part(part, nbytes=9)
+        with mock.patch.object(self.getter, '_dig_for_source_and_node',
+                               return_value=(None, None)):
+            with mock.patch.object(part, 'read',
+                                   side_effect=[b'some', ChunkReadTimeout(9)]):
+                with self.assertRaises(ChunkReadTimeout) as cm:
+                    b''.join(it)
+        self.assertEqual('9 seconds', str(cm.exception))
+
+    def test_iter_bytes_from_response_part_small_fragment_size(self):
+        self.getter.fragment_size = 4
+        part = FileLikeIter([b'some', b'thing', b''])
+        it = self.getter.iter_bytes_from_response_part(part, nbytes=None)
+        self.assertEqual([b'some', b'thin', b'g'], [ch for ch in it])
+        self.getter.fragment_size = 1
+        part = FileLikeIter([b'some', b'thing', b''])
+        it = self.getter.iter_bytes_from_response_part(part, nbytes=None)
+        self.assertEqual([c.encode() for c in 'something'], [ch for ch in it])
 
 
 if __name__ == '__main__':

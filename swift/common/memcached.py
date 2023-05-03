@@ -48,8 +48,7 @@ import os
 import six
 import json
 import logging
-import random
-import time
+import time as tm
 from bisect import bisect
 
 from eventlet.green import socket, ssl
@@ -100,7 +99,7 @@ def sanitize_timeout(timeout):
     additional second), client beware.
     """
     if timeout > (30 * 24 * 60 * 60):
-        timeout += time.time()
+        timeout += tm.time()
     return int(timeout)
 
 
@@ -116,6 +115,13 @@ def set_msg(key, flags, timeout, value):
         str(timeout).encode('ascii'),
         str(len(value)).encode('ascii'),
     ]) + (b'\r\n' + value + b'\r\n')
+
+
+# get the prefix of a user provided memcache key by removing the content after
+# the last '/', all current usages within swift are using prefix, such as
+# "shard-updating-v2", "nvratelimit" and etc.
+def get_key_prefix(key):
+    return key.rsplit('/', 1)[0]
 
 
 class MemcacheConnectionError(Exception):
@@ -217,18 +223,36 @@ class MemcacheRing(object):
     def memcache_servers(self):
         return list(self._client_cache.keys())
 
-    def _exception_occurred(self, server, e, action='talking',
-                            sock=None, fp=None, got_connection=True):
+    def _exception_occurred(self, server, e, key_prefix, method,
+                            conn_start_time, action='talking', sock=None,
+                            fp=None, got_connection=True):
         if isinstance(e, Timeout):
-            self.logger.error("Timeout %(action)s to memcached: %(server)s",
-                              {'action': action, 'server': server})
+            self.logger.error(
+                "Timeout %(action)s to memcached: %(server)s"
+                ": with key_prefix %(key_prefix)s, method %(method)s, "
+                "config_timeout %(config_timeout)s, time_spent %(time_spent)s",
+                {'action': action, 'server': server,
+                 'key_prefix': key_prefix, 'method': method,
+                 'config_timeout': e.seconds,
+                 'time_spent': tm.time() - conn_start_time})
+            self.logger.timing_since(
+                'memcached.' + method + '.timeout.timing', conn_start_time)
         elif isinstance(e, (socket.error, MemcacheConnectionError)):
             self.logger.error(
-                "Error %(action)s to memcached: %(server)s: %(err)s",
-                {'action': action, 'server': server, 'err': e})
+                "Error %(action)s to memcached: %(server)s: "
+                "with key_prefix %(key_prefix)s: %(err)s",
+                {'action': action, 'server': server, 'err': e,
+                 'key_prefix': key_prefix})
+            self.logger.timing_since(
+                'memcached.' + method + '.conn_err.timing', conn_start_time)
         else:
-            self.logger.exception("Error %(action)s to memcached: %(server)s",
-                                  {'action': action, 'server': server})
+            self.logger.exception("Error %(action)s to memcached: %(server)s"
+                                  ": with key_prefix %(key_prefix)s",
+                                  {'action': action, 'server': server,
+                                   'key_prefix': key_prefix})
+            self.logger.timing_since(
+                'memcached.' + method + '.errors.timing', conn_start_time)
+
         try:
             if fp:
                 fp.close()
@@ -249,7 +273,7 @@ class MemcacheRing(object):
         if self._error_limit_time <= 0 or self._error_limit_duration <= 0:
             return
 
-        now = time.time()
+        now = tm.time()
         self._errors[server].append(now)
         if len(self._errors[server]) > self._error_limit_count:
             self._errors[server] = [err for err in self._errors[server]
@@ -258,14 +282,18 @@ class MemcacheRing(object):
                 self._error_limited[server] = now + self._error_limit_duration
                 self.logger.error('Error limiting server %s', server)
 
-    def _get_conns(self, key):
+    def _get_conns(self, method, key_prefix, hash_key):
         """
         Retrieves a server conn from the pool, or connects a new one.
         Chooses the server based on a consistent hash of "key".
 
+        :param method: the name of memcache method.
+        :param key_prefix: the prefix of user provided key.
+        :param hash_key: the consistent hash of user key, or server key for
+                         set_multi and get_multi.
         :return: generator to serve memcached connection
         """
-        pos = bisect(self._sorted, key)
+        pos = bisect(self._sorted, hash_key)
         served = []
         any_yielded = False
         while len(served) < self._tries:
@@ -274,7 +302,8 @@ class MemcacheRing(object):
             if server in served:
                 continue
             served.append(server)
-            if self._error_limited[server] > time.time():
+            pool_start_time = tm.time()
+            if self._error_limited[server] > pool_start_time:
                 continue
             sock = None
             try:
@@ -284,14 +313,15 @@ class MemcacheRing(object):
                 yield server, fp, sock
             except MemcachePoolTimeout as e:
                 self._exception_occurred(
-                    server, e, action='getting a connection',
-                    got_connection=False)
+                    server, e, key_prefix, method, pool_start_time,
+                    action='getting a connection', got_connection=False)
             except (Exception, Timeout) as e:
                 # Typically a Timeout exception caught here is the one raised
                 # by the create() method of this server's MemcacheConnPool
                 # object.
                 self._exception_occurred(
-                    server, e, action='connecting', sock=sock)
+                    server, e, key_prefix, method, pool_start_time,
+                    action='connecting', sock=sock)
         if not any_yielded:
             self.logger.error('All memcached servers error-limited')
 
@@ -319,7 +349,8 @@ class MemcacheRing(object):
         :param raise_on_error: if True, propagate Timeouts and other errors.
                                By default, errors are ignored.
         """
-        key = md5hash(key)
+        key_prefix = get_key_prefix(key)
+        hash_key = md5hash(key)
         timeout = sanitize_timeout(time)
         flags = 0
         if serialize:
@@ -330,10 +361,13 @@ class MemcacheRing(object):
         elif not isinstance(value, bytes):
             value = str(value).encode('utf-8')
 
-        for (server, fp, sock) in self._get_conns(key):
+        for (server, fp, sock) in self._get_conns('set', key_prefix, hash_key):
+            # the name of 'time' module is changed to 'tm', to avoid change the
+            # signature of this function.
+            conn_start_time = tm.time()
             try:
                 with Timeout(self._io_timeout):
-                    sock.sendall(set_msg(key, flags, timeout, value))
+                    sock.sendall(set_msg(hash_key, flags, timeout, value))
                     # Wait for the set to complete
                     msg = fp.readline().strip()
                     if msg != b'STORED':
@@ -353,7 +387,9 @@ class MemcacheRing(object):
                     self._return_conn(server, fp, sock)
                     return
             except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+                self._exception_occurred(
+                    server, e, key_prefix, 'set', conn_start_time,
+                    sock=sock, fp=fp)
         if raise_on_error:
             raise MemcacheConnectionError(
                 "No memcached connections succeeded.")
@@ -369,23 +405,21 @@ class MemcacheRing(object):
                                By default, errors are treated as cache misses.
         :returns: value of the key in memcache
         """
-        if skip_cache_pct > 0 and random.random() * 100 < skip_cache_pct:
-            self.logger.increment('memcache.get.skip')
-            return None
-
-        key = md5hash(key)
+        key_prefix = get_key_prefix(key)
+        hash_key = md5hash(key)
         value = None
-        for (server, fp, sock) in self._get_conns(key):
+        for (server, fp, sock) in self._get_conns('get', key_prefix, hash_key):
+            conn_start_time = tm.time()
             try:
                 with Timeout(self._io_timeout):
-                    sock.sendall(b'get ' + key + b'\r\n')
+                    sock.sendall(b'get ' + hash_key + b'\r\n')
                     line = fp.readline().strip().split()
                     while True:
                         if not line:
                             raise MemcacheConnectionError('incomplete read')
                         if line[0].upper() == b'END':
                             break
-                        if line[0].upper() == b'VALUE' and line[1] == key:
+                        if line[0].upper() == b'VALUE' and line[1] == hash_key:
                             size = int(line[3])
                             value = fp.read(size)
                             if int(line[2]) & PICKLE_FLAG:
@@ -401,8 +435,9 @@ class MemcacheRing(object):
                         self.logger.increment('memcache.get.hit')
                     return value
             except (Exception, Timeout) as e:
-                self.logger.increment('memcache.get.error')
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+                self._exception_occurred(
+                    server, e, key_prefix, 'get', conn_start_time,
+                    sock=sock, fp=fp)
         if raise_on_error:
             raise MemcacheConnectionError(
                 "No memcached connections succeeded.")
@@ -425,17 +460,21 @@ class MemcacheRing(object):
         :returns: result of incrementing
         :raises MemcacheConnectionError:
         """
-        key = md5hash(key)
+        key_prefix = get_key_prefix(key)
+        hash_key = md5hash(key)
         command = b'incr'
         if delta < 0:
             command = b'decr'
         delta = str(abs(int(delta))).encode('ascii')
         timeout = sanitize_timeout(time)
-        for (server, fp, sock) in self._get_conns(key):
+        method = command.decode()
+        for (server, fp, sock) in self._get_conns(method, key_prefix,
+                                                  hash_key):
+            conn_start_time = tm.time()
             try:
                 with Timeout(self._io_timeout):
                     sock.sendall(b' '.join([
-                        command, key, delta]) + b'\r\n')
+                        command, hash_key, delta]) + b'\r\n')
                     line = fp.readline().strip().split()
                     if not line:
                         raise MemcacheConnectionError('incomplete read')
@@ -443,14 +482,16 @@ class MemcacheRing(object):
                         add_val = delta
                         if command == b'decr':
                             add_val = b'0'
-                        sock.sendall(b' '.join([
-                            b'add', key, b'0', str(timeout).encode('ascii'),
-                            str(len(add_val)).encode('ascii')
-                        ]) + b'\r\n' + add_val + b'\r\n')
+                        sock.sendall(
+                            b' '.join(
+                                [b'add', hash_key, b'0', str(timeout).encode(
+                                    'ascii'),
+                                 str(len(add_val)).encode('ascii')
+                                 ]) + b'\r\n' + add_val + b'\r\n')
                         line = fp.readline().strip().split()
                         if line[0].upper() == b'NOT_STORED':
                             sock.sendall(b' '.join([
-                                command, key, delta]) + b'\r\n')
+                                command, hash_key, delta]) + b'\r\n')
                             line = fp.readline().strip().split()
                             ret = int(line[0].strip())
                         else:
@@ -460,8 +501,10 @@ class MemcacheRing(object):
                     self._return_conn(server, fp, sock)
                     return ret
             except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
-        raise MemcacheConnectionError("No Memcached connections succeeded.")
+                self._exception_occurred(
+                    server, e, key_prefix, method, conn_start_time,
+                    sock=sock, fp=fp)
+        raise MemcacheConnectionError("No memcached connections succeeded.")
 
     @memcached_timing_stats(sample_rate=TIMING_SAMPLE_RATE_LOW)
     def decr(self, key, delta=1, time=0):
@@ -488,18 +531,23 @@ class MemcacheRing(object):
         :param server_key: key to use in determining which server in the ring
                             is used
         """
-        key = md5hash(key)
-        server_key = md5hash(server_key) if server_key else key
-        for (server, fp, sock) in self._get_conns(server_key):
+        key_prefix = get_key_prefix(key)
+        hash_key = md5hash(key)
+        server_key = md5hash(server_key) if server_key else hash_key
+        for (server, fp, sock) in self._get_conns('delete', key_prefix,
+                                                  server_key):
+            conn_start_time = tm.time()
             try:
                 with Timeout(self._io_timeout):
-                    sock.sendall(b'delete ' + key + b'\r\n')
+                    sock.sendall(b'delete ' + hash_key + b'\r\n')
                     # Wait for the delete to complete
                     fp.readline()
                     self._return_conn(server, fp, sock)
                     return
             except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+                self._exception_occurred(
+                    server, e, key_prefix, 'delete', conn_start_time,
+                    sock=sock, fp=fp)
 
     @memcached_timing_stats(sample_rate=TIMING_SAMPLE_RATE_HIGH)
     def set_multi(self, mapping, server_key, serialize=True, time=0,
@@ -518,7 +566,8 @@ class MemcacheRing(object):
                            python-memcached interface. This implementation
                            ignores it
         """
-        server_key = md5hash(server_key)
+        key_prefix = get_key_prefix(server_key)
+        hash_key = md5hash(server_key)
         timeout = sanitize_timeout(time)
         msg = []
         for key, value in mapping.items():
@@ -530,7 +579,9 @@ class MemcacheRing(object):
                 value = json.dumps(value).encode('ascii')
                 flags |= JSON_FLAG
             msg.append(set_msg(key, flags, timeout, value))
-        for (server, fp, sock) in self._get_conns(server_key):
+        for (server, fp, sock) in self._get_conns('set_multi', key_prefix,
+                                                  hash_key):
+            conn_start_time = tm.time()
             try:
                 with Timeout(self._io_timeout):
                     sock.sendall(b''.join(msg))
@@ -540,7 +591,9 @@ class MemcacheRing(object):
                     self._return_conn(server, fp, sock)
                     return
             except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+                self._exception_occurred(
+                    server, e, key_prefix, 'set_multi', conn_start_time,
+                    sock=sock, fp=fp)
 
     @memcached_timing_stats(sample_rate=TIMING_SAMPLE_RATE_HIGH)
     def get_multi(self, keys, server_key):
@@ -552,12 +605,15 @@ class MemcacheRing(object):
                            is used
         :returns: list of values
         """
+        key_prefix = get_key_prefix(server_key)
         server_key = md5hash(server_key)
-        keys = [md5hash(key) for key in keys]
-        for (server, fp, sock) in self._get_conns(server_key):
+        hash_keys = [md5hash(key) for key in keys]
+        for (server, fp, sock) in self._get_conns('get_multi', key_prefix,
+                                                  server_key):
+            conn_start_time = tm.time()
             try:
                 with Timeout(self._io_timeout):
-                    sock.sendall(b'get ' + b' '.join(keys) + b'\r\n')
+                    sock.sendall(b'get ' + b' '.join(hash_keys) + b'\r\n')
                     line = fp.readline().strip().split()
                     responses = {}
                     while True:
@@ -576,7 +632,7 @@ class MemcacheRing(object):
                             fp.readline()
                         line = fp.readline().strip().split()
                     values = []
-                    for key in keys:
+                    for key in hash_keys:
                         if key in responses:
                             values.append(responses[key])
                         else:
@@ -584,7 +640,9 @@ class MemcacheRing(object):
                     self._return_conn(server, fp, sock)
                     return values
             except (Exception, Timeout) as e:
-                self._exception_occurred(server, e, sock=sock, fp=fp)
+                self._exception_occurred(
+                    server, e, key_prefix, 'get_multi', conn_start_time,
+                    sock=sock, fp=fp)
 
 
 def load_memcache(conf, logger):
