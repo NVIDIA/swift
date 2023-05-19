@@ -1350,6 +1350,8 @@ class StatsdClient(object):
         return self._send(metric, timing_ms, 'ms', sample_rate)
 
     def timing_since(self, metric, orig_time, sample_rate=None):
+        if isinstance(orig_time, Timestamp):
+            orig_time = float(orig_time)
         return self.timing(metric, (time.time() - orig_time) * 1000,
                            sample_rate)
 
