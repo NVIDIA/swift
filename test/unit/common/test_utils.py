@@ -5524,6 +5524,10 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.972',
                                self.logger.timing_since, 'another.op',
                                time.time(), sample_rate=0.972)
+        # Timestamp objects work too
+        self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.972',
+                               self.logger.timing_since, 'another.op',
+                               utils.Timestamp.now(), sample_rate=0.972)
         self.assertStat('pfx.another.counter:3|c|@0.972',
                         self.logger.update_stats, 'another.counter', 3,
                         sample_rate=0.972)
@@ -5575,6 +5579,10 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.9912',
                                self.logger.timing_since, 'another.op',
                                time.time(), sample_rate=0.9912)
+        # Timestamp objects work too
+        self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.9912',
+                               self.logger.timing_since, 'another.op',
+                               utils.Timestamp.now(), sample_rate=0.9912)
         self.assertStat('pfx.another.counter:3|c|@0.9912',
                         self.logger.update_stats, 'another.counter', 3,
                         sample_rate=0.9912)
@@ -5613,6 +5621,10 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStatMatches(
             r'alpha\.beta\.pfx\.another\.op:\d+\.\d+\|ms',
             self.logger.timing_since, 'another.op', time.time())
+        # Timestamp objects work too
+        self.assertStatMatches(
+            r'alpha\.beta\.pfx\.another\.op:\d+\.\d+\|ms',
+            self.logger.timing_since, 'another.op', utils.Timestamp.now())
         self.assertStat('alpha.beta.pfx.another.counter:3|c',
                         self.logger.update_stats, 'another.counter', 3)
 
@@ -5632,6 +5644,11 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
             r'alpha\.beta\.another\.op:\d+\.\d+\|ms|@0.9912',
             self.logger.timing_since, 'another.op',
             time.time(), sample_rate=0.9912)
+        # Timestamp objects work too
+        self.assertStatMatches(
+            r'alpha\.beta\.another\.op:\d+\.\d+\|ms|@0.9912',
+            self.logger.timing_since, 'another.op',
+            utils.Timestamp.now(), sample_rate=0.9912)
         self.assertStat('alpha.beta.another.counter:3|c|@0.9912',
                         self.logger.update_stats, 'another.counter', 3,
                         sample_rate=0.9912)
