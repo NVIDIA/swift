@@ -17,6 +17,7 @@
 from __future__ import print_function
 
 import hashlib
+import itertools
 
 from test import annotate_failure
 from test.debug_logger import debug_logger
@@ -65,7 +66,6 @@ from io import BytesIO
 from shutil import rmtree
 from functools import partial
 from tempfile import TemporaryFile, NamedTemporaryFile, mkdtemp
-from netifaces import AF_INET6
 from mock import MagicMock, patch
 from six.moves.configparser import NoSectionError, NoOptionError
 from uuid import uuid4
@@ -74,8 +74,7 @@ from swift.common.exceptions import Timeout, MessageTimeout, \
     ConnectionTimeout, LockTimeout, ReplicationLockTimeout, \
     MimeInvalid
 from swift.common import utils
-from swift.common.utils import is_valid_ip, is_valid_ipv4, is_valid_ipv6, \
-    set_swift_dir, md5, ShardRangeList
+from swift.common.utils import set_swift_dir, md5, ShardRangeList
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import POLICIES, reload_storage_policies
@@ -1613,132 +1612,6 @@ class TestUtils(unittest.TestCase):
                          '[fe80::0204:61ff:fe9d:f156]:6200/sdb')
         self.assertEqual(utils.node_to_string(dev, replication=True),
                          '[fe80::0204:61ff:ff9d:1234]:6400/sdb')
-
-    def test_is_valid_ip(self):
-        self.assertTrue(is_valid_ip("127.0.0.1"))
-        self.assertTrue(is_valid_ip("10.0.0.1"))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80:0:0:0:204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80::204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80:0:0:0:0204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80::204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80::"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "::1"
-        self.assertTrue(is_valid_ip(ipv6))
-        not_ipv6 = "3ffe:0b00:0000:0001:0000:0000:000a"
-        self.assertFalse(is_valid_ip(not_ipv6))
-        not_ipv6 = "1:2:3:4:5:6::7:8"
-        self.assertFalse(is_valid_ip(not_ipv6))
-
-    def test_is_valid_ipv4(self):
-        self.assertTrue(is_valid_ipv4("127.0.0.1"))
-        self.assertTrue(is_valid_ipv4("10.0.0.1"))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:fe9d:f156"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80:0:0:0:204:61ff:fe9d:f156"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80::204:61ff:fe9d:f156"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:254.157.241.86"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80:0:0:0:0204:61ff:254.157.241.86"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80::204:61ff:254.157.241.86"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80::"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "::1"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        not_ipv6 = "3ffe:0b00:0000:0001:0000:0000:000a"
-        self.assertFalse(is_valid_ipv4(not_ipv6))
-        not_ipv6 = "1:2:3:4:5:6::7:8"
-        self.assertFalse(is_valid_ipv4(not_ipv6))
-
-    def test_is_valid_ipv6(self):
-        self.assertFalse(is_valid_ipv6("127.0.0.1"))
-        self.assertFalse(is_valid_ipv6("10.0.0.1"))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80:0:0:0:204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80::204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80:0:0:0:0204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80::204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80::"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "::1"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        not_ipv6 = "3ffe:0b00:0000:0001:0000:0000:000a"
-        self.assertFalse(is_valid_ipv6(not_ipv6))
-        not_ipv6 = "1:2:3:4:5:6::7:8"
-        self.assertFalse(is_valid_ipv6(not_ipv6))
-
-    def test_expand_ipv6(self):
-        expanded_ipv6 = "fe80::204:61ff:fe9d:f156"
-        upper_ipv6 = "fe80:0000:0000:0000:0204:61ff:fe9d:f156"
-        self.assertEqual(expanded_ipv6, utils.expand_ipv6(upper_ipv6))
-        omit_ipv6 = "fe80:0000:0000::0204:61ff:fe9d:f156"
-        self.assertEqual(expanded_ipv6, utils.expand_ipv6(omit_ipv6))
-        less_num_ipv6 = "fe80:0:00:000:0204:61ff:fe9d:f156"
-        self.assertEqual(expanded_ipv6, utils.expand_ipv6(less_num_ipv6))
-
-    def test_whataremyips(self):
-        myips = utils.whataremyips()
-        self.assertTrue(len(myips) > 1)
-        self.assertTrue('127.0.0.1' in myips)
-
-    def test_whataremyips_bind_to_all(self):
-        for any_addr in ('0.0.0.0', '0000:0000:0000:0000:0000:0000:0000:0000',
-                         '::0', '::0000', '::',
-                         # Wacky parse-error input produces all IPs
-                         'I am a bear'):
-            myips = utils.whataremyips(any_addr)
-            self.assertTrue(len(myips) > 1)
-            self.assertTrue('127.0.0.1' in myips)
-
-    def test_whataremyips_bind_ip_specific(self):
-        self.assertEqual(['1.2.3.4'], utils.whataremyips('1.2.3.4'))
-
-    def test_whataremyips_error(self):
-        def my_interfaces():
-            return ['eth0']
-
-        def my_ifaddress_error(interface):
-            raise ValueError
-
-        with patch('netifaces.interfaces', my_interfaces), \
-                patch('netifaces.ifaddresses', my_ifaddress_error):
-            self.assertEqual(utils.whataremyips(), [])
-
-    def test_whataremyips_ipv6(self):
-        test_ipv6_address = '2001:6b0:dead:beef:2::32'
-        test_interface = 'eth0'
-
-        def my_ipv6_interfaces():
-            return ['eth0']
-
-        def my_ipv6_ifaddresses(interface):
-            return {AF_INET6:
-                    [{'netmask': 'ffff:ffff:ffff:ffff::',
-                      'addr': '%s%%%s' % (test_ipv6_address, test_interface)}]}
-        with patch('netifaces.interfaces', my_ipv6_interfaces), \
-                patch('netifaces.ifaddresses', my_ipv6_ifaddresses):
-            myips = utils.whataremyips()
-            self.assertEqual(len(myips), 1)
-            self.assertEqual(myips[0], test_ipv6_address)
 
     def test_hash_path(self):
         # Yes, these tests are deliberately very fragile. We want to make sure
@@ -3816,6 +3689,15 @@ cluster_dfw1 = http://dfw1.host/v1/
         if failures:
             self.fail('Invalid results from pure function:\n%s' %
                       '\n'.join(failures))
+
+    def test_cap_length(self):
+        self.assertEqual(utils.cap_length(None, 3), None)
+        self.assertEqual(utils.cap_length('', 3), '')
+        self.assertEqual(utils.cap_length('asdf', 3), 'asd...')
+        self.assertEqual(utils.cap_length('asdf', 5), 'asdf')
+
+        self.assertEqual(utils.cap_length(b'asdf', 3), b'asd...')
+        self.assertEqual(utils.cap_length(b'asdf', 5), b'asdf')
 
     def test_get_partition_for_hash(self):
         hex_hash = 'af088baea4806dcaba30bf07d9e64c77'
@@ -9124,3 +9006,67 @@ class TestCloseableChain(unittest.TestCase):
         chain.close()
         self.assertEqual(1, test_iter1.close_call_count)
         self.assertTrue(generator_closed[0])
+
+
+class TestCooperativeIterator(unittest.TestCase):
+    def test_init(self):
+        wrapped = itertools.count()
+        it = utils.CooperativeIterator(wrapped, period=3)
+        self.assertIs(wrapped, it.wrapped_iter)
+        self.assertEqual(0, it.count)
+        self.assertEqual(3, it.period)
+
+    def test_iter(self):
+        it = utils.CooperativeIterator(itertools.count())
+        actual = []
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            for i in it:
+                if i >= 100:
+                    break
+                actual.append(i)
+        self.assertEqual(list(range(100)), actual)
+        self.assertEqual(20, mock_sleep.call_count)
+
+    def test_close(self):
+        it = utils.CooperativeIterator(range(5))
+        it.close()
+
+        closeable = mock.MagicMock()
+        closeable.close = mock.MagicMock()
+        it = utils.CooperativeIterator(closeable)
+        it.close()
+        self.assertTrue(closeable.close.called)
+
+    def test_next(self):
+        def do_test(it, period):
+            results = []
+            for i in range(period):
+                with mock.patch('swift.common.utils.sleep') as mock_sleep:
+                    results.append(next(it))
+                self.assertFalse(mock_sleep.called, i)
+
+            with mock.patch('swift.common.utils.sleep') as mock_sleep:
+                results.append(next(it))
+            self.assertTrue(mock_sleep.called)
+
+            for i in range(period - 1):
+                with mock.patch('swift.common.utils.sleep') as mock_sleep:
+                    results.append(next(it))
+                self.assertFalse(mock_sleep.called, i)
+
+            with mock.patch('swift.common.utils.sleep') as mock_sleep:
+                results.append(next(it))
+            self.assertTrue(mock_sleep.called)
+
+            return results
+
+        actual = do_test(utils.CooperativeIterator(itertools.count()), 5)
+        self.assertEqual(list(range(11)), actual)
+        actual = do_test(utils.CooperativeIterator(itertools.count(), 5), 5)
+        self.assertEqual(list(range(11)), actual)
+        actual = do_test(utils.CooperativeIterator(itertools.count(), 3), 3)
+        self.assertEqual(list(range(7)), actual)
+        actual = do_test(utils.CooperativeIterator(itertools.count(), 1), 1)
+        self.assertEqual(list(range(3)), actual)
+        actual = do_test(utils.CooperativeIterator(itertools.count(), 0), 0)
+        self.assertEqual(list(range(2)), actual)

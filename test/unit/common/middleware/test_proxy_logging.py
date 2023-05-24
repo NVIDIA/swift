@@ -858,10 +858,10 @@ class TestProxyLogging(unittest.TestCase):
         self.assertEqual(do_test(environ_updates),
                          ['GET', '/v1/a/c', '499', '503'])
 
-        # logged status is forced to 429
+        # logged status is forced to 499 despite swift.proxy_logging_status
         environ_updates = {'swift.proxy_logging_status': '429'}
         self.assertEqual(do_test(environ_updates),
-                         ['GET', '/v1/a/c', '429', '503'])
+                         ['GET', '/v1/a/c', '499', '503'])
 
     def test_app_exception(self):
         app = proxy_logging.ProxyLoggingMiddleware(

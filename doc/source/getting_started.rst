@@ -6,12 +6,12 @@ Getting Started
 System Requirements
 -------------------
 
-Swift development currently targets Ubuntu Server 16.04, but should work on
+Swift development currently targets Ubuntu Server 22.04, but should work on
 most Linux platforms.
 
 Swift is written in Python and has these dependencies:
 
-* Python (2.7 or 3.6-3.9)
+* Python (2.7 or 3.6-3.10)
 * rsync 3.x
 * `liberasurecode <https://opendev.org/openstack/liberasurecode/>`__
 * The Python packages listed in `the requirements file <https://github.com/openstack/swift/blob/master/requirements.txt>`__
@@ -47,4 +47,4 @@ Production
 If you want to set up and configure Swift for a production cluster, the
 following doc should be useful:
 
-* :doc:`Multiple Server Swift Installation <howto_installmultinode>`
+* :doc:`install/index`

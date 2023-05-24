@@ -65,7 +65,6 @@ from eventlet.event import Event
 from eventlet.green import socket, threading
 import eventlet.hubs
 import eventlet.queue
-import netifaces
 import codecs
 utf8_decoder = codecs.getdecoder('utf-8')
 utf8_encoder = codecs.getencoder('utf-8')
@@ -118,7 +117,14 @@ from swift.common.utils.timestamp import (  # noqa
     last_modified_date_to_timestamp,
     normalize_delete_at_timestamp,
 )
-
+from swift.common.utils.ipaddrs import (  # noqa
+    is_valid_ip,
+    is_valid_ipv4,
+    is_valid_ipv6,
+    expand_ipv6,
+    parse_socket_string,
+    whataremyips,
+)
 from logging.handlers import SysLogHandler
 import logging
 
@@ -137,9 +143,6 @@ HASH_PATH_PREFIX = b''
 SWIFT_CONF_FILE = '/etc/swift/swift.conf'
 
 O_TMPFILE = getattr(os, 'O_TMPFILE', 0o20000000 | os.O_DIRECTORY)
-
-# Used by the parse_socket_string() function to validate IPv6 addresses
-IPV6_RE = re.compile(r"^\[(?P<address>.*)\](:(?P<port>[0-9]+))?$")
 
 MD5_OF_EMPTY_STRING = 'd41d8cd98f00b204e9800998ecf8427e'
 RESERVED_BYTE = b'\x00'
@@ -2060,125 +2063,6 @@ def parse_options(parser=None, once=False, test_config=False, test_args=None):
     if extra_args:
         options['extra_args'] = extra_args
     return config, options
-
-
-def is_valid_ip(ip):
-    """
-    Return True if the provided ip is a valid IP-address
-    """
-    return is_valid_ipv4(ip) or is_valid_ipv6(ip)
-
-
-def is_valid_ipv4(ip):
-    """
-    Return True if the provided ip is a valid IPv4-address
-    """
-    try:
-        socket.inet_pton(socket.AF_INET, ip)
-    except socket.error:  # not a valid IPv4 address
-        return False
-    return True
-
-
-def is_valid_ipv6(ip):
-    """
-    Returns True if the provided ip is a valid IPv6-address
-    """
-    try:
-        socket.inet_pton(socket.AF_INET6, ip)
-    except socket.error:  # not a valid IPv6 address
-        return False
-    return True
-
-
-def expand_ipv6(address):
-    """
-    Expand ipv6 address.
-    :param address: a string indicating valid ipv6 address
-    :returns: a string indicating fully expanded ipv6 address
-
-    """
-    packed_ip = socket.inet_pton(socket.AF_INET6, address)
-    return socket.inet_ntop(socket.AF_INET6, packed_ip)
-
-
-def whataremyips(ring_ip=None):
-    """
-    Get "our" IP addresses ("us" being the set of services configured by
-    one `*.conf` file). If our REST listens on a specific address, return it.
-    Otherwise, if listen on '0.0.0.0' or '::' return all addresses, including
-    the loopback.
-
-    :param str ring_ip: Optional ring_ip/bind_ip from a config file; may be
-                        IP address or hostname.
-    :returns: list of Strings of ip addresses
-    """
-    if ring_ip:
-        # See if bind_ip is '0.0.0.0'/'::'
-        try:
-            _, _, _, _, sockaddr = socket.getaddrinfo(
-                ring_ip, None, 0, socket.SOCK_STREAM, 0,
-                socket.AI_NUMERICHOST)[0]
-            if sockaddr[0] not in ('0.0.0.0', '::'):
-                return [ring_ip]
-        except socket.gaierror:
-            pass
-
-    addresses = []
-    for interface in netifaces.interfaces():
-        try:
-            iface_data = netifaces.ifaddresses(interface)
-            for family in iface_data:
-                if family not in (netifaces.AF_INET, netifaces.AF_INET6):
-                    continue
-                for address in iface_data[family]:
-                    addr = address['addr']
-
-                    # If we have an ipv6 address remove the
-                    # %ether_interface at the end
-                    if family == netifaces.AF_INET6:
-                        addr = expand_ipv6(addr.split('%')[0])
-                    addresses.append(addr)
-        except ValueError:
-            pass
-    return addresses
-
-
-def parse_socket_string(socket_string, default_port):
-    """
-    Given a string representing a socket, returns a tuple of (host, port).
-    Valid strings are DNS names, IPv4 addresses, or IPv6 addresses, with an
-    optional port. If an IPv6 address is specified it **must** be enclosed in
-    [], like *[::1]* or *[::1]:11211*. This follows the accepted prescription
-    for `IPv6 host literals`_.
-
-    Examples::
-
-        server.org
-        server.org:1337
-        127.0.0.1:1337
-        [::1]:1337
-        [::1]
-
-    .. _IPv6 host literals: https://tools.ietf.org/html/rfc3986#section-3.2.2
-    """
-    port = default_port
-    # IPv6 addresses must be between '[]'
-    if socket_string.startswith('['):
-        match = IPV6_RE.match(socket_string)
-        if not match:
-            raise ValueError("Invalid IPv6 address: %s" % socket_string)
-        host = match.group('address')
-        port = match.group('port') or port
-    else:
-        if ':' in socket_string:
-            tokens = socket_string.split(':')
-            if len(tokens) > 2:
-                raise ValueError("IPv6 addresses must be between '[]'")
-            host, port = tokens
-        else:
-            host = socket_string
-    return (host, port)
 
 
 def select_ip_port(node_dict, use_replication=False):
@@ -5748,6 +5632,15 @@ def strict_b64decode(value, allow_line_breaks=False):
         raise ValueError
 
 
+def cap_length(value, max_length):
+    if value and len(value) > max_length:
+        if isinstance(value, bytes):
+            return value[:max_length] + b'...'
+        else:
+            return value[:max_length] + '...'
+    return value
+
+
 MD5_BLOCK_READ_BYTES = 4096
 
 
@@ -6345,3 +6238,48 @@ class WatchdogTimeout(object):
 
     def __exit__(self, type, value, traceback):
         self.watchdog.stop(self.key)
+
+
+class CooperativeIterator(object):
+    """
+    Wrapper to make a deliberate periodic call to ``sleep()`` while iterating
+    over wrapped iterator, providing an opportunity to switch greenthreads.
+
+    This is for fairness; if the network is outpacing the CPU, we'll always be
+    able to read and write data without encountering an EWOULDBLOCK, and so
+    eventlet will not switch greenthreads on its own. We do it manually so that
+    clients don't starve.
+
+    The number 5 here was chosen by making stuff up. It's not every single
+    chunk, but it's not too big either, so it seemed like it would probably be
+    an okay choice.
+
+    Note that we may trampoline to other greenthreads more often than once
+    every 5 chunks, depending on how blocking our network IO is; the explicit
+    sleep here simply provides a lower bound on the rate of trampolining.
+
+    :param iterable: iterator to wrap.
+    :param period: number of items yielded from this iterator between calls to
+        ``sleep()``.
+    """
+    __slots__ = ('period', 'count', 'wrapped_iter')
+
+    def __init__(self, iterable, period=5):
+        self.wrapped_iter = iterable
+        self.count = 0
+        self.period = period
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        if self.count >= self.period:
+            self.count = 0
+            sleep()
+        self.count += 1
+        return next(self.wrapped_iter)
+
+    __next__ = next
+
+    def close(self):
+        close_if_possible(self.wrapped_iter)

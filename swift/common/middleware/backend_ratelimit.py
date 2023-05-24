@@ -17,7 +17,8 @@ import time
 from collections import defaultdict
 
 from swift.common.request_helpers import split_and_validate_path
-from swift.common.swob import Request, HTTPTooManyBackendRequests
+from swift.common.swob import Request, HTTPTooManyBackendRequests, \
+    HTTPException
 from swift.common.utils import get_logger, non_negative_float, \
     EventletRateLimiter, readconf
 
@@ -156,13 +157,14 @@ class BackendRateLimitMiddleware(object):
             try:
                 device, partition, _ = split_and_validate_path(req, 1, 3, True)
                 int(partition)  # check it's a valid partition
+            except (ValueError, HTTPException):
+                # request may not have device/partition e.g. a healthcheck req
+                pass
+            else:
                 rate_limiter = self.rate_limiters[device]
                 if not rate_limiter.is_allowed():
                     self.logger.increment('backend.ratelimit')
                     handler = HTTPTooManyBackendRequests()
-            except Exception:  # noqa
-                # request may not have device/partition e.g. a healthcheck req
-                pass
         return handler(env, start_response)
 
 
