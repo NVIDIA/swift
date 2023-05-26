@@ -3211,6 +3211,10 @@ class TestContainerController(TestRingBase):
                  'shard-listing-v2/a/c', self.ns_bound_list.bounds, time=600),
              mock.call.set('container/a/c', mock.ANY, time=60)],
             self.memcache.calls)
+        info_lines = self.logger.get_lines_for_level('info')
+        self.assertIn(
+            'Caching 3 listing shards for shard-listing-v2/a/c',
+            info_lines[0])
         # shards were cached
         self.assertEqual('sharded',
                          self.memcache.calls[2][1][1]['sharding_state'])

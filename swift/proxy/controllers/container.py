@@ -239,8 +239,8 @@ class ContainerController(Controller):
             memcache = cache_from_env(req.environ, True)
             if memcache and ns_bound_list:
                 # cache in memcache only if shard ranges as expected
-                self.logger.debug('Caching %d shards for %s',
-                                  len(ns_bound_list.bounds), req.path_qs)
+                self.logger.info('Caching %d listing shards for %s',
+                                 len(ns_bound_list.bounds), cache_key)
                 memcache.set(cache_key, ns_bound_list.bounds,
                              time=self.app.recheck_listing_shard_ranges)
         return ns_bound_list
@@ -433,7 +433,7 @@ class ContainerController(Controller):
             set_info_cache(self.app, req.environ, self.account_name,
                            self.container_name, resp)
         if 'swift.authorize' in req.environ:
-            req.acl = resp.headers.get('x-container-read')
+            req.acl = wsgi_to_str(resp.headers.get('x-container-read'))
             aresp = req.environ['swift.authorize'](req)
             if aresp:
                 # Don't cache this. It doesn't reflect the state of the

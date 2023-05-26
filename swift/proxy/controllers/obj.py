@@ -388,6 +388,10 @@ class BaseObjectController(Controller):
                     shard_ranges)
                 infocache[cache_key] = cached_namespaces
                 if memcache:
+                    self.logger.info(
+                        'Caching %d updating shards for %s',
+                        len(cached_namespaces.bounds),
+                        cache_key)
                     memcache.set(
                         cache_key, cached_namespaces.bounds,
                         time=self.app.recheck_updating_shard_ranges)
@@ -446,17 +450,19 @@ class BaseObjectController(Controller):
             req.headers['X-Backend-Next-Part-Power'] = next_part_power
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
+        db_state = container_info.get('sharding_state', 'unsharded')
 
         headers = self._backend_requests(
             req, len(nodes), container_partition, container_nodes,
             delete_at_container, delete_at_part, delete_at_nodes,
-            container_path=container_path)
+            db_state, container_path=container_path)
         return self._post_object(req, obj_ring, partition, headers)
 
     def _backend_requests(self, req, n_outgoing,
                           container_partition, containers,
                           delete_at_container=None, delete_at_partition=None,
-                          delete_at_nodes=None, container_path=None):
+                          delete_at_nodes=None, db_state=None,
+                          container_path=None):
         policy_index = req.headers['X-Backend-Storage-Policy-Index']
         policy = POLICIES.get_by_index(policy_index)
         headers = [self.generate_request_headers(req, additional=req.headers)
@@ -470,6 +476,7 @@ class BaseObjectController(Controller):
             headers[index]['X-Container-Device'] = csv_append(
                 headers[index].get('X-Container-Device'),
                 container['device'])
+            headers[index]['X-Container-Db-State'] = db_state
             if container_path:
                 headers[index]['X-Backend-Quoted-Container-Path'] = quote(
                     container_path)
@@ -907,10 +914,11 @@ class BaseObjectController(Controller):
             delete_at_nodes = self._config_obj_expiration(req)
 
         # add special headers to be handled by storage nodes
+        db_state = container_info.get('sharding_state', 'unsharded')
         outgoing_headers = self._backend_requests(
             req, len(nodes), container_partition, container_nodes,
             delete_at_container, delete_at_part, delete_at_nodes,
-            container_path=container_path)
+            db_state, container_path=container_path)
 
         # send object to storage nodes
         resp = self._store_object(
@@ -964,9 +972,10 @@ class BaseObjectController(Controller):
                 obj_ring, partition, req, policy=policy,
                 local_handoffs_first=True)
 
+        db_state = container_info.get('sharding_state', 'unsharded')
         headers = self._backend_requests(
             req, node_count, container_partition, container_nodes,
-            container_path=container_path)
+            db_state=db_state, container_path=container_path)
         return self._delete_object(req, obj_ring, partition, headers,
                                    node_count=node_count,
                                    node_iterator=node_iterator)
