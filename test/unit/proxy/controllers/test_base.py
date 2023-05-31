@@ -401,7 +401,10 @@ class TestFuncs(BaseTest):
                 # ...then decide to no-op based on the result
                 return app(env, start_response)
 
+            # Note that we have to do some book-keeping in tests to mimic what
+            # would be done in swift.common.wsgi.load_app
             wsgi_filter._pipeline_final_app = final_app
+            wsgi_filter._pipeline_request_logging_app = final_app
             return wsgi_filter
 
         # build up a pipeline
