@@ -363,12 +363,16 @@ def loadapp(conf_file, global_conf=None, allow_modify_pipeline=True):
         pipeline = [ultimate_app]
         ultimate_app._pipeline = pipeline
         ultimate_app._pipeline_final_app = ultimate_app
-        app = ultimate_app
+        request_logging_app = app = ultimate_app
         for filter_app in filters:
             app = filter_app(pipeline[0])
             pipeline.insert(0, app)
             app._pipeline = pipeline
             app._pipeline_final_app = ultimate_app
+            app._pipeline_request_logging_app = request_logging_app
+            if request_logging_app is ultimate_app and \
+                    app.__class__.__name__ == 'ProxyLoggingMiddleware':
+                request_logging_app = app
         return app
     return ctx.create()
 
