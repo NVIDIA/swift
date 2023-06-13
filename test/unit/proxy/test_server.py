@@ -517,7 +517,7 @@ class TestController(unittest.TestCase):
 
     def test_get_account_info_returns_values_as_strings(self):
         app = mock.MagicMock()
-        app._pipeline_final_app = app
+        app._pipeline_request_logging_app = app._pipeline_final_app = app
         app.account_existence_skip_cache = 0.0
         memcache = mock.MagicMock()
         memcache.get = mock.MagicMock()
@@ -544,7 +544,7 @@ class TestController(unittest.TestCase):
 
     def test_get_container_info_returns_values_as_strings(self):
         app = mock.MagicMock()
-        app._pipeline_final_app = app
+        app._pipeline_request_logging_app = app._pipeline_final_app = app
         app.container_existence_skip_cache = 0.0
         memcache = mock.MagicMock()
         memcache.get = mock.MagicMock()
@@ -4364,7 +4364,7 @@ class TestReplicatedObjectController(
             info_lines = self.logger.get_lines_for_level('info')
             self.assertIn(
                 'Caching 3 updating shards for shard-updating-v2/a/c',
-                info_lines[0])
+                info_lines)
 
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]

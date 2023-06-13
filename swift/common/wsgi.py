@@ -363,12 +363,16 @@ def loadapp(conf_file, global_conf=None, allow_modify_pipeline=True):
         pipeline = [ultimate_app]
         ultimate_app._pipeline = pipeline
         ultimate_app._pipeline_final_app = ultimate_app
-        app = ultimate_app
+        request_logging_app = app = ultimate_app
         for filter_app in filters:
             app = filter_app(pipeline[0])
             pipeline.insert(0, app)
             app._pipeline = pipeline
             app._pipeline_final_app = ultimate_app
+            app._pipeline_request_logging_app = request_logging_app
+            if request_logging_app is ultimate_app and \
+                    app.__class__.__name__ == 'ProxyLoggingMiddleware':
+                request_logging_app = app
         return app
     return ctx.create()
 
@@ -476,6 +480,8 @@ class StrategyBase(object):
             capture_stdio(self.logger)
         drop_privileges(self.conf.get('user', 'swift'))
         del self.tracking_data  # children don't need to track siblings
+        # only MAINPID should be sending systemd notifications
+        os.environ.pop('NOTIFY_SOCKET', None)
 
     def shutdown_sockets(self):
         """
@@ -877,6 +883,7 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
         run_server(conf, logger, no_fork_sock, global_conf=global_conf,
                    ready_callback=strategy.signal_ready,
                    allow_modify_pipeline=allow_modify_pipeline)
+        systemd_notify(logger, "STOPPING=1")
         return 0
 
     def stop_with_signal(signum, *args):
@@ -970,8 +977,10 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
         else:
             logger.notice('%s received (%s)', signame, os.getpid())
     if running_context[1] == signal.SIGTERM:
+        systemd_notify(logger, "STOPPING=1")
         os.killpg(0, signal.SIGTERM)
     elif running_context[1] == signal.SIGUSR1:
+        systemd_notify(logger, "RELOADING=1")
         # set up a pipe, fork off a child to handle cleanup later,
         # and rexec ourselves with an environment variable set which will
         # indicate which fd (one of the pipe ends) to write a byte to
@@ -1030,6 +1039,9 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
                 os.close(read_fd)
             except Exception:
                 pass
+    else:
+        # SIGHUP or, less likely, run in "once" mode
+        systemd_notify(logger, "STOPPING=1")
 
     strategy.shutdown_sockets()
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
