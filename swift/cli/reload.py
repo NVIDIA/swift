@@ -126,6 +126,9 @@ def main(args=None):
                                         b"STOPPING=1"):
                                 print("Process is %s" %
                                       data.decode("ascii")[:-2])
+                            elif data.startswith(b"STATUS="):
+                                print("Status: %s" %
+                                      data.decode("utf8").partition("=")[-1])
                             else:
                                 print("Received notification %r" % data)
 

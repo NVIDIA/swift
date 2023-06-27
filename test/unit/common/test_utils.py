@@ -1325,15 +1325,33 @@ class TestUtils(unittest.TestCase):
             log_exception(http_client.BadStatusLine(''))
             log_msg = strip_value(sio)
             self.assertNotIn('Traceback', log_msg)
-            self.assertIn('BadStatusLine', log_msg)
-            self.assertIn("''", log_msg)
+            self.assertIn('''BadStatusLine("''"''', log_msg)
 
             # green version is separate :-(
             log_exception(green_http_client.BadStatusLine(''))
             log_msg = strip_value(sio)
             self.assertNotIn('Traceback', log_msg)
-            self.assertIn('BadStatusLine', log_msg)
-            self.assertIn("''", log_msg)
+            self.assertIn('''BadStatusLine("''"''', log_msg)
+
+            if not six.PY2:
+                # py3 introduced RemoteDisconnected exceptions which inherit
+                # from both BadStatusLine *and* OSError; make sure those are
+                # handled as BadStatusLine, not OSError
+                log_exception(http_client.RemoteDisconnected(
+                    'Remote end closed connection'))
+                log_msg = strip_value(sio)
+                self.assertNotIn('Traceback', log_msg)
+                self.assertIn(
+                    "RemoteDisconnected('Remote end closed connection'",
+                    log_msg)
+
+                log_exception(green_http_client.RemoteDisconnected(
+                    'Remote end closed connection'))
+                log_msg = strip_value(sio)
+                self.assertNotIn('Traceback', log_msg)
+                self.assertIn(
+                    "RemoteDisconnected('Remote end closed connection'",
+                    log_msg)
 
             # test unhandled
             log_exception(Exception('my error message'))
@@ -3945,22 +3963,25 @@ cluster_dfw1 = http://dfw1.host/v1/
     @mock.patch('importlib.metadata.distribution')
     def test_load_pkg_resource_importlib(self, mock_driver):
         import importlib.metadata
+
+        class TestEntryPoint(importlib.metadata.EntryPoint):
+            def load(self):
+                return self.value
+
         repl_obj = object()
         ec_obj = object()
         other_obj = object()
         mock_driver.return_value.entry_points = [
-            importlib.metadata.EntryPoint(group='swift.diskfile',
-                                          name='replication.fs',
-                                          value=repl_obj),
-            importlib.metadata.EntryPoint(group='swift.diskfile',
-                                          name='erasure_coding.fs',
-                                          value=ec_obj),
-            importlib.metadata.EntryPoint(group='swift.section',
-                                          name='thing.other',
-                                          value=other_obj),
+            TestEntryPoint(group='swift.diskfile',
+                           name='replication.fs',
+                           value=repl_obj),
+            TestEntryPoint(group='swift.diskfile',
+                           name='erasure_coding.fs',
+                           value=ec_obj),
+            TestEntryPoint(group='swift.section',
+                           name='thing.other',
+                           value=other_obj),
         ]
-        for ep in mock_driver.return_value.entry_points:
-            ep.load = lambda ep=ep: ep.value
         tests = {
             ('swift.diskfile', 'egg:swift#replication.fs'): repl_obj,
             ('swift.diskfile', 'egg:swift#erasure_coding.fs'): ec_obj,
@@ -7330,6 +7351,29 @@ class TestDistributeEvenly(unittest.TestCase):
         self.assertEqual(out, [[0], [1], [2], [3], [4], [], []])
 
 
+@mock.patch('swift.common.utils.open')
+class TestGetPpid(unittest.TestCase):
+    def test_happy_path(self, mock_open):
+        mock_open.return_value.__enter__().read.return_value = \
+            'pid comm stat 456 see the procfs(5) man page for more info\n'
+        self.assertEqual(utils.get_ppid(123), 456)
+        self.assertIn(mock.call('/proc/123/stat'), mock_open.mock_calls)
+
+    def test_not_found(self, mock_open):
+        mock_open.side_effect = IOError(errno.ENOENT, "Not there")
+        with self.assertRaises(OSError) as caught:
+            utils.get_ppid(123)
+        self.assertEqual(caught.exception.errno, errno.ESRCH)
+        self.assertEqual(mock_open.mock_calls[0], mock.call('/proc/123/stat'))
+
+    def test_not_allowed(self, mock_open):
+        mock_open.side_effect = OSError(errno.EPERM, "Not for you")
+        with self.assertRaises(OSError) as caught:
+            utils.get_ppid(123)
+        self.assertEqual(caught.exception.errno, errno.EPERM)
+        self.assertEqual(mock_open.mock_calls[0], mock.call('/proc/123/stat'))
+
+
 class TestShardName(unittest.TestCase):
     def test(self):
         ts = utils.Timestamp.now()
@@ -9119,3 +9163,23 @@ class TestCooperativeIterator(unittest.TestCase):
         self.assertEqual(list(range(3)), actual)
         actual = do_test(utils.CooperativeIterator(itertools.count(), 0), 0)
         self.assertEqual(list(range(2)), actual)
+
+
+class TestContextPool(unittest.TestCase):
+    def test_context_manager(self):
+        size = 5
+        pool = utils.ContextPool(size)
+        with pool:
+            for _ in range(size):
+                pool.spawn(eventlet.sleep, 10)
+            self.assertEqual(pool.running(), size)
+        self.assertEqual(pool.running(), 0)
+
+    def test_close(self):
+        size = 10
+        pool = utils.ContextPool(size)
+        for _ in range(size):
+            pool.spawn(eventlet.sleep, 10)
+        self.assertEqual(pool.running(), size)
+        pool.close()
+        self.assertEqual(pool.running(), 0)

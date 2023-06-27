@@ -2485,6 +2485,9 @@ class TestSharder(BaseTestSharder):
         self.assertEqual('sharder.sharding.cleave',
                          self.logger.log_dict['timing_since'][-1][0][0])
         self.assertGreater(self.logger.log_dict['timing_since'][-1][0][1], 0)
+        for call in self.logger.log_dict['timing_since']:
+            self.assertNotIsInstance(call[0][1], Timestamp)
+            self.assertIsInstance(call[0][1], float)
         lines = sharder.logger.get_lines_for_level('info')
         self.assertEqual(
             ["Kick off container cleaving, own shard range in state "
@@ -2543,6 +2546,9 @@ class TestSharder(BaseTestSharder):
         self.assertEqual('sharder.sharding.send_sr',
                          self.logger.log_dict['timing_since'][-1][0][0])
         self.assertGreater(self.logger.log_dict['timing_since'][-1][0][1], 0)
+        for call in self.logger.log_dict['timing_since']:
+            self.assertNotIsInstance(call[0][1], Timestamp)
+            self.assertIsInstance(call[0][1], float)
 
     def test_cleave_timing_metrics(self):
         broker = self._make_broker()

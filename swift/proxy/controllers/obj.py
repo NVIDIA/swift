@@ -38,7 +38,7 @@ import random
 import sys
 
 from greenlet import GreenletExit
-from eventlet import GreenPile, sleep
+from eventlet import GreenPile
 from eventlet.queue import Queue, Empty
 from eventlet.timeout import Timeout
 
@@ -69,7 +69,7 @@ from swift.common.storage_policy import (POLICIES, REPL_POLICY, EC_POLICY,
                                          ECDriverError, PolicyError)
 from swift.proxy.controllers.base import Controller, delay_denial, \
     cors_validation, update_headers, bytes_to_skip, close_swift_conn, \
-    ByteCountEnforcer, record_cache_op_metrics, get_cache_key
+    ByteCountEnforcer, record_cache_op_metrics, get_cache_key, GetterBase
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestEntityTooLarge, HTTPRequestTimeout, \
     HTTPServerError, HTTPServiceUnavailable, HTTPClientDisconnect, \
@@ -389,8 +389,8 @@ class BaseObjectController(Controller):
                 infocache[cache_key] = cached_namespaces
                 if memcache:
                     self.logger.info(
-                        'Caching %d updating shards for %s',
-                        len(cached_namespaces.bounds), cache_key)
+                        'Caching updating shards for %s (%d shards)',
+                        cache_key, len(cached_namespaces.bounds))
                     memcache.set(
                         cache_key, cached_namespaces.bounds,
                         time=self.app.recheck_updating_shard_ranges)
@@ -1182,7 +1182,7 @@ class ECAppIter(object):
         self.pool = ContextPool(len(internal_parts_iters))
 
     def close(self):
-        # close down the stashed iter and shutdown the context pool can
+        # close down the stashed iter and shutdown the context pool to
         # clean up the frag queue feeding coroutines that may be currently
         # executing the internal_parts_iters.
         if self.stashed_iter:
@@ -2500,97 +2500,19 @@ def is_good_source(status):
     return is_success(status) or is_redirection(status)
 
 
-class ECFragGetter(object):
+class ECFragGetter(GetterBase):
 
     def __init__(self, app, req, node_iter, partition, policy, path,
                  backend_headers, header_provider, logger_thread_locals,
                  logger):
-        self.app = app
-        self.req = req
-        self.node_iter = node_iter
-        self.partition = partition
-        self.path = path
-        self.backend_headers = backend_headers
+        super(ECFragGetter, self).__init__(
+            app=app, req=req, node_iter=node_iter,
+            partition=partition, policy=policy, path=path,
+            backend_headers=backend_headers, logger=logger)
         self.header_provider = header_provider
-        self.req_query_string = req.query_string
         self.fragment_size = policy.fragment_size
         self.skip_bytes = 0
-        self.bytes_used_from_backend = 0
-        self.source = self.node = None
         self.logger_thread_locals = logger_thread_locals
-        self.logger = logger
-
-    def fast_forward(self, num_bytes):
-        """
-        Will skip num_bytes into the current ranges.
-
-        :params num_bytes: the number of bytes that have already been read on
-                           this request. This will change the Range header
-                           so that the next req will start where it left off.
-
-        :raises HTTPRequestedRangeNotSatisfiable: if begin + num_bytes
-                                                  > end of range + 1
-        :raises RangeAlreadyComplete: if begin + num_bytes == end of range + 1
-        """
-        try:
-            req_range = Range(self.backend_headers.get('Range'))
-        except ValueError:
-            req_range = None
-
-        if req_range:
-            begin, end = req_range.ranges[0]
-            if begin is None:
-                # this is a -50 range req (last 50 bytes of file)
-                end -= num_bytes
-                if end == 0:
-                    # we sent out exactly the first range's worth of bytes, so
-                    # we're done with it
-                    raise RangeAlreadyComplete()
-
-                if end < 0:
-                    raise HTTPRequestedRangeNotSatisfiable()
-
-            else:
-                begin += num_bytes
-                if end is not None and begin == end + 1:
-                    # we sent out exactly the first range's worth of bytes, so
-                    # we're done with it
-                    raise RangeAlreadyComplete()
-
-                if end is not None and begin > end:
-                    raise HTTPRequestedRangeNotSatisfiable()
-
-            req_range.ranges = [(begin, end)] + req_range.ranges[1:]
-            self.backend_headers['Range'] = str(req_range)
-        else:
-            self.backend_headers['Range'] = 'bytes=%d-' % num_bytes
-
-        # Reset so if we need to do this more than once, we don't double-up
-        self.bytes_used_from_backend = 0
-
-    def pop_range(self):
-        """
-        Remove the first byterange from our Range header.
-
-        This is used after a byterange has been completely sent to the
-        client; this way, should we need to resume the download from another
-        object server, we do not re-fetch byteranges that the client already
-        has.
-
-        If we have no Range header, this is a no-op.
-        """
-        if 'Range' in self.backend_headers:
-            try:
-                req_range = Range(self.backend_headers['Range'])
-            except ValueError:
-                # there's a Range header, but it's garbage, so get rid of it
-                self.backend_headers.pop('Range')
-                return
-            begin, end = req_range.ranges.pop(0)
-            if len(req_range.ranges) > 0:
-                self.backend_headers['Range'] = str(req_range)
-            else:
-                self.backend_headers.pop('Range')
 
     def learn_size_from_content_range(self, start, end, length):
         """
@@ -2656,23 +2578,10 @@ class ECFragGetter(object):
                         self.source_parts_iter)
                 return (start_byte, end_byte, length, headers, part)
             except ChunkReadTimeout:
-                new_source, new_node = self._dig_for_source_and_node()
-                if not new_source:
+                if not self._replace_source_and_node(
+                        'Trying to read next part of EC multi-part GET '
+                        '(retrying)'):
                     raise
-                self.app.error_occurred(
-                    self.node, 'Trying to read next part of '
-                    'EC multi-part GET (retrying)')
-                # Close-out the connection as best as possible.
-                if getattr(self.source, 'swift_conn', None):
-                    close_swift_conn(self.source)
-                self.source = new_source
-                self.node = new_node
-                # This is safe; it sets up a generator but does
-                # not call next() on it, so no IO is performed.
-                self.source_parts_iter = \
-                    http_response_to_document_iters(
-                        new_source,
-                        read_chunk_size=self.app.object_chunk_size)
 
     def iter_bytes_from_response_part(self, part_file, nbytes):
         buf = b''
@@ -2698,24 +2607,8 @@ class ECFragGetter(object):
                 except RangeAlreadyComplete:
                     break
                 buf = b''
-                old_node = self.node
-                new_source, new_node = self._dig_for_source_and_node()
-                if new_source:
-                    self.app.error_occurred(
-                        old_node, 'Trying to read EC fragment '
-                        'during GET (retrying)')
-                    # Close-out the connection as best as possible.
-                    if getattr(self.source, 'swift_conn', None):
-                        close_swift_conn(self.source)
-                    self.source = new_source
-                    self.node = new_node
-                    # This is safe; it just sets up a generator but
-                    # does not call next() on it, so no IO is
-                    # performed.
-                    self.source_parts_iter = \
-                        http_response_to_document_iters(
-                            new_source,
-                            read_chunk_size=self.app.object_chunk_size)
+                if self._replace_source_and_node(
+                        'Trying to read EC fragment during GET (retrying)'):
                     try:
                         _junk, _junk, _junk, _junk, part_file = \
                             self.get_next_doc_part()
@@ -2843,7 +2736,7 @@ class ECFragGetter(object):
                     ip, port, node['device'],
                     self.partition, 'GET', self.path,
                     headers=req_headers,
-                    query_string=self.req_query_string)
+                    query_string=self.req.query_string)
             self.app.set_node_timing(node, time.time() - start_node_timing)
 
             with Timeout(node_timeout):
@@ -2902,13 +2795,12 @@ class ECFragGetter(object):
                 node, self.app.recoverable_node_timeout)
 
             if source:
-                self.node = node
                 yield source, node
             else:
                 yield None, None
             self.status = self.reason = self.body = self.source_headers = None
 
-    def _dig_for_source_and_node(self):
+    def _get_source_and_node(self):
         # capture last used etag before continuation
         used_etag = self.last_headers.get('X-Object-Sysmeta-EC-ETag')
         for source, node in self.source_and_node_iter:

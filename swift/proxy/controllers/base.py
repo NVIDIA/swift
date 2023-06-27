@@ -478,7 +478,7 @@ def get_container_info(env, app, swift_source=None):
         # See similar comment in get_account_info() for justification.
         info = _get_info_from_infocache(env, account, container)
         if info is None:
-            info = set_info_cache(logged_app, env, account, container, resp)
+            info = set_info_cache(env, account, container, resp)
 
     if info:
         info = deepcopy(info)  # avoid mutating what's in swift.infocache
@@ -568,7 +568,7 @@ def get_account_info(env, app, swift_source=None):
         # memcache would defeat the purpose.
         info = _get_info_from_infocache(env, account)
         if info is None:
-            info = set_info_cache(app, env, account, None, resp)
+            info = set_info_cache(env, account, None, resp)
 
     if info:
         info = info.copy()  # avoid mutating what's in swift.infocache
@@ -635,11 +635,11 @@ def get_cache_key(account, container=None, obj=None, shard=None):
     return cache_key
 
 
-def set_info_cache(app, env, account, container, resp):
+def set_info_cache(env, account, container, resp):
     """
     Cache info in both memcache and env.
 
-    :param  app: the application object
+    :param  env: the WSGI request environment
     :param  account: the unquoted account name
     :param  container: the unquoted container name or None
     :param  resp: the response received or None if info cache should be cleared
@@ -651,7 +651,7 @@ def set_info_cache(app, env, account, container, resp):
     infocache = env.setdefault('swift.infocache', {})
     memcache = cache_from_env(env, True)
     if resp is None:
-        clear_info_cache(app, env, account, container)
+        clear_info_cache(env, account, container)
         return
 
     if container:
@@ -708,12 +708,11 @@ def set_object_info_cache(app, env, account, container, obj, resp):
     return info
 
 
-def clear_info_cache(app, env, account, container=None, shard=None):
+def clear_info_cache(env, account, container=None, shard=None):
     """
     Clear the cached info in both memcache and env
 
-    :param  app: the application object
-    :param  env: the WSGI environment
+    :param  env: the WSGI request environment
     :param  account: the account name
     :param  container: the container name if clearing info for containers, or
               None
@@ -1018,55 +1017,46 @@ class ByteCountEnforcer(object):
             return chunk
 
 
-class GetOrHeadHandler(object):
-    def __init__(self, app, req, server_type, node_iter, partition, path,
-                 backend_headers, concurrency=1, policy=None,
-                 client_chunk_size=None, newest=None, logger=None):
+class GetterBase(object):
+    def __init__(self, app, req, node_iter, partition, policy,
+                 path, backend_headers, logger=None):
         self.app = app
+        self.req = req
         self.node_iter = node_iter
-        self.server_type = server_type
         self.partition = partition
+        self.policy = policy
         self.path = path
         self.backend_headers = backend_headers
-        self.client_chunk_size = client_chunk_size
         self.logger = logger or app.logger
-        self.skip_bytes = 0
         self.bytes_used_from_backend = 0
-        self.used_nodes = []
-        self.used_source_etag = ''
-        self.concurrency = concurrency
-        self.policy = policy
         self.node = None
         self.source = None
         self.source_parts_iter = None
-        self.latest_404_timestamp = Timestamp(0)
-        if self.server_type == 'Object':
-            self.node_timeout = self.app.recoverable_node_timeout
-        else:
-            self.node_timeout = self.app.node_timeout
-        policy_options = self.app.get_policy_options(self.policy)
-        self.rebalance_missing_suppression_count = min(
-            policy_options.rebalance_missing_suppression_count,
-            node_iter.num_primary_nodes - 1)
 
-        # stuff from request
-        self.req_method = req.method
-        self.req_path = req.path
-        self.req_query_string = req.query_string
-        if newest is None:
-            self.newest = config_true_value(req.headers.get('x-newest', 'f'))
-        else:
-            self.newest = newest
+    def _get_source_and_node(self):
+        raise NotImplementedError()
 
-        # populated when finding source
-        self.statuses = []
-        self.reasons = []
-        self.bodies = []
-        self.source_headers = []
-        self.sources = []
+    def _replace_source_and_node(self, err_msg):
+        # be defensive against _get_source_and_node modifying self.source
+        # or self.node...
+        old_source = self.source
+        old_node = self.node
 
-        # populated from response headers
-        self.start_byte = self.end_byte = self.length = None
+        new_source, new_node = self._get_source_and_node()
+        if not new_source:
+            return False
+
+        self.app.error_occurred(old_node, err_msg)
+        # Close-out the connection as best as possible.
+        if getattr(old_source, 'swift_conn', None):
+            close_swift_conn(old_source)
+        self.source = new_source
+        self.node = new_node
+        # This is safe; it sets up a generator but does
+        # not call next() on it, so no IO is performed.
+        self.source_parts_iter = http_response_to_document_iters(
+            new_source, read_chunk_size=self.app.object_chunk_size)
+        return True
 
     def fast_forward(self, num_bytes):
         """
@@ -1140,6 +1130,46 @@ class GetOrHeadHandler(object):
             else:
                 self.backend_headers.pop('Range')
 
+
+class GetOrHeadHandler(GetterBase):
+    def __init__(self, app, req, server_type, node_iter, partition, path,
+                 backend_headers, concurrency=1, policy=None,
+                 client_chunk_size=None, newest=None, logger=None):
+        super(GetOrHeadHandler, self).__init__(
+            app=app, req=req, node_iter=node_iter,
+            partition=partition, policy=policy, path=path,
+            backend_headers=backend_headers, logger=logger)
+        self.server_type = server_type
+        self.client_chunk_size = client_chunk_size
+        self.skip_bytes = 0
+        self.used_nodes = []
+        self.used_source_etag = ''
+        self.concurrency = concurrency
+        self.latest_404_timestamp = Timestamp(0)
+        if self.server_type == 'Object':
+            self.node_timeout = self.app.recoverable_node_timeout
+        else:
+            self.node_timeout = self.app.node_timeout
+        policy_options = self.app.get_policy_options(self.policy)
+        self.rebalance_missing_suppression_count = min(
+            policy_options.rebalance_missing_suppression_count,
+            node_iter.num_primary_nodes - 1)
+
+        if newest is None:
+            self.newest = config_true_value(req.headers.get('x-newest', 'f'))
+        else:
+            self.newest = newest
+
+        # populated when finding source
+        self.statuses = []
+        self.reasons = []
+        self.bodies = []
+        self.source_headers = []
+        self.sources = []
+
+        # populated from response headers
+        self.start_byte = self.end_byte = self.length = None
+
     def learn_size_from_content_range(self, start, end, length):
         """
         If client_chunk_size is set, makes sure we yield things starting on
@@ -1205,22 +1235,8 @@ class GetOrHeadHandler(object):
                         self.source_parts_iter)
                 return (start_byte, end_byte, length, headers, part)
             except ChunkReadTimeout:
-                new_source, new_node = self._get_source_and_node()
-                if new_source:
-                    self.app.error_occurred(
-                        self.node, 'Trying to read object during '
-                        'GET (retrying)')
-                    # Close-out the connection as best as possible.
-                    if getattr(self.source, 'swift_conn', None):
-                        close_swift_conn(self.source)
-                    self.source = new_source
-                    self.node = new_node
-                    # This is safe; it sets up a generator but does
-                    # not call next() on it, so no IO is performed.
-                    self.source_parts_iter = http_response_to_document_iters(
-                        new_source,
-                        read_chunk_size=self.app.object_chunk_size)
-                else:
+                if not self._replace_source_and_node(
+                        'Trying to read object during GET (retrying)'):
                     raise StopIteration()
 
     def iter_bytes_from_response_part(self, part_file, nbytes):
@@ -1247,24 +1263,8 @@ class GetOrHeadHandler(object):
                 except RangeAlreadyComplete:
                     break
                 buf = b''
-                new_source, new_node = self._get_source_and_node()
-                if new_source:
-                    self.app.error_occurred(
-                        self.node, 'Trying to read object during '
-                        'GET (retrying)')
-                    # Close-out the connection as best as possible.
-                    if getattr(self.source, 'swift_conn', None):
-                        close_swift_conn(self.source)
-                    self.source = new_source
-                    self.node = new_node
-                    # This is safe; it just sets up a generator but
-                    # does not call next() on it, so no IO is
-                    # performed.
-                    self.source_parts_iter = \
-                        http_response_to_document_iters(
-                            new_source,
-                            read_chunk_size=self.app.object_chunk_size)
-
+                if self._replace_source_and_node(
+                        'Trying to read object during GET (retrying)'):
                     try:
                         _junk, _junk, _junk, _junk, part_file = \
                             self.get_next_doc_part()
@@ -1407,9 +1407,9 @@ class GetOrHeadHandler(object):
             with ConnectionTimeout(self.app.conn_timeout):
                 conn = http_connect(
                     ip, port, node['device'],
-                    self.partition, self.req_method, self.path,
+                    self.partition, self.req.method, self.path,
                     headers=req_headers,
-                    query_string=self.req_query_string)
+                    query_string=self.req.query_string)
             self.app.set_node_timing(node, time.time() - start_node_timing)
 
             with Timeout(node_timeout):
@@ -1420,7 +1420,7 @@ class GetOrHeadHandler(object):
             self.app.exception_occurred(
                 node, self.server_type,
                 'Trying to %(method)s %(path)s' %
-                {'method': self.req_method, 'path': self.req_path})
+                {'method': self.req.method, 'path': self.req.path})
             return False
 
         src_headers = dict(
@@ -1490,7 +1490,7 @@ class GetOrHeadHandler(object):
                 if ts > self.latest_404_timestamp:
                     self.latest_404_timestamp = ts
             self.app.check_response(node, self.server_type, possible_source,
-                                    self.req_method, self.path,
+                                    self.req.method, self.path,
                                     self.bodies[-1])
         return False
 
@@ -2164,7 +2164,7 @@ class Controller(object):
                                   path, [headers] * len(nodes))
         if is_success(resp.status_int):
             self.logger.info('autocreate account %r', path)
-            clear_info_cache(self.app, req.environ, account)
+            clear_info_cache(req.environ, account)
             return True
         else:
             self.logger.warning('Could not autocreate account %r', path)

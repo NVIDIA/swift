@@ -3213,7 +3213,8 @@ class TestContainerController(TestRingBase):
             self.memcache.calls)
         info_lines = self.logger.get_lines_for_level('info')
         self.assertIn(
-            'Caching 3 listing shards for shard-listing-v2/a/c', info_lines)
+            'Caching listing shards for shard-listing-v2/a/c (3 shards)',
+            info_lines)
         # shards were cached
         self.assertEqual('sharded',
                          self.memcache.calls[2][1][1]['sharding_state'])

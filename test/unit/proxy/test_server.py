@@ -2521,6 +2521,74 @@ class BaseTestObjectController(object):
         self.assertEqual(len(error_lines), 0)  # sanity
         self.assertEqual(len(warn_lines), 0)  # sanity
 
+    @unpatch_policies
+    def test_GET_pipeline(self):
+        conf = _test_context['conf']
+        conf['client_timeout'] = 0.1
+        prosrv = proxy_server.Application(conf, logger=debug_logger('proxy'))
+        with in_process_proxy(
+                prosrv, socket_timeout=conf['client_timeout']) as prolis:
+            self.put_container(self.policy.name, self.policy.name,
+                               prolis=prolis)
+
+            obj = b'0123456' * 11 * 17
+
+            sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+            fd = sock.makefile('rwb')
+            fd.write(('PUT /v1/a/%s/go-get-it HTTP/1.1\r\n'
+                      'Host: localhost\r\n'
+                      'Content-Length: %d\r\n'
+                      'X-Storage-Token: t\r\n'
+                      'X-Object-Meta-Color: chartreuse\r\n'
+                      'Content-Type: application/octet-stream\r\n'
+                      '\r\n' % (
+                          self.policy.name,
+                          len(obj),
+                      )).encode('ascii'))
+            fd.write(obj)
+            fd.flush()
+            headers = readuntil2crlfs(fd)
+            exp = b'HTTP/1.1 201'
+            self.assertEqual(headers[:len(exp)], exp)
+
+            fd.write(('GET /v1/a/%s/go-get-it HTTP/1.1\r\n'
+                      'Host: localhost\r\n'
+                      'X-Storage-Token: t\r\n'
+                      '\r\n' % self.policy.name).encode('ascii'))
+            fd.flush()
+            headers = readuntil2crlfs(fd)
+            exp = b'HTTP/1.1 200'
+            self.assertEqual(headers[:len(exp)], exp)
+            for line in headers.splitlines():
+                if b'Content-Length' in line:
+                    h, v = line.split()
+                    content_length = int(v.strip())
+                    break
+            else:
+                self.fail("Didn't find content-length in %r" % (headers,))
+
+            gotten_obj = fd.read(content_length)
+            self.assertEqual(gotten_obj, obj)
+
+            sleep(0.3)  # client_timeout should kick us off
+
+            fd.write(('GET /v1/a/%s/go-get-it HTTP/1.1\r\n'
+                      'Host: localhost\r\n'
+                      'X-Storage-Token: t\r\n'
+                      '\r\n' % self.policy.name).encode('ascii'))
+            fd.flush()
+            # makefile is a little weird, but this is disconnected
+            self.assertEqual(b'', fd.read())
+            # I expected this to raise a socket error
+            self.assertEqual(b'', sock.recv(1024))
+            # ... but we ARE disconnected
+            with self.assertRaises(socket.error) as caught:
+                sock.send(b'test')
+            self.assertEqual(caught.exception.errno, errno.EPIPE)
+            # and logging confirms we've timed out
+            last_debug_msg = prosrv.logger.get_lines_for_level('debug')[-1]
+            self.assertIn('timed out', last_debug_msg)
+
 
 @patch_policies([StoragePolicy(0, 'zero', True,
                                object_ring=FakeRing(base_port=3000))])
@@ -2538,6 +2606,7 @@ class TestReplicatedObjectController(
             logger=self.logger,
             account_ring=FakeRing(),
             container_ring=FakeRing())
+        self.policy = POLICIES[0]
         super(TestReplicatedObjectController, self).setUp()
 
     def tearDown(self):
@@ -4363,7 +4432,7 @@ class TestReplicatedObjectController(
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
             info_lines = self.logger.get_lines_for_level('info')
             self.assertIn(
-                'Caching 3 updating shards for shard-updating-v2/a/c',
+                'Caching updating shards for shard-updating-v2/a/c (3 shards)',
                 info_lines)
 
             backend_requests = fake_conn.requests
@@ -8298,73 +8367,6 @@ class BaseTestECObjectController(BaseTestObjectController):
             os.rename(self.ec_policy.object_ring.serialized_path + '.bak',
                       self.ec_policy.object_ring.serialized_path)
 
-    def test_GET_ec_pipeline(self):
-        conf = _test_context['conf']
-        conf['client_timeout'] = 0.1
-        prosrv = proxy_server.Application(conf, logger=debug_logger('proxy'))
-        with in_process_proxy(
-                prosrv, socket_timeout=conf['client_timeout']) as prolis:
-            self.put_container(self.ec_policy.name, self.ec_policy.name,
-                               prolis=prolis)
-
-            obj = b'0123456' * 11 * 17
-
-            sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-            fd = sock.makefile('rwb')
-            fd.write(('PUT /v1/a/%s/go-get-it HTTP/1.1\r\n'
-                      'Host: localhost\r\n'
-                      'Content-Length: %d\r\n'
-                      'X-Storage-Token: t\r\n'
-                      'X-Object-Meta-Color: chartreuse\r\n'
-                      'Content-Type: application/octet-stream\r\n'
-                      '\r\n' % (
-                          self.ec_policy.name,
-                          len(obj),
-                      )).encode('ascii'))
-            fd.write(obj)
-            fd.flush()
-            headers = readuntil2crlfs(fd)
-            exp = b'HTTP/1.1 201'
-            self.assertEqual(headers[:len(exp)], exp)
-
-            fd.write(('GET /v1/a/%s/go-get-it HTTP/1.1\r\n'
-                      'Host: localhost\r\n'
-                      'X-Storage-Token: t\r\n'
-                      '\r\n' % self.ec_policy.name).encode('ascii'))
-            fd.flush()
-            headers = readuntil2crlfs(fd)
-            exp = b'HTTP/1.1 200'
-            self.assertEqual(headers[:len(exp)], exp)
-            for line in headers.splitlines():
-                if b'Content-Length' in line:
-                    h, v = line.split()
-                    content_length = int(v.strip())
-                    break
-            else:
-                self.fail("Didn't find content-length in %r" % (headers,))
-
-            gotten_obj = fd.read(content_length)
-            self.assertEqual(gotten_obj, obj)
-
-            sleep(0.3)  # client_timeout should kick us off
-
-            fd.write(('GET /v1/a/%s/go-get-it HTTP/1.1\r\n'
-                      'Host: localhost\r\n'
-                      'X-Storage-Token: t\r\n'
-                      '\r\n' % self.ec_policy.name).encode('ascii'))
-            fd.flush()
-            # makefile is a little weird, but this is disconnected
-            self.assertEqual(b'', fd.read())
-            # I expected this to raise a socket error
-            self.assertEqual(b'', sock.recv(1024))
-            # ... but we ARE disconnected
-            with self.assertRaises(socket.error) as caught:
-                sock.send(b'test')
-            self.assertEqual(caught.exception.errno, errno.EPIPE)
-            # and logging confirms we've timed out
-            last_debug_msg = prosrv.logger.get_lines_for_level('debug')[-1]
-            self.assertIn('timed out', last_debug_msg)
-
     def test_ec_client_disconnect(self):
         prolis = _test_sockets[0]
 
@@ -8595,7 +8597,7 @@ class BaseTestECObjectController(BaseTestObjectController):
 class TestECObjectController(BaseTestECObjectController, unittest.TestCase):
     def setUp(self):
         skip_if_no_xattrs()
-        self.ec_policy = POLICIES[3]
+        self.policy = self.ec_policy = POLICIES[3]
         super(TestECObjectController, self).setUp()
 
 
@@ -8603,7 +8605,7 @@ class TestECDuplicationObjectController(
         BaseTestECObjectController, unittest.TestCase):
     def setUp(self):
         skip_if_no_xattrs()
-        self.ec_policy = POLICIES[4]
+        self.policy = self.ec_policy = POLICIES[4]
         super(TestECDuplicationObjectController, self).setUp()
 
 
@@ -10148,6 +10150,38 @@ class TestContainerController(unittest.TestCase):
                                   call['method'], key, call['headers']))
                 self.assertEqual(value, call['headers'][key])
 
+    def test_PUT_autocreate_account_utf8(self):
+        with save_globals():
+            controller = proxy_server.ContainerController(
+                self.app, wsgi_to_str('\xe2\x98\x83'),
+                wsgi_to_str('\xe2\x98\x83'))
+
+            def test_status_map(statuses, expected, headers=None, **kwargs):
+                set_http_connect(*statuses, **kwargs)
+                req = Request.blank('/v1/a/c', {}, headers=headers)
+                req.content_length = 0
+                self.app.update_request(req)
+                res = controller.PUT(req)
+                expected = str(expected)
+                self.assertEqual(res.status[:len(expected)], expected)
+
+            self.app.account_autocreate = True
+            calls = []
+            callback = _make_callback_func(calls)
+
+            # all goes according to plan
+            test_status_map(
+                (404, 404, 404,   # account_info fails on 404
+                 201, 201, 201,   # PUT account
+                 200,             # account_info success
+                 201, 201, 201),  # put container success
+                201, missing_container=True,
+                give_connect=callback)
+
+            self.assertEqual(10, len(calls))
+            for call in calls[3:6]:
+                self.assertEqual(wsgi_to_str('/\xe2\x98\x83'), call['path'])
+
     def test_POST(self):
         with save_globals():
             controller = proxy_server.ContainerController(self.app, 'account',
@@ -11683,6 +11717,15 @@ class TestAccountControllerFakeGetResponse(unittest.TestCase):
                                          'QUERY_STRING': 'format=\xff\xfe'})
             resp = req.get_response(self.app)
             self.assertEqual(400, resp.status_int)
+
+    def test_GET_autocreate_utf8(self):
+        with save_globals():
+            set_http_connect(*([404] * 100))  # nonexistent: all backends 404
+            req = Request.blank('/v1/\xe2\x98\x83',
+                                environ={'REQUEST_METHOD': 'GET',
+                                         'PATH_INFO': '/v1/\xe2\x98\x83'})
+            resp = req.get_response(self.app)
+            self.assertEqual(204, resp.status_int)
 
     def test_account_acl_header_access(self):
         acl = {
