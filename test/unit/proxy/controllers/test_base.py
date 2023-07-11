@@ -183,7 +183,7 @@ class FakeCache(FakeMemcache):
         return self.stub or self.store.get(key)
 
 
-class TestSource(object):
+class FakeSource(object):
     def __init__(self, chunks, headers=None, body=b''):
         self.chunks = list(chunks)
         self.headers = headers or {}
@@ -514,6 +514,50 @@ class TestFuncs(BaseTest):
                                   for k, v in subdict.items()],
                                  [(k, str, v, str)
                                   for k, v in subdict.items()])
+
+    def test_get_container_info_only_lookup_cache(self):
+        # no container info is cached in cache.
+        req = Request.blank("/v1/AUTH_account/cont",
+                            environ={'swift.cache': FakeCache({})})
+        resp = get_container_info(
+            req.environ, self.app, swift_source=None, cache_only=True)
+        self.assertEqual(resp['storage_policy'], 0)
+        self.assertEqual(resp['bytes'], 0)
+        self.assertEqual(resp['object_count'], 0)
+        self.assertEqual(resp['versions'], None)
+        self.assertEqual(
+            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            ['container.info.cache.miss'])
+
+        # container info is cached in cache.
+        self.logger.clear()
+        cache_stub = {
+            'status': 404, 'bytes': 3333, 'object_count': 10,
+            'versions': u"\U0001F4A9",
+            'meta': {u'some-\N{SNOWMAN}': u'non-ascii meta \U0001F334'}}
+        req = Request.blank("/v1/account/cont",
+                            environ={'swift.cache': FakeCache(cache_stub)})
+        resp = get_container_info(
+            req.environ, self.app, swift_source=None, cache_only=True)
+        self.assertEqual([(k, type(k)) for k in resp],
+                         [(k, str) for k in resp])
+        self.assertEqual(resp['storage_policy'], 0)
+        self.assertEqual(resp['bytes'], 3333)
+        self.assertEqual(resp['object_count'], 10)
+        self.assertEqual(resp['status'], 404)
+        expected = u'\U0001F4A9'
+        if six.PY2:
+            expected = expected.encode('utf8')
+        self.assertEqual(resp['versions'], expected)
+        for subdict in resp.values():
+            if isinstance(subdict, dict):
+                self.assertEqual([(k, type(k), v, type(v))
+                                  for k, v in subdict.items()],
+                                 [(k, str, v, str)
+                                  for k, v in subdict.items()])
+        self.assertEqual(
+            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            ['container.info.cache.hit'])
 
     def test_get_cache_key(self):
         self.assertEqual(get_cache_key("account", "cont"),
@@ -1145,6 +1189,16 @@ class TestFuncs(BaseTest):
         self.assertRaises(exceptions.RangeAlreadyComplete,
                           handler.fast_forward, 1)
 
+        handler = GetOrHeadHandler(
+            self.app, req, None, Namespace(num_primary_nodes=3), None, None,
+            {'Range': 'bytes=23-',
+             'X-Backend-Ignore-Range-If-Metadata-Present':
+             'X-Static-Large-Object'})
+        handler.fast_forward(20)
+        self.assertEqual(handler.backend_headers['Range'], 'bytes=43-')
+        self.assertNotIn('X-Backend-Ignore-Range-If-Metadata-Present',
+                         handler.backend_headers)
+
     def test_range_fast_forward_after_data_timeout(self):
         req = Request.blank('/')
 
@@ -1308,7 +1362,7 @@ class TestFuncs(BaseTest):
         self.assertEqual('', dst_headers['Referer'])
 
     def test_client_chunk_size(self):
-        source = TestSource((
+        source = FakeSource((
             b'abcd', b'1234', b'abc', b'd1', b'234abcd1234abcd1', b'2'))
         req = Request.blank('/v1/a/c/o')
         handler = GetOrHeadHandler(
@@ -1325,11 +1379,11 @@ class TestFuncs(BaseTest):
     def test_client_chunk_size_resuming(self):
         node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
 
-        source1 = TestSource([b'abcd', b'1234', None,
+        source1 = FakeSource([b'abcd', b'1234', None,
                               b'efgh', b'5678', b'lots', b'more', b'data'])
         # incomplete reads of client_chunk_size will be re-fetched
-        source2 = TestSource([b'efgh', b'5678', b'lots', None])
-        source3 = TestSource([b'lots', b'more', b'data'])
+        source2 = FakeSource([b'efgh', b'5678', b'lots', None])
+        source3 = FakeSource([b'lots', b'more', b'data'])
         req = Request.blank('/v1/a/c/o')
         handler = GetOrHeadHandler(
             self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
@@ -1354,8 +1408,8 @@ class TestFuncs(BaseTest):
         node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
         headers = {'transfer-encoding': 'chunked',
                    'content-type': 'text/plain'}
-        source1 = TestSource([b'abcd', b'1234', b'abc', None], headers=headers)
-        source2 = TestSource([b'efgh5678'], headers=headers)
+        source1 = FakeSource([b'abcd', b'1234', b'abc', None], headers=headers)
+        source2 = FakeSource([b'efgh5678'], headers=headers)
         sources = [(source1, node), (source2, node)]
         req = Request.blank('/v1/a/c/o')
         handler = GetOrHeadHandler(
@@ -1375,7 +1429,7 @@ class TestFuncs(BaseTest):
         self.app.logger = mock.Mock()
         req = Request.blank('/v1/a/c/o')
         headers = {'content-type': 'text/plain'}
-        source = TestSource([], headers=headers, body=b'the cake is a lie')
+        source = FakeSource([], headers=headers, body=b'the cake is a lie')
 
         node = {'ip': '1.2.3.4', 'port': 6200, 'device': 'sda'}
         handler = GetOrHeadHandler(

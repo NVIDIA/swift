@@ -303,7 +303,8 @@ class S3ApiMiddleware(object):
             wsgi_conf.get('s3_inventory_allowed_paths', '*'))
 
         self.logger = get_logger(
-            wsgi_conf, log_route=wsgi_conf.get('log_name', 's3api'))
+            wsgi_conf, log_route=wsgi_conf.get('log_name', 's3api'),
+            statsd_tail_prefix='s3api')
         self.check_pipeline(wsgi_conf)
 
         if self.conf.use_async_delete and (self.conf.s3_acl or
@@ -367,6 +368,7 @@ class S3ApiMiddleware(object):
         except InvalidSubresource as e:
             self.logger.debug(e.cause)
         except ErrorResponse as err_resp:
+            self.logger.increment(err_resp.metric_name)
             if isinstance(err_resp, InternalError):
                 self.logger.exception(err_resp)
             resp = err_resp

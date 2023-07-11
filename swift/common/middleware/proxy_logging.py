@@ -385,21 +385,12 @@ class ProxyLoggingMiddleware(object):
         self.mark_req_logged(env)
 
         start_response_args = [None]
-        input_proxy = InputProxy(env['wsgi.input'])
+        input_proxy = InputProxy(env['wsgi.input'], env=env)
         env['wsgi.input'] = input_proxy
         start_time = time.time()
 
         def my_start_response(status, headers, exc_info=None):
             start_response_args[0] = (status, list(headers), exc_info)
-
-        def status_int_for_logging(start_status, client_disconnect=False):
-            if client_disconnect or input_proxy.client_disconnect:
-                # log disconnected clients as '499' status code, always
-                return 499
-            if 'swift.proxy_logging_status' in env:
-                # log alternative status that another middleware has specified
-                return env['swift.proxy_logging_status']
-            return start_status
 
         def iter_response(iterable):
             iterator = reiterate(iterable)
@@ -444,21 +435,20 @@ class ProxyLoggingMiddleware(object):
                         metric_name_policy + '.first-byte.timing', ttfb * 1000)
 
             bytes_sent = 0
-            client_disconnect = False
             start_status = wire_status_int
             try:
                 for chunk in iterator:
                     bytes_sent += len(chunk)
                     yield chunk
             except GeneratorExit:  # generator was closed before we finished
-                client_disconnect = True
-                pass
+                env['swift.proxy_logging_status'] = 499
+                raise
             except Exception:
                 start_status = 500
                 raise
             finally:
-                status_int = status_int_for_logging(
-                    start_status, client_disconnect)
+                status_int = env.get('swift.proxy_logging_status',
+                                     start_status)
                 self.log_request(
                     req, status_int, input_proxy.bytes_received, bytes_sent,
                     start_time, time.time(), resp_headers=resp_headers,
@@ -469,7 +459,7 @@ class ProxyLoggingMiddleware(object):
             iterable = self.app(env, my_start_response)
         except Exception:
             req = Request(env)
-            status_int = status_int_for_logging(500)
+            status_int = env.get('swift.proxy_logging_status', 500)
             self.log_request(
                 req, status_int, input_proxy.bytes_received, 0, start_time,
                 time.time())

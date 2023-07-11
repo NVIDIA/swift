@@ -273,6 +273,9 @@ class TestObjectController(BaseTestCase):
         headers = {'X-Timestamp': post_timestamp,
                    'X-Object-Meta-3': 'Three',
                    'X-Object-Meta-4': 'Four',
+                   'x-object-meta-t\xc3\xa8st': 'm\xc3\xa8ta',
+                   'X-Backend-Replication-Headers':
+                       'x-object-meta-t\xc3\xa8st',
                    'Content-Encoding': 'gzip',
                    'Foo': 'fooheader',
                    'Bar': 'barheader'}
@@ -297,6 +300,7 @@ class TestObjectController(BaseTestCase):
             'X-Object-Sysmeta-Color': 'blue',
             'X-Object-Meta-3': 'Three',
             'X-Object-Meta-4': 'Four',
+            'X-Object-Meta-T\xc3\xa8St': 'm\xc3\xa8ta',
             'Foo': 'fooheader',
             'Bar': 'barheader',
             'Content-Encoding': 'gzip',
@@ -1432,9 +1436,10 @@ class TestObjectController(BaseTestCase):
                      'Content-Length': '6',
                      'Content-Type': 'application/octet-stream',
                      'x-object-meta-test': 'one',
+                     'x-object-meta-t\xc3\xa8st': 'm\xc3\xa8ta',
                      'Custom-Header': '*',
                      'X-Backend-Replication-Headers':
-                     'Content-Type Content-Length'})
+                     'x-object-meta-t\xc3\xa8st Content-Type Content-Length'})
         req.body = 'VERIFY'
         with mock.patch.object(self.object_controller, 'allowed_headers',
                                ['Custom-Header']):
@@ -1456,6 +1461,7 @@ class TestObjectController(BaseTestCase):
                           'Content-Type': 'application/octet-stream',
                           'name': '/a/c/o',
                           'X-Object-Meta-Test': 'one',
+                          'X-Object-Meta-T\xc3\xa8St': 'm\xc3\xa8ta',
                           'Custom-Header': '*'})
 
     def test_PUT_overwrite(self):
@@ -4295,17 +4301,157 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 404)
 
+    def test_GET_keep_cache_private_config_true(self):
+        # Test swift.obj.server.ObjectController.GET that, when
+        # 'keep_cache_private' is configured True, then
+        # disk_file.reader will be called with keep_cache=True.
+        # Set up a new ObjectController with customized configurations.
+        conf = {'devices': self.testdir, 'mount_check': 'false',
+                'container_update_timeout': 0.0,
+                'keep_cache_private': 'True'}
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+        obj_controller.bytes_per_sync = 1
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': timestamp,
+                                     'Content-Type': 'application/x-test'})
+        req.body = b'VERIFY'
+        resp = req.get_response(obj_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # Request headers have neither 'X-Auth-Token' nor 'X-Storage-Token'.
+        req = Request.blank('/sda1/p/a/c/o',
+                            headers={'Content-Type': 'application/x-test'})
+        reader_mock = mock.Mock(keep_cache=False)
+        with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
+            resp = req.get_response(obj_controller)
+            reader_mock.assert_called_with(keep_cache=True)
+        self.assertEqual(resp.status_int, 200)
+        etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
+        self.assertEqual(dict(resp.headers), {
+            'Content-Type': 'application/x-test',
+            'Content-Length': '6',
+            'Etag': etag,
+            'X-Backend-Timestamp': timestamp,
+            'X-Timestamp': timestamp,
+            'X-Backend-Data-Timestamp': timestamp,
+            'X-Backend-Durable-Timestamp': timestamp,
+            'Last-Modified': strftime(
+                '%a, %d %b %Y %H:%M:%S GMT',
+                gmtime(math.ceil(float(timestamp)))),
+        })
+
+        # Request headers have 'X-Auth-Token'.
+        req = Request.blank('/sda1/p/a/c/o',
+                            headers={'Content-Type': 'application/x-test',
+                                     'X-Auth-Token': '2340lsdfhhjl02lxfjj'})
+        reader_mock = mock.Mock(keep_cache=False)
+        with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
+            resp = req.get_response(obj_controller)
+            reader_mock.assert_called_with(keep_cache=True)
+        self.assertEqual(resp.status_int, 200)
+
+        # Request headers have 'X-Storage-Token'.
+        req = Request.blank('/sda1/p/a/c/o',
+                            headers={'Content-Type': 'application/x-test',
+                                     'X-Storage-Token': '2340lsdfhhjl02lxfjj'})
+        reader_mock = mock.Mock(keep_cache=False)
+        with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
+            resp = req.get_response(obj_controller)
+            reader_mock.assert_called_with(keep_cache=True)
+        self.assertEqual(resp.status_int, 200)
+
+        # Request headers have both 'X-Auth-Token' and 'X-Storage-Token'.
+        req = Request.blank('/sda1/p/a/c/o',
+                            headers={'Content-Type': 'application/x-test',
+                                     'X-Auth-Token': '2340lsdfhhjl02lxfjj',
+                                     'X-Storage-Token': '2340lsdfhhjl02lxfjj'})
+        reader_mock = mock.Mock(keep_cache=False)
+        with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
+            resp = req.get_response(obj_controller)
+            reader_mock.assert_called_with(keep_cache=True)
+        self.assertEqual(resp.status_int, 200)
+
+    def test_GET_keep_cache_private_config_false(self):
+        # Test swift.obj.server.ObjectController.GET that, when
+        # 'keep_cache_private' is configured false, then
+        # disk_file.reader will be called with correct 'keep_cache'.
+        # Set up a new ObjectController with customized configurations.
+        conf = {'devices': self.testdir, 'mount_check': 'false',
+                'container_update_timeout': 0.0,
+                'keep_cache_private': 'false'}
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+        obj_controller.bytes_per_sync = 1
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': timestamp,
+                                     'Content-Type': 'application/x-test'})
+        req.body = b'VERIFY'
+        resp = req.get_response(obj_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # Request headers have neither 'X-Auth-Token' nor 'X-Storage-Token'.
+        req = Request.blank('/sda1/p/a/c/o',
+                            headers={'Content-Type': 'application/x-test'})
+        reader_mock = mock.Mock(keep_cache=False)
+        with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
+            resp = req.get_response(obj_controller)
+            reader_mock.assert_called_with(keep_cache=True)
+        self.assertEqual(resp.status_int, 200)
+        etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
+        self.assertEqual(dict(resp.headers), {
+            'Content-Type': 'application/x-test',
+            'Content-Length': '6',
+            'Etag': etag,
+            'X-Backend-Timestamp': timestamp,
+            'X-Timestamp': timestamp,
+            'X-Backend-Data-Timestamp': timestamp,
+            'X-Backend-Durable-Timestamp': timestamp,
+            'Last-Modified': strftime(
+                '%a, %d %b %Y %H:%M:%S GMT',
+                gmtime(math.ceil(float(timestamp)))),
+        })
+
+        # Request headers have 'X-Auth-Token'.
+        req = Request.blank('/sda1/p/a/c/o',
+                            headers={'Content-Type': 'application/x-test',
+                                     'X-Auth-Token': '2340lsdfhhjl02lxfjj'})
+        reader_mock = mock.Mock(keep_cache=False)
+        with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
+            resp = req.get_response(obj_controller)
+            reader_mock.assert_called_with(keep_cache=False)
+        self.assertEqual(resp.status_int, 200)
+
+        # Request headers have 'X-Storage-Token'.
+        req = Request.blank('/sda1/p/a/c/o',
+                            headers={'Content-Type': 'application/x-test',
+                                     'X-Storage-Token': '2340lsdfhhjl02lxfjj'})
+        reader_mock = mock.Mock(keep_cache=False)
+        with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
+            resp = req.get_response(obj_controller)
+            reader_mock.assert_called_with(keep_cache=False)
+        self.assertEqual(resp.status_int, 200)
+
+        # Request headers have both 'X-Auth-Token' and 'X-Storage-Token'.
+        req = Request.blank('/sda1/p/a/c/o',
+                            headers={'Content-Type': 'application/x-test',
+                                     'X-Auth-Token': '2340lsdfhhjl02lxfjj',
+                                     'X-Storage-Token': '2340lsdfhhjl02lxfjj'})
+        reader_mock = mock.Mock(keep_cache=False)
+        with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
+            resp = req.get_response(obj_controller)
+            reader_mock.assert_called_with(keep_cache=False)
+        self.assertEqual(resp.status_int, 200)
+
     def test_GET_keep_cache_slo_manifest_no_config(self):
         # Test swift.obj.server.ObjectController.GET that, when
         # 'keep_cache_slo_manifest' is not configured and object
         # metadata has "X-Static-Large-Object", then disk_file.reader
         # will be called with keep_cache=False.
         # Set up a new ObjectController with customized configurations.
-        slo_tmpdir = mkdtemp()
-        slo_testdir = os.path.join(slo_tmpdir,
-                                   'tmp_test_object_server_ObjectController')
-        mkdirs(os.path.join(slo_testdir, 'sda1'))
-        conf = {'devices': slo_testdir, 'mount_check': 'false',
+        conf = {'devices': self.testdir, 'mount_check': 'false',
                 'container_update_timeout': 0.0,
                 'keep_cache_private': 'false'}
         obj_controller = object_server.ObjectController(
@@ -4342,8 +4488,6 @@ class TestObjectController(BaseTestCase):
                 '%a, %d %b %Y %H:%M:%S GMT',
                 gmtime(math.ceil(float(timestamp)))),
         })
-        # clean up for this customized ObjectController.
-        rmtree(slo_tmpdir)
 
     def test_GET_keep_cache_slo_manifest_config_false(self):
         # Test swift.obj.server.ObjectController.GET that, when
@@ -4351,11 +4495,7 @@ class TestObjectController(BaseTestCase):
         # metadata has "X-Static-Large-Object", then disk_file.reader
         # will be called with keep_cache=False.
         # Set up a new ObjectController with customized configurations.
-        slo_tmpdir = mkdtemp()
-        slo_testdir = os.path.join(slo_tmpdir,
-                                   'tmp_test_object_server_ObjectController')
-        mkdirs(os.path.join(slo_testdir, 'sda1'))
-        conf = {'devices': slo_testdir, 'mount_check': 'false',
+        conf = {'devices': self.testdir, 'mount_check': 'false',
                 'container_update_timeout': 0.0,
                 'keep_cache_private': 'false',
                 'keep_cache_slo_manifest': 'false'}
@@ -4393,8 +4533,6 @@ class TestObjectController(BaseTestCase):
                 '%a, %d %b %Y %H:%M:%S GMT',
                 gmtime(math.ceil(float(timestamp)))),
         })
-        # clean up for this customized ObjectController.
-        rmtree(slo_tmpdir)
 
     def test_GET_keep_cache_slo_manifest_config_true(self):
         # Test swift.obj.server.ObjectController.GET that, when
@@ -4402,11 +4540,7 @@ class TestObjectController(BaseTestCase):
         # metadata has "X-Static-Large-Object", then disk_file.reader
         # will be called with keep_cache=True.
         # Set up a new ObjectController with customized configurations.
-        slo_tmpdir = mkdtemp()
-        slo_testdir = os.path.join(slo_tmpdir,
-                                   'tmp_test_object_server_ObjectController')
-        mkdirs(os.path.join(slo_testdir, 'sda1'))
-        conf = {'devices': slo_testdir, 'mount_check': 'false',
+        conf = {'devices': self.testdir, 'mount_check': 'false',
                 'container_update_timeout': 0.0,
                 'keep_cache_private': 'false',
                 'keep_cache_slo_manifest': 'true'}
@@ -4444,8 +4578,6 @@ class TestObjectController(BaseTestCase):
                 '%a, %d %b %Y %H:%M:%S GMT',
                 gmtime(math.ceil(float(timestamp)))),
         })
-        # clean up for this customized ObjectController.
-        rmtree(slo_tmpdir)
 
     def test_GET_keep_cache_slo_manifest_not_slo(self):
         # Test swift.obj.server.ObjectController.GET that, when
@@ -4453,11 +4585,7 @@ class TestObjectController(BaseTestCase):
         # metadata has NO "X-Static-Large-Object", then disk_file.reader
         # will be called with keep_cache=False.
         # Set up a new ObjectController with customized configurations.
-        slo_tmpdir = mkdtemp()
-        slo_testdir = os.path.join(slo_tmpdir,
-                                   'tmp_test_object_server_ObjectController')
-        mkdirs(os.path.join(slo_testdir, 'sda1'))
-        conf = {'devices': slo_testdir, 'mount_check': 'false',
+        conf = {'devices': self.testdir, 'mount_check': 'false',
                 'container_update_timeout': 0.0,
                 'keep_cache_private': 'false',
                 'keep_cache_slo_manifest': 'true'}
@@ -4493,8 +4621,6 @@ class TestObjectController(BaseTestCase):
                 '%a, %d %b %Y %H:%M:%S GMT',
                 gmtime(math.ceil(float(timestamp)))),
         })
-        # clean up for this customized ObjectController.
-        rmtree(slo_tmpdir)
 
     @mock.patch("time.time", mock_time)
     def test_DELETE(self):

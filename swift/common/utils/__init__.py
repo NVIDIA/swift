@@ -1672,13 +1672,13 @@ class LogAdapter(logging.LoggerAdapter, object):
 
         :param statsd_func_name: the name of a method on StatsdClient.
         """
-
         func = getattr(StatsdClient, statsd_func_name)
 
         @functools.wraps(func)
         def wrapped(self, *a, **kw):
             if getattr(self.logger, 'statsd_client'):
-                return func(self.logger.statsd_client, *a, **kw)
+                func = getattr(self.logger.statsd_client, statsd_func_name)
+                return func(*a, **kw)
         return wrapped
 
     update_stats = statsd_delegate('update_stats')
@@ -3622,11 +3622,12 @@ class InputProxy(object):
     To be swapped in for wsgi.input for accounting purposes.
     """
 
-    def __init__(self, wsgi_input):
+    def __init__(self, wsgi_input, env=None):
         """
         :param wsgi_input: file-like object to wrap the functionality of
         """
         self.wsgi_input = wsgi_input
+        self.env = {} if env is None else env
         self.bytes_received = 0
         self.client_disconnect = False
 
@@ -3638,6 +3639,7 @@ class InputProxy(object):
         try:
             chunk = self.wsgi_input.read(*args, **kwargs)
         except Exception:
+            self.env['swift.proxy_logging_status'] = 499
             self.client_disconnect = True
             raise
         self.bytes_received += len(chunk)
@@ -3651,6 +3653,7 @@ class InputProxy(object):
         try:
             line = self.wsgi_input.readline(*args, **kwargs)
         except Exception:
+            self.env['swift.proxy_logging_status'] = 499
             self.client_disconnect = True
             raise
         self.bytes_received += len(line)
