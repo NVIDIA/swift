@@ -303,8 +303,7 @@ class S3ApiMiddleware(object):
             wsgi_conf.get('s3_inventory_allowed_paths', '*'))
 
         self.logger = get_logger(
-            wsgi_conf, log_route=wsgi_conf.get('log_name', 's3api'),
-            statsd_tail_prefix='s3api')
+            wsgi_conf, log_route='s3api', statsd_tail_prefix='s3api')
         self.check_pipeline(wsgi_conf)
 
         if self.conf.use_async_delete and (self.conf.s3_acl or
