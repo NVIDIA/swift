@@ -617,17 +617,20 @@ class ContainerController(BaseStorageServer):
         resp.last_modified = Timestamp(headers['X-PUT-Timestamp']).ceil()
         return resp
 
-    def update_shard_record(self, record):
+    def update_shard_record(self, record, shard_record_full=True):
         """
         Return the shard_range database record as a dict, the keys will depend
         on the database fields provided in the record.
 
-        :param record: shard entry record.
+        :param record: shard entry record, either ShardRange or Namespace.
+        :param shard_record_full: boolean, when true the timestamp field is
+                                  added as "last_modified" in iso format.
         :returns: dict suitable for listing responses
         """
         response = dict(record)
-        created = record.timestamp
-        response['last_modified'] = Timestamp(created).isoformat
+        if shard_record_full:
+            created = record.timestamp
+            response['last_modified'] = Timestamp(created).isoformat
         return response
 
     def update_object_record(self, record):
@@ -712,11 +715,11 @@ class ContainerController(BaseStorageServer):
           either the string or integer representation of
           :data:`~swift.common.utils.ShardRange.STATES`.
 
-          Two alias values may be used in a ``states`` parameter value:
-          ``listing`` will cause the listing to include all shard ranges in a
-          state suitable for contributing to an object listing; ``updating``
-          will cause the listing to include all shard ranges in a state
-          suitable to accept an object update.
+          Alias values may be used in a ``states`` parameter value. The
+          ``listing`` alias will cause the listing to include all shard ranges
+          in a state suitable for contributing to an object listing. The
+          ``updating`` alias will cause the listing to include all shard ranges
+          in a state suitable to accept an object update.
 
           If either of these aliases is used then the shard range listing will
           if necessary be extended with a synthesised 'filler' range in order
@@ -724,6 +727,23 @@ class ContainerController(BaseStorageServer):
           ranges are found. Any 'filler' shard range will cover the otherwise
           uncovered tail of the requested name range and will point back to the
           same container.
+
+          The ``auditing`` alias will cause the listing to include all shard
+          ranges in a state useful to the sharder while auditing a shard
+          container. This alias will not cause a 'filler' range to be added,
+          but will cause the container's own shard range to be included in the
+          listing. For now, ``auditing`` is only supported when
+          'X-Backend-Record-Shard-Format' is 'full'.
+
+        * Shard range listings can be simplified to include only Namespace
+          only attributes (name, lower and upper) if the caller send the header
+          ``X-Backend-Record-Shard-Format`` with value 'namespace' as a hint
+          that it would prefer namespaces. If this header doesn't exist or the
+          value is 'full', the listings will default to include all attributes
+          of shard ranges. But if params has includes/marker/end_marker then
+          the response will be full shard ranges, regardless the header of
+          ``X-Backend-Record-Shard-Format``. The response header
+          ``X-Backend-Record-Type`` will tell the user what type it gets back.
 
         * Listings are not normally returned from a deleted container. However,
           the ``X-Backend-Override-Deleted`` header may be used with a value in
@@ -760,7 +780,7 @@ class ContainerController(BaseStorageServer):
     def GET_shard(self, req, broker, container, params, info,
                   is_deleted, out_content_type):
         """
-        Returns a list of persisted shard ranges in response.
+        Returns a list of persisted shard ranges or namespaces in response.
 
         :param req: swob.Request object
         :param broker: container DB broker object
@@ -776,10 +796,26 @@ class ContainerController(BaseStorageServer):
         reverse = config_true_value(params.get('reverse'))
         states = params.get('states')
         includes = params.get('includes')
+        shard_format = req.headers.get(
+            'x-backend-record-shard-format', 'full').lower()
         include_deleted = config_true_value(
             req.headers.get('x-backend-include-deleted', False))
-        override_deleted = info and config_true_value(
-            req.headers.get('x-backend-override-deleted', False))
+
+        # For record type of 'shard', user can specify an additional header
+        # to ask for list of Namespaces instead of full ShardRanges.
+        # This will allow proxy server who is going to retrieve Namespace
+        # to talk to older version of container servers who don't support
+        # Namespace yet during upgrade.
+        # Note: there is no support of 'includes', 'marker', 'end_marker'
+        # or 'reverse' for 'namespace' GET.
+        if shard_format == "namespace" and not (
+            includes or marker or end_marker or reverse
+        ):
+            override_deleted = False
+        else:
+            shard_format = 'full'
+            override_deleted = info and config_true_value(
+                req.headers.get('x-backend-override-deleted', False))
 
         resp_headers = gen_resp_headers(
             info, is_deleted=is_deleted and not override_deleted)
@@ -787,6 +823,7 @@ class ContainerController(BaseStorageServer):
             return HTTPNotFound(request=req, headers=resp_headers)
 
         resp_headers['X-Backend-Record-Type'] = 'shard'
+        resp_headers['X-Backend-Record-Shard-Format'] = shard_format
         override_filter_hdr = req.headers.get(
             'x-backend-override-shard-name-filter', '').lower()
         if override_filter_hdr == info.get('db_state') == 'sharded':
@@ -809,11 +846,25 @@ class ContainerController(BaseStorageServer):
             except ValueError:
                 return HTTPBadRequest(request=req, body='Bad state')
 
-        container_list = broker.get_shard_ranges(
-            marker, end_marker, includes, reverse, states=states,
-            include_deleted=include_deleted, fill_gaps=fill_gaps,
-            include_own=include_own)
-        listing = [self.update_shard_record(record)
+        if shard_format == 'namespace':
+            # Namespace GET supports a subset of functions of Shard Range GET,
+            # for example, it doesn't support 'x-backend-include-deleted'
+            # header, nor 'auditing' state query parameter.
+            if include_deleted:
+                return HTTPBadRequest(
+                    request=req, body='No include_deleted for namespace GET')
+            if include_own:
+                return HTTPBadRequest(
+                    request=req, body='No auditing state for namespace GET')
+            shard_format_full = False
+            container_list = broker.get_namespaces(states, fill_gaps)
+        else:
+            shard_format_full = True
+            container_list = broker.get_shard_ranges(
+                marker, end_marker, includes, reverse, states=states,
+                include_deleted=include_deleted, fill_gaps=fill_gaps,
+                include_own=include_own)
+        listing = [self.update_shard_record(record, shard_format_full)
                    for record in container_list]
         return self._create_GET_response(req, out_content_type, info,
                                          resp_headers, broker.metadata,
