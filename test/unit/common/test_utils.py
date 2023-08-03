@@ -2477,6 +2477,25 @@ cluster_dfw1 = http://dfw1.host/v1/
         for v in utils.TRUE_VALUES:
             self.assertEqual(v, v.lower())
 
+    def test_transform_to_set(self):
+        self.assertIsNone(utils.transform_to_set(None))
+        self.assertEqual(set(), utils.transform_to_set([]))
+
+        self.assertEqual({1}, utils.transform_to_set(1))
+        self.assertEqual({1}, utils.transform_to_set([1]))
+        self.assertEqual({1}, utils.transform_to_set([1, 1]))
+        self.assertEqual({1, 2}, utils.transform_to_set([2, 1]))
+        self.assertEqual({1, 2}, utils.transform_to_set((2, 1)))
+        self.assertEqual({1, 2}, utils.transform_to_set({2, 1}))
+        self.assertEqual({1, 2}, utils.transform_to_set([1, 2, 1, 2]))
+
+        self.assertEqual({'x'}, utils.transform_to_set('x'))
+        self.assertEqual({'x'}, utils.transform_to_set(['x']))
+        self.assertEqual({'x', 1},
+                         utils.transform_to_set(['x', 'x', 1]))
+        self.assertEqual({'x', 'y'},
+                         utils.transform_to_set(('x', 'y')))
+
     def test_config_true_value(self):
         orig_trues = utils.TRUE_VALUES
         try:
