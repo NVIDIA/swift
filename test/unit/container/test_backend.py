@@ -4585,7 +4585,6 @@ class TestContainerBroker(test_db.TestDbBase):
         self.assertEqual([dict(shard_ranges[1])],
                          [dict(sr) for sr in actual])
         self.assertEqual(1, len(mock_call_args))
-        # verify that includes keyword plumbs through to an SQL condition
         self.assertIn("WHERE deleted=0 AND state in (?,?,?,?) AND name != ? "
                       "AND lower < ? AND (upper = '' OR upper >= ?)",
                       mock_call_args[0][1])
@@ -4673,6 +4672,172 @@ class TestContainerBroker(test_db.TestDbBase):
                                               limit=4)
         self.assertEqual(1, len(actual))
         self.assertEqual(shard_ranges[0], ShardRange(*actual[0]))
+
+    def _setup_broker_with_shard_ranges(self, tempdir,
+                                        own_shard_range, shard_ranges):
+        db_path = os.path.join(tempdir, 'container.db')
+        broker = ContainerBroker(db_path, account='a', container='c')
+        broker.initialize(next(self.ts).internal, 0)
+
+        # no rows
+        self.assertFalse(broker.get_shard_ranges())
+        self.assertFalse(broker.get_namespaces())
+
+        # merge row for own shard range
+        broker.merge_shard_ranges([own_shard_range])
+        actual = broker.get_shard_ranges(include_own=True)
+        self.assertEqual([dict(sr) for sr in [own_shard_range]],
+                         [dict(sr) for sr in actual])
+        self.assertFalse(broker.get_namespaces())
+
+        # merge rows for other shard ranges
+        broker.merge_shard_ranges(shard_ranges)
+        return broker
+
+    @with_tempdir
+    def test_get_namespaces(self, tempdir):
+        own_shard_range = ShardRange('a/c', next(
+            self.ts), 'a', 'z', state=ShardRange.SHARDING)
+        shard_ranges = [
+            ShardRange('.a/c0', next(self.ts), 'a',
+                       'c', state=ShardRange.CREATED),
+            ShardRange('.a/c1', next(self.ts), 'c',
+                       'd', state=ShardRange.CREATED),
+            ShardRange('.a/c2', next(self.ts), 'd', 'f',
+                       state=ShardRange.ACTIVE),
+            ShardRange('.a/c3', next(self.ts), 'e', 'f', deleted=1,
+                       state=ShardRange.SHARDING,),
+            ShardRange('.a/c4', next(self.ts), 'f', 'h',
+                       state=ShardRange.SHARDING),
+            ShardRange('.a/c5', next(self.ts), 'h', 'j', deleted=1)
+        ]
+        broker = self._setup_broker_with_shard_ranges(
+            tempdir, own_shard_range, shard_ranges)
+        actual_sr = broker.get_shard_ranges()
+        undeleted = [sr for sr in shard_ranges if not sr.deleted]
+        self.assertEqual([dict(sr) for sr in undeleted],
+                         [dict(sr) for sr in actual_sr])
+
+        # test get all undeleted namespaces with gap filled.
+        actual_ns = broker.get_namespaces(fill_gaps=True)
+        expected_ns = [Namespace(sr.name, sr.lower, sr.upper)
+                       for sr in undeleted]
+        filler = [Namespace('a/c', 'h', 'z')]
+        self.assertEqual(expected_ns + filler, actual_ns)
+        # test get all undeleted namespaces w/o gap filled.
+        actual_ns = broker.get_namespaces()
+        self.assertEqual(expected_ns, actual_ns)
+        # cross-check with get_shard_ranges.
+        self.assertEqual(expected_ns, [Namespace(sr.name, sr.lower, sr.upper)
+                                       for sr in actual_sr])
+
+        orig_execute = GreenDBConnection.execute
+        mock_call_args = []
+
+        def mock_execute(*args, **kwargs):
+            mock_call_args.append(args)
+            return orig_execute(*args, **kwargs)
+
+        with mock.patch('swift.common.db.GreenDBConnection.execute',
+                        mock_execute):
+            actual_ns = broker.get_namespaces(
+                states=[ShardRange.CREATED, ShardRange.ACTIVE,
+                        ShardRange.SHARDING])
+        self.assertEqual(expected_ns, actual_ns)
+        self.assertEqual(1, len(mock_call_args))
+        # verify that includes keyword plumbs through to an SQL condition
+        self.assertIn(
+            "WHERE deleted = 0 AND name != ? AND state in (?,?,?)",
+            mock_call_args[0][1])
+        self.assertEqual(set(['a/c', ShardRange.ACTIVE, ShardRange.CREATED,
+                         ShardRange.SHARDING]), set(mock_call_args[0][2]))
+
+    @with_tempdir
+    def test_get_namespaces_state_filtering(self, tempdir):
+        own_shard_range = ShardRange('a/c', next(
+            self.ts), 'a', 'z', state=ShardRange.SHARDING)
+        shard_ranges = [
+            ShardRange('.a/c0', next(self.ts), 'a', 'c',
+                       state=ShardRange.CREATED),
+            ShardRange('.a/c1', next(self.ts), 'c', 'd',
+                       state=ShardRange.CREATED),
+            ShardRange('.a/c2', next(self.ts), 'd', 'f',
+                       state=ShardRange.SHARDING),
+            ShardRange('.a/c2a', next(self.ts), 'd', 'e',
+                       state=ShardRange.ACTIVE),
+            ShardRange('.a/c2b', next(self.ts), 'e', 'f',
+                       state=ShardRange.ACTIVE, ),
+            ShardRange('.a/c3', next(self.ts), 'f', 'h',
+                       state=ShardRange.SHARDING),
+            ShardRange('.a/c4', next(self.ts), 'h', 'j', deleted=1,
+                       state=ShardRange.SHARDED)
+        ]
+        broker = self._setup_broker_with_shard_ranges(
+            tempdir, own_shard_range, shard_ranges)
+
+        def do_test(states, expected_ns):
+            actual = broker.get_namespaces(states=states)
+            self.assertEqual(expected_ns, actual)
+            # cross-check with get_shard_ranges.
+            actual_sr = broker.get_shard_ranges(states=states)
+            self.assertEqual(expected_ns,
+                             [Namespace(sr.name, sr.lower, sr.upper)
+                              for sr in actual_sr])
+            actual = broker.get_namespaces(states=states, fill_gaps=True)
+            filler_lower = expected_ns[-1].upper if expected_ns else 'a'
+            filler = [Namespace('a/c', filler_lower, 'z')]
+            self.assertEqual(expected_ns + filler, actual)
+
+        do_test(ShardRange.CREATED,
+                [Namespace('a/c0', 'a', 'c'), Namespace('a/c1', 'c', 'd')])
+        do_test([ShardRange.CREATED],
+                [Namespace('a/c0', 'a', 'c'), Namespace('a/c1', 'c', 'd')])
+        do_test([ShardRange.CREATED, ShardRange.ACTIVE],
+                [Namespace('a/c0', 'a', 'c'), Namespace('a/c1', 'c', 'd'),
+                 Namespace('a/c2a', 'd', 'e'), Namespace('a/c2b', 'e', 'f')])
+        # this case verifies that state trumps lower for ordering...
+        do_test([ShardRange.ACTIVE, ShardRange.SHARDING],
+                [Namespace('a/c2a', 'd', 'e'), Namespace('a/c2b', 'e', 'f'),
+                 Namespace('a/c2', 'd', 'f'), Namespace('a/c3', 'f', 'h')])
+        do_test([ShardRange.CREATED, ShardRange.ACTIVE, ShardRange.SHARDING],
+                [Namespace('a/c0', 'a', 'c'), Namespace('a/c1', 'c', 'd'),
+                 Namespace('a/c2a', 'd', 'e'), Namespace('a/c2b', 'e', 'f'),
+                 Namespace('a/c2', 'd', 'f'), Namespace('a/c3', 'f', 'h')])
+        do_test([ShardRange.SHARDED], [])
+
+    @with_tempdir
+    def test_get_namespaces_root_container(self, tempdir):
+        own_shard_range = ShardRange('a/c', next(
+            self.ts), '', '', state=ShardRange.SHARDED)
+        shard_ranges = [
+            ShardRange('.a/c0', next(self.ts), 'a',
+                       'c', state=ShardRange.CREATED),
+            ShardRange('.a/c1', next(self.ts), 'c',
+                       'd', state=ShardRange.CREATED),
+            ShardRange('.a/c2', next(self.ts), 'd', 'f',
+                       state=ShardRange.ACTIVE),
+            ShardRange('.a/c4', next(self.ts), 'f', 'h',
+                       state=ShardRange.SHARDING),
+        ]
+        broker = self._setup_broker_with_shard_ranges(
+            tempdir, own_shard_range, shard_ranges)
+        actual_sr = broker.get_shard_ranges()
+        undeleted = [sr for sr in shard_ranges if not sr.deleted]
+        self.assertEqual([dict(sr) for sr in undeleted],
+                         [dict(sr) for sr in actual_sr])
+
+        # test get all undeleted namespaces with gap filled.
+        actual_ns = broker.get_namespaces(fill_gaps=True)
+        expected_ns = [Namespace(sr.name, sr.lower, sr.upper)
+                       for sr in undeleted]
+        filler = [Namespace('a/c', 'h', '')]
+        self.assertEqual(expected_ns + filler, actual_ns)
+        # test get all undeleted namespaces w/o gap filled.
+        actual_ns = broker.get_namespaces()
+        self.assertEqual(expected_ns, actual_ns)
+        # cross-check with get_shard_ranges.
+        self.assertEqual(expected_ns, [Namespace(sr.name, sr.lower, sr.upper)
+                                       for sr in actual_sr])
 
     @with_tempdir
     def test_get_own_shard_range(self, tempdir):
