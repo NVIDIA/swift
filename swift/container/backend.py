@@ -32,7 +32,7 @@ from swift.common.utils import Timestamp, encode_timestamps, \
     decode_timestamps, extract_swift_bytes, storage_directory, hash_path, \
     ShardRange, renamer, MD5_OF_EMPTY_STRING, mkdirs, get_db_files, \
     parse_db_filename, make_db_file_path, split_path, RESERVED_BYTE, \
-    ShardRangeList, Namespace
+    ShardRangeList, Namespace, transform_to_set
 from swift.common.db import DatabaseBroker, utf8encode, BROKER_TIMEOUT, \
     zero_like, DatabaseAlreadyExists, SQLITE_ARG_LIMIT
 
@@ -1688,6 +1688,81 @@ class ContainerBroker(DatabaseBroker):
             if ('no such table: %s' % SHARD_RANGE_TABLE) not in str(err):
                 raise
 
+    def get_namespaces(self, states=None, fill_gaps=False):
+        """
+        Returns a list of persisted namespaces per input parameters.
+
+        :param states: if specified, restricts the returned list to namespaces
+            that have the given state(s); can be a list of ints or a single
+            int.
+        :param fill_gaps: if True, insert a modified copy of own shard range to
+            fill any gap between the end of any found shard ranges and the
+            upper bound of own shard range. Gaps enclosed within the found
+            shard ranges are not filled.
+        :return: a list of Namespace objects.
+        """
+        included_states = transform_to_set(states)
+        with self.get() as conn:
+            # Namespace only needs 'name', 'lower' and 'upper', but the query
+            # also need to include 'state' to be used when subesequently
+            # sorting the rows. And the sorting can't be done within SQLite
+            # since the value for maximum upper bound is an empty string.
+            params = [self.path]
+            sql = '''
+            SELECT name, lower, upper, state FROM %s
+            WHERE deleted = 0 AND name != ?
+            ''' % (SHARD_RANGE_TABLE)
+            if included_states:
+                sql = (
+                    sql.rstrip()
+                    + " AND state in (%s)\n            "
+                    % ",".join("?" * len(included_states))
+                )
+                params.extend(included_states)
+            try:
+                data = conn.execute(sql, params)
+                data.row_factory = None
+                namespaces = [row for row in data]
+            except sqlite3.OperationalError as err:
+                if ('no such table: %s' % SHARD_RANGE_TABLE) in str(err):
+                    return []
+                else:
+                    raise
+
+        # Sort those namespaces in order, note that each namespace record also
+        # include additional attribute 'state'.
+        def sort_key(namespace):
+            return ShardRange.sort_key_order(name=namespace[0],
+                                             lower=namespace[1],
+                                             upper=namespace[2],
+                                             state=namespace[3])
+        namespaces.sort(key=sort_key)
+        # Convert the record tuples to Namespace objects.
+        namespaces = [Namespace(row[0], row[1], row[2]) for row in namespaces]
+
+        if fill_gaps and not (
+            namespaces and namespaces[-1].upper == Namespace.MAX
+        ):
+            # If there is a gap in the last, insert a modified copy of own
+            # shard range to fill any gap between the end of any found and the
+            # upper bound of own shard range. Gaps enclosed within the found
+            # shard ranges are not filled.
+            own_shard_range = self.get_own_shard_range()
+            if namespaces:
+                last_upper = namespaces[-1].upper
+            else:
+                last_upper = own_shard_range.lower
+            required_upper = own_shard_range.upper
+            if required_upper > last_upper:
+                filler_sr = own_shard_range
+                filler_sr.lower = last_upper
+                filler_sr.upper = required_upper
+                namespaces.append(
+                    Namespace(filler_sr.name,
+                              filler_sr.lower, filler_sr.upper))
+
+        return namespaces
+
     def _get_shard_range_rows(self, connection=None, marker=None,
                               end_marker=None, includes=None,
                               include_deleted=False, states=None,
@@ -1737,11 +1812,7 @@ class ContainerBroker(DatabaseBroker):
         if exclude_others and not include_own:
             return []
 
-        included_states = set()
-        if isinstance(states, (list, tuple, set)):
-            included_states.update(states)
-        elif states is not None:
-            included_states.add(states)
+        included_states = transform_to_set(states)
 
         # defaults to be used when legacy db's are missing columns
         default_values = {'reported': 0,
