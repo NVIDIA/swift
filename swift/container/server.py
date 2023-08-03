@@ -600,7 +600,8 @@ class ContainerController(BaseStorageServer):
         resp.last_modified = Timestamp(headers['X-PUT-Timestamp']).ceil()
         return resp
 
-    def update_data_record(self, record):
+    def update_data_record(self, record, record_type=None,
+                           shard_record_format=None):
         """
         Perform any mutations to container listing records that are common to
         all serialization formats, and returns it as a dict.
@@ -608,13 +609,19 @@ class ContainerController(BaseStorageServer):
         Converts created time to iso timestamp.
         Replaces size with 'swift_bytes' content type parameter.
 
-        :params record: object entry record
+        :param record: object entry record
+        :param record_type: Either shard, auto, '' or None. This value
+                             determines how it'll build the response dict.
+        :param shard_record_format: Either 'namespace', 'full' or None.
         :returns: modified record
         """
-        if isinstance(record, ShardRange):
-            created = record.timestamp
+        if record_type == 'shard':
             response = dict(record)
+            if shard_record_format == 'full':
+                created = record.timestamp
+                response['last_modified'] = Timestamp(created).isoformat
         else:
+            # record is object info
             (name, created, size, content_type, etag) = record[:5]
             name_ = name.decode('utf8') if six.PY2 else name
             if content_type is None:
@@ -623,7 +630,7 @@ class ContainerController(BaseStorageServer):
                 'bytes': size, 'hash': etag, 'name': name_,
                 'content_type': content_type}
             override_bytes_from_content_type(response, logger=self.logger)
-        response['last_modified'] = Timestamp(created).isoformat
+            response['last_modified'] = Timestamp(created).isoformat
         return response
 
     @public
@@ -698,6 +705,16 @@ class ContainerController(BaseStorageServer):
           uncovered tail of the requested name range and will point back to the
           same container.
 
+        * Shard range listings can be simplified to include only Namespace
+          only attributes (name, lower and upper) if the caller send the header
+          ``X-Backend-Record-Shard-Format`` with value 'namespace' as a hint
+          that it would prefer namespaces. If this header doesn't exist or the
+          value is 'full', the listings will default to include all attributes
+          of shard ranges. But if params has includes/marker/end_marker then
+          the response will be full shard ranges, regardless the header of
+          ``X-Backend-Record-Shard-Format``. The response header
+          ``X-Backend-Record-Type`` will tell the user what type it gets back.
+
         * Listings are not normally returned from a deleted container. However,
           the ``X-Backend-Override-Deleted`` header may be used with a value in
           :attr:`swift.common.utils.TRUE_VALUES` to force a shard range
@@ -716,6 +733,8 @@ class ContainerController(BaseStorageServer):
         end_marker = params.get('end_marker')
         limit = params['limit']
         reverse = config_true_value(params.get('reverse'))
+        states = params.get('states')
+        includes = params.get('includes')
         out_content_type = listing_formats.get_listing_content_type(req)
         try:
             check_drive(self.root, drive, self.mount_check)
@@ -730,14 +749,31 @@ class ContainerController(BaseStorageServer):
         if record_type == 'auto' and db_state in (SHARDING, SHARDED):
             record_type = 'shard'
         if record_type == 'shard':
-            override_deleted = info and config_true_value(
-                req.headers.get('x-backend-override-deleted', False))
+            shard_format = req.headers.get(
+                'x-backend-record-shard-format', 'full').lower()
+            # For record type of 'shard', user can specify an additional header
+            # to ask for list of Namespaces instead of full ShardRanges.
+            # This will allow proxy server who is going to retrieve Namespace
+            # to talk to older version of container servers who don't support
+            # Namespace yet during upgrade.
+            # Note: there is no support of 'includes', 'marker', 'end_marker'
+            # or 'reverse' for 'namespace' GET.
+            if shard_format == "namespace" and not (
+                includes or marker or end_marker or reverse
+            ):
+                override_deleted = False
+            else:
+                shard_format = 'full'
+                override_deleted = info and config_true_value(
+                    req.headers.get('x-backend-override-deleted', False))
+
             resp_headers = gen_resp_headers(
                 info, is_deleted=is_deleted and not override_deleted)
             if is_deleted and not override_deleted:
                 return HTTPNotFound(request=req, headers=resp_headers)
+
             resp_headers['X-Backend-Record-Type'] = 'shard'
-            includes = params.get('includes')
+            resp_headers['X-Backend-Record-Shard-Format'] = shard_format
             override_filter_hdr = req.headers.get(
                 'x-backend-override-shard-name-filter', '').lower()
             if override_filter_hdr == db_state == 'sharded':
@@ -746,26 +782,36 @@ class ContainerController(BaseStorageServer):
                 resp_headers['X-Backend-Override-Shard-Name-Filter'] = 'true'
                 marker = end_marker = includes = None
                 reverse = False
-            states = params.get('states')
             fill_gaps = include_own = False
             if states:
                 states = list_from_csv(states)
                 fill_gaps = any(('listing' in states, 'updating' in states))
-                # 'auditing' is used during shard audit; if the shard is
-                # shrinking then it needs to get acceptor shard ranges, which
-                # may be the root container itself, so use include_own
+                # The 'auditing' state alias is used by the sharder during
+                # shard audit; if the shard is shrinking then it needs to get
+                # acceptor shard ranges, which may be the root container
+                # itself, so use include_own.
+                # For 'namespace' record type, container server only supports
+                # listing of states using 'updating' or 'listing', 'auditing'
+                # is not supported, for which caller should set
+                # 'x-backend-record-shard-format' to 'full' instead.
                 include_own = 'auditing' in states
                 try:
                     states = broker.resolve_shard_range_states(states)
                 except ValueError:
                     return HTTPBadRequest(request=req, body='Bad state')
+            # This is also not supported for 'namespace' record type
             include_deleted = config_true_value(
                 req.headers.get('x-backend-include-deleted', False))
-            container_list = broker.get_shard_ranges(
-                marker, end_marker, includes, reverse, states=states,
-                include_deleted=include_deleted, fill_gaps=fill_gaps,
-                include_own=include_own)
+
+            if shard_format == 'namespace':
+                container_list = broker.get_namespaces(states, fill_gaps)
+            else:
+                container_list = broker.get_shard_ranges(
+                    marker, end_marker, includes, reverse, states=states,
+                    include_deleted=include_deleted, fill_gaps=fill_gaps,
+                    include_own=include_own)
         else:
+            shard_format = None
             requested_policy_index = self.get_and_validate_policy_index(req)
             resp_headers = gen_resp_headers(info, is_deleted=is_deleted)
             if is_deleted:
@@ -784,16 +830,20 @@ class ContainerController(BaseStorageServer):
                 storage_policy_index=storage_policy_index,
                 reverse=reverse, allow_reserved=req.allow_reserved_names)
         return self.create_listing(req, out_content_type, info, resp_headers,
-                                   broker.metadata, container_list, container)
+                                   broker.metadata, container_list, container,
+                                   record_type, shard_format)
 
     def create_listing(self, req, out_content_type, info, resp_headers,
-                       metadata, container_list, container):
+                       metadata, container_list, container, record_type=None,
+                       shard_record_format=None):
         for key, (value, _timestamp) in metadata.items():
             if value and (key.lower() in self.save_headers or
                           is_sys_or_user_meta('container', key)):
                 resp_headers[str_to_wsgi(key)] = str_to_wsgi(value)
-        listing = [self.update_data_record(record)
-                   for record in container_list]
+
+        listing = [self.update_data_record(
+            record, record_type, shard_record_format)
+            for record in container_list]
         if out_content_type.endswith('/xml'):
             body = listing_formats.container_to_xml(listing, container)
         elif out_content_type.endswith('/json'):
