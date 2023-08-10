@@ -68,8 +68,9 @@ from swift.common.memcached import MemcacheConnectionError
 from swift.common.storage_policy import (POLICIES, REPL_POLICY, EC_POLICY,
                                          ECDriverError, PolicyError)
 from swift.proxy.controllers.base import Controller, delay_denial, \
-    cors_validation, update_headers, bytes_to_skip, close_swift_conn, \
-    ByteCountEnforcer, record_cache_op_metrics, get_cache_key, GetterBase
+    cors_validation, update_headers, bytes_to_skip, ByteCountEnforcer, \
+    record_cache_op_metrics, get_cache_key, GetterBase, GetterSource, \
+    is_good_source
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestEntityTooLarge, HTTPRequestTimeout, \
     HTTPServerError, HTTPServiceUnavailable, HTTPClientDisconnect, \
@@ -77,8 +78,7 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPRequestedRangeNotSatisfiable, Range, HTTPInternalServerError, \
     normalize_etag
 from swift.common.request_helpers import update_etag_is_at_header, \
-    resolve_etag_is_at_header, validate_internal_obj, get_ip_port, \
-    http_response_to_document_iters
+    resolve_etag_is_at_header, validate_internal_obj, get_ip_port
 
 
 def check_content_type(req):
@@ -2243,8 +2243,8 @@ class ECGetResponseBucket(object):
         Close bucket's responses; they won't be used for a client response.
         """
         for getter, frag_iter in self.get_responses():
-            if getattr(getter.source, 'swift_conn', None):
-                close_swift_conn(getter.source)
+            if getter.source:
+                getter.source.close()
 
     def __str__(self):
         # return a string summarising bucket state, useful for debugging.
@@ -2334,7 +2334,8 @@ class ECGetResponseCollection(object):
         frag_sets = safe_json_loads(headers.get('X-Backend-Fragments')) or {}
         for t_frag, frag_set in frag_sets.items():
             t_frag = Timestamp(t_frag)
-            self._get_bucket(t_frag).add_alternate_nodes(get.node, frag_set)
+            self._get_bucket(t_frag).add_alternate_nodes(
+                get.source.node, frag_set)
         # If the response includes a durable timestamp then mark that bucket as
         # durable. Note that this may be a different bucket than the one this
         # response got added to, and that we may never go and get a durable
@@ -2487,19 +2488,6 @@ class ECGetResponseCollection(object):
             return nodes.pop(0).copy()
 
 
-def is_good_source(status):
-    """
-    Indicates whether or not the request made to the backend found
-    what it was looking for.
-
-    :param status: the response from the backend
-    :returns: True if found, False if not
-    """
-    if status == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE:
-        return True
-    return is_success(status) or is_redirection(status)
-
-
 class ECFragGetter(GetterBase):
 
     def __init__(self, app, req, node_iter, partition, policy, path,
@@ -2514,18 +2502,9 @@ class ECFragGetter(GetterBase):
         self.skip_bytes = 0
         self.logger_thread_locals = logger_thread_locals
         self.status = self.reason = self.body = self.source_headers = None
+        self._source_iter = None
 
-    def response_parts_iter(self, req):
-        try:
-            self.source, self.node = next(self.source_and_node_iter)
-        except StopIteration:
-            return
-        it = None
-        if self.source:
-            it = self._get_response_parts_iter(req)
-        return it
-
-    def get_next_doc_part(self):
+    def _get_next_response_part(self):
         node_timeout = self.app.recoverable_node_timeout
 
         while True:
@@ -2543,15 +2522,15 @@ class ECFragGetter(GetterBase):
                     # we have a multipart/byteranges response; as it
                     # will read the MIME boundary and part headers.
                     start_byte, end_byte, length, headers, part = next(
-                        self.source_parts_iter)
+                        self.source.parts_iter)
                 return (start_byte, end_byte, length, headers, part)
             except ChunkReadTimeout:
-                if not self._replace_source_and_node(
+                if not self._replace_source(
                         'Trying to read next part of EC multi-part GET '
                         '(retrying)'):
                     raise
 
-    def iter_bytes_from_response_part(self, part_file, nbytes):
+    def _iter_bytes_from_response_part(self, part_file, nbytes):
         buf = b''
         part_file = ByteCountEnforcer(part_file, nbytes)
         while True:
@@ -2575,14 +2554,14 @@ class ECFragGetter(GetterBase):
                 except RangeAlreadyComplete:
                     break
                 buf = b''
-                if self._replace_source_and_node(
+                if self._replace_source(
                         'Trying to read EC fragment during GET (retrying)'):
                     try:
                         _junk, _junk, _junk, _junk, part_file = \
-                            self.get_next_doc_part()
+                            self._get_next_response_part()
                     except StopIteration:
                         # it's not clear to me how to make
-                        # get_next_doc_part raise StopIteration for the
+                        # _get_next_response_part raise StopIteration for the
                         # first doc part of a new request
                         six.reraise(exc_type, exc_value, exc_traceback)
                     part_file = ByteCountEnforcer(part_file, nbytes)
@@ -2611,19 +2590,14 @@ class ECFragGetter(GetterBase):
                 if not chunk:
                     break
 
-    def _get_response_parts_iter(self, req):
+    def _iter_parts_from_response(self, req):
         try:
-            # This is safe; it sets up a generator but does not call next()
-            # on it, so no IO is performed.
-            self.source_parts_iter = http_response_to_document_iters(
-                self.source, read_chunk_size=self.app.object_chunk_size)
-
             part_iter = None
             try:
                 while True:
                     try:
                         start_byte, end_byte, length, headers, part = \
-                            self.get_next_doc_part()
+                            self._get_next_response_part()
                     except StopIteration:
                         # it seems this is the only way out of the loop; not
                         # sure why the req.environ update is always needed
@@ -2643,7 +2617,7 @@ class ECFragGetter(GetterBase):
                                       and start_byte is not None)
                                   else None)
                     part_iter = CooperativeIterator(
-                        self.iter_bytes_from_response_part(part, byte_count))
+                        self._iter_bytes_from_response_part(part, byte_count))
                     yield {'start_byte': start_byte, 'end_byte': end_byte,
                            'entity_length': length, 'headers': headers,
                            'part_iter': part_iter}
@@ -2653,7 +2627,7 @@ class ECFragGetter(GetterBase):
                     part_iter.close()
 
         except ChunkReadTimeout:
-            self.app.exception_occurred(self.node, 'Object',
+            self.app.exception_occurred(self.source.node, 'Object',
                                         'Trying to read during GET')
             raise
         except ChunkWriteTimeout:
@@ -2679,9 +2653,7 @@ class ECFragGetter(GetterBase):
             self.logger.exception('Trying to send to client')
             raise
         finally:
-            # Close-out the connection as best as possible.
-            if getattr(self.source, 'swift_conn', None):
-                close_swift_conn(self.source)
+            self.source.close()
 
     @property
     def last_status(self):
@@ -2695,6 +2667,8 @@ class ECFragGetter(GetterBase):
             return HeaderKeyDict()
 
     def _make_node_request(self, node, node_timeout):
+        # make a backend request; return a response if it has an acceptable
+        # status code, otherwise None
         self.logger.thread_locals = self.logger_thread_locals
         req_headers = dict(self.backend_headers)
         ip, port = get_ip_port(node, req_headers)
@@ -2738,7 +2712,7 @@ class ECFragGetter(GetterBase):
         self.status = possible_source.status
         self.reason = possible_source.reason
         self.source_headers = possible_source.getheaders()
-        if is_good_source(possible_source.status):
+        if is_good_source(possible_source.status, server_type='Object'):
             self.body = None
             return possible_source
         else:
@@ -2753,37 +2727,62 @@ class ECFragGetter(GetterBase):
             return None
 
     @property
-    def source_and_node_iter(self):
-        if not hasattr(self, '_source_and_node_iter'):
-            self._source_and_node_iter = self._source_and_node_gen()
-        return self._source_and_node_iter
+    def source_iter(self):
+        """
+        An iterator over responses to backend fragment GETs. Yields an
+        instance of ``GetterSource`` if a response is good, otherwise ``None``.
+        """
+        if self._source_iter is None:
+            self._source_iter = self._source_gen()
+        return self._source_iter
 
-    def _source_and_node_gen(self):
+    def _source_gen(self):
         self.status = self.reason = self.body = self.source_headers = None
         for node in self.node_iter:
             source = self._make_node_request(
                 node, self.app.recoverable_node_timeout)
 
             if source:
-                yield source, node
+                yield GetterSource(self.app, source, node)
             else:
-                yield None, None
+                yield None
             self.status = self.reason = self.body = self.source_headers = None
 
-    def _get_source_and_node(self):
+    def _find_source(self):
         # capture last used etag before continuation
         used_etag = self.last_headers.get('X-Object-Sysmeta-EC-ETag')
-        for source, node in self.source_and_node_iter:
+        for source in self.source_iter:
             if not source:
                 # _make_node_request only returns good sources
                 continue
-            if source.getheader('X-Object-Sysmeta-EC-ETag') != used_etag:
+            if source.resp.getheader('X-Object-Sysmeta-EC-ETag') != used_etag:
                 self.logger.warning(
                     'Skipping source (etag mismatch: got %s, expected %s)',
-                    source.getheader('X-Object-Sysmeta-EC-ETag'), used_etag)
+                    source.resp.getheader('X-Object-Sysmeta-EC-ETag'),
+                    used_etag)
             else:
-                return source, node
-        return None, None
+                self.source = source
+                return True
+        return False
+
+    def response_parts_iter(self, req):
+        """
+        Create an iterator over a single fragment response body.
+
+        :param req: a ``swob.Request``.
+        :return: an interator that yields chunks of bytes from a fragment
+            response body.
+        """
+        it = None
+        try:
+            source = next(self.source_iter)
+        except StopIteration:
+            pass
+        else:
+            if source:
+                self.source = source
+                it = self._iter_parts_from_response(req)
+        return it
 
 
 @ObjectControllerRouter.register(EC_POLICY)
@@ -2944,9 +2943,9 @@ class ECObjectController(BaseObjectController):
                     break
                 requests_available = extra_requests < max_extra_requests and (
                     node_iter.nodes_left > 0 or buckets.has_alternate_node())
-                bad_resp = not is_good_source(get.last_status)
                 if requests_available and (
-                        buckets.shortfall > pile._pending or bad_resp):
+                        buckets.shortfall > pile._pending or
+                        not is_good_source(get.last_status, self.server_type)):
                     extra_requests += 1
                     pile.spawn(self._fragment_GET_request, req, safe_iter,
                                partition, policy, buckets.get_extra_headers,

@@ -12,6 +12,7 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import operator
 import os
 from argparse import Namespace
 import itertools
@@ -28,7 +29,7 @@ from swift.proxy.controllers.base import headers_to_container_info, \
     get_cache_key, get_account_info, get_info, get_object_info, \
     Controller, GetOrHeadHandler, bytes_to_skip, clear_info_cache, \
     set_info_cache, NodeIter, headers_from_container_info, \
-    record_cache_op_metrics
+    record_cache_op_metrics, GetterSource
 from swift.common.swob import Request, HTTPException, RESPONSE_REASONS, \
     bytes_to_wsgi
 from swift.common import exceptions
@@ -40,7 +41,8 @@ from swift.common.storage_policy import StoragePolicy, StoragePolicyCollection
 from test.debug_logger import debug_logger
 from test.unit import (
     fake_http_connect, FakeRing, FakeMemcache, PatchPolicies,
-    make_timestamp_iter, mocked_http_conn, patch_policies, FakeSource)
+    make_timestamp_iter, mocked_http_conn, patch_policies, FakeSource,
+    StubResponse)
 from swift.common.request_helpers import (
     get_sys_meta_prefix, get_object_transient_sysmeta
 )
@@ -381,6 +383,66 @@ class TestFuncs(BaseTest):
         self.assertEqual([e['PATH_INFO'] for e in final_app.captured_envs],
                          ['/v1/a', '/v1/a/c', '/v1/a/c/o'])
 
+    def test_get_account_info_uses_logging_app(self):
+        def factory(app, func=None):
+            calls = []
+
+            def wsgi_filter(env, start_response):
+                calls.append(env)
+                if func:
+                    func(env, app)
+                return app(env, start_response)
+
+            return wsgi_filter, calls
+
+        # build up a pipeline, pretend there is a proxy_logging middleware
+        final_app = FakeApp()
+        logging_app, logging_app_calls = factory(final_app)
+        filtered_app, filtered_app_calls = factory(logging_app,
+                                                   func=get_account_info)
+        # mimic what would be done in swift.common.wsgi.load_app
+        for app in (filtered_app, logging_app):
+            app._pipeline_final_app = final_app
+            app._pipeline_request_logging_app = logging_app
+        req = Request.blank("/v1/a/c/o", environ={'swift.cache': FakeCache()})
+        req.get_response(filtered_app)
+        self.assertEqual([e['PATH_INFO'] for e in final_app.captured_envs],
+                         ['/v1/a', '/v1/a/c/o'])
+        self.assertEqual([e['PATH_INFO'] for e in logging_app_calls],
+                         ['/v1/a', '/v1/a/c/o'])
+        self.assertEqual([e['PATH_INFO'] for e in filtered_app_calls],
+                         ['/v1/a/c/o'])
+
+    def test_get_container_info_uses_logging_app(self):
+        def factory(app, func=None):
+            calls = []
+
+            def wsgi_filter(env, start_response):
+                calls.append(env)
+                if func:
+                    func(env, app)
+                return app(env, start_response)
+
+            return wsgi_filter, calls
+
+        # build up a pipeline, pretend there is a proxy_logging middleware
+        final_app = FakeApp()
+        logging_app, logging_app_calls = factory(final_app)
+        filtered_app, filtered_app_calls = factory(logging_app,
+                                                   func=get_container_info)
+        # mimic what would be done in swift.common.wsgi.load_app
+        for app in (filtered_app, logging_app):
+            app._pipeline_final_app = final_app
+            app._pipeline_request_logging_app = logging_app
+        req = Request.blank("/v1/a/c/o", environ={'swift.cache': FakeCache()})
+        req.get_response(filtered_app)
+        self.assertEqual([e['PATH_INFO'] for e in final_app.captured_envs],
+                         ['/v1/a', '/v1/a/c', '/v1/a/c/o'])
+        self.assertEqual([e['PATH_INFO'] for e in logging_app_calls],
+                         ['/v1/a', '/v1/a/c', '/v1/a/c/o'])
+        self.assertEqual([e['PATH_INFO'] for e in filtered_app_calls],
+                         ['/v1/a/c/o'])
+
     def test_get_object_info_swift_source(self):
         app = FakeApp()
         req = Request.blank("/v1/a/c/o",
@@ -493,7 +555,8 @@ class TestFuncs(BaseTest):
         self.assertEqual(resp['object_count'], 0)
         self.assertEqual(resp['versions'], None)
         self.assertEqual(
-            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            [x[0][0] for x in
+             self.logger.logger.statsd_client.calls['increment']],
             ['container.info.cache.miss'])
 
         # container info is cached in cache.
@@ -523,7 +586,8 @@ class TestFuncs(BaseTest):
                                  [(k, str, v, str)
                                   for k, v in subdict.items()])
         self.assertEqual(
-            [x[0][0] for x in self.logger.logger.log_dict['increment']],
+            [x[0][0] for x in
+             self.logger.logger.statsd_client.calls['increment']],
             ['container.info.cache.hit'])
 
     def test_get_cache_key(self):
@@ -608,27 +672,27 @@ class TestFuncs(BaseTest):
         record_cache_op_metrics(
             self.logger, 'shard_listing', 'infocache_hit')
         self.assertEqual(
-            self.logger.get_increment_counts().get(
+            self.logger.statsd_client.get_increment_counts().get(
                 'shard_listing.infocache.hit'),
             1)
         record_cache_op_metrics(
             self.logger, 'shard_listing', 'hit')
         self.assertEqual(
-            self.logger.get_increment_counts().get(
+            self.logger.statsd_client.get_increment_counts().get(
                 'shard_listing.cache.hit'),
             1)
         resp = FakeResponse(status_int=200)
         record_cache_op_metrics(
             self.logger, 'shard_updating', 'skip', resp)
         self.assertEqual(
-            self.logger.get_increment_counts().get(
+            self.logger.statsd_client.get_increment_counts().get(
                 'shard_updating.cache.skip.200'),
             1)
         resp = FakeResponse(status_int=503)
         record_cache_op_metrics(
             self.logger, 'shard_updating', 'disabled', resp)
         self.assertEqual(
-            self.logger.get_increment_counts().get(
+            self.logger.statsd_client.get_increment_counts().get(
                 'shard_updating.cache.disabled.503'),
             1)
 
@@ -1338,8 +1402,13 @@ class TestFuncs(BaseTest):
         handler = GetOrHeadHandler(
             self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
             'some-path', {})
-        with mock.patch.object(handler, '_get_source_and_node',
-                               return_value=(source, node)):
+
+        def mock_find_source():
+            handler.source = GetterSource(self.app, source, node)
+            return True
+
+        with mock.patch.object(handler, '_find_source',
+                               mock_find_source):
             resp = handler.get_working_response(req)
             resp.app_iter.close()
         self.app.logger.info.assert_called_once_with(
@@ -1351,8 +1420,8 @@ class TestFuncs(BaseTest):
             self.app, req, 'Object', Namespace(num_primary_nodes=1), None,
             None, {})
 
-        with mock.patch.object(handler, '_get_source_and_node',
-                               return_value=(source, node)):
+        with mock.patch.object(handler, '_find_source',
+                               mock_find_source):
             resp = handler.get_working_response(req)
             next(resp.app_iter)
             resp.app_iter.close()
@@ -1667,3 +1736,74 @@ class TestNodeIter(BaseTest):
             self.assertIn('use_replication', node)
             self.assertFalse(node['use_replication'])
         self.assertEqual(other_iter, ring.get_part_nodes(0))
+
+
+class TestGetterSource(unittest.TestCase):
+    def _make_source(self, headers, node):
+        resp = StubResponse(200, headers=headers)
+        return GetterSource(self.app, resp, node)
+
+    def setUp(self):
+        self.app = FakeApp()
+        self.node = {'ip': '1.2.3.4', 'port': '999'}
+        self.headers = {'X-Timestamp': '1234567.12345'}
+        self.resp = StubResponse(200, headers=self.headers)
+
+    def test_init(self):
+        src = GetterSource(self.app, self.resp, self.node)
+        self.assertIs(self.app, src.app)
+        self.assertIs(self.resp, src.resp)
+        self.assertEqual(self.node, src.node)
+
+    def test_timestamp(self):
+        # first test the no timestamp header case. Defaults to 0.
+        headers = {}
+        src = self._make_source(headers, self.node)
+        self.assertIsInstance(src.timestamp, Timestamp)
+        self.assertEqual(Timestamp(0), src.timestamp)
+        # now x-timestamp
+        headers = dict(self.headers)
+        src = self._make_source(headers, self.node)
+        self.assertIsInstance(src.timestamp, Timestamp)
+        self.assertEqual(Timestamp(1234567.12345), src.timestamp)
+        headers['x-put-timestamp'] = '1234567.11111'
+        src = self._make_source(headers, self.node)
+        self.assertIsInstance(src.timestamp, Timestamp)
+        self.assertEqual(Timestamp(1234567.11111), src.timestamp)
+        headers['x-backend-timestamp'] = '1234567.22222'
+        src = self._make_source(headers, self.node)
+        self.assertIsInstance(src.timestamp, Timestamp)
+        self.assertEqual(Timestamp(1234567.22222), src.timestamp)
+        headers['x-backend-data-timestamp'] = '1234567.33333'
+        src = self._make_source(headers, self.node)
+        self.assertIsInstance(src.timestamp, Timestamp)
+        self.assertEqual(Timestamp(1234567.33333), src.timestamp)
+
+    def test_sort(self):
+        # verify sorting by timestamp
+        srcs = [
+            self._make_source({'X-Timestamp': '12345.12345'},
+                              {'ip': '1.2.3.7', 'port': '9'}),
+            self._make_source({'X-Timestamp': '12345.12346'},
+                              {'ip': '1.2.3.8', 'port': '8'}),
+            self._make_source({'X-Timestamp': '12345.12343',
+                               'X-Put-Timestamp': '12345.12344'},
+                              {'ip': '1.2.3.9', 'port': '7'}),
+        ]
+        actual = sorted(srcs, key=operator.attrgetter('timestamp'))
+        self.assertEqual([srcs[2], srcs[0], srcs[1]], actual)
+
+    def test_close(self):
+        # verify close is robust...
+        # source has no resp
+        src = GetterSource(self.app, None, self.node)
+        src.close()
+        # resp has no swift_conn
+        src = GetterSource(self.app, self.resp, self.node)
+        self.assertFalse(hasattr(src.resp, 'swift_conn'))
+        src.close()
+        # verify close is plumbed through...
+        src.resp.swift_conn = mock.MagicMock()
+        src.resp.nuke_from_orbit = mock.MagicMock()
+        src.close()
+        src.resp.nuke_from_orbit.assert_called_once_with()

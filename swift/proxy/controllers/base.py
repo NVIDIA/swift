@@ -53,7 +53,8 @@ from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_informational, is_success, is_redirection, \
     is_server_error, HTTP_OK, HTTP_PARTIAL_CONTENT, HTTP_MULTIPLE_CHOICES, \
     HTTP_BAD_REQUEST, HTTP_NOT_FOUND, HTTP_SERVICE_UNAVAILABLE, \
-    HTTP_UNAUTHORIZED, HTTP_CONTINUE, HTTP_GONE
+    HTTP_UNAUTHORIZED, HTTP_CONTINUE, HTTP_GONE, \
+    HTTP_REQUESTED_RANGE_NOT_SATISFIABLE
 from swift.common.swob import Request, Response, Range, \
     HTTPException, HTTPRequestedRangeNotSatisfiable, HTTPServiceUnavailable, \
     status_map, wsgi_to_str, str_to_wsgi, wsgi_quote, wsgi_unquote, \
@@ -87,19 +88,6 @@ def update_headers(response, headers):
                 'date', 'content-length', 'content-type',
                 'connection', 'x-put-timestamp', 'x-delete-after'):
             response.headers[name] = value
-
-
-def source_key(resp):
-    """
-    Provide the timestamp of the swift http response as a floating
-    point value.  Used as a sort key.
-
-    :param resp: bufferedhttp response object
-    """
-    return Timestamp(resp.getheader('x-backend-data-timestamp') or
-                     resp.getheader('x-backend-timestamp') or
-                     resp.getheader('x-put-timestamp') or
-                     resp.getheader('x-timestamp') or 0)
 
 
 def delay_denial(func):
@@ -1030,6 +1018,21 @@ def bytes_to_skip(record_size, range_start):
     return (record_size - (range_start % record_size)) % record_size
 
 
+def is_good_source(status, server_type):
+    """
+    Indicates whether or not the request made to the backend found
+    what it was looking for.
+
+    :param resp: the response from the backend.
+    :param server_type: the type of server: 'Account', 'Container' or 'Object'.
+    :returns: True if the response status code is acceptable, False if not.
+    """
+    if (server_type == 'Object' and
+            status == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE):
+        return True
+    return is_success(status) or is_redirection(status)
+
+
 class ByteCountEnforcer(object):
     """
     Enforces that successive calls to file_like.read() give at least
@@ -1061,6 +1064,42 @@ class ByteCountEnforcer(object):
             return chunk
 
 
+class GetterSource(object):
+    __slots__ = ('app', 'resp', 'node', '_parts_iter')
+
+    def __init__(self, app, resp, node):
+        self.app = app
+        self.resp = resp
+        self.node = node
+        self._parts_iter = None
+
+    @property
+    def timestamp(self):
+        """
+        Provide the timestamp of the swift http response as a floating
+        point value.  Used as a sort key.
+
+        :return: an instance of ``utils.Timestamp``
+        """
+        return Timestamp(self.resp.getheader('x-backend-data-timestamp') or
+                         self.resp.getheader('x-backend-timestamp') or
+                         self.resp.getheader('x-put-timestamp') or
+                         self.resp.getheader('x-timestamp') or 0)
+
+    @property
+    def parts_iter(self):
+        # lazy load a source response body parts iter if and when the source is
+        # actually read
+        if self.resp and not self._parts_iter:
+            self._parts_iter = http_response_to_document_iters(
+                self.resp, read_chunk_size=self.app.object_chunk_size)
+        return self._parts_iter
+
+    def close(self):
+        # Close-out the connection as best as possible.
+        close_swift_conn(self.resp)
+
+
 class GetterBase(object):
     def __init__(self, app, req, node_iter, partition, policy,
                  path, backend_headers, logger=None):
@@ -1073,33 +1112,27 @@ class GetterBase(object):
         self.backend_headers = backend_headers
         self.logger = logger or app.logger
         self.bytes_used_from_backend = 0
-        self.node = None
         self.source = None
-        self.source_parts_iter = None
 
-    def _get_source_and_node(self):
+    def _find_source(self):
+        """
+        Look for a suitable new source and if one is found then set
+        ``self.source``.
+
+        :return: ``True`` if ``self.source`` has been updated, ``False``
+            otherwise.
+        """
+        # Subclasses must implement this method
         raise NotImplementedError()
 
-    def _replace_source_and_node(self, err_msg):
-        # be defensive against _get_source_and_node modifying self.source
-        # or self.node...
+    def _replace_source(self, err_msg):
+        # _find_source can modify self.source so stash current source
         old_source = self.source
-        old_node = self.node
-
-        new_source, new_node = self._get_source_and_node()
-        if not new_source:
+        if not self._find_source():
             return False
 
-        self.app.error_occurred(old_node, err_msg)
-        # Close-out the connection as best as possible.
-        if getattr(old_source, 'swift_conn', None):
-            close_swift_conn(old_source)
-        self.source = new_source
-        self.node = new_node
-        # This is safe; it sets up a generator but does
-        # not call next() on it, so no IO is performed.
-        self.source_parts_iter = http_response_to_document_iters(
-            new_source, read_chunk_size=self.app.object_chunk_size)
+        self.app.error_occurred(old_source.node, err_msg)
+        old_source.close()
         return True
 
     def fast_forward(self, num_bytes):
@@ -1216,7 +1249,7 @@ class GetOrHeadHandler(GetterBase):
             backend_headers=backend_headers, logger=logger)
         self.server_type = server_type
         self.used_nodes = []
-        self.used_source_etag = ''
+        self.used_source_etag = None
         self.concurrency = concurrency
         self.latest_404_timestamp = Timestamp(0)
         if self.server_type == 'Object':
@@ -1243,19 +1276,9 @@ class GetOrHeadHandler(GetterBase):
         # populated from response headers
         self.start_byte = self.end_byte = self.length = None
 
-    def is_good_source(self, src):
-        """
-        Indicates whether or not the request made to the backend found
-        what it was looking for.
-
-        :param src: the response from the backend
-        :returns: True if found, False if not
-        """
-        if self.server_type == 'Object' and src.status == 416:
-            return True
-        return is_success(src.status) or is_redirection(src.status)
-
-    def get_next_doc_part(self):
+    def _get_next_response_part(self):
+        # return the next part of the response body; there may only be one part
+        # unless it's a multipart/byteranges response
         while True:
             try:
                 # This call to next() performs IO when we have a
@@ -1271,14 +1294,16 @@ class GetOrHeadHandler(GetterBase):
                     # if StopIteration is raised, it escapes and is
                     # handled elsewhere
                     start_byte, end_byte, length, headers, part = next(
-                        self.source_parts_iter)
+                        self.source.parts_iter)
                 return (start_byte, end_byte, length, headers, part)
             except ChunkReadTimeout:
-                if not self._replace_source_and_node(
+                if not self._replace_source(
                         'Trying to read object during GET (retrying)'):
                     raise StopIteration()
 
-    def iter_bytes_from_response_part(self, part_file, nbytes):
+    def _iter_bytes_from_response_part(self, part_file, nbytes):
+        # yield chunks of bytes from a single response part; if an error
+        # occurs, try to resume yielding bytes from a different source
         part_file = ByteCountEnforcer(part_file, nbytes)
         while True:
             try:
@@ -1297,11 +1322,11 @@ class GetOrHeadHandler(GetterBase):
                     six.reraise(exc_type, exc_value, exc_traceback)
                 except RangeAlreadyComplete:
                     break
-                if self._replace_source_and_node(
+                if self._replace_source(
                         'Trying to read object during GET (retrying)'):
                     try:
                         _junk, _junk, _junk, _junk, part_file = \
-                            self.get_next_doc_part()
+                            self._get_next_response_part()
                     except StopIteration:
                         # Tried to find a new node from which to
                         # finish the GET, but failed. There's
@@ -1320,19 +1345,15 @@ class GetOrHeadHandler(GetterBase):
                     self.bytes_used_from_backend += len(chunk)
                     yield chunk
 
-    def _get_response_parts_iter(self, req):
+    def _iter_parts_from_response(self, req):
+        # iterate over potentially multiple response body parts; for each
+        # part, yield an iterator over the part's bytes
         try:
-
-            # This is safe; it sets up a generator but does not call next()
-            # on it, so no IO is performed.
-            self.source_parts_iter = http_response_to_document_iters(
-                self.source, read_chunk_size=self.app.object_chunk_size)
-
             part_iter = None
             try:
                 while True:
                     start_byte, end_byte, length, headers, part = \
-                        self.get_next_doc_part()
+                        self._get_next_response_part()
                     self.learn_size_from_content_range(
                         start_byte, end_byte, length)
                     self.bytes_used_from_backend = 0
@@ -1343,7 +1364,7 @@ class GetOrHeadHandler(GetterBase):
                                       and start_byte is not None)
                                   else None)
                     part_iter = CooperativeIterator(
-                        self.iter_bytes_from_response_part(part, byte_count))
+                        self._iter_bytes_from_response_part(part, byte_count))
                     yield {'start_byte': start_byte, 'end_byte': end_byte,
                            'entity_length': length, 'headers': headers,
                            'part_iter': part_iter}
@@ -1355,7 +1376,7 @@ class GetOrHeadHandler(GetterBase):
                     part_iter.close()
 
         except ChunkReadTimeout:
-            self.app.exception_occurred(self.node, 'Object',
+            self.app.exception_occurred(self.source.node, 'Object',
                                         'Trying to read during GET')
             raise
         except ChunkWriteTimeout:
@@ -1381,9 +1402,7 @@ class GetOrHeadHandler(GetterBase):
             self.logger.exception('Trying to send to client')
             raise
         finally:
-            # Close-out the connection as best as possible.
-            if getattr(self.source, 'swift_conn', None):
-                close_swift_conn(self.source)
+            self.source.close()
 
     @property
     def last_status(self):
@@ -1400,6 +1419,10 @@ class GetOrHeadHandler(GetterBase):
             return None
 
     def _make_node_request(self, node, node_timeout, logger_thread_locals):
+        # make a backend request; return True if the response is deemed good
+        # (has an acceptable status code), useful (matches any previously
+        # discovered etag) and sufficient (a single good response is
+        # insufficient when we're searching for the newest timestamp)
         self.logger.thread_locals = logger_thread_locals
         if node in self.used_nodes:
             return False
@@ -1429,7 +1452,7 @@ class GetOrHeadHandler(GetterBase):
         src_headers = dict(
             (k.lower(), v) for k, v in
             possible_source.getheaders())
-        if self.is_good_source(possible_source):
+        if is_good_source(possible_source.status, self.server_type):
             # 404 if we know we don't have a synced copy
             if not float(possible_source.getheader('X-PUT-Timestamp', 1)):
                 self.statuses.append(HTTP_NOT_FOUND)
@@ -1459,7 +1482,8 @@ class GetOrHeadHandler(GetterBase):
                     self.reasons.append(possible_source.reason)
                     self.bodies.append(None)
                     self.source_headers.append(possible_source.getheaders())
-                    self.sources.append((possible_source, node))
+                    self.sources.append(
+                        GetterSource(self.app, possible_source, node))
                     if not self.newest:  # one good source is enough
                         return True
         else:
@@ -1497,7 +1521,7 @@ class GetOrHeadHandler(GetterBase):
                                     self.bodies[-1])
         return False
 
-    def _get_source_and_node(self):
+    def _find_source(self):
         self.statuses = []
         self.reasons = []
         self.bodies = []
@@ -1528,27 +1552,26 @@ class GetOrHeadHandler(GetterBase):
         # and added to the list in the case of x-newest.
         if self.sources:
             self.sources = [s for s in self.sources
-                            if source_key(s[0]) >= self.latest_404_timestamp]
+                            if s.timestamp >= self.latest_404_timestamp]
 
         if self.sources:
-            self.sources.sort(key=lambda s: source_key(s[0]))
-            source, node = self.sources.pop()
-            for src, _junk in self.sources:
-                close_swift_conn(src)
-            self.used_nodes.append(node)
-            src_headers = dict(
-                (k.lower(), v) for k, v in
-                source.getheaders())
+            self.sources.sort(key=operator.attrgetter('timestamp'))
+            source = self.sources.pop()
+            for unused_source in self.sources:
+                unused_source.close()
+            self.used_nodes.append(source.node)
 
             # Save off the source etag so that, if we lose the connection
             # and have to resume from a different node, we can be sure that
             # we have the same object (replication). Otherwise, if the cluster
             # has two versions of the same object, we might end up switching
             # between old and new mid-stream and giving garbage to the client.
-            self.used_source_etag = normalize_etag(src_headers.get('etag', ''))
-            self.node = node
-            return source, node
-        return None, None
+            if self.used_source_etag is None:
+                self.used_source_etag = normalize_etag(
+                    source.resp.getheader('etag', ''))
+            self.source = source
+            return True
+        return False
 
     def _make_app_iter(self, req):
         """
@@ -1557,12 +1580,10 @@ class GetOrHeadHandler(GetterBase):
         collection works and the underlying socket of the source is closed.
 
         :param req: incoming request object
-        :param source: The httplib.Response object this iterator should read
-                       from.
-        :param node: The node the source is reading from, for logging purposes.
+        :return: an iterator that yields chunks of response body bytes
         """
 
-        ct = self.source.getheader('Content-Type')
+        ct = self.source.resp.getheader('Content-Type')
         if ct:
             content_type, content_type_attrs = parse_content_type(ct)
             is_multipart = content_type == 'multipart/byteranges'
@@ -1575,7 +1596,7 @@ class GetOrHeadHandler(GetterBase):
             # furnished one for us, so we'll just re-use it
             boundary = dict(content_type_attrs)["boundary"]
 
-        parts_iter = self._get_response_parts_iter(req)
+        parts_iter = self._iter_parts_from_response(req)
 
         def add_content_type(response_part):
             response_part["content_type"] = \
@@ -1587,27 +1608,25 @@ class GetOrHeadHandler(GetterBase):
             boundary, is_multipart, self.logger)
 
     def get_working_response(self, req):
-        source, node = self._get_source_and_node()
         res = None
-        if source:
+        if self._find_source():
             res = Response(request=req)
-            res.status = source.status
-            update_headers(res, source.getheaders())
+            res.status = self.source.resp.status
+            update_headers(res, self.source.resp.getheaders())
             if req.method == 'GET' and \
-                    source.status in (HTTP_OK, HTTP_PARTIAL_CONTENT):
-                self.source = source
-                self.node = node
+                    self.source.resp.status in (HTTP_OK, HTTP_PARTIAL_CONTENT):
                 res.app_iter = self._make_app_iter(req)
                 # See NOTE: swift_conn at top of file about this.
-                res.swift_conn = source.swift_conn
+                res.swift_conn = self.source.resp.swift_conn
             if not res.environ:
                 res.environ = {}
-            res.environ['swift_x_timestamp'] = source.getheader('x-timestamp')
+            res.environ['swift_x_timestamp'] = self.source.resp.getheader(
+                'x-timestamp')
             res.accept_ranges = 'bytes'
-            res.content_length = source.getheader('Content-Length')
-            if source.getheader('Content-Type'):
+            res.content_length = self.source.resp.getheader('Content-Length')
+            if self.source.resp.getheader('Content-Type'):
                 res.charset = None
-                res.content_type = source.getheader('Content-Type')
+                res.content_type = self.source.resp.getheader('Content-Type')
         return res
 
 

@@ -1992,11 +1992,12 @@ class TestPipelineModification(unittest.TestCase):
                 self.assertIs(app._pipeline_request_logging_app, logging_app)
                 self.assertIs(app._pipeline_final_app, final_app)
 
-            # As did the special logging app
-            self.assertIs(logging_app._pipeline, pipeline)
+            # Special logging app got them, too
             self.assertIs(logging_app._pipeline_request_logging_app,
                           logging_app)
             self.assertIs(logging_app._pipeline_final_app, final_app)
+            # Though the pipeline's different -- may or may not matter?
+            self.assertEqual(logging_app._pipeline, [logging_app, final_app])
 
     def test_proxy_unmodified_wsgi_pipeline(self):
         # Make sure things are sane even when we modify nothing

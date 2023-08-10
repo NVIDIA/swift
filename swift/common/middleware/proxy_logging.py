@@ -57,6 +57,11 @@ be separated with a simple ``.split()``.
 * Values that are missing (e.g. due to a header not being present) or zero
   are generally represented by a single hyphen ('-').
 
+.. note::
+   The message format may be configured using the ``log_msg_template`` option,
+   allowing fields to be added, removed, re-ordered, and even anonymized. For
+   more information, see https://docs.openstack.org/swift/latest/logs.html
+
 The proxy-logging can be used twice in the proxy server's pipeline when there
 is middleware installed that can return custom responses that don't follow the
 standard pipeline to the proxy server.

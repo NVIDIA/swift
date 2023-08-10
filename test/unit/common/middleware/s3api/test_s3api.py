@@ -250,8 +250,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
-        self.assertEqual({'403.AccessDenied.invalid_header_auth': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_header_auth': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_bad_method(self):
         req = Request.blank('/',
@@ -260,8 +261,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'MethodNotAllowed')
-        self.assertEqual({'405.MethodNotAllowed': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'405.MethodNotAllowed': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_bad_method_but_method_exists_in_controller(self):
         req = Request.blank(
@@ -271,8 +273,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'MethodNotAllowed')
-        self.assertEqual({'405.MethodNotAllowed': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'405.MethodNotAllowed': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_path_info_encode(self):
         bucket_name = 'b%75cket'
@@ -404,8 +407,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
-        self.assertEqual({'403.AccessDenied.expired': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.expired': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_signed_urls(self):
         # Set expire to last 32b timestamp value
@@ -452,8 +456,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
-        self.assertEqual({'403.AccessDenied.invalid_expires': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_expires': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_signed_urls_no_sign(self):
         expire = '2147483647'  # 19 Jan 2038 03:14:07
@@ -465,8 +470,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
-        self.assertEqual({'403.AccessDenied.invalid_query_auth': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_query_auth': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_signed_urls_no_access(self):
         expire = '2147483647'  # 19 Jan 2038 03:14:07
@@ -477,8 +483,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
-        self.assertEqual({'403.AccessDenied.invalid_query_auth': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_query_auth': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_signed_urls_v4(self):
         req = Request.blank(
@@ -525,8 +532,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                              'AuthorizationQueryParametersError')
             self.assertEqual(self._get_error_message(body), message)
             self.assertIn(extra, body)
-            self.assertEqual({'400.AuthorizationQueryParametersError': 1},
-                             self.s3api.logger.logger.get_increment_counts())
+            self.assertEqual(
+                {'400.AuthorizationQueryParametersError': 1},
+                self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         dt = self.get_v4_amz_date_header().split('T', 1)[0]
         test('test:tester/not-a-date/us-east-1/s3/aws4_request',
@@ -555,8 +563,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
-        self.assertEqual({'403.AccessDenied.invalid_date': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_date': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_signed_urls_v4_invalid_algorithm(self):
         req = Request.blank(
@@ -572,8 +581,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidArgument')
-        self.assertEqual({'400.InvalidArgument': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.InvalidArgument': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_signed_urls_v4_missing_signed_headers(self):
         req = Request.blank(
@@ -589,8 +599,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body),
                          'AuthorizationHeaderMalformed')
-        self.assertEqual({'400.AuthorizationHeaderMalformed': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.AuthorizationHeaderMalformed': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_signed_urls_v4_invalid_credentials(self):
         req = Request.blank('/bucket/object'
@@ -605,8 +616,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
-        self.assertEqual({'403.AccessDenied.invalid_credential': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_credential': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_signed_urls_v4_missing_signature(self):
         req = Request.blank(
@@ -621,8 +633,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
-        self.assertEqual({'403.AccessDenied.invalid_query_auth': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_query_auth': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_bucket_virtual_hosted_style(self):
         req = Request.blank('/',
@@ -719,8 +732,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidURI')
-        self.assertEqual({'400.InvalidURI': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.InvalidURI': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_object_create_bad_md5_unreadable(self):
         req = Request.blank('/bucket/object',
@@ -730,8 +744,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             headers={'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
-        self.assertEqual({'400.InvalidDigest': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.InvalidDigest': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_object_create_bad_md5_too_short(self):
         too_short_digest = md5(b'hey', usedforsecurity=False).digest()[:-1]
@@ -746,8 +761,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             headers={'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
-        self.assertEqual({'400.InvalidDigest': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.InvalidDigest': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_object_create_bad_md5_bad_padding(self):
         too_short_digest = md5(b'hey', usedforsecurity=False).digest()
@@ -762,8 +778,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             headers={'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
-        self.assertEqual({'400.InvalidDigest': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.InvalidDigest': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_object_create_bad_md5_too_long(self):
         too_long_digest = md5(
@@ -779,8 +796,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             headers={'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
-        self.assertEqual({'400.InvalidDigest': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.InvalidDigest': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_invalid_metadata_directive(self):
         req = Request.blank('/',
@@ -791,8 +809,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             headers={'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidArgument')
-        self.assertEqual({'400.InvalidArgument': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.InvalidArgument': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_invalid_storage_class(self):
         req = Request.blank('/',
@@ -802,8 +821,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             headers={'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidStorageClass')
-        self.assertEqual({'400.InvalidStorageClass': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.InvalidStorageClass': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_invalid_ssc(self):
         req = Request.blank('/',
@@ -813,8 +833,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidArgument')
-        self.assertEqual({'400.InvalidArgument': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.InvalidArgument': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def _test_unsupported_header(self, header, value=None):
         if value is None:
@@ -827,8 +848,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.s3api.logger.logger.clear()
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'NotImplemented')
-        self.assertEqual({'501.NotImplemented': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'501.NotImplemented': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_mfa(self):
         self._test_unsupported_header('x-amz-mfa')
@@ -888,8 +910,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             headers={'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'NotImplemented')
-        self.assertEqual({'501.NotImplemented': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'501.NotImplemented': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_notification(self):
         self._test_unsupported_resource('notification')
@@ -916,8 +939,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
-        self.assertEqual({},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         req = Request.blank('/bucket?tagging',
                             environ={'REQUEST_METHOD': 'PUT'},
@@ -926,8 +950,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.s3api.logger.logger.clear()
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'NotImplemented')
-        self.assertEqual({'501.NotImplemented': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'501.NotImplemented': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         req = Request.blank('/bucket?tagging',
                             environ={'REQUEST_METHOD': 'DELETE'},
@@ -936,8 +961,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.s3api.logger.logger.clear()
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'NotImplemented')
-        self.assertEqual({'501.NotImplemented': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'501.NotImplemented': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_restore(self):
         self._test_unsupported_resource('restore')
@@ -952,8 +978,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(elem.find('./Code').text, 'MethodNotAllowed')
         self.assertEqual(elem.find('./Method').text, 'POST')
         self.assertEqual(elem.find('./ResourceType').text, 'ACL')
-        self.assertEqual({'405.MethodNotAllowed': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'405.MethodNotAllowed': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     @mock.patch.object(registry, '_sensitive_headers', set())
     @mock.patch.object(registry, '_sensitive_params', set())
@@ -1086,8 +1113,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '403')
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
-        self.assertEqual({'403.AccessDenied.invalid_date': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_date': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_signature_v4_no_payload(self):
         environ = {
@@ -1107,8 +1135,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(
             self._get_error_message(body),
             'Missing required header for this request: x-amz-content-sha256')
-        self.assertEqual({'400.InvalidRequest': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.InvalidRequest': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_signature_v4_bad_authorization_string(self):
         def test(auth_str, error, msg, metric, extra=b''):
@@ -1126,8 +1155,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             self.assertEqual(self._get_error_code(body), error)
             self.assertEqual(self._get_error_message(body), msg)
             self.assertIn(extra, body)
-            self.assertEqual({metric: 1},
-                             self.s3api.logger.logger.get_increment_counts())
+            self.assertEqual(
+                {metric: 1},
+                self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         auth_str = ('AWS4-HMAC-SHA256 '
                     'SignedHeaders=host;x-amz-date,'
@@ -1389,8 +1419,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         # FIXME: should this failed as 400 or pass via query auth?
         # for now, 403 forbidden for safety
         self.assertEqual(status.split()[0], '403', body)
-        self.assertEqual({'403.AccessDenied.invalid_expires': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_expires': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         # But if we are missing Signature in query param
         req = Request.blank(
@@ -1404,8 +1435,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.s3api.logger.logger.clear()
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '403', body)
-        self.assertEqual({'403.AccessDenied.invalid_expires': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_expires': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_s3api_with_only_s3_token(self):
         self.swift = FakeSwift()
@@ -1517,9 +1549,10 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                 self.assertEqual(1, mock_req.call_count)
                 # it never even tries to contact keystone
                 self.assertEqual(0, mock_fetch.call_count)
+                statsd_client = self.s3api.logger.logger.statsd_client
                 self.assertEqual(
                     {'403.SignatureDoesNotMatch': 1},
-                    self.s3api.logger.logger.get_increment_counts())
+                    statsd_client.get_increment_counts())
 
     def test_s3api_with_only_s3_token_in_s3acl(self):
         self.swift = FakeSwift()
@@ -1571,30 +1604,35 @@ class TestS3ApiMiddleware(S3ApiTestCase):
 
         status, _, body = do_test(800)
         self.assertEqual('200 OK', status)
-        self.assertFalse(self.s3api.logger.logger.get_increment_counts())
+        self.assertFalse(
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         status, _, body = do_test(-800)
         self.assertEqual('200 OK', status)
-        self.assertFalse(self.s3api.logger.logger.get_increment_counts())
+        self.assertFalse(
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         status, _, body = do_test(1000)
         self.assertEqual('403 Forbidden', status)
         self.assertEqual(self._get_error_code(body), 'RequestTimeTooSkewed')
-        self.assertEqual({'403.RequestTimeTooSkewed': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.RequestTimeTooSkewed': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         status, _, body = do_test(-1000)
         self.assertEqual('403 Forbidden', status)
         self.assertEqual(self._get_error_code(body), 'RequestTimeTooSkewed')
-        self.assertEqual({'403.RequestTimeTooSkewed': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.RequestTimeTooSkewed': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         self.s3api.conf.allowable_clock_skew = 100
         status, _, body = do_test(800)
         self.assertEqual('403 Forbidden', status)
         self.assertEqual(self._get_error_code(body), 'RequestTimeTooSkewed')
-        self.assertEqual({'403.RequestTimeTooSkewed': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.RequestTimeTooSkewed': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
     def test_s3api_error_metric(self):
         class KaboomResponse(ErrorResponse):
@@ -1614,17 +1652,20 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                 self.call_s3api(req)
 
         do_test(ErrorResponse(status=403, msg='not good', reason='bad'))
-        self.assertEqual({'403.ErrorResponse.bad': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.ErrorResponse.bad': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         do_test(AccessDenied(msg='no entry', reason='invalid_date'))
-        self.assertEqual({'403.AccessDenied.invalid_date': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'403.AccessDenied.invalid_date': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
         # check whitespace replaced with underscore
         do_test(KaboomResponse(status=400, msg='boom', reason='boom boom'))
-        self.assertEqual({'400.ka_boom.boom_boom': 1},
-                         self.s3api.logger.logger.get_increment_counts())
+        self.assertEqual(
+            {'400.ka_boom.boom_boom': 1},
+            self.s3api.logger.logger.statsd_client.get_increment_counts())
 
 
 if __name__ == '__main__':

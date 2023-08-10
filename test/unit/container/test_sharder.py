@@ -557,7 +557,7 @@ class TestSharder(BaseTestSharder):
                     'failure': 2,
                     'completed': 1}
         self._assert_stats(expected, sharder, 'visited')
-        counts = sharder.logger.get_stats_counts()
+        counts = sharder.logger.statsd_client.get_stats_counts()
         self.assertEqual(2, counts.get('visited_success'))
         self.assertEqual(1, counts.get('visited_failure'))
         self.assertIsNone(counts.get('visited_completed'))
@@ -572,7 +572,7 @@ class TestSharder(BaseTestSharder):
         self._assert_stats({'found': 4}, sharder, 'scanned')
         self._assert_stats({'placed': 456}, sharder, 'misplaced')
         self.assertEqual({'misplaced_placed': 456},
-                         sharder.logger.get_stats_counts())
+                         sharder.logger.statsd_client.get_stats_counts())
 
     def test_run_forever(self):
         self.maxDiff = None
@@ -1578,9 +1578,11 @@ class TestSharder(BaseTestSharder):
         self.assertIsInstance(stats['max_time'], float)
         self.assertLessEqual(stats['min_time'], stats['max_time'])
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('cleaved_db_created'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'cleaved_db_created'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('cleaved_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'cleaved_db_exists'))
         self.assertEqual(SHARDING, broker.get_db_state())
         sharder._replicate_object.assert_called_once_with(
             0, expected_shard_dbs[0], 0)
@@ -1643,9 +1645,11 @@ class TestSharder(BaseTestSharder):
                     'db_created': 1, 'db_exists': 0}
         self._assert_stats(expected, sharder, 'cleaved')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('cleaved_db_created'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'cleaved_db_created'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('cleaved_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'cleaved_db_exists'))
 
         # cleaving state is unchanged
         updated_shard_ranges = broker.get_shard_ranges()
@@ -1682,9 +1686,11 @@ class TestSharder(BaseTestSharder):
         self.assertIsInstance(stats['max_time'], float)
         self.assertLessEqual(stats['min_time'], stats['max_time'])
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('cleaved_db_created'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'cleaved_db_created'))
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('cleaved_db_exists'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'cleaved_db_exists'))
 
         self.assertEqual(SHARDING, broker.get_db_state())
         sharder._replicate_object.assert_has_calls(
@@ -1748,9 +1754,11 @@ class TestSharder(BaseTestSharder):
         self.assertIsInstance(stats['max_time'], float)
         self.assertLessEqual(stats['min_time'], stats['max_time'])
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('cleaved_db_created'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'cleaved_db_created'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('cleaved_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'cleaved_db_exists'))
 
         self.assertEqual(SHARDING, broker.get_db_state())
         sharder._replicate_object.assert_called_once_with(
@@ -1821,9 +1829,11 @@ class TestSharder(BaseTestSharder):
         self.assertIsInstance(stats['max_time'], float)
         self.assertLessEqual(stats['min_time'], stats['max_time'])
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('cleaved_db_created'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'cleaved_db_created'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('cleaved_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'cleaved_db_exists'))
 
         sharder._replicate_object.assert_called_once_with(
             0, expected_shard_dbs[4], 0)
@@ -2475,19 +2485,22 @@ class TestSharder(BaseTestSharder):
         self.assertEqual('', context.cursor)
         self.assertEqual(10, context.cleave_to_row)
         self.assertEqual(12, context.max_row)  # note that max row increased
-        self.assertTrue(self.logger.log_dict['timing_since'])
-        self.assertEqual('sharder.sharding.move_misplaced',
-                         self.logger.log_dict['timing_since'][-3][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-3][0][1], 0)
-        self.assertEqual('sharder.sharding.set_state',
-                         self.logger.log_dict['timing_since'][-2][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-2][0][1], 0)
-        self.assertEqual('sharder.sharding.cleave',
-                         self.logger.log_dict['timing_since'][-1][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-1][0][1], 0)
-        for call in self.logger.log_dict['timing_since']:
-            self.assertNotIsInstance(call[0][1], Timestamp)
-            self.assertIsInstance(call[0][1], float)
+        self.assertTrue(self.logger.statsd_client.calls['timing_since'])
+        self.assertEqual(
+            'sharder.sharding.move_misplaced',
+            self.logger.statsd_client.calls['timing_since'][-3][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-3][0][1], 0)
+        self.assertEqual(
+            'sharder.sharding.set_state',
+            self.logger.statsd_client.calls['timing_since'][-2][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-2][0][1], 0)
+        self.assertEqual(
+            'sharder.sharding.cleave',
+            self.logger.statsd_client.calls['timing_since'][-1][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-1][0][1], 0)
         lines = sharder.logger.get_lines_for_level('info')
         self.assertEqual(
             ["Kick off container cleaving, own shard range in state "
@@ -2533,22 +2546,27 @@ class TestSharder(BaseTestSharder):
             'Completed cleaving, DB set to sharded state, path: a/c, db: %s'
             % broker.db_file, lines[1:])
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
-        self.assertTrue(self.logger.log_dict['timing_since'])
-        self.assertEqual('sharder.sharding.move_misplaced',
-                         self.logger.log_dict['timing_since'][-4][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-4][0][1], 0)
-        self.assertEqual('sharder.sharding.cleave',
-                         self.logger.log_dict['timing_since'][-3][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-3][0][1], 0)
-        self.assertEqual('sharder.sharding.completed',
-                         self.logger.log_dict['timing_since'][-2][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-2][0][1], 0)
-        self.assertEqual('sharder.sharding.send_sr',
-                         self.logger.log_dict['timing_since'][-1][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-1][0][1], 0)
-        for call in self.logger.log_dict['timing_since']:
-            self.assertNotIsInstance(call[0][1], Timestamp)
-            self.assertIsInstance(call[0][1], float)
+        self.assertTrue(self.logger.statsd_client.calls['timing_since'])
+        self.assertEqual(
+            'sharder.sharding.move_misplaced',
+            self.logger.statsd_client.calls['timing_since'][-4][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-4][0][1], 0)
+        self.assertEqual(
+            'sharder.sharding.cleave',
+            self.logger.statsd_client.calls['timing_since'][-3][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-3][0][1], 0)
+        self.assertEqual(
+            'sharder.sharding.completed',
+            self.logger.statsd_client.calls['timing_since'][-2][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-2][0][1], 0)
+        self.assertEqual(
+            'sharder.sharding.send_sr',
+            self.logger.statsd_client.calls['timing_since'][-1][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-1][0][1], 0)
 
     def test_cleave_timing_metrics(self):
         broker = self._make_broker()
@@ -2587,19 +2605,27 @@ class TestSharder(BaseTestSharder):
             'Completed cleaving, DB set to sharded state, path: a/c, db: %s'
             % broker.db_file, lines[1:])
 
-        self.assertTrue(self.logger.log_dict['timing_since'])
-        self.assertEqual('sharder.sharding.move_misplaced',
-                         self.logger.log_dict['timing_since'][-4][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-4][0][1], 0)
-        self.assertEqual('sharder.sharding.cleave',
-                         self.logger.log_dict['timing_since'][-3][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-3][0][1], 0)
-        self.assertEqual('sharder.sharding.completed',
-                         self.logger.log_dict['timing_since'][-2][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-2][0][1], 0)
-        self.assertEqual('sharder.sharding.send_sr',
-                         self.logger.log_dict['timing_since'][-1][0][0])
-        self.assertGreater(self.logger.log_dict['timing_since'][-1][0][1], 0)
+        self.assertTrue(self.logger.statsd_client.calls['timing_since'])
+        self.assertEqual(
+            'sharder.sharding.move_misplaced',
+            self.logger.statsd_client.calls['timing_since'][-4][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-4][0][1], 0)
+        self.assertEqual(
+            'sharder.sharding.cleave',
+            self.logger.statsd_client.calls['timing_since'][-3][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-3][0][1], 0)
+        self.assertEqual(
+            'sharder.sharding.completed',
+            self.logger.statsd_client.calls['timing_since'][-2][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-2][0][1], 0)
+        self.assertEqual(
+            'sharder.sharding.send_sr',
+            self.logger.statsd_client.calls['timing_since'][-1][0][0])
+        self.assertGreater(
+            self.logger.statsd_client.calls['timing_since'][-1][0][1], 0)
 
         # check shard ranges were updated to ACTIVE
         self.assertEqual([ShardRange.ACTIVE] * 2,
@@ -3831,15 +3857,20 @@ class TestSharder(BaseTestSharder):
                           'db_created': 0, 'db_exists': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_found'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_found'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_placed'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_placed'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_unplaced'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_created'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_created'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_exists'))
 
         # sharding - no misplaced objects
         self.assertTrue(broker.set_sharding_state())
@@ -3848,15 +3879,20 @@ class TestSharder(BaseTestSharder):
         sharder._replicate_object.assert_not_called()
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_found'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_found'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_placed'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_placed'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_unplaced'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_created'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_created'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_exists'))
 
         # pretend we cleaved up to end of second shard range
         context = CleavingContext.load(broker)
@@ -3867,15 +3903,20 @@ class TestSharder(BaseTestSharder):
         sharder._replicate_object.assert_not_called()
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_found'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_found'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_placed'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_placed'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_unplaced'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_created'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_created'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_exists'))
 
         # sharding - misplaced objects
         for obj in objects:
@@ -3888,15 +3929,20 @@ class TestSharder(BaseTestSharder):
         sharder._replicate_object.assert_not_called()
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_found'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_found'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_placed'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_placed'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_unplaced'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_created'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_created'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_exists'))
         self.assertFalse(os.path.exists(expected_shard_dbs[0]))
         self.assertFalse(os.path.exists(expected_shard_dbs[1]))
         self.assertFalse(os.path.exists(expected_shard_dbs[2]))
@@ -3916,13 +3962,17 @@ class TestSharder(BaseTestSharder):
                           'db_created': 1, 'db_exists': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         self.assertEqual(
-            2, sharder.logger.get_stats_counts()['misplaced_placed'])
+            2, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_placed'])
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_db_created'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_db_created'])
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_exists'))
 
         # check misplaced objects were moved
         self._check_objects(objects[:2], expected_shard_dbs[1])
@@ -3959,13 +4009,17 @@ class TestSharder(BaseTestSharder):
         )
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         self.assertEqual(
-            4, sharder.logger.get_stats_counts()['misplaced_placed'])
+            4, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_placed'])
         self.assertEqual(
-            3, sharder.logger.get_stats_counts()['misplaced_db_created'])
+            3, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_db_created'])
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_exists'))
 
         # check misplaced objects were moved
         self._check_objects(new_objects, expected_shard_dbs[0])
@@ -3986,13 +4040,17 @@ class TestSharder(BaseTestSharder):
                           'db_created': 0, 'db_exists': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_found'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_found'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_placed'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_placed'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_created'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_created'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_db_exists'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_db_exists'))
 
         # and then more misplaced updates arrive
         newer_objects = [
@@ -4021,13 +4079,17 @@ class TestSharder(BaseTestSharder):
                           'db_created': 1, 'db_exists': 1}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         self.assertEqual(
-            3, sharder.logger.get_stats_counts()['misplaced_placed'])
+            3, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_placed'])
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_db_created'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_db_created'])
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_db_exists'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_db_exists'])
 
         # check new misplaced objects were moved
         self._check_objects(newer_objects[:1] + new_objects,
@@ -4221,7 +4283,8 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 4, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         # check misplaced objects were moved
         self._check_objects(objects[:2], expected_dbs[1])
         self._check_objects(objects[2:3], expected_dbs[2])
@@ -4254,7 +4317,8 @@ class TestSharder(BaseTestSharder):
                           'placed': 4, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         # check misplaced objects were moved to shard dbs
         self._check_objects(objects[:2], expected_dbs[1])
         self._check_objects(objects[2:3], expected_dbs[2])
@@ -4287,7 +4351,8 @@ class TestSharder(BaseTestSharder):
                           'placed': 4, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         # check misplaced objects were moved to shard dbs
         self._check_objects(objects[:2], expected_dbs[1])
         self._check_objects(objects[2:3], expected_dbs[2])
@@ -4320,7 +4385,8 @@ class TestSharder(BaseTestSharder):
                           'placed': 4, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         # check misplaced objects were moved to shard dbs
         self._check_objects(objects[:2], expected_dbs[1])
         self._check_objects(objects[2:3], expected_dbs[2])
@@ -4374,15 +4440,20 @@ class TestSharder(BaseTestSharder):
                           'found': 0, 'placed': 0, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('misplaced_success'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_success'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_failure'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_failure'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_found'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_found'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_placed'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_placed'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_unplaced'))
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
 
         # now put objects
@@ -4410,15 +4481,20 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 2, 'unplaced': 2}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_success'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_success'))
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('misplaced_failure'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_failure'))
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         self.assertEqual(
-            2, sharder.logger.get_stats_counts().get('misplaced_placed'))
+            2, sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_placed'))
         self.assertEqual(
-            2, sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+            2, sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_unplaced'))
         # some misplaced objects could not be moved...
         warning_lines = sharder.logger.get_lines_for_level('warning')
         self.assertIn(
@@ -4454,15 +4530,20 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 2, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('misplaced_success'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_success'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_failure'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_failure'))
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         self.assertEqual(
-            2, sharder.logger.get_stats_counts().get('misplaced_placed'))
+            2, sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_placed'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_unplaced'))
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
 
         # check misplaced objects were moved
@@ -4486,16 +4567,21 @@ class TestSharder(BaseTestSharder):
                           'found': 0, 'placed': 0, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('misplaced_success'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_success'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_failure'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_failure'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_found'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_found'))
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_placed'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_placed'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_unplaced'))
 
         # and then more misplaced updates arrive
         new_objects = [
@@ -4529,15 +4615,20 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 2, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts().get('misplaced_success'))
+            1, sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_success'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_failure'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_failure'))
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         self.assertEqual(
-            2, sharder.logger.get_stats_counts().get('misplaced_placed'))
+            2, sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_placed'))
         self.assertFalse(
-            sharder.logger.get_stats_counts().get('misplaced_unplaced'))
+            sharder.logger.statsd_client.get_stats_counts().get(
+                'misplaced_unplaced'))
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
 
         # check new misplaced objects were moved
@@ -4624,7 +4715,8 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 1, 'unplaced': 2}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         warning_lines = sharder.logger.get_lines_for_level('warning')
         self.assertIn(
             'Failed to find destination for at least 2 misplaced objects',
@@ -4659,7 +4751,8 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 2, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
 
         # check misplaced objects were moved
@@ -4710,7 +4803,8 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 5, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
         self.assertFalse(sharder.logger.get_lines_for_level('warning'))
 
         # check *all* the misplaced objects were moved
@@ -4766,7 +4860,8 @@ class TestSharder(BaseTestSharder):
                           'found': 1, 'placed': 2, 'unplaced': 0}
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
 
         # check new misplaced objects were moved
         self._check_objects(objects[:1], expected_shard_dbs[0])
@@ -4793,7 +4888,8 @@ class TestSharder(BaseTestSharder):
         )
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
 
         # check older misplaced objects were not merged to shard brokers
         self._check_objects(objects[:1], expected_shard_dbs[0])
@@ -4832,7 +4928,8 @@ class TestSharder(BaseTestSharder):
         )
         self._assert_stats(expected_stats, sharder, 'misplaced')
         self.assertEqual(
-            1, sharder.logger.get_stats_counts()['misplaced_found'])
+            1, sharder.logger.statsd_client.get_stats_counts()[
+                'misplaced_found'])
 
         # check only the newer misplaced object was moved
         self._check_objects([newer_object], expected_shard_dbs[0])

@@ -370,6 +370,12 @@ def loadapp(conf_file, global_conf=None, allow_modify_pipeline=True):
             if request_logging_app is ultimate_app and \
                     app.__class__.__name__ == 'ProxyLoggingMiddleware':
                 request_logging_app = filter_app(ultimate_app)
+                # Set some separate-pipeline attrs
+                request_logging_app._pipeline = [
+                    request_logging_app, ultimate_app]
+                request_logging_app._pipeline_request_logging_app = \
+                    request_logging_app
+                request_logging_app._pipeline_final_app = ultimate_app
 
         for app in pipeline:
             app._pipeline = pipeline
@@ -379,10 +385,6 @@ def loadapp(conf_file, global_conf=None, allow_modify_pipeline=True):
             # For getting proxy-server options like *_existence_skip_cache_pct
             app._pipeline_final_app = ultimate_app
 
-        # Do it for the logging app, too
-        request_logging_app._pipeline = pipeline
-        request_logging_app._pipeline_request_logging_app = request_logging_app
-        request_logging_app._pipeline_final_app = ultimate_app
         return pipeline[0]
     return ctx.create()
 
