@@ -3614,7 +3614,8 @@ class TestReplicatedObjectController(
 
     @unpatch_policies
     def test_PUT_no_etag_fallocate(self):
-        with mock.patch('swift.obj.diskfile.fallocate') as mock_fallocate:
+        with mock.patch('swift.obj.diskfile.fallocate_with_reserve') as \
+                mock_fallocate:
             prolis = _test_sockets[0]
             sock = connect_tcp(('localhost', prolis.getsockname()[1]))
             fd = sock.makefile('rwb')
@@ -3691,7 +3692,8 @@ class TestReplicatedObjectController(
         prolis = _test_sockets[0]
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile('rwb')
-        with mock.patch('swift.obj.diskfile.fallocate') as mock_fallocate:
+        with mock.patch('swift.obj.diskfile.fallocate_with_reserve') as \
+                mock_fallocate:
             fd.write(b'PUT /v1/a/c/o.chunked HTTP/1.1\r\n'
                      b'Host: localhost\r\n'
                      b'Connection: keep-alive\r\n'
