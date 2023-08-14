@@ -50,6 +50,7 @@ from test.unit import (mock as unit_mock, temptree, mock_check_drive,
                        encode_frag_archive_bodies, skip_if_no_xattrs)
 from swift.obj import diskfile
 from swift.common import utils
+from swift.common.utils import libc
 from swift.common.utils import hash_path, mkdirs, Timestamp, \
     encode_timestamps, O_TMPFILE, md5 as _md5
 from swift.common import ring
@@ -4931,37 +4932,29 @@ class DiskFileMixin(BaseDiskFileTestMixin):
     def test_create_prealloc(self):
         df = self.df_mgr.get_diskfile(self.existing_device, '0', 'abc', '123',
                                       'xyz', policy=POLICIES.legacy)
-        with mock.patch("swift.obj.diskfile.fallocate") as fa:
+        with mock.patch("swift.obj.diskfile.fallocate_with_reserve") as fa:
             with df.create(size=200) as writer:
                 used_fd = writer._fd
-        fa.assert_called_with(used_fd, 200)
+        fa.assert_called_with(used_fd, 1, True, 200)
 
     def test_create_prealloc_oserror(self):
         df = self.df_mgr.get_diskfile(self.existing_device, '0', 'abc', '123',
                                       'xyz', policy=POLICIES.legacy)
         for e in (errno.ENOSPC, errno.EDQUOT):
-            with mock.patch("swift.obj.diskfile.fallocate",
+            with mock.patch("swift.obj.diskfile.fallocate_with_reserve",
                             mock.MagicMock(side_effect=OSError(
                                 e, os.strerror(e)))):
-                try:
+                with self.assertRaises(DiskFileNoSpace):
                     with df.create(size=200):
                         pass
-                except DiskFileNoSpace:
-                    pass
-                else:
-                    self.fail("Expected exception DiskFileNoSpace")
 
         # Other OSErrors must not be raised as DiskFileNoSpace
-        with mock.patch("swift.obj.diskfile.fallocate",
+        with mock.patch("swift.obj.diskfile.fallocate_with_reserve",
                         mock.MagicMock(side_effect=OSError(
                             errno.EACCES, os.strerror(errno.EACCES)))):
-            try:
+            with self.assertRaises(OSError):
                 with df.create(size=200):
                     pass
-            except OSError:
-                pass
-            else:
-                self.fail("Expected exception OSError")
 
     def test_create_mkstemp_no_space(self):
         df = self.df_mgr.get_diskfile(self.existing_device, '0', 'abc', '123',
@@ -4988,7 +4981,7 @@ class DiskFileMixin(BaseDiskFileTestMixin):
         # This is a horrible hack so you can run this test in isolation.
         # Some of the ctypes machinery calls os.close(), and that runs afoul
         # of our mock.
-        with mock.patch.object(utils, '_sys_fallocate', None):
+        with mock.patch.object(libc, '_sys_fallocate', None):
             utils.disable_fallocate()
 
             df = self.df_mgr.get_diskfile(self.existing_device, '0', 'abc',
@@ -6001,15 +5994,12 @@ class DiskFileMixin(BaseDiskFileTestMixin):
         _m_fallocate = mock.MagicMock(side_effect=OSError(errno.ENOSPC,
                                       os.strerror(errno.ENOSPC)))
         _m_unlink = mock.Mock()
-        with mock.patch("swift.obj.diskfile.fallocate", _m_fallocate):
+        with mock.patch("swift.obj.diskfile.fallocate_with_reserve",
+                        _m_fallocate):
             with mock.patch("os.unlink", _m_unlink):
-                try:
+                with self.assertRaises(DiskFileNoSpace):
                     with df.create(size=100):
                         pass
-                except DiskFileNoSpace:
-                    pass
-                else:
-                    self.fail("Expected exception DiskFileNoSpace")
         self.assertTrue(_m_fallocate.called)
         self.assertTrue(_m_unlink.called)
         self.assertNotIn('error', self.logger.all_log_lines())
@@ -6051,15 +6041,12 @@ class DiskFileMixin(BaseDiskFileTestMixin):
                                       os.strerror(errno.ENOSPC)))
         _m_unlink = mock.MagicMock(side_effect=OSError(errno.ENOENT,
                                    os.strerror(errno.ENOENT)))
-        with mock.patch("swift.obj.diskfile.fallocate", _m_fallocate):
+        with mock.patch("swift.obj.diskfile.fallocate_with_reserve",
+                        _m_fallocate):
             with mock.patch("os.unlink", _m_unlink):
-                try:
+                with self.assertRaises(DiskFileNoSpace):
                     with df.create(size=100):
                         pass
-                except DiskFileNoSpace:
-                    pass
-                else:
-                    self.fail("Expected exception DiskFileNoSpace")
         self.assertTrue(_m_fallocate.called)
         self.assertTrue(_m_unlink.called)
         error_lines = self.logger.get_lines_for_level('error')
