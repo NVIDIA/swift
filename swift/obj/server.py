@@ -34,7 +34,7 @@ from swift.common.utils import public, get_logger, \
     get_expirer_container, parse_mime_headers, \
     iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads, \
     config_auto_int_value, split_path, get_redirect_data, \
-    normalize_timestamp, md5
+    normalize_timestamp, md5, config_fallocate_value, fs_has_free_space
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_object_creation, \
     valid_timestamp, check_utf8, AUTO_CREATE_ACCOUNT_PREFIX
@@ -206,6 +206,9 @@ class ObjectController(BaseStorageServer):
         if six.PY2:
             socket._fileobject.default_bufsize = self.network_chunk_size
         # TODO: find a way to enable similar functionality in py3
+
+        self.fallocate_reserve, self.fallocate_is_percent = \
+            config_fallocate_value(conf.get('fallocate_reserve', '1%'))
 
         # Provide further setup specific to an object server implementation.
         self.setup(conf)
@@ -1041,6 +1044,13 @@ class ObjectController(BaseStorageServer):
             request, device, partition, account, container, obj, policy)
         writer = disk_file.writer(size=fsize)
         try:
+            if fsize is None and self.fallocate_reserve and \
+                    not fs_has_free_space(
+                        self._diskfile_router[policy].get_dev_path(device),
+                        self.fallocate_reserve, self.fallocate_is_percent):
+                # Note: if fsize is *not* None, this gets checked when
+                # we open the diskfile in _stage_obj_data
+                raise DiskFileNoSpace
             obj_input = request.environ['wsgi.input']
             obj_input, multi_stage_mime_state = \
                 self._do_multi_stage_mime_continue_headers(request, obj_input)
