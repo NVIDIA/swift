@@ -33,8 +33,9 @@ import sqlite3
 
 from swift.common.constraints import MAX_META_COUNT, MAX_META_OVERALL_SIZE, \
     check_utf8
+from swift.common import utils
 from swift.common.utils import Timestamp, renamer, \
-    mkdirs, lock_parent_directory, fallocate, md5
+    mkdirs, lock_parent_directory, fallocate_with_reserve, md5
 from swift.common.exceptions import LockTimeout
 from swift.common.swob import HTTPBadRequest
 
@@ -325,7 +326,8 @@ class DatabaseBroker(object):
 
     def __init__(self, db_file, timeout=BROKER_TIMEOUT, logger=None,
                  account=None, container=None, pending_timeout=None,
-                 stale_reads_ok=False, skip_commits=False):
+                 stale_reads_ok=False, skip_commits=False,
+                 fallocate_reserve=None, fallocate_is_percent=None):
         """Encapsulates working with a database.
 
         :param db_file: path to a database file.
@@ -342,6 +344,13 @@ class DatabaseBroker(object):
             commit records from the pending file to the database;
             :meth:`~swift.common.db.DatabaseBroker.put_record` should not
             called on brokers with skip_commits True.
+        :param fallocate_reserve: minimum bytes or percentage of free space
+            to be kept in reserve. Optional; if omitted, defaults to
+            utils.FALLOCATE_RESERVE
+        :param fallocate_is_percent: if True, then fallocate_reserve is
+            treated as a percentage (0-100) of the filesystem's capacity;
+            if False, fallocate_reserve is a number of free bytes. Optional;
+            if omitted, defaults to utils.FALLOCATE_IS_PERCENT
         """
         self.conn = None
         self._db_file = db_file
@@ -355,6 +364,10 @@ class DatabaseBroker(object):
         self.container = container
         self._db_version = -1
         self.skip_commits = skip_commits
+        self.fallocate_reserve = fallocate_reserve \
+            if fallocate_reserve is not None else utils.FALLOCATE_RESERVE
+        self.fallocate_is_percent = fallocate_is_percent \
+            if fallocate_is_percent is not None else utils.FALLOCATE_IS_PERCENT
 
     def __str__(self):
         """
@@ -948,7 +961,12 @@ class DatabaseBroker(object):
                 break
         if allocated_size < prealloc_size:
             with open(self.db_file, 'rb+') as fp:
-                fallocate(fp.fileno(), int(prealloc_size))
+                fallocate_with_reserve(
+                    fp.fileno(),
+                    self.fallocate_reserve,
+                    self.fallocate_is_percent,
+                    int(prealloc_size),
+                )
 
     def get_raw_metadata(self):
         with self.get() as conn:
