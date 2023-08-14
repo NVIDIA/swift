@@ -7888,10 +7888,11 @@ class TestObjectController(BaseTestCase):
                     return b'VERIFY'
                 return b''
 
-        def fake_fallocate(fd, size):
+        def fake_fallocate(fd, fallocate_reserve, fallocate_is_percent, size):
             raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
 
-        with mock.patch.object(diskfile, 'fallocate', fake_fallocate):
+        with mock.patch.object(diskfile, 'fallocate_with_reserve',
+                               fake_fallocate):
             timestamp = normalize_timestamp(time())
             body_reader = IgnoredBody()
             req = Request.blank(
