@@ -17,6 +17,7 @@
 
 import ctypes
 import ctypes.util
+import errno
 import fcntl
 import logging
 import os
@@ -25,6 +26,7 @@ import socket
 
 
 # These are lazily pulled from libc elsewhere
+_sys_fallocate = None
 _posix_fadvise = None
 _libc_socket = None
 _libc_bind = None
@@ -33,6 +35,10 @@ _libc_accept = None
 _libc_setpriority = None
 # see man -s 2 syscall
 _posix_syscall = None
+
+# from /usr/include/linux/falloc.h
+FALLOC_FL_KEEP_SIZE = 1
+FALLOC_FL_PUNCH_HOLE = 2
 
 # from /usr/src/linux-headers-*/include/uapi/linux/resource.h
 PRIO_PROCESS = 0
@@ -176,6 +182,92 @@ class _LibcWrapper(object):
         else:
             raise NotImplementedError(
                 "No function %r found in libc" % self._func_name)
+
+
+_fallocate_warned_about_missing = False
+_sys_fallocate = _LibcWrapper('fallocate')
+_sys_posix_fallocate = _LibcWrapper('posix_fallocate')
+
+
+def fallocate(fd, size, offset=0):
+    """
+    Pre-allocate disk space for a file.
+
+    If no suitable C function is available in libc, this function is a no-op.
+
+    :param fd: file descriptor
+    :param size: size to allocate (in bytes)
+    """
+    if size < 0:
+        size = 0  # Done historically; not really sure why
+    if size >= (1 << 63):
+        raise ValueError('size must be less than 2 ** 63')
+    if offset < 0:
+        raise ValueError('offset must be non-negative')
+    if offset >= (1 << 63):
+        raise ValueError('offset must be less than 2 ** 63')
+
+    if _sys_fallocate.available:
+        # Parameters are (fd, mode, offset, length).
+        #
+        # mode=FALLOC_FL_KEEP_SIZE pre-allocates invisibly (without
+        # affecting the reported file size).
+        ret = _sys_fallocate(
+            fd, FALLOC_FL_KEEP_SIZE, ctypes.c_uint64(offset),
+            ctypes.c_uint64(size))
+        err = ctypes.get_errno()
+    elif _sys_posix_fallocate.available:
+        # Parameters are (fd, offset, length).
+        ret = _sys_posix_fallocate(fd, ctypes.c_uint64(offset),
+                                   ctypes.c_uint64(size))
+        err = ctypes.get_errno()
+    else:
+        # No suitable fallocate-like function is in our libc. Warn about it,
+        # but just once per process, and then do nothing.
+        global _fallocate_warned_about_missing
+        if not _fallocate_warned_about_missing:
+            logging.warning("Unable to locate fallocate, posix_fallocate in "
+                            "libc.  Leaving as a no-op.")
+            _fallocate_warned_about_missing = True
+        return
+
+    if ret and err not in (0, errno.ENOSYS, errno.EOPNOTSUPP,
+                           errno.EINVAL):
+        raise OSError(err, 'Unable to fallocate(%s)' % size)
+
+
+def punch_hole(fd, offset, length):
+    """
+    De-allocate disk space in the middle of a file.
+
+    :param fd: file descriptor
+    :param offset: index of first byte to de-allocate
+    :param length: number of bytes to de-allocate
+    """
+    if offset < 0:
+        raise ValueError('offset must be non-negative')
+    if offset >= (1 << 63):
+        raise ValueError('offset must be less than 2 ** 63')
+    if length <= 0:
+        raise ValueError('length must be positive')
+    if length >= (1 << 63):
+        raise ValueError('length must be less than 2 ** 63')
+
+    if _sys_fallocate.available:
+        # Parameters are (fd, mode, offset, length).
+        ret = _sys_fallocate(
+            fd,
+            FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+            ctypes.c_uint64(offset),
+            ctypes.c_uint64(length))
+        err = ctypes.get_errno()
+        if ret and err:
+            mode_str = "FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE"
+            raise OSError(err, "Unable to fallocate(%d, %s, %d, %d)" % (
+                fd, mode_str, offset, length))
+    else:
+        raise OSError(errno.ENOTSUP,
+                      'No suitable C function found for hole punching')
 
 
 def drop_buffer_cache(fd, offset, length):
