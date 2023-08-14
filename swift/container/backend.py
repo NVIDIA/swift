@@ -385,12 +385,15 @@ class ContainerBroker(DatabaseBroker):
     def __init__(self, db_file, timeout=BROKER_TIMEOUT, logger=None,
                  account=None, container=None, pending_timeout=None,
                  stale_reads_ok=False, skip_commits=False,
-                 force_db_file=False):
+                 force_db_file=False, fallocate_reserve=None,
+                 fallocate_is_percent=None):
         self._init_db_file = db_file
         base_db_file = make_db_file_path(db_file, None)
         super(ContainerBroker, self).__init__(
             base_db_file, timeout, logger, account, container, pending_timeout,
-            stale_reads_ok, skip_commits=skip_commits)
+            stale_reads_ok, skip_commits=skip_commits,
+            fallocate_reserve=fallocate_reserve,
+            fallocate_is_percent=fallocate_is_percent)
         # the root account and container are populated on demand
         self._root_account = self._root_container = None
         self._force_db_file = force_db_file
