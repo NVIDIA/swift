@@ -100,8 +100,13 @@ class AccountController(BaseStorageServer):
         hsh = hash_path(account)
         db_dir = storage_directory(DATADIR, part, hsh)
         db_path = os.path.join(self.root, drive, db_dir, hsh + '.db')
-        kwargs.setdefault('account', account)
-        kwargs.setdefault('logger', self.logger)
+        for key, value in (
+            ('account', account),
+            ('logger', self.logger),
+            ('fallocate_reserve', self.fallocate_reserve),
+            ('fallocate_is_percent', self.fallocate_is_percent),
+        ):
+            kwargs.setdefault(key, value)
         return AccountBroker(db_path, **kwargs)
 
     def _deleted_response(self, broker, req, resp, body=''):
