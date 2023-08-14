@@ -697,10 +697,10 @@ class TestDatabaseBroker(TestDbBase):
     def test_disk_preallocate(self):
         test_size = [-1]
 
-        def fallocate_stub(fd, size):
+        def fallocate_stub(fd, _reserve, _is_percent, size):
             test_size[0] = size
 
-        with patch('swift.common.db.fallocate', fallocate_stub):
+        with patch('swift.common.db.fallocate_with_reserve', fallocate_stub):
             db_file = os.path.join(self.testdir, 'pre.db')
             # Write 1 byte and hope that the fs will allocate less than 1 MB.
             f = open(db_file, "w")
