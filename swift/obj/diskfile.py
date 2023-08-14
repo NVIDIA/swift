@@ -59,8 +59,8 @@ from pyeclib.ec_iface import ECDriverError, ECInvalidFragmentMetadata, \
 from swift.common.constraints import check_drive
 from swift.common.request_helpers import is_sys_meta
 from swift.common.utils import mkdirs, Timestamp, \
-    storage_directory, hash_path, renamer, fallocate, fsync, fdatasync, \
-    fsync_dir, drop_buffer_cache, lock_path, write_pickle, \
+    storage_directory, hash_path, renamer, fallocate_with_reserve, fsync, \
+    fdatasync, fsync_dir, drop_buffer_cache, lock_path, write_pickle, \
     config_true_value, listdir, split_path, remove_file, \
     get_md5_socket, F_SETPIPE_SZ, decode_timestamps, encode_timestamps, \
     MD5_OF_EMPTY_STRING, link_fd_to_path, \
@@ -1870,7 +1870,9 @@ class BaseDiskFileWriter(object):
             pass
         elif self._size:
             try:
-                fallocate(self._fd, self._size)
+                fallocate_with_reserve(
+                    self._fd, self.manager.fallocate_reserve,
+                    self.manager.fallocate_is_percent, self._size)
             except OSError as err:
                 if err.errno in (errno.ENOSPC, errno.EDQUOT):
                     raise DiskFileNoSpace()
