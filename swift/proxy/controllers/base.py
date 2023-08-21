@@ -2011,7 +2011,7 @@ class Controller(object):
         :returns: a swob.Response object
         """
         nodes = GreenthreadSafeIterator(
-            node_iterator or self.app.iter_nodes(ring, part, self.logger, req)
+            node_iterator or NodeIter(self.app, ring, part, self.logger, req)
         )
         node_number = node_count or len(ring.get_part_nodes(part))
         pile = GreenAsyncPile(node_number)
@@ -2429,7 +2429,7 @@ class Controller(object):
         params.pop('limit', None)
         params['format'] = 'json'
         if includes:
-            params['includes'] = includes
+            params['includes'] = str_to_wsgi(includes)
         if states:
             params['states'] = states
         headers = {'X-Backend-Record-Type': 'shard'}
