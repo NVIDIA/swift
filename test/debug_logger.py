@@ -85,7 +85,8 @@ class FakeStatsdClient(utils.StatsdClient):
         counts = defaultdict(int)
         for metric in self.get_increments():
             counts[metric] += 1
-        return counts
+        # convert to normal dict for better failure messages
+        return dict(counts)
 
     def get_update_stats(self):
         return [call[0][:2] for call in self.calls['update_stats']]
@@ -94,7 +95,8 @@ class FakeStatsdClient(utils.StatsdClient):
         counts = defaultdict(int)
         for metric, step in self.get_update_stats():
             counts[metric] += step
-        return counts
+        # convert to normal dict for better failure messages
+        return dict(counts)
 
 
 class CaptureLog(object):
@@ -150,6 +152,9 @@ class FakeLogger(logging.Logger, CaptureLog):
         self.statsd_client = FakeStatsdClient("host", 8125)
         self.thread_locals = None
         self.parent = None
+        # ensure the NOTICE level has been named, in case it has not already
+        # been set
+        logging.addLevelName(NOTICE, 'NOTICE')
 
     store_in = {
         logging.ERROR: 'error',

@@ -334,9 +334,8 @@ class SwiftHttpProtocol(wsgi.HttpProtocol):
             body = content.encode('UTF-8', 'replace')
             self.send_header("Content-Type", self.error_content_type)
             self.send_header('Content-Length', str(len(body)))
-            if code >= 400:
-                self.send_header('X-Trans-Id', txn_id)
-                self.send_header('X-Openstack-Request-Id', txn_id)
+            self.send_header('X-Trans-Id', txn_id)
+            self.send_header('X-Openstack-Request-Id', txn_id)
         self.end_headers()
 
         if self.command != 'HEAD' and body:

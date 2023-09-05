@@ -333,7 +333,7 @@ use = egg:swift#proxy
 # are allowed some time to finish serving in-flight requests. Use this to
 # configure the grace period (in seconds), after which the reloaded server
 # will issue SIGKILLs to remaining stale workers.
-# stale_worker_timeout = 7200
+# stale_worker_timeout = 86400
 #
 # When upgrading from liberasurecode<=1.5.0, you may want to continue writing
 # legacy CRCs until all nodes are upgraded and capabale of reading fragments

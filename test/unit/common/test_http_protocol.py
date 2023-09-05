@@ -289,11 +289,6 @@ class TestSwiftHttpProtocolSomeMore(ProtocolTest):
             app_logger.records.get('ERROR')[0])
         # but we can at least assert that the logger txn_id was set
         self.assertEqual('test-trans-id', app_logger.txn_id)
-        # the app logged this, server logger not used...
-        self.assertNotIn(
-            "ERROR WSGI: code 400, message Bad request syntax ('ONLY-METHOD'),"
-            " (txn: test-bad-req-trans-id)",
-            self.logger.get_lines_for_level('info'))
 
     def test_leading_slashes(self):
         bytes_out = self._run_bytes_through_protocol((

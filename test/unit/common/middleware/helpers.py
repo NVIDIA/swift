@@ -73,6 +73,48 @@ def normalize_path(path):
 class FakeSwift(object):
     """
     A good-enough fake Swift proxy server to use in testing middleware.
+
+    Responses for expected requests should be registered using the ``register``
+    method. Registered requests are keyed by their method and path *including
+    query string*.
+
+    Received requests are matched to registered requests with the same method
+    as follows, in order of preference:
+
+      * A received request matches a registered request if the received
+        request's path, including query string, is the same as the registered
+        request's path, including query string.
+      * A received request matches a registered request if the received
+        request's path, excluding query string, is the same as the registered
+        request's path, including query string.
+
+    A received ``HEAD`` request will be matched to a registered ``GET``,
+    according to the same path preferences, if a match cannot be made to a
+    registered ``HEAD`` request.
+
+    A ``PUT`` request that matches a registered ``PUT`` request will create an
+    entry in the ``uploaded`` object cache that is keyed by the received
+    request's path, excluding query string. A subsequent ``GET`` or ``HEAD``
+    request that does not match a registered request will match an ``uploaded``
+    object based on the ``GET`` or ``HEAD`` request's path, excluding query
+    string.
+
+    A ``POST`` request whose path, excluding query string, matches an object in
+    the ``uploaded`` cache will modify the metadata of the object in the
+    ``uploaded`` cache. However, the ``POST`` request must first match a
+    registered ``POST`` request.
+
+    Examples:
+
+      * received ``GET /v1/a/c/o`` will match registered ``GET /v1/a/c/o``
+      * received ``GET /v1/a/c/o?x=y`` will match registered ``GET /v1/a/c/o``
+      * received ``HEAD /v1/a/c/o?x=y`` will match registered ``GET /v1/a/c/o``
+      * received ``GET /v1/a/c/o`` will NOT match registered
+        ``GET /v1/a/c/o?x=y``
+      * received ``PUT /v1/a/c/o?x=y``, if it matches a registered ``PUT``,
+        will create uploaded ``/v1/a/c/o``
+      * received ``POST /v1/a/c/o?x=y``, if it matches a registered ``POST``,
+        will update uploaded ``/v1/a/c/o``
     """
     ALLOWED_METHODS = [
         'PUT', 'POST', 'DELETE', 'GET', 'HEAD', 'OPTIONS', 'REPLICATE',
@@ -136,9 +178,9 @@ class FakeSwift(object):
         else:
             # special case for re-reading an uploaded file
             # ... uploaded is only objects and always raw path
-            if method in ('GET', 'HEAD') and path in self.uploaded:
+            if method in ('GET', 'HEAD') and env['PATH_INFO'] in self.uploaded:
                 resp_class = swob.HTTPOk
-                headers, body = self.uploaded[path]
+                headers, body = self.uploaded[env['PATH_INFO']]
             else:
                 raise KeyError("Didn't find %r in allowed responses" % (
                     (method, path),))
@@ -214,11 +256,11 @@ class FakeSwift(object):
             resp_headers = dict(req.headers)
             if "CONTENT_TYPE" in env:
                 resp_headers['Content-Type'] = env["CONTENT_TYPE"]
-            self.uploaded[path] = (resp_headers, req_body)
+            self.uploaded[env['PATH_INFO']] = (resp_headers, req_body)
 
         # simulate object POST
         elif method == 'POST' and obj:
-            metadata, data = self.uploaded.get(path, ({}, None))
+            metadata, data = self.uploaded.get(env['PATH_INFO'], ({}, None))
             # select items to keep from existing...
             new_metadata = dict(
                 (k, v) for k, v in metadata.items()
@@ -230,7 +272,7 @@ class FakeSwift(object):
                      if (is_user_meta('object', k) or
                          is_object_transient_sysmeta(k) or
                          k.lower == 'content-type')))
-            self.uploaded[path] = new_metadata, data
+            self.uploaded[env['PATH_INFO']] = new_metadata, data
 
         self.req_bodies.append(req_body)
 

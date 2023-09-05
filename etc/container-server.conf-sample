@@ -134,7 +134,7 @@ use = egg:swift#container
 # are allowed some time to finish serving in-flight requests. Use this to
 # configure the grace period (in seconds), after which the reloaded server
 # will issue SIGKILLs to remaining stale workers.
-# stale_worker_timeout = 7200
+# stale_worker_timeout = 86400
 
 [filter:healthcheck]
 use = egg:swift#healthcheck
