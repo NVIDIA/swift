@@ -33,6 +33,9 @@ import six
 from six import StringIO
 from six.moves import range
 from six.moves.urllib.parse import quote
+
+from swift.proxy.controllers.obj import ECGetResponseCollection
+
 if six.PY2:
     from email.parser import FeedParser as EmailFeedParser
 else:
@@ -3312,6 +3315,29 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         with set_http_connect():
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
+
+    def test_GET_best_bucket_status_is_none(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        orig_choose_best_bucket = ECGetResponseCollection.choose_best_bucket
+
+        def fake_choose_best_bucket(inst):
+            # we don't yet understand the scenario in which a bucket would be
+            # chosen with status == None so just pretend it happened
+            bucket = orig_choose_best_bucket(inst)
+            bucket.status = None
+            return bucket
+
+        with set_http_connect():
+            with mock.patch(
+                    'swift.proxy.controllers.obj.ECGetResponseCollection.'
+                    'choose_best_bucket', fake_choose_best_bucket):
+                resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+        lines = self.logger.get_lines_for_level('error')
+        self.assertTrue(lines)
+        self.assertIn('best_bucket.status is None??', lines[-2])
+        self.assertIn('status: None', lines[-2])
+        self.assertIn('Object returning 503 for []', lines[-1])
 
     def test_feed_remaining_primaries(self):
         controller = self.controller_cls(
