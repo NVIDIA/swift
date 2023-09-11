@@ -284,6 +284,10 @@ class ContainerController(Controller):
         if (resp_record_type == 'shard' and
                 sharding_state == 'sharded' and
                 complete_listing):
+            # note: old container servers return a list of shard ranges, newer
+            # ones return a list of namespaces. If we ever need to know we can
+            # look for a 'x-backend-record-shard-format' header from newer
+            # container servers.
             ns_bound_list = self._store_shard_ranges_in_cache(req, resp)
             if ns_bound_list:
                 resp.body = self._make_namespaces_response_body(
@@ -382,8 +386,13 @@ class ContainerController(Controller):
         # the sharder or in probe tests
         record_type = req.headers.get('X-Backend-Record-Type', '').lower()
         if not record_type:
+            # This is an object listing but the backend may be sharded; let
+            # newer container servers know that a list of namespaces is
+            # sufficient. Requests that actually want a list of full shard
+            # ranges (e.g. the sharder) would have set X-Backend-Record-Type.
             record_type = 'auto'
             req.headers['X-Backend-Record-Type'] = 'auto'
+            req.headers['X-Backend-Record-Shard-Format'] = 'namespace'
             params['states'] = 'listing'
         req.params = params
 
