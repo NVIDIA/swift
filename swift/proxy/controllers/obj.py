@@ -302,9 +302,13 @@ class BaseObjectController(Controller):
         params.pop('limit', None)
         params['format'] = 'json'
         params['states'] = 'updating'
+        headers = {'X-Backend-Record-Type': 'shard',
+                   'X-Backend-Record-Shard-Format': 'namespace'}
         if includes:
             params['includes'] = str_to_wsgi(includes)
-        headers = {'X-Backend-Record-Type': 'shard'}
+            # this line can be removed as soon as the container server
+            # supports get_namespaces api with 'includes'.
+            headers['X-Backend-Record-Shard-Format'] = 'full'
         listing, response = self._get_container_listing(
             req, account, container, headers=headers, params=params)
         return self._parse_shard_ranges(req, listing, response), response
