@@ -1477,7 +1477,8 @@ class TestFuncs(BaseTest):
             for i in range(3)]
         base = Controller(self.app)
         req = Request.blank('/v1/a/c', method='GET')
-        resp_headers = {'X-Backend-Record-Type': 'shard'}
+        resp_headers = {'X-Backend-Record-Type': 'shard',
+                        'X-Backend-Record-Shard-Format': 'namespace'}
         with mocked_http_conn(
             200, 200,
             body_iter=iter([b'', json.dumps(shard_ranges).encode('ascii')]),
@@ -1496,6 +1497,9 @@ class TestFuncs(BaseTest):
         self.assertEqual('format=json', captured[1]['qs'])
         self.assertEqual(
             'shard', captured[1]['headers'].get('X-Backend-Record-Type'))
+        self.assertEqual(
+            'namespace',
+            captured[1]['headers'].get('X-Backend-Record-Shard-Format'))
         self.assertEqual(shard_ranges, [dict(pr) for pr in actual])
         self.assertFalse(self.app.logger.get_lines_for_level('error'))
 
@@ -1530,6 +1534,9 @@ class TestFuncs(BaseTest):
             ['format=json', 'includes=1_test'], params)
         self.assertEqual(
             'shard', captured[1]['headers'].get('X-Backend-Record-Type'))
+        self.assertEqual(
+            'full',
+            captured[1]['headers'].get('X-Backend-Record-Shard-Format'))
         self.assertEqual(shard_ranges[1:2], [dict(pr) for pr in actual])
         self.assertFalse(self.app.logger.get_lines_for_level('error'))
 
@@ -1565,6 +1572,9 @@ class TestFuncs(BaseTest):
             ['format=json', 'includes=%E1%88%B41_test'], params)
         self.assertEqual(
             'shard', captured[1]['headers'].get('X-Backend-Record-Type'))
+        self.assertEqual(
+            'full',
+            captured[1]['headers'].get('X-Backend-Record-Shard-Format'))
         self.assertEqual(shard_ranges[1:2], [dict(pr) for pr in actual])
         self.assertFalse(self.app.logger.get_lines_for_level('error'))
 
@@ -1572,7 +1582,8 @@ class TestFuncs(BaseTest):
         base = Controller(self.app)
         req = Request.blank('/v1/a/c/o', method='PUT')
         # empty response
-        headers = {'X-Backend-Record-Type': 'shard'}
+        headers = {'X-Backend-Record-Type': 'shard',
+                   'X-Backend-Record-Shard-Format': 'namespace'}
         with mocked_http_conn(200, 200, body_iter=iter([b'', body]),
                               headers=headers):
             actual, resp = base._get_shard_ranges(req, 'a', 'c', '1_test')
@@ -1601,7 +1612,7 @@ class TestFuncs(BaseTest):
         body = json.dumps([{}]).encode('ascii')
         error_lines = self._check_get_shard_ranges_bad_data(body)
         self.assertIn('Failed to get shard ranges', error_lines[0])
-        self.assertIn('KeyError', error_lines[0])
+        self.assertIn('TypeError', error_lines[0])
         self.assertFalse(error_lines[1:])
 
     def test_get_shard_ranges_invalid_shard_range(self):
