@@ -253,6 +253,14 @@ class TestSloEnv(BaseEnv):
             ]).encode('ascii'), parms={'multipart-manifest': 'put'}
         )
 
+        file_item = cls.container.file("manifest-part-num-delete")
+        file_item.write(
+            json.dumps([
+                {'path': '%s/%s' % (cls.container.name,
+                                    "part-num-delete-file")}
+            ]).encode('ascii'), parms={'part-number': '1'}
+        )
+
 
 class TestSlo(Base):
     env = TestSloEnv
@@ -292,6 +300,74 @@ class TestSlo(Base):
             (b'd', 1024 * 1024),
             (b'e', 1),
         ], group_file_contents(file_contents))
+
+    def test_delete_part_number(self):
+        file_item = self.env.container.file('manifest-part-num-delete')
+        # part-number is 1-indexed
+        file_item.delete(parms={'part-number': '2'})
+        resp_body = file_item.conn.response.read()
+        self.assertEqual(204, file_item.conn.response.status, resp_body)
+        headers = dict(
+            (h.lower(), v)
+            for h, v in file_item.conn.response.getheaders())
+        self.assertEqual(b'', resp_body)
+        self.assertEqual(headers['content-length'], '0')
+
+    def test_get_part_number_errors(self):
+        file_item = self.env.container.file('manifest-abcde')
+        # part-number is 1-indexed
+        self.assertRaises(ResponseError, file_item.read,
+                          parms={'part-number': '0'})
+        resp_body = file_item.conn.response.read()
+        self.assertEqual(400, file_item.conn.response.status, resp_body)
+        self.assertEqual(b'Part number must be an integer greater than 0',
+                         resp_body)
+
+        file_item2 = self.env.container2.file('manifest-abcde')
+        self.assertRaises(ResponseError, file_item2.read,
+                          parms={'part-number': '10001'})
+        resp_body = file_item2.conn.response.read()
+        self.assertEqual(416, file_item2.conn.response.status, resp_body)
+        self.assertEqual(b'The requested part number is not satisfiable',
+                         resp_body)
+
+    def test_get_part_number_simple_manifest(self):
+        file_item = self.env.container.file('manifest-abcde')
+        seg_info_list = [
+            self.env.seg_info["seg_%s" % letter]
+            for letter in ['a', 'b', 'c', 'd', 'e']
+        ]
+        checksum = md5(usedforsecurity=False)
+        for seg_info in seg_info_list:
+            checksum.update(seg_info['etag'].encode('ascii'))
+        slo_etag = checksum.hexdigest()
+        for i, seg_info in enumerate(seg_info_list, start=1):
+            part_contents = file_item.read(parms={'part-number': i})
+            self.assertEqual(len(part_contents), seg_info['size_bytes'])
+            headers = dict(
+                (h.lower(), v)
+                for h, v in file_item.conn.response.getheaders())
+            self.assertEqual(headers['content-length'],
+                             str(seg_info['size_bytes']))
+            self.assertEqual(headers['etag'], '"%s"' % slo_etag)
+
+    def test_head_part_number_simple_manifest(self):
+        file_item = self.env.container.file('manifest-abcde')
+        seg_info_list = [
+            self.env.seg_info["seg_%s" % letter]
+            for letter in ['a', 'b', 'c', 'd', 'e']
+        ]
+        for i, seg_info in enumerate(seg_info_list, start=1):
+            part_info = file_item.info(parms={'part-number': i},
+                                       exp_status=206)
+            headers = dict(
+                (h.lower(), v)
+                for h, v in file_item.conn.response.getheaders())
+            self.assertEqual(headers['content-length'],
+                             str(part_info['content_length']))
+            self.assertEqual(headers['etag'], part_info['etag'])
+            self.assertEqual(headers['x-manifest-etag'],
+                             part_info['x_manifest_etag'])
 
     def test_slo_container_listing(self):
         # the listing object size should equal the sum of the size of the
