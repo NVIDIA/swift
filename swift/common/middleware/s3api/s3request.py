@@ -56,7 +56,8 @@ from swift.common.middleware.s3api.s3response import AccessDenied, \
     MissingContentLength, InvalidStorageClass, S3NotImplemented, InvalidURI, \
     MalformedXML, InvalidRequest, RequestTimeout, InvalidBucketName, \
     BadDigest, AuthorizationHeaderMalformed, SlowDown, \
-    AuthorizationQueryParametersError, ServiceUnavailable, BrokenMPU
+    AuthorizationQueryParametersError, ServiceUnavailable, BrokenMPU, \
+    InvalidPartNumber, InvalidPartArgument
 from swift.common.middleware.s3api.exception import NotS3Request
 from swift.common.middleware.s3api.utils import utf8encode, \
     S3Timestamp, mktime, MULTIUPLOAD_SUFFIX
@@ -1044,7 +1045,10 @@ class S3Request(swob.Request):
         if 'logging' in self.params:
             return LoggingStatusController
         if 'partNumber' in self.params:
-            return PartController
+            if self.method == 'PUT':
+                return PartController
+            else:
+                return ObjectController
         if 'uploadId' in self.params:
             return UploadController
         if 'uploads' in self.params:
@@ -1317,7 +1321,6 @@ class S3Request(swob.Request):
                 'GET': {
                     HTTP_NOT_FOUND: not_found_handler,
                     HTTP_PRECONDITION_FAILED: PreconditionFailed,
-                    HTTP_REQUESTED_RANGE_NOT_SATISFIABLE: InvalidRange,
                 },
                 'PUT': {
                     HTTP_NOT_FOUND: (NoSuchBucket, container),
@@ -1416,10 +1419,13 @@ class S3Request(swob.Request):
                 raise InvalidArgument('X-Delete-At',
                                       self.headers['X-Delete-At'],
                                       err_str)
-            if 'X-Delete-After' in err_msg.decode('utf8'):
+            if 'X-Delete-After' in err_str:
                 raise InvalidArgument('X-Delete-After',
                                       self.headers['X-Delete-After'],
                                       err_str)
+            elif ('Part number must be an integer'
+                  in err_str):
+                raise InvalidPartArgument(self.params['partNumber'])
             else:
                 raise InvalidRequest(msg=err_str)
         if status == HTTP_UNAUTHORIZED:
@@ -1427,6 +1433,18 @@ class S3Request(swob.Request):
                 **self.signature_does_not_match_kwargs())
         if status == HTTP_FORBIDDEN:
             raise AccessDenied(reason='forbidden')
+        if status == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE:
+            err_str = err_msg.decode('utf8')
+            if 'partNumber' in self.params:
+                try:
+                    part_num = int(self.params['partNumber'])
+                except ValueError:
+                    raise InvalidPartArgument(self.params['partNumber'])
+                if part_num > 10000:
+                    raise InvalidPartArgument(self.params['partNumber'])
+                if 'The requested part number is not satisfiable' in err_str:
+                    raise InvalidPartNumber()
+            raise InvalidRange()
         if status == HTTP_SERVICE_UNAVAILABLE:
             raise ServiceUnavailable()
         if status in (HTTP_RATE_LIMITED, HTTP_TOO_MANY_REQUESTS):

@@ -80,37 +80,47 @@ class BaseS3ApiObj(object):
         self._register_bucket_policy_index_head(
             'bucket', self.bucket_policy_index)
 
-    def _test_object_GETorHEAD(self, method):
-        req = Request.blank('/bucket/object',
+    def _test_object_GETorHEAD(self, method, query=''):
+        req = Request.blank('/bucket/object' + query,
                             environ={'REQUEST_METHOD': method},
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
-        self.assertEqual(status.split()[0], '200')
+        if 'partNumber' in query:
+            self.assertEqual(status.split()[0], '206')
+            self.assertEqual(headers['content-length'], '5')
+            self.assertTrue('content-range' in headers)
+            self.assertEqual(headers['content-range'], 'bytes 0-4/5')
+            self.assertEqual(headers['content-type'], 'text/html')
+        else:
+            self.assertEqual(status.split()[0], '200')
         # we'll want this for logging
         self._assert_policy_index(req.headers, headers,
                                   self.bucket_policy_index)
 
         unexpected_headers = []
-        for key, val in self.response_headers.items():
-            if key in ('Content-Length', 'Content-Type', 'content-encoding',
-                       'last-modified', 'cache-control', 'Content-Disposition',
-                       'Content-Language', 'expires', 'x-robots-tag',
-                       'Accept-Ranges'):
-                self.assertIn(key, headers)
-                self.assertEqual(headers[key], str(val))
+        if 'partNumber' not in query:
+            for key, val in self.response_headers.items():
+                if key in ('Content-Length', 'Content-Type',
+                           'content-encoding',
+                           'last-modified', 'cache-control',
+                           'Content-Disposition',
+                           'Content-Language', 'expires', 'x-robots-tag',
+                           'Accept-Ranges'):
+                    self.assertIn(key, headers)
+                    self.assertEqual(headers[key], str(val))
 
-            elif key == 'etag':
-                self.assertEqual(headers[key], '"%s"' % val)
+                elif key == 'etag':
+                    self.assertEqual(headers[key], '"%s"' % val)
 
-            elif key.startswith('x-object-meta-'):
-                self.assertIn('x-amz-meta-' + key[14:], headers)
-                self.assertEqual(headers['x-amz-meta-' + key[14:]], val)
+                elif key.startswith('x-object-meta-'):
+                    self.assertIn('x-amz-meta-' + key[14:], headers)
+                    self.assertEqual(headers['x-amz-meta-' + key[14:]], val)
 
-            else:
-                unexpected_headers.append((key, val))
+                else:
+                    unexpected_headers.append((key, val))
 
-        if unexpected_headers:
+        if unexpected_headers and 'partNumber' not in query:
             self.fail('unexpected headers: %r' % unexpected_headers)
 
         self.assertEqual(headers['etag'],
@@ -333,6 +343,69 @@ class BaseS3ApiObj(object):
 
     def test_object_GET(self):
         self._test_object_GETorHEAD('GET')
+
+    def test_non_slo_object_GET_part_num(self):
+        self._test_object_GETorHEAD('GET', query='?partNumber=1')
+
+    def test_non_slo_object_HEAD_part_num(self):
+        self._test_object_GETorHEAD('HEAD', query='?partNumber=1')
+
+    def _do_test_non_slo_object_part_num_not_satisfiable(self, method,
+                                                         part_number):
+        req = Request.blank('/bucket/object',
+                            params={'partNumber': part_number},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        req.method = method
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '416')
+        return body
+
+    def test_non_slo_object_GET_part_num_not_satisfiable(self):
+        body = self._do_test_non_slo_object_part_num_not_satisfiable(
+            'GET', '2')
+        self.assertEqual(self._get_error_code(body), 'InvalidPartNumber')
+        body = self._do_test_non_slo_object_part_num_not_satisfiable(
+            'GET', '10000')
+        self.assertEqual(self._get_error_code(body), 'InvalidPartNumber')
+
+    def test_non_slo_object_HEAD_part_num_not_satisfiable(self):
+        body = self._do_test_non_slo_object_part_num_not_satisfiable(
+            'HEAD', '2')
+        self.assertEqual(body, b'')
+        body = self._do_test_non_slo_object_part_num_not_satisfiable(
+            'HEAD', '10000')
+        self.assertEqual(body, b'')
+
+    def _do_test_non_slo_object_part_num_invalid(self, method, part_number):
+        req = Request.blank('/bucket/object',
+                            params={'partNumber': part_number},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        req.method = method
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '400')
+        return body
+
+    def test_non_slo_object_GET_part_num_invalid(self):
+        body = self._do_test_non_slo_object_part_num_invalid('GET', '0')
+        self.assertEqual(self._get_error_code(body), 'InvalidArgument')
+        body = self._do_test_non_slo_object_part_num_invalid('GET', '-1')
+        self.assertEqual(self._get_error_code(body), 'InvalidArgument')
+        body = self._do_test_non_slo_object_part_num_invalid('GET', '10001')
+        self.assertEqual(self._get_error_code(body), 'InvalidArgument')
+        body = self._do_test_non_slo_object_part_num_invalid('GET', 'foo')
+        self.assertEqual(self._get_error_code(body), 'InvalidArgument')
+
+    def test_non_slo_object_HEAD_part_num_invalid(self):
+        body = self._do_test_non_slo_object_part_num_invalid('HEAD', '0')
+        self.assertEqual(body, b'')
+        body = self._do_test_non_slo_object_part_num_invalid('HEAD', '-1')
+        self.assertEqual(body, b'')
+        body = self._do_test_non_slo_object_part_num_invalid('HEAD', '10001')
+        self.assertEqual(body, b'')
+        body = self._do_test_non_slo_object_part_num_invalid('HEAD', 'foo')
+        self.assertEqual(body, b'')
 
     def test_object_GET_Range(self):
         req = Request.blank('/bucket/object',
