@@ -149,6 +149,7 @@ class FakeSwift(object):
         # proper behavior across rolling upgrades, having a FakeSwift not act
         # like modern swift is now opt-in.
         self.can_ignore_range = True
+        self.call_hook = None
 
     def _find_response(self, method, path):
         path = normalize_path(path)
@@ -233,6 +234,8 @@ class FakeSwift(object):
         return path, acc, cont, obj
 
     def __call__(self, env, start_response):
+        if self.call_hook:
+            self.call_hook(env)
         method = env['REQUEST_METHOD']
         if method not in self.ALLOWED_METHODS:
             return HTTPMethodNotAllowed()(env, start_response)

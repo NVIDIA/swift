@@ -109,6 +109,30 @@ class TestFakeSwift(unittest.TestCase):
         self.assertEqual(4, swift.call_count)
         self.assertEqual(('HEAD', '/v1/a/c/o?p=q'), swift.calls[-1])
 
+    def test_GET_call_hook(self):
+        swift = FakeSwift()
+        swift.register('GET', '/v1/a/c/o', HTTPOk, {'X-Foo': 'Bar'},
+                       b'stuff')
+        swift.register('GET', '/v1/a/c/oblah', HTTPNotFound, {}, None)
+        # sanity check...
+        req = Request.blank('/v1/a/c/o')
+        req.method = 'GET'
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+
+        # now add a hook...
+        hook_calls = []
+
+        def hook(env):
+            hook_calls.append(env['PATH_INFO'])
+            env['PATH_INFO'] += 'blah'
+
+        swift.call_hook = hook
+        resp = req.get_response(swift)
+        self.assertEqual(404, resp.status_int)
+        self.assertEqual(['/v1/a/c/o'], hook_calls)
+        self.assertEqual('/v1/a/c/oblah', req.path_info)
+
     def test_GET_registered_with_query_string(self):
         # verify that a single registered GET response is sufficient to handle
         # GETs and HEADS, with and without query strings
