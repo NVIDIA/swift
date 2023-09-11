@@ -21,6 +21,10 @@ import unittest
 from eventlet import Timeout
 import six
 from six.moves import urllib
+if six.PY2:
+    from itertools import izip_longest as zip_longest
+else:
+    from itertools import zip_longest
 
 from swift.common.constraints import CONTAINER_LISTING_LIMIT
 from swift.common.swob import Request, bytes_to_wsgi, str_to_wsgi, wsgi_quote
@@ -42,8 +46,7 @@ from test.unit.proxy.test_server import node_error_count
 
 
 @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
-class TestContainerController(TestRingBase):
-
+class BaseTestContainerController(TestRingBase):
     CONTAINER_REPLICAS = 3
 
     def setUp(self):
@@ -109,6 +112,8 @@ class TestContainerController(TestRingBase):
                              'Expected %s but got %s. Failed case: %s' %
                              (expected, resp.status_int, str(responses)))
 
+
+class TestContainerController(BaseTestContainerController):
     def test_container_info_got_cached(self):
         memcache = FakeMemcache()
         controller = proxy_server.ContainerController(self.app, 'a', 'c')
@@ -465,6 +470,72 @@ class TestContainerController(TestRingBase):
         ]
         self._assert_responses('POST', POST_TEST_CASES)
 
+    def test_GET_bad_requests(self):
+        # verify that the proxy controller enforces checks on request params
+        req = Request.blank(
+            '/v1/a/c?limit=%d' % (CONTAINER_LISTING_LIMIT + 1))
+        self.assertEqual(412, req.get_response(self.app).status_int)
+        req = Request.blank('/v1/a/c?delimiter=%ff')
+        self.assertEqual(400, req.get_response(self.app).status_int)
+        req = Request.blank('/v1/a/c?marker=%ff')
+        self.assertEqual(400, req.get_response(self.app).status_int)
+        req = Request.blank('/v1/a/c?end_marker=%ff')
+        self.assertEqual(400, req.get_response(self.app).status_int)
+        req = Request.blank('/v1/a/c?prefix=%ff')
+        self.assertEqual(400, req.get_response(self.app).status_int)
+        req = Request.blank('/v1/a/c?format=%ff')
+        self.assertEqual(400, req.get_response(self.app).status_int)
+        req = Request.blank('/v1/a/c?path=%ff')
+        self.assertEqual(400, req.get_response(self.app).status_int)
+        req = Request.blank('/v1/a/c?includes=%ff')
+        self.assertEqual(400, req.get_response(self.app).status_int)
+        req = Request.blank('/v1/a/c?states=%ff')
+        self.assertEqual(400, req.get_response(self.app).status_int)
+
+
+class TestGetShardedContainer(BaseTestContainerController):
+    RESP_SHARD_FORMAT_HEADERS = {'X-Backend-Record-Shard-Format': 'namespace'}
+
+    def setUp(self):
+        super(TestGetShardedContainer, self).setUp()
+
+    def _make_root_resp_hdrs(self, object_count, bytes_used, extra_hdrs=None,
+                             extra_shard_hdrs=None):
+        # basic headers that backend will return...
+        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
+                          'X-Backend-Timestamp': '99',
+                          'X-Container-Object-Count': object_count,
+                          'X-Container-Bytes-Used': bytes_used,
+                          'X-Container-Meta-Flavour': 'peach',
+                          'X-Backend-Storage-Policy-Index': 0}
+        if extra_hdrs:
+            root_resp_hdrs.update(extra_hdrs)
+
+        # headers returned when namespaces are returned...
+        root_shard_resp_hdrs = dict(root_resp_hdrs)
+        root_shard_resp_hdrs.update(
+            {'X-Backend-Record-Type': 'shard'})
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
+        if extra_shard_hdrs:
+            root_shard_resp_hdrs.update(extra_shard_hdrs)
+        return root_resp_hdrs, root_shard_resp_hdrs
+
+    def _make_shard_resp_hdrs(self, sr_objs, extra_hdrs=None):
+        # headers returned from unsharded shard backends...
+        hdrs = []
+        for i, _ in enumerate(sr_objs):
+            shard_hdrs = {'X-Backend-Sharding-State': 'unsharded',
+                          'X-Container-Object-Count': len(sr_objs[i]),
+                          'X-Container-Bytes-Used':
+                              sum([obj['bytes'] for obj in sr_objs[i]]),
+                          'X-Container-Meta-Flavour': 'flavour%d' % i,
+                          'X-Backend-Storage-Policy-Index': 0,
+                          'X-Backend-Record-Type': 'object'}
+            if extra_hdrs:
+                shard_hdrs.update(extra_hdrs)
+            hdrs.append(shard_hdrs)
+        return hdrs
+
     def _make_shard_objects(self, shard_range):
         if six.PY2:
             lower = ord(shard_range.lower.decode('utf8')[0]
@@ -548,8 +619,9 @@ class TestContainerController(TestRingBase):
                                      req['headers'])
         return resp
 
-    def check_response(self, resp, root_resp_hdrs, expected_objects=None,
-                       exp_sharding_state='sharded'):
+    def check_listing_response(self, resp, root_resp_hdrs,
+                               expected_objects=None,
+                               exp_sharding_state='sharded'):
         info_hdrs = dict(root_resp_hdrs)
         if expected_objects is None:
             # default is to expect whatever the root container sent
@@ -573,23 +645,23 @@ class TestContainerController(TestRingBase):
         info = get_container_info(resp.request.environ, self.app)
         self.assertEqual(headers_to_container_info(info_hdrs), info)
 
+    def create_server_response_data(self, bounds, states=None, remove_char=''):
+        if not isinstance(bounds[0], (list, tuple)):
+            bounds = [(l, u) for l, u in zip(bounds[:-1], bounds[1:])]
+        namespaces = [
+            Namespace('.shards_a/c_%s' % upper.replace(remove_char, ''),
+                      lower, upper)
+            for lower, upper in bounds]
+        ns_dicts = [dict(ns) for ns in namespaces]
+        ns_objs = [self._make_shard_objects(ns) for ns in namespaces]
+        return namespaces, ns_dicts, ns_objs
+
     def test_GET_sharded_container_no_memcache(self):
         # Don't worry, ShardRange._encode takes care of unicode/bytes issues
         shard_bounds = ('', 'ham', 'pie', u'\N{SNOWMAN}', u'\U0001F334', '')
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in zip(shard_bounds[:-1], shard_bounds[1:])]
-        sr_dicts = [dict(sr, last_modified=sr.timestamp.isoformat)
-                    for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 0}
-            for i, _ in enumerate(shard_ranges)]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_resp_hdrs = self._make_shard_resp_hdrs(sr_objs)
 
         all_objects = []
         for objects in sr_objs:
@@ -598,15 +670,9 @@ class TestContainerController(TestRingBase):
         num_all_objects = len(all_objects)
         limit = CONTAINER_LISTING_LIMIT
         expected_objects = all_objects
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Timestamp': '99',
-                          # pretend root object stats are not yet updated
-                          'X-Container-Object-Count': num_all_objects - 1,
-                          'X-Container-Bytes-Used': size_all_objects - 1,
-                          'X-Container-Meta-Flavour': 'peach',
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        # pretend root object stats are not yet updated
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+            num_all_objects - 1, size_all_objects - 1)
 
         # GET all objects
         # include some failed responses
@@ -659,8 +725,8 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs,
-                            expected_objects=expected_objects)
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
 
         # GET all objects - sharding, final shard range points back to root
         root_range = ShardRange('a/c', Timestamp.now(), 'pie', '')
@@ -695,8 +761,8 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs,
-                            expected_objects=expected_objects)
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
 
         # GET all objects in reverse and *blank* limit
         mock_responses = [
@@ -750,8 +816,8 @@ class TestContainerController(TestRingBase):
             expected_requests, query_string='?reverse=true&limit=',
             reverse=True)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs,
-                            expected_objects=expected_objects)
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
 
         # GET with limit param
         limit = len(sr_objs[0]) + len(sr_objs[1]) + 1
@@ -787,7 +853,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests,
             query_string='?limit=%s' % limit)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # GET with marker
         marker = bytes_to_wsgi(sr_objs[3][2]['name'].encode('utf8'))
@@ -826,7 +892,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests,
             query_string='?marker=%s' % marker)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # GET with end marker
         end_marker = bytes_to_wsgi(sr_objs[3][6]['name'].encode('utf8'))
@@ -884,7 +950,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests,
             query_string='?end_marker=%s' % end_marker)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # GET with prefix
         prefix = 'hat'
@@ -910,7 +976,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests,
             query_string='?prefix=%s' % prefix)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # marker and end_marker and limit
         limit = 2
@@ -933,7 +999,7 @@ class TestContainerController(TestRingBase):
             mock_responses, expected_objects, expected_requests,
             query_string='?marker=%s&end_marker=%s&limit=%s'
             % (marker, end_marker, limit))
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # reverse with marker, end_marker, and limit
         expected_objects.reverse()
@@ -955,26 +1021,15 @@ class TestContainerController(TestRingBase):
             mock_responses, expected_objects, expected_requests,
             query_string='?marker=%s&end_marker=%s&limit=%s&reverse=true'
             % (end_marker, marker, limit), reverse=True)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
     def test_GET_sharded_container_with_memcache(self):
         # verify alternative code path in ContainerController when memcache is
         # available...
         shard_bounds = ('', 'ham', 'pie', u'\N{SNOWMAN}', u'\U0001F334', '')
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in zip(shard_bounds[:-1], shard_bounds[1:])]
-        sr_dicts = [dict(sr, last_modified=sr.timestamp.isoformat)
-                    for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 0}
-            for i, _ in enumerate(shard_ranges)]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_resp_hdrs = self._make_shard_resp_hdrs(sr_objs)
 
         all_objects = []
         for objects in sr_objs:
@@ -983,16 +1038,10 @@ class TestContainerController(TestRingBase):
         num_all_objects = len(all_objects)
         limit = CONTAINER_LISTING_LIMIT
         expected_objects = all_objects
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Timestamp': '99',
-                          # pretend root object stats are not yet updated
-                          'X-Container-Object-Count': num_all_objects - 1,
-                          'X-Container-Bytes-Used': size_all_objects - 1,
-                          'X-Container-Meta-Flavour': 'peach',
-                          'X-Backend-Storage-Policy-Index': 0,
-                          'X-Backend-Override-Shard-Name-Filter': 'true'}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        # pretend root object stats are not yet updated
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+            num_all_objects - 1, size_all_objects - 1,
+            extra_shard_hdrs={'x-backend-override-shard-name-filter': 'true'})
 
         # GET all objects
         # include some failed responses
@@ -1046,8 +1095,8 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests, memcache=True)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs,
-                            expected_objects=expected_objects)
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
 
         # GET all objects - sharding, final shard range points back to root
         root_range = ShardRange('a/c', Timestamp.now(), 'pie', '')
@@ -1083,8 +1132,8 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests, memcache=True)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs,
-                            expected_objects=expected_objects)
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
 
         # GET all objects in reverse and *blank* limit
         mock_responses = [
@@ -1138,8 +1187,8 @@ class TestContainerController(TestRingBase):
             expected_requests, query_string='?reverse=true&limit=',
             reverse=True, memcache=True)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs,
-                            expected_objects=expected_objects)
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
 
         # GET with limit param
         limit = len(sr_objs[0]) + len(sr_objs[1]) + 1
@@ -1177,7 +1226,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests,
             query_string='?limit=%s' % limit, memcache=True)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # GET with marker
         marker = bytes_to_wsgi(sr_objs[3][2]['name'].encode('utf8'))
@@ -1218,7 +1267,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests,
             query_string='?marker=%s' % marker, memcache=True)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # GET with end marker
         end_marker = bytes_to_wsgi(sr_objs[3][6]['name'].encode('utf8'))
@@ -1278,7 +1327,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests,
             query_string='?end_marker=%s' % end_marker, memcache=True)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # GET with prefix
         prefix = 'hat'
@@ -1306,7 +1355,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests,
             query_string='?prefix=%s' % prefix, memcache=True)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # marker and end_marker and limit
         limit = 2
@@ -1330,7 +1379,7 @@ class TestContainerController(TestRingBase):
             mock_responses, expected_objects, expected_requests,
             query_string='?marker=%s&end_marker=%s&limit=%s'
             % (marker, end_marker, limit), memcache=True)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # reverse with marker, end_marker, and limit
         expected_objects.reverse()
@@ -1353,39 +1402,22 @@ class TestContainerController(TestRingBase):
             mock_responses, expected_objects, expected_requests,
             query_string='?marker=%s&end_marker=%s&limit=%s&reverse=true'
             % (end_marker, marker, limit), reverse=True, memcache=True)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
     def _do_test_GET_sharded_container_with_deleted_shards(self, shard_specs):
         # verify that if a shard fails to return its listing component then the
         # client response is 503
         shard_bounds = (('a', 'b'), ('b', 'c'), ('c', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 0}
-            for i, _ in enumerate(shard_ranges)]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_resp_hdrs = self._make_shard_resp_hdrs(sr_objs)
 
         all_objects = []
         for objects in sr_objs:
             all_objects.extend(objects)
 
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Timestamp': '99',
-                          # pretend root object stats are not yet updated
-                          'X-Container-Object-Count': 6,
-                          'X-Container-Bytes-Used': 12,
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
-
+        # pretend root object stats are not yet updated
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(6, 12)
         mock_responses = [
             # status, body, headers
             (200, sr_dicts, root_shard_resp_hdrs),
@@ -1448,25 +1480,16 @@ class TestContainerController(TestRingBase):
     def test_GET_sharded_container_with_delimiter(self):
         shard_bounds = (('', 'ha/ppy'), ('ha/ppy', 'ha/ptic'),
                         ('ha/ptic', 'ham'), ('ham', 'pie'), ('pie', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper.replace('/', ''),
-                       Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, _ = self.create_server_response_data(
+            shard_bounds, remove_char='/')
         shard_resp_hdrs = {'X-Backend-Sharding-State': 'unsharded',
                            'X-Container-Object-Count': 2,
                            'X-Container-Bytes-Used': 4,
                            'X-Backend-Storage-Policy-Index': 0}
 
         limit = CONTAINER_LISTING_LIMIT
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Timestamp': '99',
-                          # pretend root object stats are not yet updated
-                          'X-Container-Object-Count': 6,
-                          'X-Container-Bytes-Used': 12,
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        # pretend root object stats are not yet updated
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(6, 12)
 
         sr_0_obj = {'name': 'apple',
                     'bytes': 1,
@@ -1510,30 +1533,20 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests,
             query_string='?delimiter=/')
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
     def test_GET_sharded_container_with_delimiter_and_reverse(self):
-        shard_points = ('', 'ha.d', 'ha/ppy', 'ha/ptic', 'ham', 'pie', '')
-        shard_bounds = tuple(zip(shard_points, shard_points[1:]))
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper.replace('/', ''),
-                       Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
+        shard_bounds = ('', 'ha.d', 'ha/ppy', 'ha/ptic', 'ham', 'pie', '')
+        shard_ranges, sr_dicts, _ = self.create_server_response_data(
+            shard_bounds, remove_char='/')
         shard_resp_hdrs = {'X-Backend-Sharding-State': 'unsharded',
                            'X-Container-Object-Count': 2,
                            'X-Container-Bytes-Used': 4,
                            'X-Backend-Storage-Policy-Index': 0}
 
         limit = CONTAINER_LISTING_LIMIT
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Timestamp': '99',
-                          # pretend root object stats are not yet updated
-                          'X-Container-Object-Count': 6,
-                          'X-Container-Bytes-Used': 12,
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        # pretend root object stats are not yet updated
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(6, 12)
 
         sr_0_obj = {'name': 'apple',
                     'bytes': 1,
@@ -1587,7 +1600,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests,
             query_string='?delimiter=/&reverse=on', reverse=True)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
     def test_GET_sharded_container_shard_redirects_to_root(self):
         # check that if the root redirects listing to a shard, but the shard
@@ -1595,8 +1608,11 @@ class TestContainerController(TestRingBase):
         # the root) objects are requested from the root, rather than a loop.
 
         # single shard spanning entire namespace
-        shard_sr = ShardRange('.shards_a/c_xyz', Timestamp.now(), '', '')
-        all_objects = self._make_shard_objects(shard_sr)
+        shard_bounds = ('', '')
+        shard_ranges, _, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_sr = shard_ranges[0]
+        all_objects = sr_objs[0]
         size_all_objects = sum([obj['bytes'] for obj in all_objects])
         num_all_objects = len(all_objects)
         limit = CONTAINER_LISTING_LIMIT
@@ -1612,13 +1628,8 @@ class TestContainerController(TestRingBase):
         }
 
         # root still thinks it has a shard
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Timestamp': '99',
-                          'X-Container-Object-Count': num_all_objects,
-                          'X-Container-Bytes-Used': size_all_objects,
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+            num_all_objects, size_all_objects)
 
         root_sr = ShardRange('a/c', Timestamp.now(), '', '')
         mock_responses = [
@@ -1645,10 +1656,10 @@ class TestContainerController(TestRingBase):
         expected_objects = all_objects
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests)
-        self.check_response(resp, root_resp_hdrs,
-                            expected_objects=expected_objects)
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
         self.assertEqual(
-            [('a', 'c'), ('.shards_a', 'c_xyz')],
+            [('a', 'c'), ('.shards_a', 'c_')],
             resp.request.environ.get('swift.shard_listing_history'))
         lines = [line for line in self.app.logger.get_lines_for_level('debug')
                  if line.startswith('Found 1024 objects in shard')]
@@ -1662,30 +1673,23 @@ class TestContainerController(TestRingBase):
         # out of the loop (this isn't an expected scenario, but could perhaps
         # happen if multiple conflicting shard-shrinking decisions are made)
         shard_bounds = ('', 'a', 'b', '')
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in zip(shard_bounds[:-1], shard_bounds[1:])]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         self.assertEqual([
             '.shards_a/c_a',
             '.shards_a/c_b',
             '.shards_a/c_',
         ], [sr.name for sr in shard_ranges])
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
         all_objects = []
         for objects in sr_objs:
             all_objects.extend(objects)
         size_all_objects = sum([obj['bytes'] for obj in all_objects])
         num_all_objects = len(all_objects)
 
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Timestamp': '99',
-                          'X-Container-Object-Count': num_all_objects,
-                          'X-Container-Bytes-Used': size_all_objects,
-                          'X-Backend-Storage-Policy-Index': 0,
-                          'X-Backend-Record-Storage-Policy-Index': 0,
-                          'X-Backend-Record-Type': 'shard',
-                          }
+        # pretend root object stats are not yet updated
+        _, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+            num_all_objects, size_all_objects)
+
         shard_resp_hdrs = {'X-Backend-Sharding-State': 'unsharded',
                            'X-Container-Object-Count': 2,
                            'X-Container-Bytes-Used': 4,
@@ -1697,11 +1701,12 @@ class TestContainerController(TestRingBase):
             'X-Backend-Record-Type': 'shard',
             'X-Backend-Storage-Policy-Index': 0
         }
+        shrinking_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
         limit = CONTAINER_LISTING_LIMIT
 
         mock_responses = [
             # status, body, headers
-            (200, sr_dicts, root_resp_hdrs),  # from root
+            (200, sr_dicts, root_shard_resp_hdrs),  # from root
             (200, sr_objs[0], shard_resp_hdrs),  # objects from 1st shard
             (200, [sr_dicts[2]], shrinking_resp_hdrs),  # 2nd points to 3rd
             (200, [sr_dicts[1]], shrinking_resp_hdrs),  # 3rd points to 2nd
@@ -1752,31 +1757,20 @@ class TestContainerController(TestRingBase):
         ]
         resp = self._check_GET_shard_listing(
             mock_responses, all_objects, expected_requests)
-        self.check_response(resp, root_resp_hdrs,
-                            expected_objects=all_objects)
+        self.check_listing_response(resp, root_shard_resp_hdrs,
+                                    expected_objects=all_objects)
         self.assertEqual(
             [('a', 'c'), ('.shards_a', 'c_b'), ('.shards_a', 'c_')],
             resp.request.environ.get('swift.shard_listing_history'))
 
     def test_GET_sharded_container_overlapping_shards(self):
         # verify ordered listing even if unexpected overlapping shard ranges
-        shard_bounds = (('', 'ham', ShardRange.CLEAVED),
-                        ('', 'pie', ShardRange.ACTIVE),
-                        ('lemon', '', ShardRange.ACTIVE))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper,
-                       state=state)
-            for lower, upper, state in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 0}
-            for i in range(3)]
+        shard_bounds = (('', 'ham'), ('', 'pie'), ('lemon', ''))
+        shard_states = (ShardRange.CLEAVED, ShardRange.ACTIVE,
+                        ShardRange.ACTIVE)
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds, states=shard_states)
+        shard_resp_hdrs = self._make_shard_resp_hdrs(sr_objs)
 
         all_objects = []
         for objects in sr_objs:
@@ -1784,15 +1778,9 @@ class TestContainerController(TestRingBase):
         size_all_objects = sum([obj['bytes'] for obj in all_objects])
         num_all_objects = len(all_objects)
         limit = CONTAINER_LISTING_LIMIT
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Timestamp': '99',
-                          # pretend root object stats are not yet updated
-                          'X-Container-Object-Count': num_all_objects - 1,
-                          'X-Container-Bytes-Used': size_all_objects - 1,
-                          'X-Container-Meta-Flavour': 'peach',
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        # pretend root object stats are not yet updated
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+            num_all_objects - 1, size_all_objects - 1)
 
         # forwards listing
 
@@ -1827,8 +1815,8 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs,
-                            expected_objects=expected_objects)
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
 
         # reverse listing
 
@@ -1865,25 +1853,15 @@ class TestContainerController(TestRingBase):
             mock_responses, expected_objects, expected_requests,
             query_string='?reverse=true', reverse=True)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs,
-                            expected_objects=expected_objects)
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
 
     def test_GET_sharded_container_gap_in_shards_no_memcache(self):
         # verify ordered listing even if unexpected gap between shard ranges
         shard_bounds = (('', 'ham'), ('onion', 'pie'), ('rhubarb', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 0}
-            for i in range(3)]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_resp_hdrs = self._make_shard_resp_hdrs(sr_objs)
 
         all_objects = []
         for objects in sr_objs:
@@ -1891,15 +1869,9 @@ class TestContainerController(TestRingBase):
         size_all_objects = sum([obj['bytes'] for obj in all_objects])
         num_all_objects = len(all_objects)
         limit = CONTAINER_LISTING_LIMIT
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Override-Shard-Name-Filter': 'true',
-                          'X-Backend-Timestamp': '99',
-                          'X-Container-Object-Count': num_all_objects,
-                          'X-Container-Bytes-Used': size_all_objects,
-                          'X-Container-Meta-Flavour': 'peach',
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        # pretend root object stats are not yet updated
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+            num_all_objects, size_all_objects)
 
         mock_responses = [
             # status, body, headers
@@ -1927,26 +1899,16 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, all_objects, expected_requests, memcache=False)
         # root object count will be overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
         self.assertNotIn('swift.cache', resp.request.environ)
 
     def test_GET_sharding_container_gap_in_shards_memcache(self):
         # verify ordered listing even if unexpected gap between shard ranges;
         # root is sharding so shard ranges are not cached
         shard_bounds = (('', 'ham'), ('onion', 'pie'), ('rhubarb', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 0}
-            for i in range(3)]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_resp_hdrs = self._make_shard_resp_hdrs(sr_objs)
 
         all_objects = []
         for objects in sr_objs:
@@ -1954,15 +1916,9 @@ class TestContainerController(TestRingBase):
         size_all_objects = sum([obj['bytes'] for obj in all_objects])
         num_all_objects = len(all_objects)
         limit = CONTAINER_LISTING_LIMIT
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharding',
-                          'X-Backend-Override-Shard-Name-Filter': 'true',
-                          'X-Backend-Timestamp': '99',
-                          'X-Container-Object-Count': num_all_objects,
-                          'X-Container-Bytes-Used': size_all_objects,
-                          'X-Container-Meta-Flavour': 'peach',
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+            num_all_objects, size_all_objects,
+            extra_hdrs={'X-Backend-Sharding-State': 'sharding'})
 
         mock_responses = [
             # status, body, headers
@@ -1991,8 +1947,8 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, all_objects, expected_requests, memcache=True)
         # root object count will be overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs,
-                            exp_sharding_state='sharding')
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    exp_sharding_state='sharding')
         self.assertIn('swift.cache', resp.request.environ)
         self.assertNotIn('shard-listing-v2/a/c',
                          resp.request.environ['swift.cache'].store)
@@ -2000,19 +1956,9 @@ class TestContainerController(TestRingBase):
     def test_GET_sharded_container_gap_in_shards_memcache(self):
         # verify ordered listing even if unexpected gap between shard ranges
         shard_bounds = (('', 'ham'), ('onion', 'pie'), ('rhubarb', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 0}
-            for i in range(3)]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_resp_hdrs = self._make_shard_resp_hdrs(sr_objs)
 
         all_objects = []
         for objects in sr_objs:
@@ -2020,15 +1966,9 @@ class TestContainerController(TestRingBase):
         size_all_objects = sum([obj['bytes'] for obj in all_objects])
         num_all_objects = len(all_objects)
         limit = CONTAINER_LISTING_LIMIT
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Override-Shard-Name-Filter': 'true',
-                          'X-Backend-Timestamp': '99',
-                          'X-Container-Object-Count': num_all_objects,
-                          'X-Container-Bytes-Used': size_all_objects,
-                          'X-Container-Meta-Flavour': 'peach',
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+            num_all_objects, size_all_objects,
+            extra_shard_hdrs={'x-backend-override-shard-name-filter': 'true'})
 
         mock_responses = [
             # status, body, headers
@@ -2058,7 +1998,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, all_objects, expected_requests, memcache=True)
         # root object count will be overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
         self.assertIn('swift.cache', resp.request.environ)
         self.assertIn('shard-listing-v2/a/c',
                       resp.request.environ['swift.cache'].store)
@@ -2072,19 +2012,9 @@ class TestContainerController(TestRingBase):
     def test_GET_sharded_container_empty_shard(self):
         # verify ordered listing when a shard is empty
         shard_bounds = (('', 'ham'), ('ham', 'pie'), ('pie', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 0}
-            for i in range(3)]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_resp_hdrs = self._make_shard_resp_hdrs(sr_objs)
         empty_shard_resp_hdrs = {
             'X-Backend-Sharding-State': 'unsharded',
             'X-Container-Object-Count': 0,
@@ -2095,14 +2025,9 @@ class TestContainerController(TestRingBase):
         # empty first shard range
         all_objects = sr_objs[1] + sr_objs[2]
         size_all_objects = sum([obj['bytes'] for obj in all_objects])
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Timestamp': '99',
-                          'X-Container-Object-Count': len(all_objects),
-                          'X-Container-Bytes-Used': size_all_objects,
-                          'X-Container-Meta-Flavour': 'peach',
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        num_all_objects = len(all_objects)
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+            num_all_objects, size_all_objects)
 
         mock_responses = [
             # status, body, headers
@@ -2130,7 +2055,7 @@ class TestContainerController(TestRingBase):
 
         resp = self._check_GET_shard_listing(
             mock_responses, sr_objs[1] + sr_objs[2], expected_requests)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # empty last shard range, reverse
         all_objects = sr_objs[0] + sr_objs[1]
@@ -2143,6 +2068,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2171,7 +2097,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, list(reversed(sr_objs[0] + sr_objs[1])),
             expected_requests, query_string='?reverse=true', reverse=True)
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # empty second shard range
         all_objects = sr_objs[0] + sr_objs[2]
@@ -2184,6 +2110,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2212,7 +2139,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, sr_objs[0] + sr_objs[2], expected_requests)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # marker in empty second range
         mock_responses = [
@@ -2238,7 +2165,7 @@ class TestContainerController(TestRingBase):
             mock_responses, sr_objs[2], expected_requests,
             query_string='?marker=koolaid')
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
         # marker in empty second range, reverse
         mock_responses = [
@@ -2264,26 +2191,16 @@ class TestContainerController(TestRingBase):
             mock_responses, list(reversed(sr_objs[0])), expected_requests,
             query_string='?marker=koolaid&reverse=true', reverse=True)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
     def _check_GET_sharded_container_shard_error(self, error):
         # verify ordered listing when a shard is empty
         shard_bounds = (('', 'ham'), ('ham', 'pie'), ('lemon', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         # empty second shard range
         sr_objs[1] = []
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 0}
-            for i in range(3)]
+        shard_resp_hdrs = self._make_shard_resp_hdrs(sr_objs)
 
         all_objects = []
         for objects in sr_objs:
@@ -2291,14 +2208,8 @@ class TestContainerController(TestRingBase):
         size_all_objects = sum([obj['bytes'] for obj in all_objects])
         num_all_objects = len(all_objects)
         limit = CONTAINER_LISTING_LIMIT
-        root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                          'X-Backend-Timestamp': '99',
-                          'X-Container-Object-Count': num_all_objects,
-                          'X-Container-Bytes-Used': size_all_objects,
-                          'X-Container-Meta-Flavour': 'peach',
-                          'X-Backend-Storage-Policy-Index': 0}
-        root_shard_resp_hdrs = dict(root_resp_hdrs)
-        root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+            num_all_objects, size_all_objects)
 
         mock_responses = [
             # status, body, headers
@@ -2330,21 +2241,12 @@ class TestContainerController(TestRingBase):
     def test_GET_sharded_container_sharding_shard(self):
         # one shard is in process of sharding
         shard_bounds = (('', 'ham'), ('ham', 'pie'), ('pie', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 0}
-            for i in range(3)]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_resp_hdrs = self._make_shard_resp_hdrs(sr_objs)
         shard_1_shard_resp_hdrs = dict(shard_resp_hdrs[1])
         shard_1_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        shard_1_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         # second shard is sharding and has cleaved two out of three sub shards
         shard_resp_hdrs[1]['X-Backend-Sharding-State'] = 'sharding'
@@ -2377,6 +2279,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2438,7 +2341,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
     @patch_policies([
         StoragePolicy(0, 'zero', True, object_ring=FakeRing()),
@@ -2448,22 +2351,15 @@ class TestContainerController(TestRingBase):
         # scenario: one shard is in process of sharding, shards have different
         # policy than root, expect listing to always request root policy index
         shard_bounds = (('', 'ham'), ('ham', 'pie'), ('pie', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
-        shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 1,
-             'X-Backend-Record-Storage-Policy-Index': 0}
-            for i in range(3)]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_resp_hdrs = self._make_shard_resp_hdrs(
+            sr_objs, extra_hdrs={
+                'X-Backend-Storage-Policy-Index': 1,
+                'X-Backend-Record-Storage-Policy-Index': 0})
         shard_1_shard_resp_hdrs = dict(shard_resp_hdrs[1])
         shard_1_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        shard_1_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         # second shard is sharding and has cleaved two out of three sub shards
         shard_resp_hdrs[1]['X-Backend-Sharding-State'] = 'sharding'
@@ -2473,15 +2369,10 @@ class TestContainerController(TestRingBase):
             for lower, upper in sub_shard_bounds]
         sub_sr_dicts = [dict(sr) for sr in sub_shard_ranges]
         sub_sr_objs = [self._make_shard_objects(sr) for sr in sub_shard_ranges]
-        sub_shard_resp_hdrs = [
-            {'X-Backend-Sharding-State': 'unsharded',
-             'X-Container-Object-Count': len(sub_sr_objs[i]),
-             'X-Container-Bytes-Used':
-                 sum([obj['bytes'] for obj in sub_sr_objs[i]]),
-             'X-Container-Meta-Flavour': 'flavour%d' % i,
-             'X-Backend-Storage-Policy-Index': 1,
-             'X-Backend-Record-Storage-Policy-Index': 0}
-            for i in range(2)]
+        sub_shard_resp_hdrs = self._make_shard_resp_hdrs(
+            sub_sr_objs, extra_hdrs={
+                'X-Backend-Storage-Policy-Index': 1,
+                'X-Backend-Record-Storage-Policy-Index': 0})
 
         all_objects = []
         for objects in sr_objs:
@@ -2497,6 +2388,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2558,7 +2450,7 @@ class TestContainerController(TestRingBase):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests)
         # root object count will overridden by actual length of listing
-        self.check_response(resp, root_resp_hdrs)
+        self.check_listing_response(resp, root_resp_hdrs)
 
     @patch_policies([
         StoragePolicy(0, 'zero', True, object_ring=FakeRing()),
@@ -2570,8 +2462,11 @@ class TestContainerController(TestRingBase):
         # policy index
         def do_test(shard_policy):
             # only need first shard for this test...
-            sr = ShardRange('.shards_a/c_pie', Timestamp.now(), '', 'pie')
-            sr_objs = self._make_shard_objects(sr)
+            shard_bounds = ('', 'pie')
+            shard_ranges, _, sr_objs = self.create_server_response_data(
+                shard_bounds)
+            sr = shard_ranges[0]
+            sr_objs = sr_objs[0]
             shard_resp_hdrs = {
                 'X-Backend-Sharding-State': 'unsharded',
                 'X-Container-Object-Count': len(sr_objs),
@@ -2586,15 +2481,9 @@ class TestContainerController(TestRingBase):
             size_all_objects = sum([obj['bytes'] for obj in sr_objs])
             num_all_objects = len(sr_objs)
             limit = CONTAINER_LISTING_LIMIT
-            root_resp_hdrs = {'X-Backend-Sharding-State': 'sharded',
-                              'X-Backend-Timestamp': '99',
-                              'X-Container-Object-Count': num_all_objects,
-                              'X-Container-Bytes-Used': size_all_objects,
-                              'X-Container-Meta-Flavour': 'peach',
-                              # NB root policy 1 differes from shard policy
-                              'X-Backend-Storage-Policy-Index': 1}
-            root_shard_resp_hdrs = dict(root_resp_hdrs)
-            root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+            root_resp_hdrs, root_shard_resp_hdrs = self._make_root_resp_hdrs(
+                num_all_objects, size_all_objects,
+                extra_hdrs={'X-Backend-Storage-Policy-Index': 1})
 
             mock_responses = [
                 # status, body, headers
@@ -2621,6 +2510,35 @@ class TestContainerController(TestRingBase):
         do_test(0)
         do_test(None)
 
+
+@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
+class TestGetShardedContainerLegacy(TestGetShardedContainer):
+    """
+    Test all existing test cases to query Namespaces from container server but
+    get ShardRanges returned. This is to test backward compatibility that new
+    proxy-servers ask for new Namespace format from the older version container
+    servers who don't support Namespace format yet.
+    """
+    # old container servers did not return this header
+    RESP_SHARD_FORMAT_HEADERS = {}
+
+    def create_server_response_data(self, bounds, states=None, remove_char=''):
+        if not isinstance(bounds[0], (list, tuple)):
+            bounds = [(l, u) for l, u in zip(bounds[:-1], bounds[1:])]
+        if not states:
+            states = []
+        shard_ranges = [
+            ShardRange('.shards_a/c_%s' % bound[1].replace(remove_char, ''),
+                       Timestamp.now(), bound[0], bound[1], state=state)
+            for bound, state in zip_longest(
+                bounds, states, fillvalue=ShardRange.FOUND)]
+        sr_dicts = [dict(sr, last_modified=sr.timestamp.isoformat)
+                    for sr in shard_ranges]
+        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        return shard_ranges, sr_dicts, sr_objs
+
+
+class TestGetPathShardCaching(BaseTestContainerController):
     def _build_request(self, headers, params, infocache=None):
         # helper to make a GET request with caches set in environ
         query_string = '?' + '&'.join('%s=%s' % (k, v)
@@ -3679,28 +3597,6 @@ class TestContainerController(TestRingBase):
         do_test('DELETE', 204, self.CONTAINER_REPLICAS)
         do_test('POST', 204, self.CONTAINER_REPLICAS)
         do_test('PUT', 202, self.CONTAINER_REPLICAS)
-
-    def test_GET_bad_requests(self):
-        # verify that the proxy controller enforces checks on request params
-        req = Request.blank(
-            '/v1/a/c?limit=%d' % (CONTAINER_LISTING_LIMIT + 1))
-        self.assertEqual(412, req.get_response(self.app).status_int)
-        req = Request.blank('/v1/a/c?delimiter=%ff')
-        self.assertEqual(400, req.get_response(self.app).status_int)
-        req = Request.blank('/v1/a/c?marker=%ff')
-        self.assertEqual(400, req.get_response(self.app).status_int)
-        req = Request.blank('/v1/a/c?end_marker=%ff')
-        self.assertEqual(400, req.get_response(self.app).status_int)
-        req = Request.blank('/v1/a/c?prefix=%ff')
-        self.assertEqual(400, req.get_response(self.app).status_int)
-        req = Request.blank('/v1/a/c?format=%ff')
-        self.assertEqual(400, req.get_response(self.app).status_int)
-        req = Request.blank('/v1/a/c?path=%ff')
-        self.assertEqual(400, req.get_response(self.app).status_int)
-        req = Request.blank('/v1/a/c?includes=%ff')
-        self.assertEqual(400, req.get_response(self.app).status_int)
-        req = Request.blank('/v1/a/c?states=%ff')
-        self.assertEqual(400, req.get_response(self.app).status_int)
 
 
 @patch_policies(
