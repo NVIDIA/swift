@@ -21,6 +21,10 @@ import unittest
 from eventlet import Timeout
 import six
 from six.moves import urllib
+if six.PY2:
+    from itertools import izip_longest as zip_longest
+else:
+    from itertools import zip_longest
 
 from swift.common.constraints import CONTAINER_LISTING_LIMIT
 from swift.common.swob import Request, bytes_to_wsgi, str_to_wsgi, wsgi_quote
@@ -43,6 +47,7 @@ from test.unit.proxy.test_server import node_error_count
 
 @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
 class TestContainerController(TestRingBase):
+    RESP_SHARD_FORMAT_HEADERS = {'X-Backend-Record-Shard-Format': 'namespace'}
 
     CONTAINER_REPLICAS = 3
 
@@ -573,15 +578,22 @@ class TestContainerController(TestRingBase):
         info = get_container_info(resp.request.environ, self.app)
         self.assertEqual(headers_to_container_info(info_hdrs), info)
 
+    def create_server_response_data(self, bounds, states=None, remove_char=''):
+        if not isinstance(bounds[0], (list, tuple)):
+            bounds = [(l, u) for l, u in zip(bounds[:-1], bounds[1:])]
+        namespaces = [
+            Namespace('.shards_a/c_%s' % upper.replace(remove_char, ''),
+                      lower, upper)
+            for lower, upper in bounds]
+        ns_dicts = [dict(ns) for ns in namespaces]
+        ns_objs = [self._make_shard_objects(ns) for ns in namespaces]
+        return namespaces, ns_dicts, ns_objs
+
     def test_GET_sharded_container_no_memcache(self):
         # Don't worry, ShardRange._encode takes care of unicode/bytes issues
         shard_bounds = ('', 'ham', 'pie', u'\N{SNOWMAN}', u'\U0001F334', '')
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in zip(shard_bounds[:-1], shard_bounds[1:])]
-        sr_dicts = [dict(sr, last_modified=sr.timestamp.isoformat)
-                    for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         shard_resp_hdrs = [
             {'X-Backend-Sharding-State': 'unsharded',
              'X-Container-Object-Count': len(sr_objs[i]),
@@ -607,6 +619,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         # GET all objects
         # include some failed responses
@@ -961,12 +974,8 @@ class TestContainerController(TestRingBase):
         # verify alternative code path in ContainerController when memcache is
         # available...
         shard_bounds = ('', 'ham', 'pie', u'\N{SNOWMAN}', u'\U0001F334', '')
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in zip(shard_bounds[:-1], shard_bounds[1:])]
-        sr_dicts = [dict(sr, last_modified=sr.timestamp.isoformat)
-                    for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         shard_resp_hdrs = [
             {'X-Backend-Sharding-State': 'unsharded',
              'X-Container-Object-Count': len(sr_objs[i]),
@@ -993,6 +1002,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Override-Shard-Name-Filter': 'true'}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         # GET all objects
         # include some failed responses
@@ -1359,11 +1369,8 @@ class TestContainerController(TestRingBase):
         # verify that if a shard fails to return its listing component then the
         # client response is 503
         shard_bounds = (('a', 'b'), ('b', 'c'), ('c', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         shard_resp_hdrs = [
             {'X-Backend-Sharding-State': 'unsharded',
              'X-Container-Object-Count': len(sr_objs[i]),
@@ -1385,6 +1392,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -1448,11 +1456,8 @@ class TestContainerController(TestRingBase):
     def test_GET_sharded_container_with_delimiter(self):
         shard_bounds = (('', 'ha/ppy'), ('ha/ppy', 'ha/ptic'),
                         ('ha/ptic', 'ham'), ('ham', 'pie'), ('pie', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper.replace('/', ''),
-                       Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, _ = self.create_server_response_data(
+            shard_bounds, remove_char='/')
         shard_resp_hdrs = {'X-Backend-Sharding-State': 'unsharded',
                            'X-Container-Object-Count': 2,
                            'X-Container-Bytes-Used': 4,
@@ -1467,6 +1472,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         sr_0_obj = {'name': 'apple',
                     'bytes': 1,
@@ -1513,13 +1519,9 @@ class TestContainerController(TestRingBase):
         self.check_response(resp, root_resp_hdrs)
 
     def test_GET_sharded_container_with_delimiter_and_reverse(self):
-        shard_points = ('', 'ha.d', 'ha/ppy', 'ha/ptic', 'ham', 'pie', '')
-        shard_bounds = tuple(zip(shard_points, shard_points[1:]))
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper.replace('/', ''),
-                       Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
+        shard_bounds = ('', 'ha.d', 'ha/ppy', 'ha/ptic', 'ham', 'pie', '')
+        shard_ranges, sr_dicts, _ = self.create_server_response_data(
+            shard_bounds, remove_char='/')
         shard_resp_hdrs = {'X-Backend-Sharding-State': 'unsharded',
                            'X-Container-Object-Count': 2,
                            'X-Container-Bytes-Used': 4,
@@ -1534,6 +1536,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         sr_0_obj = {'name': 'apple',
                     'bytes': 1,
@@ -1595,8 +1598,11 @@ class TestContainerController(TestRingBase):
         # the root) objects are requested from the root, rather than a loop.
 
         # single shard spanning entire namespace
-        shard_sr = ShardRange('.shards_a/c_xyz', Timestamp.now(), '', '')
-        all_objects = self._make_shard_objects(shard_sr)
+        shard_bounds = ('', '')
+        shard_ranges, _, sr_objs = self.create_server_response_data(
+            shard_bounds)
+        shard_sr = shard_ranges[0]
+        all_objects = sr_objs[0]
         size_all_objects = sum([obj['bytes'] for obj in all_objects])
         num_all_objects = len(all_objects)
         limit = CONTAINER_LISTING_LIMIT
@@ -1619,6 +1625,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         root_sr = ShardRange('a/c', Timestamp.now(), '', '')
         mock_responses = [
@@ -1648,7 +1655,7 @@ class TestContainerController(TestRingBase):
         self.check_response(resp, root_resp_hdrs,
                             expected_objects=expected_objects)
         self.assertEqual(
-            [('a', 'c'), ('.shards_a', 'c_xyz')],
+            [('a', 'c'), ('.shards_a', 'c_')],
             resp.request.environ.get('swift.shard_listing_history'))
         lines = [line for line in self.app.logger.get_lines_for_level('debug')
                  if line.startswith('Found 1024 objects in shard')]
@@ -1662,16 +1669,13 @@ class TestContainerController(TestRingBase):
         # out of the loop (this isn't an expected scenario, but could perhaps
         # happen if multiple conflicting shard-shrinking decisions are made)
         shard_bounds = ('', 'a', 'b', '')
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in zip(shard_bounds[:-1], shard_bounds[1:])]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         self.assertEqual([
             '.shards_a/c_a',
             '.shards_a/c_b',
             '.shards_a/c_',
         ], [sr.name for sr in shard_ranges])
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
         all_objects = []
         for objects in sr_objs:
             all_objects.extend(objects)
@@ -1686,6 +1690,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Record-Storage-Policy-Index': 0,
                           'X-Backend-Record-Type': 'shard',
                           }
+        root_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
         shard_resp_hdrs = {'X-Backend-Sharding-State': 'unsharded',
                            'X-Container-Object-Count': 2,
                            'X-Container-Bytes-Used': 4,
@@ -1697,6 +1702,7 @@ class TestContainerController(TestRingBase):
             'X-Backend-Record-Type': 'shard',
             'X-Backend-Storage-Policy-Index': 0
         }
+        shrinking_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
         limit = CONTAINER_LISTING_LIMIT
 
         mock_responses = [
@@ -1760,15 +1766,12 @@ class TestContainerController(TestRingBase):
 
     def test_GET_sharded_container_overlapping_shards(self):
         # verify ordered listing even if unexpected overlapping shard ranges
-        shard_bounds = (('', 'ham', ShardRange.CLEAVED),
-                        ('', 'pie', ShardRange.ACTIVE),
-                        ('lemon', '', ShardRange.ACTIVE))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper,
-                       state=state)
-            for lower, upper, state in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_bounds = (('', 'ham'), ('', 'pie'), ('lemon', ''))
+        shard_states = (ShardRange.CLEAVED, ShardRange.ACTIVE,
+                        ShardRange.ACTIVE)
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds, states=shard_states)
+
         shard_resp_hdrs = [
             {'X-Backend-Sharding-State': 'unsharded',
              'X-Container-Object-Count': len(sr_objs[i]),
@@ -1793,6 +1796,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         # forwards listing
 
@@ -1871,11 +1875,8 @@ class TestContainerController(TestRingBase):
     def test_GET_sharded_container_gap_in_shards_no_memcache(self):
         # verify ordered listing even if unexpected gap between shard ranges
         shard_bounds = (('', 'ham'), ('onion', 'pie'), ('rhubarb', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         shard_resp_hdrs = [
             {'X-Backend-Sharding-State': 'unsharded',
              'X-Container-Object-Count': len(sr_objs[i]),
@@ -1900,6 +1901,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -1934,11 +1936,8 @@ class TestContainerController(TestRingBase):
         # verify ordered listing even if unexpected gap between shard ranges;
         # root is sharding so shard ranges are not cached
         shard_bounds = (('', 'ham'), ('onion', 'pie'), ('rhubarb', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         shard_resp_hdrs = [
             {'X-Backend-Sharding-State': 'unsharded',
              'X-Container-Object-Count': len(sr_objs[i]),
@@ -1963,6 +1962,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2000,11 +2000,8 @@ class TestContainerController(TestRingBase):
     def test_GET_sharded_container_gap_in_shards_memcache(self):
         # verify ordered listing even if unexpected gap between shard ranges
         shard_bounds = (('', 'ham'), ('onion', 'pie'), ('rhubarb', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         shard_resp_hdrs = [
             {'X-Backend-Sharding-State': 'unsharded',
              'X-Container-Object-Count': len(sr_objs[i]),
@@ -2029,6 +2026,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2072,11 +2070,8 @@ class TestContainerController(TestRingBase):
     def test_GET_sharded_container_empty_shard(self):
         # verify ordered listing when a shard is empty
         shard_bounds = (('', 'ham'), ('ham', 'pie'), ('pie', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         shard_resp_hdrs = [
             {'X-Backend-Sharding-State': 'unsharded',
              'X-Container-Object-Count': len(sr_objs[i]),
@@ -2103,6 +2098,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2143,6 +2139,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2184,6 +2181,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2269,11 +2267,8 @@ class TestContainerController(TestRingBase):
     def _check_GET_sharded_container_shard_error(self, error):
         # verify ordered listing when a shard is empty
         shard_bounds = (('', 'ham'), ('ham', 'pie'), ('lemon', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_%s' % upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         # empty second shard range
         sr_objs[1] = []
         shard_resp_hdrs = [
@@ -2299,6 +2294,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2330,11 +2326,8 @@ class TestContainerController(TestRingBase):
     def test_GET_sharded_container_sharding_shard(self):
         # one shard is in process of sharding
         shard_bounds = (('', 'ham'), ('ham', 'pie'), ('pie', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         shard_resp_hdrs = [
             {'X-Backend-Sharding-State': 'unsharded',
              'X-Container-Object-Count': len(sr_objs[i]),
@@ -2345,6 +2338,7 @@ class TestContainerController(TestRingBase):
             for i in range(3)]
         shard_1_shard_resp_hdrs = dict(shard_resp_hdrs[1])
         shard_1_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        shard_1_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         # second shard is sharding and has cleaved two out of three sub shards
         shard_resp_hdrs[1]['X-Backend-Sharding-State'] = 'sharding'
@@ -2377,6 +2371,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2448,11 +2443,8 @@ class TestContainerController(TestRingBase):
         # scenario: one shard is in process of sharding, shards have different
         # policy than root, expect listing to always request root policy index
         shard_bounds = (('', 'ham'), ('ham', 'pie'), ('pie', ''))
-        shard_ranges = [
-            ShardRange('.shards_a/c_' + upper, Timestamp.now(), lower, upper)
-            for lower, upper in shard_bounds]
-        sr_dicts = [dict(sr) for sr in shard_ranges]
-        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        shard_ranges, sr_dicts, sr_objs = self.create_server_response_data(
+            shard_bounds)
         shard_resp_hdrs = [
             {'X-Backend-Sharding-State': 'unsharded',
              'X-Container-Object-Count': len(sr_objs[i]),
@@ -2464,6 +2456,7 @@ class TestContainerController(TestRingBase):
             for i in range(3)]
         shard_1_shard_resp_hdrs = dict(shard_resp_hdrs[1])
         shard_1_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        shard_1_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         # second shard is sharding and has cleaved two out of three sub shards
         shard_resp_hdrs[1]['X-Backend-Sharding-State'] = 'sharding'
@@ -2497,6 +2490,7 @@ class TestContainerController(TestRingBase):
                           'X-Backend-Storage-Policy-Index': 0}
         root_shard_resp_hdrs = dict(root_resp_hdrs)
         root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+        root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
         mock_responses = [
             # status, body, headers
@@ -2570,8 +2564,11 @@ class TestContainerController(TestRingBase):
         # policy index
         def do_test(shard_policy):
             # only need first shard for this test...
-            sr = ShardRange('.shards_a/c_pie', Timestamp.now(), '', 'pie')
-            sr_objs = self._make_shard_objects(sr)
+            shard_bounds = ('', 'pie')
+            shard_ranges, _, sr_objs = self.create_server_response_data(
+                shard_bounds)
+            sr = shard_ranges[0]
+            sr_objs = sr_objs[0]
             shard_resp_hdrs = {
                 'X-Backend-Sharding-State': 'unsharded',
                 'X-Container-Object-Count': len(sr_objs),
@@ -2595,6 +2592,7 @@ class TestContainerController(TestRingBase):
                               'X-Backend-Storage-Policy-Index': 1}
             root_shard_resp_hdrs = dict(root_resp_hdrs)
             root_shard_resp_hdrs['X-Backend-Record-Type'] = 'shard'
+            root_shard_resp_hdrs.update(self.RESP_SHARD_FORMAT_HEADERS)
 
             mock_responses = [
                 # status, body, headers
@@ -3768,6 +3766,33 @@ class TestContainerController4Replicas(TestContainerController):
             ((503, 503, 503, 503), 503)
         ]
         self._assert_responses('POST', POST_TEST_CASES)
+
+
+@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
+class TestContainerControllerReturnShardRanges(TestContainerController):
+    """
+    Test all existing test cases to query Namespaces from container server but
+    get ShardRanges returned. This is to test backward compatibility that new
+    proxy-servers ask for new Namespace format from the older version container
+    servers who don't support Namespace format yet.
+    """
+    # old container servers did not return this header
+    RESP_SHARD_FORMAT_HEADERS = {}
+
+    def create_server_response_data(self, bounds, states=None, remove_char=''):
+        if not isinstance(bounds[0], (list, tuple)):
+            bounds = [(l, u) for l, u in zip(bounds[:-1], bounds[1:])]
+        if not states:
+            states = []
+        shard_ranges = [
+            ShardRange('.shards_a/c_%s' % bound[1].replace(remove_char, ''),
+                       Timestamp.now(), bound[0], bound[1], state=state)
+            for bound, state in zip_longest(
+                bounds, states, fillvalue=ShardRange.FOUND)]
+        sr_dicts = [dict(sr, last_modified=sr.timestamp.isoformat)
+                    for sr in shard_ranges]
+        sr_objs = [self._make_shard_objects(sr) for sr in shard_ranges]
+        return shard_ranges, sr_dicts, sr_objs
 
 
 if __name__ == '__main__':
