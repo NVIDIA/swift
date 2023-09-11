@@ -2472,8 +2472,11 @@ class Controller(object):
             return None
 
         try:
-            return [ShardRange.from_dict(shard_range)
-                    for shard_range in listing]
+            # Note: the listing could either be shard ranges or namespace
+            # dicts; namespaces only has 'name', 'lower' and 'upper' keys. We
+            # therefore cannot use ShardRange.from_dict(). So forced to use the
+            # constructor
+            return [ShardRange(**data) for data in listing]
         except (ValueError, TypeError, KeyError) as err:
             self.logger.error(
                 "Failed to get shard ranges from %s: invalid data: %r",
