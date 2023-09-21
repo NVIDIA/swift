@@ -7988,7 +7988,7 @@ class TestObjectController(BaseTestCase):
                     return b'VERIFY'
                 return b''
 
-        with mock.patch.object(object_server, 'fs_has_free_space',
+        with mock.patch.object(diskfile, 'fs_has_free_space',
                                lambda *a: False):
             timestamp = normalize_timestamp(time())
             body_reader = IgnoredBody()
@@ -8002,6 +8002,44 @@ class TestObjectController(BaseTestCase):
                          'Expect': '100-continue'})
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 507)
+            self.assertFalse(body_reader.read_called)
+
+    def test_chunked_DELETE_with_full_drive(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'PUT'},
+            body=b'VERIFY',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'application/octet-stream'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        class IgnoredBody(object):
+
+            def __init__(self):
+                self.read_called = False
+
+            def read(self, size=-1):
+                if not self.read_called:
+                    self.read_called = True
+                    return b'VERIFY'
+                return b''
+
+        with mock.patch.object(diskfile, 'fs_has_free_space',
+                               lambda *a: False):
+            timestamp = normalize_timestamp(time())
+            body_reader = IgnoredBody()
+            req = Request.blank(
+                '/sda1/p/a/c/o',
+                environ={'REQUEST_METHOD': 'DELETE',
+                         'wsgi.input': body_reader},
+                headers={'X-Timestamp': timestamp,
+                         'Transfer-Encoding': 'chunked',
+                         'Content-Type': 'application/octet-stream',
+                         'Expect': '100-continue'})
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 204)
             self.assertFalse(body_reader.read_called)
 
     def test_global_conf_callback_does_nothing(self):
