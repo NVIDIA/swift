@@ -1531,6 +1531,8 @@ def timing_stats(**dec_kwargs):
         @functools.wraps(func)
         def _timing_stats(ctrl, *args, **kwargs):
             start_time = time.time()
+            if getattr(ctrl, 'sleep_in_call', False):
+                sleep()
             resp = func(ctrl, *args, **kwargs)
             # .timing is for successful responses *or* error codes that are
             # not Swift's fault. For example, 500 is definitely the server's
