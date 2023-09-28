@@ -4354,7 +4354,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4377,7 +4378,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have 'X-Storage-Token'.
@@ -4387,7 +4389,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have both 'X-Auth-Token' and 'X-Storage-Token'.
@@ -4398,7 +4401,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
 
     def test_GET_keep_cache_private_config_false(self):
@@ -4426,7 +4430,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4449,7 +4454,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have 'X-Storage-Token'.
@@ -4459,7 +4465,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have both 'X-Auth-Token' and 'X-Storage-Token'.
@@ -4470,7 +4477,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
 
     def test_GET_keep_cache_slo_manifest_no_config(self):
@@ -4500,7 +4508,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4545,7 +4554,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4590,7 +4600,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=True)
+            reader_mock.assert_called_with(
+                keep_cache=True, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4634,7 +4645,8 @@ class TestObjectController(BaseTestCase):
         reader_mock = mock.Mock(keep_cache=False)
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
-            reader_mock.assert_called_with(keep_cache=False)
+            reader_mock.assert_called_with(
+                keep_cache=False, cooperative_period=-1)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4649,6 +4661,158 @@ class TestObjectController(BaseTestCase):
                 '%a, %d %b %Y %H:%M:%S GMT',
                 gmtime(math.ceil(float(timestamp)))),
         })
+
+    def test_GET_cooperative_period_config(self):
+        # Test config of 'cooperative_period' gets passed to DiskFile reader.
+        conf = {'devices': self.testdir, 'mount_check': 'false',
+                'container_update_timeout': 0.0,
+                'cooperative_period': '99'}
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+        obj_controller.bytes_per_sync = 1
+
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': timestamp,
+                                     'Content-Type': 'application/x-test'})
+        req.body = b'7 bytes'
+        resp = req.get_response(obj_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            headers={'Content-Type': 'application/x-test',
+                                     'X-Auth-Token': '2340lsdfhhjl02lxfjj'})
+        reader_mock = mock.Mock(keep_cache=False)
+        with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
+            resp = req.get_response(obj_controller)
+        reader_mock.assert_called_with(keep_cache=False, cooperative_period=99)
+        self.assertEqual(resp.status_int, 200)
+
+        # Test DiskFile reader actually sleeps when reading chunks. When
+        # cooperative_period is 1, disk reader sleeps once after each next().
+        conf['cooperative_period'] = '1'
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+        obj_controller.bytes_per_sync = 1
+
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': timestamp,
+                                     'Content-Type': 'application/x-test'})
+        req.body = b'7 bytes'
+        resp = req.get_response(obj_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Range': 'bytes=1-6'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 206)
+            self.assertEqual('bytes 1-6/7', resp.headers.get('Content-Range'))
+            self.assertEqual(b' bytes', resp.body)
+        self.assertEqual(1, mock_sleep.call_count)
+
+        # Test DiskFile reader actually sleeps when reading chunks. When
+        # cooperative_period is 0, disk reader sleeps once before each next().
+        conf['cooperative_period'] = '0'
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+        obj_controller.bytes_per_sync = 1
+
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': timestamp,
+                                     'Content-Type': 'application/x-test'})
+        req.body = b'7 bytes'
+        resp = req.get_response(obj_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Range': 'bytes=1-6'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 206)
+            self.assertEqual('bytes 1-6/7', resp.headers.get('Content-Range'))
+            self.assertEqual(b' bytes', resp.body)
+        self.assertEqual(2, mock_sleep.call_count)
+
+        # Test DiskFile reader won't sleep with default cooperative_period.
+        conf.pop('cooperative_period')
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+        obj_controller.bytes_per_sync = 1
+
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': timestamp,
+                                     'Content-Type': 'application/x-test'})
+        req.body = b'7 bytes'
+        resp = req.get_response(obj_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Range': 'bytes=1-6'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 206)
+            self.assertEqual('bytes 1-6/7', resp.headers.get('Content-Range'))
+            self.assertEqual(b' bytes', resp.body)
+        self.assertFalse(mock_sleep.called)
+
+    def test_sleep_in_call_config(self):
+        def do_call(method, sleep_in_call):
+            conf = {'devices': self.testdir, 'mount_check': 'false',
+                    'sleep_in_call': sleep_in_call}
+            obj_controller = object_server.ObjectController(
+                conf, logger=self.logger)
+            obj_controller.bytes_per_sync = 1
+
+            start_time = time()
+            now = [start_time]
+            sleep_calls = [0]
+
+            def fake_time():
+                now[0] += 1
+                return now[0]
+
+            def mock_sleep():
+                sleep_calls[0] += 1
+                now[0] += 12345
+
+            req = Request.blank('/sda1/p/a/c/o',
+                                environ={'REQUEST_METHOD': method})
+            req.headers.update({'X-Timestamp': Timestamp.now().normal,
+                                'Content-Length': '0',
+                                'Content-Type': 'plain/text'})
+
+            with mock.patch(
+                    'swift.obj.server.get_log_line',
+                    return_value='mocked log line') as mock_get_log_line:
+                with mock.patch('swift.common.utils.sleep', mock_sleep):
+                    with mock.patch('swift.obj.server.time.time', fake_time):
+                        with mock.patch.object(obj_controller,
+                                               'logger') as mock_logger:
+                            req.get_response(obj_controller)
+
+            self.assertEqual(1 if sleep_in_call else 0, sleep_calls[0])
+            mock_get_log_line.assert_called_once()
+            log_trans_time = mock_get_log_line.call_args_list[0][0][2]
+
+            mock_logger.timing_since.assert_called_once()
+            stats_start_time = mock_logger.timing_since.call_args_list[0][0][1]
+            stats_elapsed_time = fake_time() - stats_start_time
+            return log_trans_time, stats_elapsed_time
+
+        for method in ('GET', 'HEAD', 'DELETE', 'PUT', 'POST', 'REPLICATE'):
+            log_time, stats_time = do_call(method, False)
+            self.assertLess(log_time, 12345)
+            self.assertLess(stats_time, 12345)
+            log_time, stats_time = do_call(method, True)
+            self.assertGreater(log_time, 12345)
+            self.assertGreater(stats_time, 12345)
 
     @mock.patch("time.time", mock_time)
     def test_DELETE(self):
