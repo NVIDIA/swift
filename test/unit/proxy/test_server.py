@@ -2305,6 +2305,7 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         mock_statsd.assert_called_once_with(
             'example.com', 8125, base_prefix='', tail_prefix='proxy-server',
             default_sample_rate=1.0, sample_rate_factor=1.0,
+            emit_legacy=True,
             logger=app.logger.logger)
 
         conf_sections = """
@@ -2332,6 +2333,7 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         mock_statsd.assert_called_once_with(
             'example.com', 8125, base_prefix='', tail_prefix='proxy-server',
             default_sample_rate=1.0, sample_rate_factor=1.0,
+            emit_legacy=True,
             logger=app.logger.logger)
 
 
