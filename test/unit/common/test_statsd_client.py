@@ -117,6 +117,52 @@ class TestStatsdClient(BaseTestStasdClient):
         self.assertFalse(mock_open1.mock_calls)
         self.assertFalse(self.getaddrinfo_calls)
 
+    def test_user_label(self):
+        conf = {
+            'log_statsd_host': 'myhost1',
+            'log_statsd_port': 1235,
+            'statsd_label_mode': 'librato',
+            'statsd_user_label_foo': 'foo.bar.com',
+        }
+        client = statsd_client.get_labeled_statsd_client(conf)
+        self.assertEqual('metric#app=value,user_foo=foo.bar.com:10|c',
+                         client._build_line(
+                             'metric', '10', 'c', 1.0, {'app': 'value'}))
+
+    def test_user_label_invalid_chars(self):
+        invalid = ',|=[]:.'
+        for c in invalid:
+            user_label = 'statsd_user_label_foo%sbar' % c
+            conf = {
+                'log_statsd_host': 'myhost1',
+                'log_statsd_port': 1235,
+                'statsd_label_mode': 'librato',
+                user_label: 'buz',
+            }
+            with self.assertRaises(ValueError) as ctx:
+                statsd_client.get_labeled_statsd_client(conf)
+            self.assertEqual("invalid character in statsd "
+                             "user label configuration "
+                             "'%s': '%s'" % (user_label, c),
+                             str(ctx.exception))
+
+    def test_user_label_value_invalid_chars(self):
+        invalid = ',|=[]:'
+        for c in invalid:
+            label_value = 'bar%sbaz' % c
+            conf = {
+                'log_statsd_host': 'myhost1',
+                'log_statsd_port': 1235,
+                'statsd_label_mode': 'librato',
+                'statsd_user_label_foo': label_value
+            }
+            with self.assertRaises(ValueError) as ctx:
+                statsd_client.get_labeled_statsd_client(conf)
+            self.assertEqual("invalid character in configuration "
+                             "'statsd_user_label_foo' value "
+                             "'%s': '%s'" % (label_value, c),
+                             str(ctx.exception))
+
 
 class TestStatsdLogging(BaseTestStasdClient):
     def test_get_logger_statsd_client_not_specified(self):
@@ -544,7 +590,7 @@ class TestStatsdLogging(BaseTestStasdClient):
             self.assertEqual(mock_cache.args[1], 2000.99)
 
 
-class TestStatsdLoggingDelegation(unittest.TestCase):
+class BaseTestStatsdLogging(unittest.TestCase):
 
     def setUp(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -588,24 +634,24 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         while not got:
             sender_fn(*args, **kwargs)
             try:
-                got = self.queue.get(timeout=0.5)
+                got = self.queue.get(timeout=0.3)
             except Empty:
                 pass
+        if got and six.PY3:
+            got = got.decode('utf-8')
         return got
 
     def assertStat(self, expected, sender_fn, *args, **kwargs):
         got = self._send_and_get(sender_fn, *args, **kwargs)
-        if six.PY3:
-            got = got.decode('utf-8')
         return self.assertEqual(expected, got)
 
     def assertStatMatches(self, expected_regexp, sender_fn, *args, **kwargs):
         got = self._send_and_get(sender_fn, *args, **kwargs)
-        if six.PY3:
-            got = got.decode('utf-8')
         return self.assertTrue(re.search(expected_regexp, got),
                                [got, expected_regexp])
 
+
+class TestStatsdLoggingDelegation(BaseTestStatsdLogging):
     def test_methods_are_no_ops_when_not_enabled(self):
         logger = utils.get_logger({
             # No "log_statsd_host" means "disabled"
@@ -779,6 +825,292 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStat('alpha.beta.another.counter:3|c|@0.9912',
                         self.logger.update_stats, 'another.counter', 3,
                         sample_rate=0.9912)
+
+
+class TestStatsdMethods(BaseTestStatsdLogging):
+    def test_statsd_methods_with_labels_and_legacy_disabled(self):
+        conf = {
+            'log_statsd_host': 'localhost',
+            'log_statsd_port': str(self.port),
+            'log_statsd_metric_prefix': 'my_prefix',
+            'statsd_label_mode': 'disabled',
+            'statsd_emit_legacy': 'false',
+        }
+        statsd = statsd_client.get_statsd_client(conf, tail_prefix='pfx')
+        labeled_statsd = statsd_client.get_labeled_statsd_client(conf)
+        with mock.patch.object(statsd,
+                               '_open_socket') as mock_open:
+            # Any pre-labeled-metrics callers should not emit legacy metrics
+            statsd.increment('some.counter')
+            statsd.decrement('some.counter')
+            statsd.timing('some.timing', 6.28 * 1000)
+            statsd.update_stats('some.stat', 3)
+        self.assertFalse(mock_open.mock_calls)
+        labels = {'action': 'some', 'result': 'ok'}
+        with mock.patch.object(labeled_statsd,
+                               '_open_socket') as mock_open:
+            # Any labeled-metrics callers should not emit any metrics
+            labeled_statsd.increment('the_counter', labels=labels)
+            labeled_statsd.decrement('the_counter', labels=labels)
+            labeled_statsd.timing('the_timing', 6.28 * 1000, labels=labels)
+            labeled_statsd.update_stats('the_stat', 3, labels=labels)
+        self.assertFalse(mock_open.mock_calls)
+
+    def test_statsd_methods_emitting_legacy_only(self):
+        conf = {
+            'log_statsd_host': 'localhost',
+            'log_statsd_port': str(self.port),
+            'log_statsd_metric_prefix': 'my_prefix',
+            'statsd_label_mode': 'disabled',
+            'statsd_emit_legacy': 'true',
+        }
+        statsd = statsd_client.get_statsd_client(conf, tail_prefix='pfx')
+        labeled_statsd = statsd_client.get_labeled_statsd_client(conf)
+        # Any pre-labeled-metrics callers continue to emit legacy metrics
+        self.assertStat('my_prefix.pfx.some.counter:1|c',
+                        statsd.increment, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.counter:-1|c',
+                        statsd.decrement, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.timing:6280.0|ms',
+                        statsd.timing, 'some.timing', 6.28 * 1000)
+        self.assertStat('my_prefix.pfx.some.stat:3|c',
+                        statsd.update_stats, 'some.stat', 3)
+        # Any labeled-metrics callers should not emit any metrics
+        labels = {'action': 'some', 'result': 'ok'}
+        with mock.patch.object(labeled_statsd,
+                               '_open_socket') as mock_open:
+            labeled_statsd.increment('the_counter', labels=labels)
+            labeled_statsd.decrement('the_counter', labels=labels)
+            labeled_statsd.timing('the_timing', 6.28 * 1000, labels=labels)
+            labeled_statsd.update_stats('the_stat', 3, labels=labels)
+        self.assertFalse(mock_open.mock_calls)
+
+    def test_statsd_methods_with_invalid_label_mode(self):
+        conf = {
+            'log_statsd_host': 'localhost',
+            'log_statsd_port': str(self.port),
+            'statsd_label_mode': 'invalid',
+        }
+        self.assertRaises(ValueError, statsd_client.get_labeled_statsd_client,
+                          conf)
+
+    def test_statsd_methods_with_labels_no_tail_prefix(self):
+        conf = {
+            'log_statsd_host': 'localhost',
+            'log_statsd_port': str(self.port),
+            'log_statsd_metric_prefix': 'my_prefix',
+            'statsd_label_mode': 'dogstatsd',
+            'statsd_emit_legacy': 'true',
+        }
+        statsd = statsd_client.get_statsd_client(conf, tail_prefix='')
+        labeled_statsd = statsd_client.get_labeled_statsd_client(conf)
+        # Any pre-labeled-metrics callers continue to emit legacy metrics
+        self.assertStat('my_prefix.some.counter:1|c',
+                        statsd.increment, 'some.counter')
+        self.assertStat('my_prefix.some.counter:-1|c',
+                        statsd.decrement, 'some.counter')
+        self.assertStat('my_prefix.some.timing:6280.0|ms',
+                        statsd.timing, 'some.timing', 6.28 * 1000)
+        self.assertStat('my_prefix.some.stat:3|c',
+                        statsd.update_stats, 'some.stat', 3)
+        # But once they get updated, we get richer data
+        labels = {'action': 'some', 'result': 'ok'}
+        self.assertStat(
+            'the_counter:1|c|#action:some,result:ok',
+            labeled_statsd.increment, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_counter:-1|c|#action:some,result:ok',
+            labeled_statsd.decrement, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_timing:6280.0|ms'
+            '|#action:some,result:ok',
+            labeled_statsd.timing, 'the_timing', 6.28 * 1000, labels=labels)
+        self.assertStat(
+            'the_stat:3|c|#action:some,result:ok',
+            labeled_statsd.update_stats, 'the_stat', 3, labels=labels)
+
+    def test_statsd_methods_with_labels_and_prefix_dogstatsd(self):
+        conf = {
+            'log_statsd_host': 'localhost',
+            'log_statsd_port': str(self.port),
+            'log_statsd_metric_prefix': 'my_prefix',
+            'statsd_label_mode': 'dogstatsd',
+            'statsd_emit_legacy': 'true',
+        }
+        statsd = statsd_client.get_statsd_client(conf, tail_prefix='pfx')
+        labeled_statsd = statsd_client.get_labeled_statsd_client(conf)
+        # Any pre-labeled-metrics callers continue to emit legacy metrics
+        self.assertStat('my_prefix.pfx.some.counter:1|c',
+                        statsd.increment, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.counter:-1|c',
+                        statsd.decrement, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.timing:6280.0|ms',
+                        statsd.timing, 'some.timing', 6.28 * 1000)
+        self.assertStat('my_prefix.pfx.some.stat:3|c',
+                        statsd.update_stats, 'some.stat', 3)
+        # But once they get updated, we get richer data
+        labels = {'action': 'some', 'result': 'ok'}
+        self.assertStat(
+            'the_counter:1|c|#action:some,result:ok',
+            labeled_statsd.increment, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_counter:-1|c|#action:some,result:ok',
+            labeled_statsd.decrement, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_timing:6280.0|ms'
+            '|#action:some,result:ok',
+            labeled_statsd.timing, 'the_timing', 6.28 * 1000, labels=labels)
+        self.assertStat(
+            'the_stat:3|c|#action:some,result:ok',
+            labeled_statsd.update_stats, 'the_stat', 3, labels=labels)
+
+    def test_statsd_methods_with_labels_and_prefix_graphite(self):
+        conf = {
+            'log_statsd_host': 'localhost',
+            'log_statsd_port': str(self.port),
+            'log_statsd_metric_prefix': 'my_prefix',
+            'statsd_label_mode': 'graphite',
+            'statsd_emit_legacy': 'true',
+        }
+        statsd = statsd_client.get_statsd_client(conf, tail_prefix='pfx')
+        labeled_statsd = statsd_client.get_labeled_statsd_client(conf)
+        self.assertStat('my_prefix.pfx.some.counter:1|c',
+                        statsd.increment, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.counter:-1|c',
+                        statsd.decrement, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.timing:6280.0|ms',
+                        statsd.timing, 'some.timing', 6.28 * 1000)
+        self.assertStat('my_prefix.pfx.some.stat:3|c',
+                        statsd.update_stats, 'some.stat', 3)
+        labels = {'action': 'some', 'result': 'ok'}
+        self.assertStat(
+            'the_counter;action=some;result=ok:1|c',
+            labeled_statsd.increment, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_counter;action=some;result=ok:-1|c',
+            labeled_statsd.decrement, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_timing;action=some;result=ok'
+            ':6280.0|ms',
+            labeled_statsd.timing, 'the_timing', 6.28 * 1000, labels=labels)
+        self.assertStat(
+            'the_stat;action=some;result=ok:3|c',
+            labeled_statsd.update_stats, 'the_stat', 3, labels=labels)
+
+    def test_statsd_methods_with_labels_and_prefix_influxdb(self):
+        conf = {
+            'log_statsd_host': 'localhost',
+            'log_statsd_port': str(self.port),
+            'log_statsd_metric_prefix': 'my_prefix',
+            'statsd_label_mode': 'influxdb',
+            'statsd_emit_legacy': 'true',
+        }
+        statsd = statsd_client.get_statsd_client(conf, tail_prefix='pfx')
+        labeled_statsd = statsd_client.get_labeled_statsd_client(conf)
+        self.assertStat('my_prefix.pfx.some.counter:1|c',
+                        statsd.increment, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.counter:-1|c',
+                        statsd.decrement, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.timing:6280.0|ms',
+                        statsd.timing, 'some.timing', 6.28 * 1000)
+        self.assertStat('my_prefix.pfx.some.stat:3|c',
+                        statsd.update_stats, 'some.stat', 3)
+        labels = {'action': 'some', 'result': 'ok'}
+        self.assertStat(
+            'the_counter,action=some,result=ok:1|c',
+            labeled_statsd.increment, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_counter,action=some,result=ok:-1|c',
+            labeled_statsd.decrement, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_counter,action=some,result=ok:-1|c',
+            labeled_statsd.decrement, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_timing,action=some,result=ok'
+            ':6280.0|ms',
+            labeled_statsd.timing, 'the_timing', 6.28 * 1000, labels=labels)
+        self.assertStat(
+            'the_stat,action=some,result=ok:3|c',
+            labeled_statsd.update_stats, 'the_stat', 3, labels=labels)
+
+    def test_statsd_methods_with_labels_and_prefix_librato(self):
+        conf = {
+            'log_statsd_host': 'localhost',
+            'log_statsd_port': str(self.port),
+            'log_statsd_metric_prefix': 'my_prefix',
+            'statsd_label_mode': 'librato',
+            'statsd_emit_legacy': 'true',
+        }
+        statsd = statsd_client.get_statsd_client(conf, tail_prefix='pfx')
+        labeled_statsd = statsd_client.get_labeled_statsd_client(conf)
+        self.assertStat('my_prefix.pfx.some.counter:1|c',
+                        statsd.increment, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.counter:-1|c',
+                        statsd.decrement, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.timing:6280.0|ms',
+                        statsd.timing, 'some.timing', 6.28 * 1000)
+        self.assertStat('my_prefix.pfx.some.stat:3|c',
+                        statsd.update_stats, 'some.stat', 3)
+        labels = {'action': 'some', 'result': 'ok'}
+        self.assertStat(
+            'the_counter#action=some,result=ok:1|c',
+            labeled_statsd.increment, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_counter#action=some,result=ok:-1|c',
+            labeled_statsd.decrement, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_timing#action=some,result=ok'
+            ':6280.0|ms',
+            labeled_statsd.timing, 'the_timing', 6.28 * 1000, labels=labels)
+        self.assertStat(
+            'the_stat#action=some,result=ok:3|c',
+            labeled_statsd.update_stats, 'the_stat', 3, labels=labels)
+
+    def test_statsd_methods_with_labels_and_prefix_signalfx(self):
+        conf = {
+            'log_statsd_host': 'localhost',
+            'log_statsd_port': str(self.port),
+            'log_statsd_metric_prefix': 'my_prefix',
+            'statsd_label_mode': 'signalfx',
+            'statsd_emit_legacy': 'true',
+        }
+        statsd = statsd_client.get_statsd_client(conf, tail_prefix='pfx')
+        labeled_statsd = statsd_client.get_labeled_statsd_client(conf)
+        self.assertStat('my_prefix.pfx.some.counter:1|c',
+                        statsd.increment, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.counter:-1|c',
+                        statsd.decrement, 'some.counter')
+        self.assertStat('my_prefix.pfx.some.timing:6280.0|ms',
+                        statsd.timing, 'some.timing', 6.28 * 1000)
+        self.assertStat('my_prefix.pfx.some.stat:3|c',
+                        statsd.update_stats, 'some.stat', 3)
+        labels = {'action': 'some', 'result': 'ok'}
+        self.assertStat(
+            'the_counter[action=some,result=ok]:1|c',
+            labeled_statsd.increment, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_counter[action=some,result=ok]:-1|c',
+            labeled_statsd.decrement, 'the_counter', labels=labels)
+        self.assertStat(
+            'the_timing[action=some,result=ok]'
+            ':6280.0|ms',
+            labeled_statsd.timing, 'the_timing', 6.28 * 1000, labels=labels)
+        self.assertStat(
+            'the_stat[action=some,result=ok]:3|c',
+            labeled_statsd.update_stats, 'the_stat', 3, labels=labels)
+
+    def test_statsd_methods_with_labels_and_prefix_graphite_no_legacy(self):
+        conf = {
+            'log_statsd_host': 'localhost',
+            'log_statsd_port': str(self.port),
+            'log_statsd_metric_prefix': 'my_prefix',
+            'statsd_label_mode': 'graphite',
+            'statsd_emit_legacy': 'false',
+        }
+        labeled_statsd = statsd_client.get_labeled_statsd_client(conf)
+        self.assertStat(
+            'simple_counter:1|c',
+            labeled_statsd.increment, 'simple_counter', labels={})
 
 
 class TestModuleFunctions(unittest.TestCase):
