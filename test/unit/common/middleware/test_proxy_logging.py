@@ -124,7 +124,7 @@ class TestProxyLogging(unittest.TestCase):
         # really, this would come by way of base_prefix/tail_prefix in
         # get_logger, ultimately tracing back to our hard-coded
         # statsd_tail_prefix
-        self.logger.logger.statsd_client._prefix = 'proxy-server.'
+        self.logger.statsd_client._prefix = 'proxy-server.'
 
     def _log_parts(self, app, should_be_empty=False):
         info_calls = app.access_logger.log_dict['info']
