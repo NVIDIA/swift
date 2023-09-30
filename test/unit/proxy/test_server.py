@@ -2305,6 +2305,7 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         mock_statsd.assert_called_once_with(
             'example.com', 8125, base_prefix='', tail_prefix='proxy-server',
             default_sample_rate=1.0, sample_rate_factor=1.0,
+            emit_legacy=True,
             logger=app.logger.logger)
 
         conf_sections = """
@@ -2332,6 +2333,7 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         mock_statsd.assert_called_once_with(
             'example.com', 8125, base_prefix='', tail_prefix='proxy-server',
             default_sample_rate=1.0, sample_rate_factor=1.0,
+            emit_legacy=True,
             logger=app.logger.logger)
 
 
@@ -6159,7 +6161,9 @@ class TestReplicatedObjectController(
                         'Handoff requested (5)',
                         'Handoff requested (6)',
                     ])
-                stats = self.app.logger.statsd_client.get_increment_counts()
+                stats = (
+                    self.app.logger.statsd_client.get_increment_counts()
+                )
                 self.assertEqual(2, stats.get('error_limiter.is_limited', 0))
                 self.assertEqual(2, stats.get('object.handoff_count', 0))
 
@@ -6187,7 +6191,9 @@ class TestReplicatedObjectController(
                         'Handoff requested (9)',
                         'Handoff requested (10)',
                     ])
-                stats = self.app.logger.statsd_client.get_increment_counts()
+                stats = (
+                    self.app.logger.statsd_client.get_increment_counts()
+                )
                 self.assertEqual(4, stats.get('error_limiter.is_limited', 0))
                 self.assertEqual(4, stats.get('object.handoff_count', 0))
                 self.assertEqual(1, stats.get('object.handoff_all_count', 0))
