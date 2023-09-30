@@ -2293,6 +2293,7 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         self.assertEqual(app.logger.logger.statsd_client._port, 8125)
         self.assertEqual(app.logger.logger.statsd_client._prefix,
                          'proxy-server.')
+        self.assertTrue(app.logger.logger.statsd_client.emit_legacy)
 
         conf_sections = """
         [DEFAULT]
@@ -2321,6 +2322,7 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         self.assertEqual(app.logger.logger.statsd_client._port, 8125)
         self.assertEqual(app.logger.logger.statsd_client._prefix,
                          'proxy-server.')
+        self.assertTrue(app.logger.logger.statsd_client.emit_legacy)
 
 
 class TestProxyServerConfigStringLoading(TestProxyServerConfigLoading):
