@@ -17,11 +17,74 @@
 
 import time
 import warnings
+import re
 from contextlib import closing
 from random import random
 
 from eventlet.green import socket
 import six
+
+from swift.common.utils.config import config_true_value
+
+
+STATSD_CONF_USER_LABEL_PREFIX = 'statsd_user_label_'
+STATSD_USER_LABEL_NAMESPACE = 'user_'
+USER_LABEL_PATTERN = re.compile(r"[^0-9a-zA-Z_]")
+USER_VALUE_PATTERN = re.compile(r"[^0-9a-zA-Z_.]")
+
+
+def _build_line_parts(name, value, type, sample_rate):
+    line = '%s:%s|%s' % (name, value, type)
+    if sample_rate < 1:
+        line += '@%s' % (sample_rate,)
+    return line
+
+
+class LabeledFormats(object):
+    disabled = None
+
+    @staticmethod
+    def librato(name, value, type, sample_rate, labels):
+        # https://www.librato.com/docs/kb/collect/collection_agents/stastd/#stat-level-tags
+        name += '#' + ','.join('%s=%s' % (k, v) for k, v in labels)
+        line = _build_line_parts(name, value, type, sample_rate)
+        return line
+
+    @staticmethod
+    def influxdb(name, value, type, sample_rate, labels):
+        # https://www.influxdata.com/blog/getting-started-with-sending-statsd-metrics-to-telegraf-influxdb/#introducing-influx-statsd
+        name += ''.join(',%s=%s' % (k, v) for k, v in labels)
+        line = _build_line_parts(name, value, type, sample_rate)
+        return line
+
+    @staticmethod
+    def signalfx(name, value, type, sample_rate, labels):
+        # https://web.archive.org/web/20211123040355/https://docs.signalfx.com/en/latest/integrations/agent/monitors/collectd-statsd.html#adding-dimensions-to-statsd-metrics
+        # https://docs.splunk.com/Observability/gdi/statsd/statsd.html#adding-dimensions-to-statsd-metrics
+        name += '[%s]' % ','.join('%s=%s' % (k, v) for k, v in labels)
+        line = _build_line_parts(name, value, type, sample_rate)
+        return line
+
+    @staticmethod
+    def graphite(name, value, type, sample_rate, labels):
+        # https://graphite.readthedocs.io/en/latest/tags.html#carbon
+        name += ''.join(';%s=%s' % (k, v) for k, v in labels)
+        line = _build_line_parts(name, value, type, sample_rate)
+        return line
+
+    @staticmethod
+    def dogstatsd(name, value, type, sample_rate, labels):
+        # https://docs.datadoghq.com/developers/dogstatsd/datagram_shell/?tab=metrics
+        line = _build_line_parts(name, value, type, sample_rate)
+        line += '|#' + ','.join('%s:%s' % (k, v) for k, v in labels)
+        return line
+
+
+def build_line_legacy_format(prefix, name, value, type, sample_rate):
+    parts = ['%s%s:%s' % (prefix, name, value), type]
+    if sample_rate < 1:
+        parts.append('@%s' % (sample_rate,))
+    return '|'.join(parts)
 
 
 def get_statsd_client(conf=None, tail_prefix='', logger=None):
@@ -35,12 +98,12 @@ def get_statsd_client(conf=None, tail_prefix='', logger=None):
         log_statsd_default_sample_rate = 1.0
         log_statsd_sample_rate_factor = 1.0
         log_statsd_metric_prefix = (empty-string)
+        statsd_emit_legacy = true
 
     :param conf: Configuration dict to read settings from
     :param tail_prefix: tail prefix to pass to statsd client
     :param logger: stdlib logger instance used by statsd client for logging
     :return: an instance of ``StatsdClient``
-
     """
     conf = conf or {}
 
@@ -52,23 +115,87 @@ def get_statsd_client(conf=None, tail_prefix='', logger=None):
     sample_rate_factor = float(
         conf.get('log_statsd_sample_rate_factor', 1))
 
-    return StatsdClient(host, port, base_prefix=base_prefix,
-                        tail_prefix=tail_prefix,
-                        default_sample_rate=default_sample_rate,
-                        sample_rate_factor=sample_rate_factor, logger=logger)
+    emit_legacy = config_true_value(conf.get(
+        'statsd_emit_legacy', 'true'))
+
+    return StatsdClient(
+        host, port,
+        base_prefix=base_prefix,
+        tail_prefix=tail_prefix,
+        default_sample_rate=default_sample_rate,
+        sample_rate_factor=sample_rate_factor,
+        emit_legacy=emit_legacy,
+        logger=logger)
 
 
-class StatsdClient(object):
-    def __init__(self, host, port, base_prefix='', tail_prefix='',
-                 default_sample_rate=1, sample_rate_factor=1, logger=None):
+def get_labeled_statsd_client(conf=None, logger=None):
+    """
+    Get an instance of LabeledStatsdClient using config settings.
+
+    **config and defaults**::
+
+        log_statsd_host = (disabled)
+        log_statsd_port = 8125
+        log_statsd_default_sample_rate = 1.0
+        log_statsd_sample_rate_factor = 1.0
+        statsd_label_mode = disabled
+
+    :param conf: Configuration dict to read settings from
+    :param logger: stdlib logger instance used by statsd client for logging
+    :return: an instance of ``LabeledStatsdClient``
+    """
+    conf = conf or {}
+
+    host = conf.get('log_statsd_host')
+    port = int(conf.get('log_statsd_port', 8125))
+    default_sample_rate = float(
+        conf.get('log_statsd_default_sample_rate', 1))
+    sample_rate_factor = float(
+        conf.get('log_statsd_sample_rate_factor', 1))
+
+    label_mode = conf.get(
+        'statsd_label_mode', 'disabled').lower()
+
+    default_labels = {}
+    for k, v in conf.items():
+        if not k.startswith(STATSD_CONF_USER_LABEL_PREFIX):
+            continue
+        conf_label = k[len(STATSD_CONF_USER_LABEL_PREFIX):]
+        result = USER_LABEL_PATTERN.search(conf_label)
+        if result is not None:
+            raise ValueError(
+                'invalid character in statsd user label '
+                'configuration {0!r}: {1!r}'.format(
+                    k, result.group(0)))
+        result = USER_VALUE_PATTERN.search(v)
+        if result is not None:
+            raise ValueError(
+                'invalid character in configuration {0!r} '
+                'value {1!r}: {2!r}'.format(
+                    k, v, result.group(0)))
+        conf_label = STATSD_USER_LABEL_NAMESPACE + conf_label
+        default_labels[conf_label] = v
+
+    return LabeledStatsdClient(
+        host, port,
+        default_sample_rate=default_sample_rate,
+        sample_rate_factor=sample_rate_factor,
+        label_mode=label_mode,
+        default_labels=default_labels,
+        logger=logger)
+
+
+class AbstractStatsdClient(object):
+    def __init__(self, host, port,
+                 default_sample_rate=1, sample_rate_factor=1,
+                 logger=None):
         self._host = host
         self._port = port
-        self._base_prefix = base_prefix
         self._default_sample_rate = default_sample_rate
         self._sample_rate_factor = sample_rate_factor
+
         self.random = random
         self.logger = logger
-        self._set_prefix(tail_prefix)
         self._sock_family = self._target = None
 
         if self._host:
@@ -110,6 +237,67 @@ class StatsdClient(object):
         else:
             self._target = (host, port)
 
+    def _is_emitted(self, sample_rate):
+        if not self._host:
+            # StatsD not configured
+            return False, None
+
+        if sample_rate is None:
+            sample_rate = self._default_sample_rate
+        sample_rate = sample_rate * self._sample_rate_factor
+
+        if sample_rate < 1 and self.random() >= sample_rate:
+            return False, None
+
+        return True, sample_rate
+
+    def _send_line(self, line):
+        """
+        Send a line of metrics to socket if allowed by sample_rate. If
+        sample_rate < 1, may not actually send a packet.
+        """
+
+        if line is None:
+            return
+
+        if not six.PY2:
+            line = line.encode('utf-8')
+
+        # Ideally, we'd cache a sending socket in self, but that
+        # results in a socket getting shared by multiple green threads.
+        with closing(self._open_socket()) as sock:
+            try:
+                return sock.sendto(line, self._target)
+            except IOError as err:
+                if self.logger:
+                    self.logger.warning(
+                        'Error sending UDP message to %(target)r: %(err)s',
+                        {'target': self._target, 'err': err})
+
+    def _open_socket(self):
+        return socket.socket(self._sock_family, socket.SOCK_DGRAM)
+
+
+class StatsdClient(AbstractStatsdClient):
+    def __init__(self, host, port,
+                 base_prefix='', tail_prefix='',
+                 default_sample_rate=1, sample_rate_factor=1,
+                 emit_legacy=True,
+                 logger=None):
+        AbstractStatsdClient.__init__(
+            self, host, port, default_sample_rate, sample_rate_factor, logger)
+        self._base_prefix = base_prefix
+
+        self.emit_legacy = emit_legacy
+
+        self._set_prefix(tail_prefix)
+
+    def _send(self, m_name, m_value, m_type, sample_rate):
+        is_emitted, sample_rate = self._is_emitted(sample_rate)
+        if self.emit_legacy and is_emitted:
+            return self._send_line(build_line_legacy_format(
+                self._prefix, m_name, m_value, m_type, sample_rate))
+
     def _set_prefix(self, tail_prefix):
         """
         Modifies the prefix that is added to metric names. The resulting prefix
@@ -149,37 +337,6 @@ class StatsdClient(object):
         )
         self._set_prefix(tail_prefix)
 
-    def _send(self, m_name, m_value, m_type, sample_rate):
-        if not self._host:
-            # StatsD not configured
-            return
-
-        if sample_rate is None:
-            sample_rate = self._default_sample_rate
-        sample_rate = sample_rate * self._sample_rate_factor
-
-        parts = ['%s%s:%s' % (self._prefix, m_name, m_value), m_type]
-        if sample_rate < 1:
-            if self.random() < sample_rate:
-                parts.append('@%s' % (sample_rate,))
-            else:
-                return
-        if six.PY3:
-            parts = [part.encode('utf-8') for part in parts]
-        # Ideally, we'd cache a sending socket in self, but that
-        # results in a socket getting shared by multiple green threads.
-        with closing(self._open_socket()) as sock:
-            try:
-                return sock.sendto(b'|'.join(parts), self._target)
-            except IOError as err:
-                if self.logger:
-                    self.logger.warning(
-                        'Error sending UDP message to %(target)r: %(err)s',
-                        {'target': self._target, 'err': err})
-
-    def _open_socket(self):
-        return socket.socket(self._sock_family, socket.SOCK_DGRAM)
-
     def update_stats(self, m_name, m_value, sample_rate=None):
         return self._send(m_name, m_value, 'c', sample_rate)
 
@@ -197,11 +354,78 @@ class StatsdClient(object):
         return self._timing(metric, timing_ms, sample_rate)
 
     def timing_since(self, metric, orig_time, sample_rate=None):
-        return self._timing(metric, (time.time() - orig_time) * 1000,
-                            sample_rate)
+        return self._timing(
+            metric, (time.time() - orig_time) * 1000, sample_rate)
 
     def transfer_rate(self, metric, elapsed_time, byte_xfer, sample_rate=None):
         if byte_xfer:
-            return self.timing(metric,
-                               elapsed_time * 1000 / byte_xfer * 1000,
-                               sample_rate)
+            return self.timing(
+                metric, elapsed_time * 1000 / byte_xfer * 1000, sample_rate)
+
+
+class LabeledStatsdClient(AbstractStatsdClient):
+    def __init__(self, host, port,
+                 default_sample_rate=1, sample_rate_factor=1,
+                 label_mode='disabled', default_labels=None,
+                 logger=None):
+        AbstractStatsdClient.__init__(
+            self, host, port, default_sample_rate, sample_rate_factor, logger)
+        self.label_mode = label_mode
+        self.default_labels = default_labels or {}
+
+        try:
+            self._label_line_f = getattr(LabeledFormats, label_mode)
+        except AttributeError:
+            label_modes = [
+                f for f in LabeledFormats.__dict__ if
+                not f.startswith('__')]
+            raise ValueError(
+                'unknown statsd_label_mode %r; '
+                'expected one of %r' % (label_mode, label_modes))
+
+    def _send(self, m_name, m_value, m_type, sample_rate, labels):
+        is_emitted, sample_rate = self._is_emitted(sample_rate)
+        if is_emitted:
+            return self._send_line(self._build_line(
+                m_name, m_value, m_type, sample_rate, labels))
+
+    def _build_line(self, m_name, m_value, m_type, sample_rate, labels):
+        build_line_f = self._label_line_f
+        if not build_line_f:
+            return
+        labels = dict(self.default_labels, **labels)
+        return build_line_f(
+            m_name,
+            m_value,
+            m_type,
+            sample_rate,
+            sorted(labels.items()))
+
+    def update_stats(self, m_name, m_value, labels, sample_rate=None):
+        return self._send(m_name, m_value, 'c', sample_rate, labels=labels)
+
+    def increment(self, metric, labels, sample_rate=None):
+        return self.update_stats(metric, 1, labels, sample_rate)
+
+    def decrement(self, metric, labels, sample_rate=None):
+        return self.update_stats(metric, -1, labels, sample_rate)
+
+    def _timing(self, metric, timing_ms, labels, sample_rate):
+        # This method was added to disagregate timing metrics when testing
+        return self._send(metric, round(timing_ms, 4), 'ms',
+                          sample_rate, labels=labels)
+
+    def timing(self, metric, timing_ms, labels, sample_rate=None):
+        return self._timing(metric, timing_ms, labels, sample_rate)
+
+    def timing_since(self, metric, orig_time, labels, sample_rate=None):
+        return self._timing(
+            metric, (time.time() - orig_time) * 1000,
+            labels, sample_rate)
+
+    def transfer_rate(self, metric, elapsed_time, byte_xfer,
+                      labels, sample_rate=None):
+        if byte_xfer:
+            return self.timing(
+                metric, elapsed_time * 1000 / byte_xfer * 1000,
+                labels, sample_rate)
