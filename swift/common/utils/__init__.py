@@ -279,7 +279,26 @@ def backward(f, blocksize=4096):
 
 
 # Used when reading config values
-TRUE_VALUES = set(('true', '1', 'yes', 'on', 't', 'y'))
+TRUE_VALUES = {'true', '1', 'yes', 'on', 't', 'y'}
+
+
+def transform_to_set(value):
+    """
+    Transform either a single value or a collection of values to a set of
+    unique values.
+
+    :param value: An object to transform.
+    :return: A set. If ``value`` is an instance of a ``list``, ``tuple`` or
+        ``set`` then a set containing the items in ``value`` is returned; if
+        value is None then None is returned; otherwise a set containing
+        the single ``value`` is returned.
+    """
+    if value is None:
+        return None
+    elif isinstance(value, (list, tuple, set)):
+        return set(value)
+    else:
+        return {value}
 
 
 def non_negative_float(value):
@@ -5078,11 +5097,18 @@ class ShardRange(Namespace):
 
     @classmethod
     def sort_key(cls, sr):
+        return cls.sort_key_order(sr.name, sr.lower, sr.upper, sr.state)
+
+    @staticmethod
+    def sort_key_order(name, lower, upper, state):
+        # Use Namespace.MaxBound() for upper bound '', this will allow this
+        # record to be sorted correctly by upper.
+        upper = upper if upper else Namespace.MaxBound()
         # defines the sort order for shard ranges
         # note if this ever changes to *not* sort by upper first then it breaks
         # a key assumption for bisect, which is used by utils.find_namespace
         # with shard ranges.
-        return sr.upper, sr.state, sr.lower, sr.name
+        return upper, state, lower, name
 
     def is_child_of(self, parent):
         """

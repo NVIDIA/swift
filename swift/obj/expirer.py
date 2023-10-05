@@ -547,7 +547,9 @@ class ObjectExpirer(Daemon):
             a, c, o,
             headers=headers, acceptable_statuses=acceptable_statuses)
         upload_id_key = sysmeta_header('object', 'upload-id')
-        if not (is_success(resp.status_int) and upload_id_key in resp.headers):
+        if not (is_success(resp.status_int) and
+                resp.headers.get(upload_id_key)):
+            # Note that upload_id_key may be the empty string!
             return
         segments_key = sysmeta_header('object', 'etag')
         # cleanup s3api mpu segments
