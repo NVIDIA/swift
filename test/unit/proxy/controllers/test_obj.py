@@ -56,8 +56,8 @@ from test.unit import (
     FakeRing, fake_http_connect, patch_policies, SlowBody, FakeStatus,
     DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub,
     fake_ec_node_response, StubResponse, mocked_http_conn,
-    quiet_eventlet_exceptions, FakeSource, make_timestamp_iter, FakeMemcache)
-from test.unit.proxy.test_server import node_error_count
+    quiet_eventlet_exceptions, FakeSource, make_timestamp_iter, FakeMemcache,
+    node_error_count, node_error_counts)
 
 
 def unchunk_body(chunked_body):
@@ -1825,13 +1825,15 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
 
         req = swob.Request.blank('/v1/a/c/o', headers={
             'Range': 'bytes=0-49,100-104'})
-        with capture_http_requests(get_response) as log:
+        with capture_http_requests(get_response) as captured_requests:
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 206)
             actual_body = resp.body
 
         self.assertEqual(resp.status_int, 206)
-        self.assertEqual(2, len(log))
+        self.assertEqual(2, len(captured_requests))
+        self.assertEqual([1] + [0] * (self.replicas() - 1),
+                         node_error_counts(self.app, self.obj_ring.devs))
         # note: client response uses boundary from first backend response
         self.assertEqual(resp_body1, actual_body)
         error_lines = self.app.logger.get_lines_for_level('error')
@@ -1867,7 +1869,6 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
 
     def test_GET_with_multirange_slow_body_unable_to_resume(self):
         self.app.recoverable_node_timeout = 0.01
-        self.app.object_chunk_size = 10
         obj_data = b'testing' * 100
         etag = md5(obj_data, usedforsecurity=False).hexdigest()
         boundary = b'81eb9c110b32ced5fe'
@@ -1905,13 +1906,14 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
             'Range': 'bytes=0-49,100-104'})
         with capture_http_requests(get_response) as log:
             resp = req.get_response(self.app)
-            self.assertEqual(resp.status_int, 206)
-            actual_body = resp.body
+            with self.assertRaises(ChunkReadTimeout):
+                # note: the error is raised while the resp_iter is read...
+                _ = resp.body
 
         self.assertEqual(resp.status_int, 206)
+        self.assertEqual([1, 1, 1],
+                         node_error_counts(self.app, self.obj_ring.devs))
         self.assertEqual(6, len(log))
-        resp_boundary = resp.headers['content-type'].rsplit('=', 1)[1].encode()
-        self.assertEqual(b'--%s--' % resp_boundary, actual_body)
         error_lines = self.app.logger.get_lines_for_level('error')
         self.assertEqual(3, len(error_lines))
         for line in error_lines:
@@ -1947,6 +1949,8 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                 _ = resp.body
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(etag, resp.headers.get('ETag'))
+        self.assertEqual([1] * self.replicas(),
+                         node_error_counts(self.app, self.obj_ring.devs))
 
         error_lines = self.app.logger.get_lines_for_level('error')
         self.assertEqual(3, len(error_lines))
@@ -2076,6 +2080,8 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                          log.requests[2]['headers']['Range'])
         self.assertNotIn('X-Backend-Ignore-Range-If-Metadata-Present',
                          log.requests[2]['headers'])
+        self.assertEqual([1, 1] + [0] * (self.replicas() - 2),
+                         node_error_counts(self.app, self.obj_ring.devs))
 
     def test_GET_transfer_encoding_chunked(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
@@ -2140,6 +2146,8 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
+        self.assertEqual([1] * self.replicas(),
+                         node_error_counts(self.app, self.obj_ring.devs))
 
     def test_HEAD_error_limit_supression_count(self):
         def do_test(primary_codes, expected, clear_stats=True):
@@ -4968,7 +4976,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             'Range': 'bytes=1000-2000,14000-15000'})
         with capture_http_requests(get_response) as log:
             resp = req.get_response(self.app)
-            _ = resp.body
+            # note: the error is raised before the resp_iter is read
+            self.assertIn(b'Internal Error', resp.body)
         self.assertEqual(resp.status_int, 500)
         self.assertEqual(len(log), self.policy.ec_n_unique_fragments * 2)
         log_lines = self.app.logger.get_lines_for_level('error')
@@ -4980,6 +4989,70 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         # not the most graceful ending
         self.assertIn('Unhandled exception in request: ChunkReadTimeout',
                       log_lines[2])
+
+    def test_GET_with_multirange_unable_to_resume_body_started(self):
+        self.app.object_chunk_size = 256
+        self.app.recoverable_node_timeout = 0.01
+        test_body = b'test' * self.policy.ec_segment_size
+        ec_stub = make_ec_object_stub(test_body, self.policy, None)
+        frag_archives = ec_stub['frags']
+        self.assertEqual(len(frag_archives[0]), 1960)
+        boundary = b'81eb9c110b32ced5fe'
+
+        def make_mime_body(frag_archive):
+            return b'\r\n'.join([
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 0-489/1960',
+                b'',
+                frag_archive[0:490],
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 1470-1959/1960',
+                b'',
+                frag_archive[1470:],
+                b'--' + boundary + b'--',
+            ])
+
+        obj_resp_bodies = [make_mime_body(fa) for fa
+                           # no extra good responses
+                           in ec_stub['frags'][:self.policy.ec_ndata]]
+
+        headers = {
+            'Content-Type': b'multipart/byteranges;boundary=' + boundary,
+            'Content-Length': len(obj_resp_bodies[0]),
+            'X-Object-Sysmeta-Ec-Content-Length': len(ec_stub['body']),
+            'X-Object-Sysmeta-Ec-Etag': ec_stub['etag'],
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+
+        responses = [
+            StubResponse(206, body, headers, i,
+                         # make the first one slow
+                         slowdown=0.1 if i == 0 else None)
+            for i, body in enumerate(obj_resp_bodies)
+        ]
+        # the first response serves some bytes before slowing down
+        responses[0].slowdown_after = 1000
+
+        def get_response(req):
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=1000-2000,14000-15000'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+            with self.assertRaises(ChunkReadTimeout):
+                # note: the error is raised while the resp_iter is read
+                _ = resp.body
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(len(log), self.policy.ec_n_unique_fragments * 2)
+        log_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(2, len(log_lines), log_lines)
+        self.assertIn('Trying to read next part of EC multi-part GET',
+                      log_lines[0])
+        self.assertIn('Trying to read during GET: ChunkReadTimeout',
+                      log_lines[1])
 
     def test_GET_with_multirange_short_resume_body(self):
         self.app.object_chunk_size = 256
