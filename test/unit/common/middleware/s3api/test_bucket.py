@@ -20,8 +20,10 @@ import six
 from six.moves.urllib.parse import quote, parse_qsl
 
 from swift.common import swob
+from swift.common.middleware.proxy_logging import ProxyLoggingMiddleware
 from swift.common.middleware.versioned_writes.object_versioning import \
     DELETE_MARKER_CONTENT_TYPE
+from swift.common.storage_policy import StoragePolicy
 from swift.common.swob import Request
 from swift.common.utils import json
 
@@ -30,6 +32,7 @@ from swift.common.middleware.s3api.etree import fromstring, tostring, \
 from swift.common.middleware.s3api.subresource import Owner, encode_acl, \
     ACLPublicRead
 from swift.common.middleware.s3api.s3request import MAX_32BIT_INT
+from test.unit import patch_policies
 
 from test.unit.common.middleware.helpers import normalize_path
 from test.unit.common.middleware.s3api import S3ApiTestCase
@@ -101,7 +104,8 @@ class TestS3ApiBucket(S3ApiTestCase):
             'GET', '/v1/AUTH_test/bucket+segments?format=json&marker=',
             swob.HTTPOk, {'Content-Type': 'application/json'}, listing_body)
         self.swift.register(
-            'HEAD', '/v1/AUTH_test/junk', swob.HTTPNoContent, {}, None)
+            'HEAD', '/v1/AUTH_test/junk', swob.HTTPNoContent,
+            {'X-Backend-Storage-Policy-Index': '3'}, None)
         self.swift.register(
             'HEAD', '/v1/AUTH_test/nojunk', swob.HTTPNotFound, {}, None)
         self.swift.register(
@@ -109,7 +113,8 @@ class TestS3ApiBucket(S3ApiTestCase):
             {}, None)
         self.swift.register(
             'GET', '/v1/AUTH_test/junk', swob.HTTPOk,
-            {'Content-Type': 'application/json'}, listing_body)
+            {'Content-Type': 'application/json',
+             'X-Backend-Storage-Policy-Index': '3'}, listing_body)
         self.swift.register(
             'GET', '/v1/AUTH_test/junk-subdir', swob.HTTPOk,
             {'Content-Type': 'application/json; charset=utf-8'},
@@ -134,6 +139,32 @@ class TestS3ApiBucket(S3ApiTestCase):
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
+
+    def _do_test_bucket_HEAD_policy_index_logging(self, bucket_policy_index):
+        self.logger.clear()
+        self._register_bucket_policy('junk', bucket_policy_index)
+        req = Request.blank('/junk',
+                            environ={'REQUEST_METHOD': 'HEAD'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        self.assertNotIn('X-Backend-Storage-Policy-Index', req.headers)
+        self.s3api = ProxyLoggingMiddleware(self.s3api, {}, logger=self.logger)
+        status, headers, body = self.call_s3api(req)
+        self._assert_policy_index(req.headers, headers, bucket_policy_index)
+        self.assertEqual('/v1/AUTH_test/junk',
+                         req.environ['swift.backend_path'])
+        access_lines = self.logger.get_lines_for_level('info')
+        self.assertEqual(1, len(access_lines))
+        parts = access_lines[0].split()
+        self.assertEqual(' '.join(parts[3:7]), 'HEAD /junk HTTP/1.0 200')
+        self.assertEqual(parts[-1], str(bucket_policy_index))
+
+    @patch_policies([
+        StoragePolicy(0, 'gold', is_default=True),
+        StoragePolicy(1, 'silver')])
+    def test_bucket_HEAD_policy_index_logging(self):
+        self._do_test_bucket_HEAD_policy_index_logging(0)
+        self._do_test_bucket_HEAD_policy_index_logging(1)
 
     def test_bucket_HEAD_error(self):
         req = Request.blank('/nojunk',
@@ -208,9 +239,12 @@ class TestS3ApiBucket(S3ApiTestCase):
                             environ={'REQUEST_METHOD': 'GET'},
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
+        self.assertNotIn('X-Backend-Storage-Policy-Index', req.headers)
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
-
+        self._assert_policy_index(req.headers, headers, 3)
+        self.assertEqual('/v1/AUTH_test/junk',
+                         req.environ.get('swift.backend_path'))
         elem = fromstring(body, 'ListBucketResult')
         name = elem.find('./Name').text
         self.assertEqual(name, bucket_name)
