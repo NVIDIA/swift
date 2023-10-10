@@ -508,3 +508,46 @@ class TestFakeSwift(unittest.TestCase):
         self.assertEqual('bytes=0-2', req.headers.get('Range'))
         self.assertEqual('bytes=0-2',
                          swift.calls_with_headers[-1].headers.get('Range'))
+
+    def test_object_GET_updated_with_storage_policy(self):
+        swift = FakeSwift()
+        swift.register('GET', '/v1/a/c/o', HTTPOk, {}, body=b'stuff')
+        req = Request.blank('/v1/a/c/o')
+        req.method = 'GET'
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual({'Content-Length': '5',
+                          'Content-Type': 'text/html; charset=UTF-8'},
+                         resp.headers)
+        self.assertEqual(b'stuff', resp.body)
+        self.assertEqual(1, swift.call_count)
+        self.assertEqual(('GET', '/v1/a/c/o'), swift.calls[-1])
+        self.assertEqual(('GET', '/v1/a/c/o',
+                          {'Host': 'localhost:80'}),  # from swob
+                         swift.calls_with_headers[-1])
+        # default storage policy is applied...
+        self.assertEqual(('GET', '/v1/a/c/o',
+                          {'Host': 'localhost:80',
+                           'X-Backend-Storage-Policy-Index': '0'}),
+                         swift.updated_calls_with_headers[-1])
+
+        # register a container with storage policy 99...
+        swift.register('HEAD', '/v1/a/c', HTTPCreated,
+                       {'X-Backend-Storage-Policy-Index': '99'}, None)
+        req = Request.blank('/v1/a/c/o')
+        req.method = 'GET'
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual({'Content-Length': '5',
+                          'Content-Type': 'text/html; charset=UTF-8'},
+                         resp.headers)
+        self.assertEqual(b'stuff', resp.body)
+        self.assertEqual(2, swift.call_count)
+        self.assertEqual(('GET', '/v1/a/c/o'), swift.calls[-1])
+        self.assertEqual(('GET', '/v1/a/c/o',
+                          {'Host': 'localhost:80'}),  # from swob
+                         swift.calls_with_headers[-1])
+        self.assertEqual(('GET', '/v1/a/c/o',
+                          {'Host': 'localhost:80',
+                           'X-Backend-Storage-Policy-Index': '99'}),
+                         swift.updated_calls_with_headers[-1])
