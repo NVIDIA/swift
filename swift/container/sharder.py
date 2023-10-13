@@ -1710,9 +1710,11 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             part, dest_broker.db_file, node_id)
         quorum = quorum_size(self.ring.replica_count)
         if not success and responses.count(True) < quorum:
-            self.warning(broker, 'Failed to sufficiently replicate misplaced '
-                                 'objects to %s (not removing)',
-                         dest_shard_range)
+            self.warning(
+                broker, 'Failed to sufficiently replicate misplaced objects '
+                        'to %s in state %s (not removing), shard db: %s',
+                dest_shard_range.name, dest_shard_range.state_text,
+                dest_broker.db_file)
             return False
 
         if broker.get_info()['id'] != info['id']:
@@ -1730,9 +1732,9 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             success = True
 
         if not success:
-            self.warning(broker,
-                         'Refused to remove misplaced objects for dest %s',
-                         dest_shard_range)
+            self.warning(broker, 'Refused to remove misplaced objects for '
+                                 'dest %s in state %s',
+                         dest_shard_range.name, dest_shard_range.state_text)
         return success
 
     def _move_objects(self, src_broker, src_shard_range, policy_index,
@@ -2089,10 +2091,12 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                 # insufficient replication or replication not even attempted;
                 # break because we don't want to progress the cleave cursor
                 # until each shard range has been successfully cleaved
-                self.warning(broker,
-                             'Failed to sufficiently replicate cleaved shard '
-                             '%s: %s successes, %s required', shard_range,
-                             replication_successes, replication_quorum)
+                self.warning(
+                    broker,
+                    'Failed to sufficiently replicate cleaved shard '
+                    '%s: %s successes, %s required, shard db: %s',
+                    shard_broker.path, replication_successes,
+                    replication_quorum, shard_broker.db_file)
                 self._increment_stat('cleaved', 'failure', statsd=True)
                 result = CLEAVE_FAILED
             else:
