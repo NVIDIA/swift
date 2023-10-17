@@ -150,6 +150,17 @@ use = egg:swift#object
 # 'keep_cache_private' is false.
 # keep_cache_slo_manifest = false
 #
+# Cooperative_period defines how frequent object server GET request will perform
+# the cooperative yielding during iterating the disk chunks. For example, value
+# of '5' will insert one sleep() after every 5 chunks read. And value of '-1' will
+# turn off any cooperative yielding.
+# cooperative_period = -1
+#
+# If true, object server will perform cooperative yielding once in the '__call__'
+# function and before handling any actual operation logics. This would get the emitted
+# timing metrics to be closer to reflecting the time spent waiting in accept queues.
+# sleep_in_call = false
+#
 # on PUTs, sync data every n MB
 # mb_per_sync = 512
 #

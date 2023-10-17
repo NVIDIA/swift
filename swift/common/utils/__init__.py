@@ -39,8 +39,6 @@ import functools
 import email.parser
 from random import random, shuffle
 from contextlib import contextmanager, closing
-import ctypes
-import ctypes.util
 from optparse import OptionParser
 import traceback
 import warnings
@@ -93,13 +91,14 @@ from swift.common.linkat import linkat
 
 # For backwards compatability with 3rd party middlewares
 from swift.common.registry import register_swift_info, get_swift_info  # noqa
+from swift.common.utils import libc
 from swift.common.utils.libc import (  # noqa
     F_SETPIPE_SZ,
     load_libc_function,
+    punch_hole,
     drop_buffer_cache,
     get_md5_socket,
     modify_priority,
-    _LibcWrapper,
 )
 from swift.common.utils.timestamp import (  # noqa
     NORMAL_FORMAT,
@@ -128,24 +127,12 @@ import logging
 
 NOTICE = 25
 
-# These are lazily pulled from libc elsewhere
-_sys_fallocate = None
-
 # If set to non-zero, fallocate routines will fail based on free space
 # available being at or below this amount, in bytes.
 FALLOCATE_RESERVE = 0
 # Indicates if FALLOCATE_RESERVE is the percentage of free space (True) or
 # the number of bytes (False).
 FALLOCATE_IS_PERCENT = False
-
-# from /usr/include/linux/falloc.h
-FALLOC_FL_KEEP_SIZE = 1
-FALLOC_FL_PUNCH_HOLE = 2
-
-
-# Note that this may be overridden by a strict_locks config option
-# (see swift/common/wsgi.py and swift/common/daemon.py)
-STRICT_LOCKS = False
 
 # Used by hash_path to offer a bit more security when generating hashes for
 # paths. It simply appends this value to all paths; guessing the hash a path
@@ -155,10 +142,6 @@ HASH_PATH_PREFIX = b''
 
 SWIFT_CONF_FILE = '/etc/swift/swift.conf'
 
-# These constants are Linux-specific, and Python doesn't seem to know
-# about them. We ask anyway just in case that ever gets fixed.
-#
-# The values were copied from the Linux 3.x kernel headers.
 O_TMPFILE = getattr(os, 'O_TMPFILE', 0o20000000 | os.O_DIRECTORY)
 
 MD5_OF_EMPTY_STRING = 'd41d8cd98f00b204e9800998ecf8427e'
@@ -853,6 +836,20 @@ class FileLikeIter(object):
         self.closed = True
 
 
+def _free_and_reserved_space(fs_path_or_fd, reserve_space, is_percent):
+    if isinstance(fs_path_or_fd, int):
+        st = os.fstatvfs(fs_path_or_fd)
+    else:
+        st = os.statvfs(fs_path_or_fd)
+    free_bytes = st.f_frsize * st.f_bavail
+    if is_percent:
+        size_bytes = st.f_frsize * st.f_blocks
+        reserve_bytes = int(reserve_space / 100.0 * size_bytes)
+    else:
+        reserve_bytes = reserve_space
+    return free_bytes, reserve_bytes
+
+
 def fs_has_free_space(fs_path_or_fd, space_needed, is_percent):
     """
     Check to see whether or not a filesystem has the given amount of space
@@ -862,34 +859,24 @@ def fs_has_free_space(fs_path_or_fd, space_needed, is_percent):
         open file descriptor; if a directory, typically the path to the
         filesystem's mount point
 
-    :param space_needed: minimum bytes or percentage of free space
+    :param space_needed: minimum bytes or percentage of free space to be
+        kept in reserve
 
     :param is_percent: if True, then space_needed is treated as a percentage
-        of the filesystem's capacity; if False, space_needed is a number of
-        free bytes.
+        (0-100) of the filesystem's capacity; if False, space_needed is a
+        number of free bytes.
 
     :returns: True if the filesystem has at least that much free space,
         False otherwise
 
     :raises OSError: if fs_path does not exist
     """
-    if isinstance(fs_path_or_fd, int):
-        st = os.fstatvfs(fs_path_or_fd)
-    else:
-        st = os.statvfs(fs_path_or_fd)
-    free_bytes = st.f_frsize * st.f_bavail
-    if is_percent:
-        size_bytes = st.f_frsize * st.f_blocks
-        free_percent = float(free_bytes) / float(size_bytes) * 100
-        return free_percent >= space_needed
-    else:
-        return free_bytes >= space_needed
+    free, reserved = _free_and_reserved_space(
+        fs_path_or_fd, space_needed, is_percent)
+    return free >= reserved
 
 
 _fallocate_enabled = True
-_fallocate_warned_about_missing = False
-_sys_fallocate = _LibcWrapper('fallocate')
-_sys_posix_fallocate = _LibcWrapper('posix_fallocate')
 
 
 def disable_fallocate():
@@ -897,14 +884,20 @@ def disable_fallocate():
     _fallocate_enabled = False
 
 
-def fallocate(fd, size, offset=0):
+def fallocate_with_reserve(fd, fallocate_reserve, fallocate_is_percent,
+                           size, offset=0):
     """
-    Pre-allocate disk space for a file.
+    Pre-allocate disk space for a file while holding some space in reserve.
 
     This function can be disabled by calling disable_fallocate(). If no
     suitable C function is available in libc, this function is a no-op.
 
     :param fd: file descriptor
+    :param fallocate_reserve: minimum bytes or percentage of free space
+        to be kept in reserve
+    :param fallocate_is_percent: if True, then fallocate_reserve is
+        treated as a percentage (0-100) of the filesystem's capacity;
+        if False, fallocate_reserve is a number of free bytes
     :param size: size to allocate (in bytes)
     """
     global _fallocate_enabled
@@ -922,78 +915,33 @@ def fallocate(fd, size, offset=0):
 
     # Make sure there's some (configurable) amount of free space in
     # addition to the number of bytes we're allocating.
-    if FALLOCATE_RESERVE:
-        st = os.fstatvfs(fd)
-        free = st.f_frsize * st.f_bavail - size
-        if FALLOCATE_IS_PERCENT:
-            free = (float(free) / float(st.f_frsize * st.f_blocks)) * 100
-        if float(free) <= float(FALLOCATE_RESERVE):
+    if fallocate_reserve:
+        free, reserved = _free_and_reserved_space(
+            fd, fallocate_reserve, fallocate_is_percent)
+        if free - size <= reserved:
             raise OSError(
                 errno.ENOSPC,
-                'FALLOCATE_RESERVE fail %g <= %g' %
-                (free, FALLOCATE_RESERVE))
+                'FALLOCATE_RESERVE fail %d <= %d' %
+                (free - size, reserved))
 
-    if _sys_fallocate.available:
-        # Parameters are (fd, mode, offset, length).
-        #
-        # mode=FALLOC_FL_KEEP_SIZE pre-allocates invisibly (without
-        # affecting the reported file size).
-        ret = _sys_fallocate(
-            fd, FALLOC_FL_KEEP_SIZE, ctypes.c_uint64(offset),
-            ctypes.c_uint64(size))
-        err = ctypes.get_errno()
-    elif _sys_posix_fallocate.available:
-        # Parameters are (fd, offset, length).
-        ret = _sys_posix_fallocate(fd, ctypes.c_uint64(offset),
-                                   ctypes.c_uint64(size))
-        err = ctypes.get_errno()
-    else:
-        # No suitable fallocate-like function is in our libc. Warn about it,
-        # but just once per process, and then do nothing.
-        global _fallocate_warned_about_missing
-        if not _fallocate_warned_about_missing:
-            logging.warning("Unable to locate fallocate, posix_fallocate in "
-                            "libc.  Leaving as a no-op.")
-            _fallocate_warned_about_missing = True
-        return
-
-    if ret and err not in (0, errno.ENOSYS, errno.EOPNOTSUPP,
-                           errno.EINVAL):
-        raise OSError(err, 'Unable to fallocate(%s)' % size)
+    return libc.fallocate(fd, size, offset)
 
 
-def punch_hole(fd, offset, length):
-    """
-    De-allocate disk space in the middle of a file.
-
-    :param fd: file descriptor
-    :param offset: index of first byte to de-allocate
-    :param length: number of bytes to de-allocate
-    """
-    if offset < 0:
-        raise ValueError('offset must be non-negative')
-    if offset >= (1 << 63):
-        raise ValueError('offset must be less than 2 ** 63')
-    if length <= 0:
-        raise ValueError('length must be positive')
-    if length >= (1 << 63):
-        raise ValueError('length must be less than 2 ** 63')
-
-    if _sys_fallocate.available:
-        # Parameters are (fd, mode, offset, length).
-        ret = _sys_fallocate(
-            fd,
-            FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-            ctypes.c_uint64(offset),
-            ctypes.c_uint64(length))
-        err = ctypes.get_errno()
-        if ret and err:
-            mode_str = "FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE"
-            raise OSError(err, "Unable to fallocate(%d, %s, %d, %d)" % (
-                fd, mode_str, offset, length))
-    else:
-        raise OSError(errno.ENOTSUP,
-                      'No suitable C function found for hole punching')
+def fallocate(fd, size, offset=0):
+    warnings.warn(
+        'The swift.common.utils.fallocate function is deprecated '
+        'and may be removed in a future release. Use '
+        'swift.common.utils.fallocate_with_reserve (with appropriate '
+        'reserve values) or swift.common.utils.libc.fallocate instead.',
+        DeprecationWarning, stacklevel=2,
+    )
+    return fallocate_with_reserve(
+        fd,
+        FALLOCATE_RESERVE,
+        FALLOCATE_IS_PERCENT,
+        size,
+        offset,
+    )
 
 
 def fsync(fd):
@@ -1522,7 +1470,7 @@ class StatsdClient(object):
 
     def _timing(self, metric, timing_ms, sample_rate):
         # This method was added to disagregate timing metrics when testing
-        return self._send(metric, timing_ms, 'ms', sample_rate)
+        return self._send(metric, round(timing_ms, 4), 'ms', sample_rate)
 
     def timing(self, metric, timing_ms, sample_rate=None):
         return self._timing(metric, timing_ms, sample_rate)
@@ -1549,6 +1497,8 @@ def timing_stats(**dec_kwargs):
         @functools.wraps(func)
         def _timing_stats(ctrl, *args, **kwargs):
             start_time = time.time()
+            if getattr(ctrl, 'sleep_in_call', False):
+                sleep()
             resp = func(ctrl, *args, **kwargs)
             # .timing is for successful responses *or* error codes that are
             # not Swift's fault. For example, 500 is definitely the server's
@@ -4589,7 +4539,7 @@ class Namespace(object):
     :param upper: the upper bound of object names contained in the namespace;
         the upper bound *is* included in the namespace.
     """
-    __slots__ = ('_lower', '_upper', 'name')
+    __slots__ = ('_lower', '_upper', '_name')
 
     @functools.total_ordering
     class MaxBound(NamespaceOuterBound):
@@ -4683,6 +4633,14 @@ class Namespace(object):
                 isinstance(bound, six.binary_type)):
             raise TypeError('must be a string type')
         return self._encode(bound)
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, path):
+        self._name = self._encode(path)
 
     @property
     def lower(self):
@@ -5067,7 +5025,7 @@ class ShardRange(Namespace):
     CLEAVING_STATES = SHRINKING_STATES + SHARDING_STATES
 
     __slots__ = (
-        'account', 'container',
+        '_account', '_container',
         '_timestamp', '_meta_timestamp', '_state_timestamp', '_epoch',
         '_deleted', '_state', '_count', '_bytes',
         '_tombstones', '_reported')
@@ -5077,13 +5035,13 @@ class ShardRange(Namespace):
                  object_count=0, bytes_used=0, meta_timestamp=None,
                  deleted=False, state=None, state_timestamp=None, epoch=None,
                  reported=False, tombstones=-1, **kwargs):
+        self._account = self._container = None
         super(ShardRange, self).__init__(name=name, lower=lower, upper=upper)
-        self.account = self.container = self._timestamp = \
-            self._meta_timestamp = self._state_timestamp = self._epoch = None
+        self._timestamp = self._meta_timestamp = self._state_timestamp = \
+            self._epoch = None
         self._deleted = False
         self._state = None
 
-        self.name = name
         self.timestamp = timestamp
         self.deleted = deleted
         self.object_count = object_count
@@ -5248,17 +5206,33 @@ class ShardRange(Namespace):
         return Timestamp(timestamp)
 
     @property
+    def account(self):
+        return self._account
+
+    @account.setter
+    def account(self, value):
+        self._account = self._encode(value)
+
+    @property
+    def container(self):
+        return self._container
+
+    @container.setter
+    def container(self, value):
+        self._container = self._encode(value)
+
+    @property
     def name(self):
         return '%s/%s' % (self.account, self.container)
 
     @name.setter
-    def name(self, path):
-        path = self._encode(path)
-        if not path or len(path.split('/')) != 2 or not all(path.split('/')):
+    def name(self, name):
+        name = self._encode(name)
+        if not name or len(name.split('/')) != 2 or not all(name.split('/')):
             raise ValueError(
                 "Name must be of the form '<account>/<container>', got %r" %
-                path)
-        self.account, self.container = path.split('/')
+                name)
+        self._account, self._container = name.split('/')
 
     @property
     def timestamp(self):

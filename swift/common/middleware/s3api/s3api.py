@@ -295,8 +295,6 @@ class S3ApiMiddleware(object):
                              'all domains, * must be the only entry')
         self.conf.ratelimit_as_client_error = config_true_value(
             wsgi_conf.get('ratelimit_as_client_error', False))
-        self.conf.use_async_delete = config_true_value(
-            wsgi_conf.get('use_async_delete', False))
         self.conf.s3_inventory_enabled = config_true_value(
             wsgi_conf.get('s3_inventory_enabled', False))
         self.conf.s3_inventory_allowed_paths = list_from_csv(
@@ -362,6 +360,9 @@ class S3ApiMiddleware(object):
             req_class = get_request_class(env, self.conf.s3_acl)
             req = req_class(env, self.app, self.conf)
             resp = self.handle_request(req)
+            if req.policy_index is not None:
+                resp.headers.setdefault('X-Backend-Storage-Policy-Index',
+                                        req.policy_index)
         except NotS3Request:
             resp = self.app
         except InvalidSubresource as e:
@@ -381,6 +382,7 @@ class S3ApiMiddleware(object):
 
         if 's3api.backend_path' in env and 'swift.backend_path' not in env:
             env['swift.backend_path'] = env['s3api.backend_path']
+
         return resp(env, start_response)
 
     def handle_request(self, req):

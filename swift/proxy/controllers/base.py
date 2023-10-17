@@ -2406,8 +2406,11 @@ class Controller(object):
             return None
 
         try:
-            return [ShardRange.from_dict(shard_range)
-                    for shard_range in listing]
+            # Note: the listing could either be shard ranges or namespace
+            # dicts; namespaces only has 'name', 'lower' and 'upper' keys. We
+            # therefore cannot use ShardRange.from_dict(). So forced to use the
+            # constructor
+            return [ShardRange(**data) for data in listing]
         except (ValueError, TypeError, KeyError) as err:
             self.logger.error(
                 "Failed to get shard ranges from %s: invalid data: %r",
@@ -2433,11 +2436,15 @@ class Controller(object):
         params = req.params.copy()
         params.pop('limit', None)
         params['format'] = 'json'
+        headers = {'X-Backend-Record-Type': 'shard',
+                   'X-Backend-Record-Shard-Format': 'namespace'}
         if includes:
             params['includes'] = str_to_wsgi(includes)
+            # this line can be removed as soon as the container server
+            # supports get_namespaces api with 'includes'.
+            headers['X-Backend-Record-Shard-Format'] = 'full'
         if states:
             params['states'] = states
-        headers = {'X-Backend-Record-Type': 'shard'}
         listing, response = self._get_container_listing(
             req, account, container, headers=headers, params=params)
         return self._parse_shard_ranges(req, listing, response), response

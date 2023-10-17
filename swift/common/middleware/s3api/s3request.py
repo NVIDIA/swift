@@ -26,7 +26,7 @@ from six.moves.urllib.parse import quote, unquote, parse_qsl
 import string
 
 from swift.common.utils import split_path, json, close_if_possible, md5, \
-    streq_const_time
+    streq_const_time, get_policy_index
 from swift.common.registry import get_swift_info
 from swift.common import swob
 from swift.common.http import HTTP_OK, HTTP_CREATED, HTTP_ACCEPTED, \
@@ -47,7 +47,7 @@ from swift.common.middleware.s3api.controllers import ServiceController, \
     LocationController, LoggingStatusController, PartController, \
     UploadController, UploadsController, VersioningController, \
     UnsupportedController, S3AclController, BucketController, \
-    TaggingController, InventoryController
+    TaggingController, ObjectLockController, InventoryController
 from swift.common.middleware.s3api.s3response import AccessDenied, \
     InvalidArgument, InvalidDigest, BucketAlreadyOwnedByYou, \
     RequestTimeTooSkewed, S3Response, SignatureDoesNotMatch, \
@@ -74,7 +74,8 @@ ALLOWED_SUB_RESOURCES = sorted([
     'versionId', 'versioning', 'versions', 'website',
     'response-cache-control', 'response-content-disposition',
     'response-content-encoding', 'response-content-language',
-    'response-content-type', 'response-expires', 'cors', 'tagging', 'restore'
+    'response-content-type', 'response-expires', 'cors', 'tagging', 'restore',
+    'object-lock'
 ])
 
 
@@ -103,6 +104,7 @@ def _header_acl_property(resource):
     """
     Set and retrieve the acl in self.headers
     """
+
     def getter(self):
         return getattr(self, '_%s' % resource)
 
@@ -121,6 +123,7 @@ class HashingInput(object):
     """
     wsgi.input wrapper to verify the hash of the input as it's read.
     """
+
     def __init__(self, reader, content_length, hasher, expected_hex_hash):
         self._input = reader
         self._to_read = content_length
@@ -548,6 +551,7 @@ class S3Request(swob.Request):
         }
         self.account = None
         self.user_id = None
+        self.policy_index = None
 
         # Avoids that swift.swob.Response replaces Location header value
         # by full URL when absolute path given. See swift.swob for more detail.
@@ -920,8 +924,6 @@ class S3Request(swob.Request):
         src_resp = self.get_response(app, 'HEAD', src_bucket,
                                      swob.str_to_wsgi(src_obj),
                                      headers=headers, query=query)
-        # we can't let this HEAD req spoil our COPY
-        self.headers.pop('x-backend-storage-policy-index')
         if src_resp.status_int == 304:  # pylint: disable-msg=E1101
             raise PreconditionFailed()
 
@@ -1052,6 +1054,8 @@ class S3Request(swob.Request):
             return VersioningController
         if 'tagging' in self.params:
             return TaggingController
+        if 'object-lock' in self.params:
+            return ObjectLockController
         if 'inventory' in self.params:
             return InventoryController
 
@@ -1373,11 +1377,11 @@ class S3Request(swob.Request):
                                             2, 3, True)
             # Update s3.backend_path from the response environ
             self.environ['s3api.backend_path'] = sw_resp.environ['PATH_INFO']
-            # Propogate backend headers back into our req headers for logging
-            for k, v in sw_req.headers.items():
-                if k.lower().startswith('x-backend-'):
-                    self.headers.setdefault(k, v)
 
+        # keep a record of the backend policy index so that the s3api can add
+        # it to the headers of whatever response it returns, which may not
+        # necessarily be this resp.
+        self.policy_index = get_policy_index(sw_req.headers, sw_resp.headers)
         resp = S3Response.from_swift_resp(sw_resp)
         status = resp.status_int  # pylint: disable-msg=E1101
 
@@ -1543,6 +1547,7 @@ class S3AclRequest(S3Request):
     """
     S3Acl request object.
     """
+
     def __init__(self, env, app=None, conf=None):
         super(S3AclRequest, self).__init__(env, app, conf)
         self.authenticate(app)
