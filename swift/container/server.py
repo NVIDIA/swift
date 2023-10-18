@@ -516,59 +516,42 @@ class ContainerController(BaseStorageServer):
             return HTTPInsufficientStorage(drive=drive, request=req)
         if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
-        requested_policy_index = self.get_and_validate_policy_index(req)
+
         broker = self._get_container_broker(drive, part, account, container)
-        if obj:     # put container object
-            # obj put expects the policy_index header, default is for
-            # legacy support during upgrade.
-            obj_policy_index = requested_policy_index or 0
-            self._maybe_autocreate(
-                broker, req_timestamp, account, obj_policy_index, req)
-            # redirect if a shard exists for this object name
-            response = self._redirect_to_shard(req, broker, obj)
-            if response:
-                return response
-
-            broker.put_object(obj, req_timestamp.internal,
-                              int(req.headers['x-size']),
-                              wsgi_to_str(req.headers['x-content-type']),
-                              wsgi_to_str(req.headers['x-etag']), 0,
-                              obj_policy_index,
-                              wsgi_to_str(req.headers.get(
-                                  'x-content-type-timestamp')),
-                              wsgi_to_str(req.headers.get('x-meta-timestamp')))
-            return HTTPCreated(request=req)
-
+        if obj:
+            return self.PUT_object(req, broker, account, obj, req_timestamp)
         record_type = req.headers.get('x-backend-record-type', '').lower()
         if record_type == RECORD_TYPE_SHARD:
-            try:
-                # validate incoming data...
-                shard_ranges = [ShardRange.from_dict(sr)
-                                for sr in json.loads(req.body)]
-            except (ValueError, KeyError, TypeError) as err:
-                return HTTPBadRequest('Invalid body: %r' % err)
-            created = self._maybe_autocreate(
-                broker, req_timestamp, account, requested_policy_index, req)
-            self._update_metadata(req, broker, req_timestamp, 'PUT')
-            if shard_ranges:
-                # TODO: consider writing the shard ranges into the pending
-                # file, but if so ensure an all-or-none semantic for the write
-                broker.merge_shard_ranges(shard_ranges)
-        else:   # put container
-            if requested_policy_index is None:
-                # use the default index sent by the proxy if available
-                new_container_policy = req.headers.get(
-                    'X-Backend-Storage-Policy-Default', int(POLICIES.default))
-            else:
-                new_container_policy = requested_policy_index
-            created = self._update_or_create(req, broker,
-                                             req_timestamp.internal,
-                                             new_container_policy,
-                                             requested_policy_index)
-            self._update_metadata(req, broker, req_timestamp, 'PUT')
-            resp = self.account_update(req, account, container, broker)
-            if resp:
-                return resp
+            return self.PUT_shard(req, broker, account, req_timestamp)
+        else:
+            return self.PUT_container(req, broker, account,
+                                      container, req_timestamp)
+
+    @timing_stats()
+    def PUT_object(self, req, broker, account, obj, req_timestamp):
+        """Put object into container."""
+        # obj put expects the policy_index header, default is for
+        # legacy support during upgrade.
+        requested_policy_index = self.get_and_validate_policy_index(req)
+        obj_policy_index = requested_policy_index or 0
+        self._maybe_autocreate(
+            broker, req_timestamp, account, obj_policy_index, req)
+        # redirect if a shard exists for this object name
+        response = self._redirect_to_shard(req, broker, obj)
+        if response:
+            return response
+
+        broker.put_object(obj, req_timestamp.internal,
+                          int(req.headers['x-size']),
+                          wsgi_to_str(req.headers['x-content-type']),
+                          wsgi_to_str(req.headers['x-etag']), 0,
+                          obj_policy_index,
+                          wsgi_to_str(req.headers.get(
+                              'x-content-type-timestamp')),
+                          wsgi_to_str(req.headers.get('x-meta-timestamp')))
+        return HTTPCreated(request=req)
+
+    def _create_PUT_response(self, req, broker, created):
         if created:
             return HTTPCreated(request=req,
                                headers={'x-backend-storage-policy-index':
@@ -577,6 +560,45 @@ class ContainerController(BaseStorageServer):
             return HTTPAccepted(request=req,
                                 headers={'x-backend-storage-policy-index':
                                          broker.storage_policy_index})
+
+    @timing_stats()
+    def PUT_shard(self, req, broker, account, req_timestamp):
+        """Put shards into container."""
+        requested_policy_index = self.get_and_validate_policy_index(req)
+        try:
+            # validate incoming data...
+            shard_ranges = [ShardRange.from_dict(sr)
+                            for sr in json.loads(req.body)]
+        except (ValueError, KeyError, TypeError) as err:
+            return HTTPBadRequest('Invalid body: %r' % err)
+        created = self._maybe_autocreate(
+            broker, req_timestamp, account, requested_policy_index, req)
+        self._update_metadata(req, broker, req_timestamp, 'PUT')
+        if shard_ranges:
+            # TODO: consider writing the shard ranges into the pending
+            # file, but if so ensure an all-or-none semantic for the write
+            broker.merge_shard_ranges(shard_ranges)
+        return self._create_PUT_response(req, broker, created)
+
+    @timing_stats()
+    def PUT_container(self, req, broker, account, container, req_timestamp):
+        """Update or create container."""
+        requested_policy_index = self.get_and_validate_policy_index(req)
+        if requested_policy_index is None:
+            # use the default index sent by the proxy if available
+            new_container_policy = req.headers.get(
+                'X-Backend-Storage-Policy-Default', int(POLICIES.default))
+        else:
+            new_container_policy = requested_policy_index
+        created = self._update_or_create(req, broker,
+                                         req_timestamp.internal,
+                                         new_container_policy,
+                                         requested_policy_index)
+        self._update_metadata(req, broker, req_timestamp, 'PUT')
+        resp = self.account_update(req, account, container, broker)
+        if resp:
+            return resp
+        return self._create_PUT_response(req, broker, created)
 
     @public
     @timing_stats(sample_rate=0.1)
@@ -764,6 +786,7 @@ class ContainerController(BaseStorageServer):
             return self.GET_object(req, broker, container, params, info,
                                    is_deleted, out_content_type)
 
+    @timing_stats()
     def GET_shard(self, req, broker, container, params, info,
                   is_deleted, out_content_type):
         """
@@ -856,14 +879,15 @@ class ContainerController(BaseStorageServer):
                                          resp_headers, broker.metadata,
                                          container, listing)
 
+    @timing_stats()
     def GET_object(self, req, broker, container, params, info,
                    is_deleted, out_content_type):
         """
-        Returns a list of persisted shard ranges or namespaces in response.
+        Returns a list of objects in response.
 
-        :param container: container name
-        :param broker: container DB broker object
         :param req: swob.Request object
+        :param broker: container DB broker object
+        :param container: container name
         :param params: the request params.
         :param info: the global info for the container
         :param is_deleted: the is_deleted status for the container.
