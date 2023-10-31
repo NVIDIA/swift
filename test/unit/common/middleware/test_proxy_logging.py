@@ -865,6 +865,63 @@ class TestProxyLogging(unittest.TestCase):
         self.assertEqual(do_test(environ_updates),
                          ['GET', '/v1/a/c', '499', '503'])
 
+    def test_environ_has_proxy_logging_status_and_app_explodes(self):
+        # verify exception overrides proxy_logging_status
+        conf = {'log_msg_template':
+                '{method} {path} {status_int} {wire_status_int}'}
+
+        class ExplodingFakeApp(object):
+
+            def __call__(self, env, start_response):
+                # this is going to be so great!
+                env['swift.proxy_logging_status'] = '456'
+                start_response('568 Bespoke', [('X-Special', 'fun')])
+                raise Exception('oops!')
+
+        fake_app = ExplodingFakeApp()
+        app = proxy_logging.ProxyLoggingMiddleware(fake_app, conf)
+        app.access_logger = debug_logger()
+        req = Request.blank('/v1/a/c')
+        captured_start_resp = mock.MagicMock()
+        with self.assertRaises(Exception) as cm:
+            app(req.environ, captured_start_resp)
+        captured_start_resp.assert_not_called()
+        self.assertEqual('oops!', str(cm.exception))
+        self.assertEqual(self._log_parts(app),
+                         ['GET', '/v1/a/c', '500', '500'])
+
+    def test_environ_has_proxy_logging_status_and_body_explodes(self):
+        # verify exception overrides proxy_logging_status
+        conf = {'log_msg_template':
+                '{method} {path} {status_int} {wire_status_int}'}
+
+        def exploding_body():
+            yield 'some'
+            yield 'stuff'
+            raise Exception('oops!')
+
+        class ExplodingFakeApp(object):
+
+            def __call__(self, env, start_response):
+                # this is going to be so great!
+                env['swift.proxy_logging_status'] = '456'
+                start_response('568 Bespoke', [('X-Special', 'fun')])
+                return exploding_body()
+
+        fake_app = ExplodingFakeApp()
+        app = proxy_logging.ProxyLoggingMiddleware(fake_app, conf)
+        app.access_logger = debug_logger()
+        req = Request.blank('/v1/a/c')
+        captured_start_resp = mock.MagicMock()
+        app_iter = app(req.environ, captured_start_resp)
+        with self.assertRaises(Exception) as cm:
+            b''.join(app_iter)
+        captured_start_resp.assert_called_once_with(
+            '568 Bespoke', [('X-Special', 'fun')], None)
+        self.assertEqual('oops!', str(cm.exception))
+        self.assertEqual(self._log_parts(app),
+                         ['GET', '/v1/a/c', '500', '568'])
+
     def test_app_exception(self):
         app = proxy_logging.ProxyLoggingMiddleware(
             FakeAppThatExcepts(), {})

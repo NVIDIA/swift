@@ -161,9 +161,11 @@ class FakeSwift(object):
                                      (method, path),))
         return resp
 
-    def _select_response(self, env, method, path):
+    def _select_response(self, env):
         # in some cases we can borrow different registered response
         # ... the order is brittle and significant
+        method = env['REQUEST_METHOD']
+        path = self._parse_path(env)[0]
         preferences = [(method, path)]
         if env.get('QUERY_STRING'):
             # we can always reuse response w/o query string
@@ -200,7 +202,7 @@ class FakeSwift(object):
         env = {'PATH_INFO': path,
                'REQUEST_METHOD': 'HEAD'}
         try:
-            resp_class, headers, _ = self._select_response(env, 'HEAD', path)
+            resp_class, headers, _ = self._select_response(env)
             policy_index = headers.get('X-Backend-Storage-Policy-Index')
         except KeyError:
             policy_index = None
@@ -208,17 +210,22 @@ class FakeSwift(object):
             policy_index = str(int(POLICIES.default))
         return policy_index
 
-    def __call__(self, env, start_response):
-        method = env['REQUEST_METHOD']
-        if method not in self.ALLOWED_METHODS:
-            raise HTTPNotImplemented()
-
+    def _parse_path(self, env):
         path = env['PATH_INFO']
+
         _, acc, cont, obj = split_path(env['PATH_INFO'], 0, 4,
                                        rest_with_last=True)
         if env.get('QUERY_STRING'):
             path += '?' + env['QUERY_STRING']
         path = normalize_path(path)
+        return path, acc, cont, obj
+
+    def __call__(self, env, start_response):
+        method = env['REQUEST_METHOD']
+        if method not in self.ALLOWED_METHODS:
+            raise HTTPNotImplemented()
+
+        path, acc, cont, obj = self._parse_path(env)
 
         if 'swift.authorize' in env:
             resp = env['swift.authorize'](swob.Request(env))
@@ -229,7 +236,7 @@ class FakeSwift(object):
         self.swift_sources.append(env.get('swift.source'))
         self.txn_ids.append(env.get('swift.trans_id'))
 
-        resp_class, headers, body = self._select_response(env, method, path)
+        resp_class, headers, body = self._select_response(env)
 
         # Capture the request before reading the body, in case the iter raises
         # an exception.
@@ -286,9 +293,6 @@ class FakeSwift(object):
         if obj:
             req.headers.setdefault('X-Backend-Storage-Policy-Index',
                                    self._get_policy_index(acc, cont))
-        req_headers_copy = HeaderKeyDict(req.headers)
-        self._updated_calls.append(
-            FakeSwiftCall(method, path, req_headers_copy))
 
         # Apply conditional etag overrides
         conditional_etag = resolve_etag_is_at_header(req, headers)

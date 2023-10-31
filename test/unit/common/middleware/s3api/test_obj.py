@@ -79,7 +79,7 @@ class TestS3ApiObj(S3ApiTestCase):
         StoragePolicy(1, 'silver')])
     def _test_object_GETorHEAD(self, method):
         bucket_policy_index = 1
-        self._register_bucket_policy('bucket', bucket_policy_index)
+        self._register_bucket_head('bucket', bucket_policy_index)
         req = Request.blank('/bucket/object',
                             environ={'REQUEST_METHOD': method},
                             headers={'Authorization': 'AWS test:tester:hmac',
@@ -188,7 +188,7 @@ class TestS3ApiObj(S3ApiTestCase):
 
     def _do_test_object_policy_index_logging(self, bucket_policy_index):
         self.logger.clear()
-        self._register_bucket_policy('bucket', bucket_policy_index)
+        self._register_bucket_head('bucket', bucket_policy_index)
         req = Request.blank('/bucket/object',
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
@@ -868,9 +868,9 @@ class TestS3ApiObj(S3ApiTestCase):
         StoragePolicy(1, 'silver')])
     def test_simple_object_copy(self):
         src_policy_index = 0
-        self._register_bucket_policy('some', src_policy_index)
+        self._register_bucket_head('some', src_policy_index)
         dst_policy_index = 1
-        self._register_bucket_policy('bucket', dst_policy_index)
+        self._register_bucket_head('bucket', dst_policy_index)
         self.swift.register('HEAD', '/v1/AUTH_test/some/source',
                             swob.HTTPOk, {}, None)
         req = Request.blank(
@@ -893,15 +893,8 @@ class TestS3ApiObj(S3ApiTestCase):
 
         head_call, put_call = self.swift.calls_with_headers
         self.assertNotIn('x-backend-storage-policy-index', head_call.headers)
-        self.assertEqual(put_call.headers['x-copy-from'], '/some/source')
         self.assertNotIn('x-backend-storage-policy-index', put_call.headers)
-        head_call, put_call = self.swift.updated_calls_with_headers
-        self.assertEqual(
-            head_call.headers['x-backend-storage-policy-index'],
-            str(src_policy_index))
-        self.assertEqual(
-            put_call.headers['x-backend-storage-policy-index'],
-            str(dst_policy_index))
+        self.assertEqual(put_call.headers['x-copy-from'], '/some/source')
 
     @s3acl
     def test_object_PUT_copy(self):

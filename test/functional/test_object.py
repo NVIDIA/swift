@@ -26,6 +26,7 @@ from xml.dom import minidom
 import six
 from six.moves import range
 
+from swift.common.header_key_dict import HeaderKeyDict
 from test.functional import check_response, retry, requires_acls, \
     requires_policies, requires_bulk
 import test.functional as tf
@@ -536,9 +537,13 @@ class TestObject(unittest.TestCase):
         self.assertEqual(resp.status, 404)
 
         resp = retry(get, extra_headers={'X-Open-Expired': True})
+        dt = datetime.datetime.now()
+        delete_time = str(int(time.mktime(dt.timetuple())) + 2)
         resp.read()
+        headers = HeaderKeyDict(resp.getheaders())
         # read the expired object with magic x-open-expired header
         self.assertEqual(resp.status, 200)
+        self.assertTrue(delete_time > headers['X-Delete-At'])
 
         resp = retry(head, extra_headers={'X-Open-Expired': True})
         resp.read()
@@ -558,6 +563,8 @@ class TestObject(unittest.TestCase):
         resp = retry(get, extra_headers={'X-Open-Expired': True})
         resp.read()
         self.assertEqual(resp.status, 200)
+        headers = HeaderKeyDict(resp.getheaders())
+        self.assertTrue(delete_time > headers['X-Delete-At'])
 
         resp = retry(head, extra_headers={'X-Open-Expired': False})
         resp.read()
@@ -565,7 +572,9 @@ class TestObject(unittest.TestCase):
 
         resp = retry(head, extra_headers={'X-Open-Expired': True})
         resp.read()
+        headers = HeaderKeyDict(resp.getheaders())
         self.assertEqual(resp.status, 200)
+        self.assertTrue(delete_time > headers['X-Delete-At'])
 
         resp = retry(post, extra_headers={'X-Open-Expired': False})
         resp.read()

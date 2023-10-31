@@ -125,14 +125,17 @@ class TestMixedPolicyMPU(ReplProbeTest):
 
         # s3 listing has correct bytes
         resp = self.s3.list_objects(Bucket=self.bucket_name)
-        self.assertEqual(resp['Contents'], [{
-            'ETag': s3_head_resp['ETag'],
-            'Key': self.mpu_name,
-            'LastModified': mock.ANY,
-            'Size': expected_size,
-            'Owner': {'DisplayName': 'test:tester', 'ID': 'test:tester'},
-            'StorageClass': 'STANDARD',
-        }])
+        # note: with PY2 the args order (expected, actual) is significant for
+        # mock.ANY == datetime(...) to be true
+        self.assertEqual([{
+            u'ETag': s3_head_resp['ETag'],
+            u'Key': self.mpu_name,
+            u'LastModified': mock.ANY,
+            u'Size': expected_size,
+            u'Owner': {u'DisplayName': 'test:tester', u'ID': 'test:tester'},
+            u'StorageClass': 'STANDARD',
+        }], resp['Contents'])
+
         # swift listing is the same
         stat, listing = swiftclient.get_container(
             self.url, self.token, self.bucket_name)

@@ -50,6 +50,8 @@ CLEAVE_SUCCESS = 0
 CLEAVE_FAILED = 1
 CLEAVE_EMPTY = 2
 
+DEFAULT_PERIODIC_WARNINGS_INTERVAL = 24 * 3600
+
 
 def sharding_enabled(broker):
     # NB all shards will by default have been created with
@@ -910,9 +912,13 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                 (internal_client_conf_path, err))
         self.stats_interval = float(conf.get('stats_interval', '3600'))
         self.reported = 0
+        self.periodic_warnings_interval = float(
+            conf.get('periodic_warnings_interval',
+                     DEFAULT_PERIODIC_WARNINGS_INTERVAL))
+        self.periodic_warnings_start = time.time()
+        self.periodic_warnings = set()
 
-    def _format_log_msg(self, broker, msg, *args):
-        # make best effort to include broker properties...
+    def _get_broker_details(self, broker):
         try:
             db_file = broker.db_file
         except Exception:  # noqa
@@ -921,7 +927,11 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             path = broker.path
         except Exception:  # noqa
             path = ''
+        return db_file, path
 
+    def _format_log_msg(self, broker, msg, *args):
+        # make best effort to include broker properties...
+        db_file, path = self._get_broker_details(broker)
         if args:
             msg = msg % args
         return '%s, path: %s, db: %s' % (msg, quote(path), db_file)
@@ -940,6 +950,19 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
 
     def warning(self, broker, msg, *args, **kwargs):
         self._log(logging.WARNING, broker, msg, *args, **kwargs)
+
+    def periodic_warning(self, broker, msg, *args, **kwargs):
+        now = time.time()
+        if now - self.periodic_warnings_start >= \
+                self.periodic_warnings_interval:
+            self.periodic_warnings.clear()
+            self.periodic_warnings_start = now
+
+        db_file, path = self._get_broker_details(broker)
+        key = (db_file, msg)
+        if key not in self.periodic_warnings:
+            self.periodic_warnings.add(key)
+            self._log(logging.WARNING, broker, msg, *args, **kwargs)
 
     def error(self, broker, msg, *args, **kwargs):
         self._log(logging.ERROR, broker, msg, *args, **kwargs)
@@ -1582,8 +1605,8 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         if broker.is_deleted():
             if broker.is_old_enough_to_reclaim(time.time(), self.reclaim_age) \
                     and not broker.is_empty_enough_to_reclaim():
-                self.warning(broker,
-                             'Reclaimable db stuck waiting for shrinking')
+                self.periodic_warning(
+                    broker, 'Reclaimable db stuck waiting for shrinking')
             # if the container has been marked as deleted, all metadata will
             # have been erased so no point auditing. But we want it to pass, in
             # case any objects exist inside it.
@@ -1711,13 +1734,15 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                               dest_broker, node_id, info):
         success, responses = self._replicate_object(
             part, dest_broker.db_file, node_id)
+        replication_successes = responses.count(True)
         quorum = quorum_size(self.ring.replica_count)
-        if not success and responses.count(True) < quorum:
+        if not success and replication_successes < quorum:
             self.warning(
                 broker, 'Failed to sufficiently replicate misplaced objects '
-                        'to %s in state %s (not removing), shard db: %s',
+                        'shard %s in state %s: %s successes, %s required '
+                        '(not removing objects), shard db: %s',
                 dest_shard_range.name, dest_shard_range.state_text,
-                dest_broker.db_file)
+                replication_successes, quorum, dest_broker.db_file)
             return False
 
         if broker.get_info()['id'] != info['id']:
@@ -2095,11 +2120,12 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                 # break because we don't want to progress the cleave cursor
                 # until each shard range has been successfully cleaved
                 self.warning(
-                    broker,
-                    'Failed to sufficiently replicate cleaved shard '
-                    '%s: %s successes, %s required, shard db: %s',
-                    shard_broker.path, replication_successes,
-                    replication_quorum, shard_broker.db_file)
+                    broker, 'Failed to sufficiently replicate cleaved shard '
+                            '%s in state %s: %s successes, %s required, '
+                            'shard db: %s',
+                    shard_broker.path, shard_range.state_text,
+                    replication_successes, replication_quorum,
+                    shard_broker.db_file)
                 self._increment_stat('cleaved', 'failure', statsd=True)
                 result = CLEAVE_FAILED
             else:

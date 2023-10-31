@@ -142,12 +142,11 @@ class TestS3ApiBucket(S3ApiTestCase):
 
     def _do_test_bucket_HEAD_policy_index_logging(self, bucket_policy_index):
         self.logger.clear()
-        self._register_bucket_policy('junk', bucket_policy_index)
+        self._register_bucket_head('junk', bucket_policy_index)
         req = Request.blank('/junk',
                             environ={'REQUEST_METHOD': 'HEAD'},
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
-        self.assertNotIn('X-Backend-Storage-Policy-Index', req.headers)
         self.s3api = ProxyLoggingMiddleware(self.s3api, {}, logger=self.logger)
         status, headers, body = self.call_s3api(req)
         self._assert_policy_index(req.headers, headers, bucket_policy_index)
@@ -159,9 +158,6 @@ class TestS3ApiBucket(S3ApiTestCase):
         self.assertEqual(' '.join(parts[3:7]), 'HEAD /junk HTTP/1.0 200')
         self.assertEqual(parts[-1], str(bucket_policy_index))
 
-    @patch_policies([
-        StoragePolicy(0, 'gold', is_default=True),
-        StoragePolicy(1, 'silver')])
     def test_bucket_HEAD_policy_index_logging(self):
         self._do_test_bucket_HEAD_policy_index_logging(0)
         self._do_test_bucket_HEAD_policy_index_logging(1)
@@ -726,8 +722,6 @@ class TestS3ApiBucket(S3ApiTestCase):
             self.swift.register(
                 'HEAD', '/v1/AUTH_test/junk/%s' % quote(obj[0].encode('utf8')),
                 swob.HTTPOk, {}, None)
-        # self.swift.register('HEAD', '/v1/AUTH_test/junk/viola',
-        #                     swob.HTTPOk, {}, None)
 
         self._add_versions_request(versioned_objects=[])
         req = Request.blank('/junk?versions',
