@@ -7365,6 +7365,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 202)
 
+        # You can POST to an expired object with a much later x-delete-at
         the_time = now + 2
         req = Request.blank(
             '/sda1/p/a/c/o',
@@ -7375,6 +7376,16 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 202)
 
+        # You restored an expired object with just a later x-delete-at
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers.get('x-delete-at'),
+                         str(delete_at_timestamp))
+        self.assertIsNone(resp.headers.get('x-backend-open-expired'))
+
         the_time = now + 2
         req = Request.blank(
             '/sda1/p/a/c/o',
@@ -7384,6 +7395,16 @@ class TestObjectController(BaseTestCase):
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers.get('x-delete-at'),
                          str(delete_at_timestamp))
+
+        # verify object has expired and we have no x-delete-at in response
+        the_time = now + 300
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'X-Timestamp': normalize_timestamp(the_time)})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 404)
+        self.assertIsNone(resp.headers.get('x-delete-at'))
 
     def test_DELETE_can_skip_updating_expirer_queue(self):
         policy = POLICIES.get_by_index(0)

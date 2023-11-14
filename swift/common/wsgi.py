@@ -51,6 +51,7 @@ from swift.common.utils import capture_stdio, disable_fallocate, \
 SIGNUM_TO_NAME = {getattr(signal, n): n for n in dir(signal)
                   if n.startswith('SIG') and '_' not in n}
 NOTIFY_FD_ENV_KEY = '__SWIFT_SERVER_NOTIFY_FD'
+CHILD_STATE_FD_ENV_KEY = '__SWIFT_SERVER_CHILD_STATE_FD'
 
 # Set maximum line size of message headers to be accepted.
 wsgi.MAX_HEADER_LINE = constraints.MAX_HEADER_SIZE
@@ -541,21 +542,21 @@ class StrategyBase(object):
         # connections. This is used for seamless reloading using SIGUSR1.
         reexec_signal_fd = os.getenv(NOTIFY_FD_ENV_KEY)
         if reexec_signal_fd:
-            worker_state_fd = None
             if ',' in reexec_signal_fd:
                 reexec_signal_fd, worker_state_fd = reexec_signal_fd.split(',')
             reexec_signal_fd = int(reexec_signal_fd)
             os.write(reexec_signal_fd, str(os.getpid()).encode('utf8'))
             os.close(reexec_signal_fd)
-            try:
-                self.read_state_from_old_manager(worker_state_fd)
-            except Exception as e:
-                # This was all opportunistic anyway; old swift wouldn't even
-                # *try* to send us any state -- we don't want *new* code to
-                # fail just because *old* code didn't live up to its promise
-                self.logger.warning(
-                    'Failed to read state from the old manager: %r', e,
-                    exc_info=True)
+        worker_state_fd = os.getenv(CHILD_STATE_FD_ENV_KEY)
+        try:
+            self.read_state_from_old_manager(worker_state_fd)
+        except Exception as e:
+            # This was all opportunistic anyway; old swift wouldn't even
+            # *try* to send us any state -- we don't want *new* code to
+            # fail just because *old* code didn't live up to its promise
+            self.logger.warning(
+                'Failed to read state from the old manager: %r', e,
+                exc_info=True)
 
         # Finally, signal systemd (if appropriate) that process started
         # properly.
@@ -564,6 +565,27 @@ class StrategyBase(object):
         self.signaled_ready = True
 
     def read_state_from_old_manager(self, worker_state_fd):
+        """
+        Read worker state from the old manager's socket-closer.
+
+        The socket-closing process is the last thing to still have the worker
+        PIDs in its head, so it sends us a JSON dict (prefixed by its length)
+        of the form::
+
+           {
+             "old_pids": {
+               "<old worker>": "<first reload time>",
+               ...
+             }
+           }
+
+        More data may be added in the future.
+
+        :param worker_state_fd: The file descriptor that should have the
+                                old worker state. Should be passed to us
+                                via the ``__SWIFT_SERVER_CHILD_STATE_FD``
+                                environment variable.
+        """
         if not worker_state_fd:
             return
         worker_state_fd = int(worker_state_fd)
@@ -1141,7 +1163,8 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
             # parent; set env var for fds and reexec ourselves
             os.close(read_fd)
             os.close(state_wfd)
-            os.putenv(NOTIFY_FD_ENV_KEY, '%s,%s' % (write_fd, state_rfd))
+            os.putenv(NOTIFY_FD_ENV_KEY, str(write_fd))
+            os.putenv(CHILD_STATE_FD_ENV_KEY, str(state_rfd))
             myself = os.path.realpath(sys.argv[0])
             logger.info("Old server PID=%d re'execing as: %r",
                         orig_server_pid, [myself] + list(sys.argv))

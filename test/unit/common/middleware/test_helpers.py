@@ -15,6 +15,7 @@
 # limitations under the License.
 import unittest
 
+from swift.common.storage_policy import POLICIES
 from swift.common.swob import Request, HTTPOk, HTTPNotFound, HTTPCreated
 from swift.common import request_helpers as rh
 from test.unit.common.middleware.helpers import FakeSwift
@@ -522,13 +523,13 @@ class TestFakeSwift(unittest.TestCase):
                          resp.headers)
         self.assertEqual(b'stuff', resp.body)
         self.assertEqual(1, swift.call_count)
-        self.assertEqual(('GET', '/v1/a/c/o'), swift.calls[-1])
+        self.assertEqual(('GET', '/v1/a/c/o'), swift.calls[0])
         self.assertEqual(('GET', '/v1/a/c/o',
                           {'Host': 'localhost:80'}),  # from swob
-                         swift.calls_with_headers[-1])
+                         swift.calls_with_headers[0])
         # default storage policy is applied...
-        self.assertEqual(
-            '0', req.headers.get('X-Backend-Storage-Policy-Index'))
+        self.assertEqual(str(int(POLICIES.default)),
+                         req.headers.get('X-Backend-Storage-Policy-Index'))
 
         # register a container with storage policy 99...
         swift.register('HEAD', '/v1/a/c', HTTPOk,
@@ -543,9 +544,151 @@ class TestFakeSwift(unittest.TestCase):
                          resp.headers)
         self.assertEqual(b'stuff', resp.body)
         self.assertEqual(2, swift.call_count)
-        self.assertEqual(('GET', '/v1/a/c/o'), swift.calls[-1])
+        self.assertEqual(('GET', '/v1/a/c/o'), swift.calls[1])
         self.assertEqual(('GET', '/v1/a/c/o',
                           {'Host': 'localhost:80'}),  # from swob
-                         swift.calls_with_headers[-1])
+                         swift.calls_with_headers[1])
         self.assertEqual(
             '99', req.headers.get('X-Backend-Storage-Policy-Index'))
+
+
+class TestFakeSwiftMultipleResponses(unittest.TestCase):
+
+    def test_register_response_is_forever(self):
+        swift = FakeSwift()
+        swift.register('GET', '/v1/a/c/o',
+                       HTTPOk, {'X-Foo': 'Bar'}, b'stuff')
+        req = Request.blank('/v1/a/c/o')
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Bar', resp.headers['X-Foo'])
+        # you can get this response as much as you want
+        for i in range(10):
+            resp = req.get_response(swift)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual('Bar', resp.headers['X-Foo'])
+
+    def test_register_response_is_last_response_wins(self):
+        swift = FakeSwift()
+        swift.register('GET', '/v1/a/c/o',
+                       HTTPOk, {'X-Foo': 'Bar'}, b'stuff')
+        req = Request.blank('/v1/a/c/o')
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Bar', resp.headers['X-Foo'])
+
+        swift.register('GET', '/v1/a/c/o',
+                       HTTPOk, {'X-Foo': 'Baz'}, b'other')
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Baz', resp.headers['X-Foo'])
+        # you can get this new response as much as you want
+        for i in range(10):
+            resp = req.get_response(swift)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual('Baz', resp.headers['X-Foo'])
+
+    def test_register_next_response_is_last_response_wins(self):
+        swift = FakeSwift()
+        swift.register(
+            'GET', '/v1/a/c/o',
+            HTTPOk, {'X-Foo': 'Bar'}, b'stuff')
+        swift.register_next_response(
+            'GET', '/v1/a/c/o',
+            HTTPOk, {'X-Foo': 'Baz'}, b'other')
+        req = Request.blank('/v1/a/c/o')
+
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Bar', resp.headers['X-Foo'])
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Baz', resp.headers['X-Foo'])
+        # you can get this new response as much as you want
+        for i in range(10):
+            resp = req.get_response(swift)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual('Baz', resp.headers['X-Foo'])
+
+    def test_register_next_response_keeps_current_registered_response(self):
+        # we expect test authors will typically 'd register ALL their responses
+        # before you start calling FakeSwift
+        swift = FakeSwift()
+        swift.register(
+            'GET', '/v1/a/c/o',
+            HTTPOk, {'X-Foo': 'Bar'}, b'stuff')
+        req = Request.blank('/v1/a/c/o')
+
+        # we get the registered response, obviously
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Bar', resp.headers['X-Foo'])
+
+        # because before calling register_next_response, no resp are consumed
+        swift.register_next_response(
+            'GET', '/v1/a/c/o',
+            HTTPOk, {'X-Foo': 'Baz'}, b'other')
+
+        # so, this is the "current" response, not the *next* response
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Bar', resp.headers['X-Foo'])
+
+        # the *next* response is the next response
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Baz', resp.headers['X-Foo'])
+
+    def test_register_next_response_first(self):
+        # you can just use register_next_response
+        swift = FakeSwift()
+        swift.register_next_response(
+            'GET', '/v1/a/c/o',
+            HTTPOk, {'X-Foo': 'Bar'}, b'stuff')
+        swift.register_next_response(
+            'GET', '/v1/a/c/o',
+            HTTPOk, {'X-Foo': 'Baz'}, b'other')
+        req = Request.blank('/v1/a/c/o')
+
+        # it works just like you'd called register
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Bar', resp.headers['X-Foo'])
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Baz', resp.headers['X-Foo'])
+        # you can get this new response as much as you want
+        for i in range(10):
+            resp = req.get_response(swift)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual('Baz', resp.headers['X-Foo'])
+
+    def test_register_resets(self):
+        swift = FakeSwift()
+        swift.register_next_response(
+            'GET', '/v1/a/c/o',
+            HTTPOk, {'X-Foo': 'Bar'}, b'stuff')
+        req = Request.blank('/v1/a/c/o')
+
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Bar', resp.headers['X-Foo'])
+        # you can get this response as much as you want
+        for i in range(10):
+            resp = req.get_response(swift)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual('Bar', resp.headers['X-Foo'])
+
+        # if you call register mid test you immediately reset the resp
+        swift.register(
+            'GET', '/v1/a/c/o',
+            HTTPOk, {'X-Foo': 'Baz'}, b'other')
+
+        resp = req.get_response(swift)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Baz', resp.headers['X-Foo'])
+        # you can get this new response as much as you want
+        for i in range(10):
+            resp = req.get_response(swift)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual('Baz', resp.headers['X-Foo'])

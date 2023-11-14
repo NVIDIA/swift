@@ -36,7 +36,8 @@ from swift.common.swob import HTTPBadRequest, \
     HTTPServiceUnavailable, Range, is_chunked, multi_range_iterator, \
     HTTPPreconditionFailed, wsgi_to_bytes, wsgi_unquote, wsgi_to_str
 from swift.common.utils import split_path, validate_device_partition, \
-    close_if_possible, maybe_multipart_byteranges_to_document_iters, \
+    close_if_possible, friendly_close, \
+    maybe_multipart_byteranges_to_document_iters, \
     multipart_byteranges_to_document_iters, parse_content_type, \
     parse_content_range, csv_append, list_from_csv, Spliterator, quote, \
     RESERVED, config_true_value, md5, CloseableChain, select_ip_port
@@ -460,15 +461,17 @@ class SegmentedIterable(object):
     :param app: WSGI application from which segments will come
 
     :param listing_iter: iterable yielding the object segments to fetch,
-        along with the byte subranges to fetch, in the form of a 5-tuple
-        (object-path, object-etag, object-size, first-byte, last-byte).
+        along with the byte sub-ranges to fetch. Each yielded item should be a
+        dict with the following keys: ``path`` or ``raw_data``,
+        ``first-byte``, ``last-byte``, ``hash`` (optional), ``bytes``
+        (optional).
 
-        If object-etag is None, no MD5 verification will be done.
+        If ``hash`` is None, no MD5 verification will be done.
 
-        If object-size is None, no length verification will be done.
+        If ``bytes`` is None, no length verification will be done.
 
-        If first-byte and last-byte are None, then the entire object will be
-        fetched.
+        If ``first-byte`` and ``last-byte`` are None, then the entire object
+        will be fetched.
 
     :param max_get_time: maximum permitted duration of a GET request (seconds)
     :param logger: logger object
@@ -740,7 +743,10 @@ class SegmentedIterable(object):
             for x in mri:
                 yield x
         finally:
-            self.close()
+            # Spliterator and multi_range_iterator can't possibly know we've
+            # consumed the whole of the app_iter, but we want to read/close the
+            # final segment response
+            friendly_close(self.app_iter)
 
     def validate_first_segment(self):
         """

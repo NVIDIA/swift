@@ -135,11 +135,9 @@ class S3ApiTestCase(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _register_bucket_head(self, bucket, bucket_policy_index, headers=None):
+    def _register_bucket_policy_index_head(self, bucket, bucket_policy_index):
         # register bucket HEAD response with given policy index header
-        headers = {} if headers is None else headers
-        headers.setdefault('X-Backend-Storage-Policy-Index',
-                           str(bucket_policy_index))
+        headers = {'X-Backend-Storage-Policy-Index': str(bucket_policy_index)}
         self.swift.register('HEAD', '/v1/AUTH_test/' + bucket,
                             swob.HTTPNoContent, headers, None)
 

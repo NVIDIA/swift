@@ -1694,8 +1694,7 @@ class ContainerBroker(DatabaseBroker):
 
         :param states: if specified, restricts the returned list to namespaces
             that have the given state(s); can be a list of ints or a single
-            int; For state 'listing', only Sharded container is supported for
-            now, since 'marker' and 'end_marker' will need to be implemented.
+            int.
         :param fill_gaps: if True, insert a modified copy of own shard range to
             fill any gap between the end of any found shard ranges and the
             upper bound of own shard range. Gaps enclosed within the found
@@ -1708,18 +1707,18 @@ class ContainerBroker(DatabaseBroker):
             # also need to include 'state' to be used when subesequently
             # sorting the rows. And the sorting can't be done within SQLite
             # since the value for maximum upper bound is an empty string.
-            if included_states is None:
-                params = [self.path]
-                sql = '''
-                SELECT name, lower, upper, state FROM %s
-                WHERE deleted = 0 AND name != ?
-                ''' % (SHARD_RANGE_TABLE)
-            else:
-                params = [self.path] + list(included_states)
-                sql = '''
-                SELECT name, lower, upper, state FROM %s
-                WHERE deleted = 0 AND name != ? AND state in (%s)
-                ''' % (SHARD_RANGE_TABLE, ','.join('?' * len(included_states)))
+            params = [self.path]
+            sql = '''
+            SELECT name, lower, upper, state FROM %s
+            WHERE deleted = 0 AND name != ?
+            ''' % (SHARD_RANGE_TABLE)
+            if included_states:
+                sql = (
+                    sql.rstrip()
+                    + " AND state in (%s)\n            "
+                    % ",".join("?" * len(included_states))
+                )
+                params.extend(included_states)
             try:
                 data = conn.execute(sql, params)
                 data.row_factory = None

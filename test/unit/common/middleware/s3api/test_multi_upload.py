@@ -162,9 +162,9 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
 
     def _do_test_bucket_upload_part_success(self, bucket_policy_index,
                                             segment_bucket_policy_index):
-        self._register_bucket_head('bucket', bucket_policy_index)
-        self._register_bucket_head('bucket+segments',
-                                   segment_bucket_policy_index)
+        self._register_bucket_policy_index_head('bucket', bucket_policy_index)
+        self._register_bucket_policy_index_head('bucket+segments',
+                                                segment_bucket_policy_index)
         req = Request.blank('/bucket/object?partNumber=1&uploadId=X',
                             method='PUT',
                             headers={'Authorization': 'AWS test:tester:hmac',
@@ -753,9 +753,9 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
             expected_write_acl=None):
         if segment_bucket_policy_index is None:
             segment_bucket_policy_index = bucket_policy_index
-        self._register_bucket_head('bucket', bucket_policy_index)
-        self._register_bucket_head('bucket+segments',
-                                   segment_bucket_policy_index)
+        self._register_bucket_policy_index_head('bucket', bucket_policy_index)
+        self._register_bucket_policy_index_head('bucket+segments',
+                                                segment_bucket_policy_index)
         headers.update({
             'Authorization': 'AWS test:tester:hmac',
             'Date': self.get_date_header(),
@@ -941,10 +941,12 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
         container_headers = encode_acl('container', ACL(
             Owner('test:tester', 'test:tester'),
             [Grant(User('test:tester'), 'FULL_CONTROL')]))
-        self._register_bucket_head('bucket', bucket_policy_index,
-                                   headers=container_headers)
-        self._register_bucket_head('bucket+segments',
-                                   segment_bucket_policy_index)
+        container_headers['X-Backend-Storage-Policy-Index'] = \
+            bucket_policy_index
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket',
+                            swob.HTTPNoContent, container_headers, None)
+        self._register_bucket_policy_index_head('bucket+segments',
+                                                segment_bucket_policy_index)
         cache.store[get_cache_key('AUTH_test')] = {'status': 204}
 
         req = Request.blank('/bucket/object?uploads',
@@ -1137,9 +1139,9 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
                             body=XML)
         if segment_bucket_policy_index is None:
             segment_bucket_policy_index = bucket_policy_index
-        self._register_bucket_head('bucket', bucket_policy_index)
-        self._register_bucket_head('bucket+segments',
-                                   segment_bucket_policy_index)
+        self._register_bucket_policy_index_head('bucket', bucket_policy_index)
+        self._register_bucket_policy_index_head('bucket+segments',
+                                                segment_bucket_policy_index)
         status, headers, body = self.call_s3api(req)
         elem = fromstring(body, 'CompleteMultipartUploadResult')
         self.assertNotIn('Etag', headers)
@@ -1258,9 +1260,9 @@ class TestS3ApiMultiUpload(S3ApiTestCase):
             segment_bucket_policy_index=None):
         if segment_bucket_policy_index is None:
             segment_bucket_policy_index = bucket_policy_index
-        self._register_bucket_head('bucket', bucket_policy_index)
-        self._register_bucket_head('bucket+segments',
-                                   segment_bucket_policy_index)
+        self._register_bucket_policy_index_head('bucket', bucket_policy_index)
+        self._register_bucket_policy_index_head('bucket+segments',
+                                                segment_bucket_policy_index)
         content_md5 = base64.b64encode(md5(
             XML.encode('ascii'), usedforsecurity=False).digest())
         self.swift.register('HEAD', '/v1/AUTH_test/bucket+segments/object/X',

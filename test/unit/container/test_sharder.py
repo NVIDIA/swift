@@ -6460,8 +6460,9 @@ class TestSharder(BaseTestSharder):
                     as mocked, mock.patch.object(
                         sharder, 'int_client') as mock_swift:
                 mock_response = mock.MagicMock()
-                mock_response.headers = {'x-backend-record-type':
-                                         'shard'}
+                mock_response.headers = {
+                    'x-backend-record-type': 'shard',
+                    'X-Backend-Record-Shard-Format': 'full'}
                 shard_ranges.sort(key=ShardRange.sort_key)
                 mock_response.body = json.dumps(
                     [dict(sr) for sr in shard_ranges])

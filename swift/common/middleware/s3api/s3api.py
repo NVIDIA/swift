@@ -407,6 +407,9 @@ class S3ApiMiddleware(object):
             raise MethodNotAllowed(req.method,
                                    req.controller.resource_type())
 
+        if req.policy_index is not None:
+            res.headers.setdefault('X-Backend-Storage-Policy-Index',
+                                   req.policy_index)
         return res
 
     def check_pipeline(self, wsgi_conf):

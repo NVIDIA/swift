@@ -142,7 +142,7 @@ class TestS3ApiBucket(S3ApiTestCase):
 
     def _do_test_bucket_HEAD_policy_index_logging(self, bucket_policy_index):
         self.logger.clear()
-        self._register_bucket_head('junk', bucket_policy_index)
+        self._register_bucket_policy_index_head('junk', bucket_policy_index)
         req = Request.blank('/junk',
                             environ={'REQUEST_METHOD': 'HEAD'},
                             headers={'Authorization': 'AWS test:tester:hmac',

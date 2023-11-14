@@ -157,6 +157,11 @@ LOG_LINE_DEFAULT_FORMAT = '{remote_addr} - - [{time.d}/{time.b}/{time.Y}' \
                           '{trans_time:.4f} "{additional_info}" {pid} ' \
                           '{policy_index}'
 DEFAULT_LOCK_TIMEOUT = 10
+# this is coupled with object-server.conf's network_chunk_size; if someone is
+# running that unreasonably small they may find this number inefficient, but in
+# the more likely case they've increased the value to optimize high througput
+# transfers this will still cut off the transfer after the first chunk.
+DEFAULT_DRAIN_LIMIT = 65536
 
 
 class InvalidHashPathConfigError(ValueError):
@@ -273,11 +278,11 @@ def transform_to_set(value):
     :param value: An object to transform.
     :return: A set. If ``value`` is an instance of a ``list``, ``tuple`` or
         ``set`` then a set containing the items in ``value`` is returned; if
-        value is None then None is returned; otherwise a set containing
-        the single ``value`` is returned.
+        value is ``None`` then an empty set is returned; otherwise a set
+        containing the single ``value`` is returned.
     """
     if value is None:
-        return None
+        return set()
     elif isinstance(value, (list, tuple, set)):
         return set(value)
     else:
@@ -4012,7 +4017,7 @@ def closing_if_possible(maybe_closable):
         close_if_possible(maybe_closable)
 
 
-def drain_and_close(response_or_app_iter):
+def drain_and_close(response_or_app_iter, read_limit=None):
     """
     Drain and close a swob or WSGI response.
 
@@ -4022,9 +4027,26 @@ def drain_and_close(response_or_app_iter):
     app_iter = getattr(response_or_app_iter, 'app_iter', response_or_app_iter)
     if app_iter is None:  # for example, if we used the Response.body property
         return
-    for _chunk in app_iter:
-        pass
-    close_if_possible(app_iter)
+    bytes_read = 0
+    with closing_if_possible(app_iter):
+        for chunk in app_iter:
+            bytes_read += len(chunk)
+            if read_limit is not None and bytes_read >= read_limit:
+                break
+
+
+def friendly_close(resp):
+    """
+    Close a swob or WSGI response and maybe drain it.
+
+    It's basically free to "read" a HEAD or HTTPException response - the bytes
+    are probably already in our network buffers.  For a larger response we
+    could possibly burn a lot of CPU/network trying to drain an un-used
+    response.  This method will read up to DEFAULT_DRAIN_LIMIT bytes to avoid
+    logging a 499 in the proxy when it would otherwise be easy to just throw
+    away the small/empty body.
+    """
+    return drain_and_close(resp, read_limit=DEFAULT_DRAIN_LIMIT)
 
 
 _rfc_token = r'[^()<>@,;:\"/\[\]?={}\x00-\x20\x7f]+'

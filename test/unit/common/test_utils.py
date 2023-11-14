@@ -649,12 +649,107 @@ class TestUtils(unittest.TestCase):
             yield 'y'
             drained[0] = True
 
-        utils.drain_and_close(gen())
+        g = gen()
+        utils.drain_and_close(g)
         self.assertTrue(drained[0])
+        self.assertIsNone(g.gi_frame)
+
         utils.drain_and_close(Response(status=200, body=b'Some body'))
         drained = [False]
         utils.drain_and_close(Response(status=200, app_iter=gen()))
         self.assertTrue(drained[0])
+
+    def test_drain_and_close_with_limit(self):
+
+        def gen():
+            yield 'a' * 5
+            yield 'a' * 4
+            yield 'a' * 3
+            drained[0] = True
+
+        drained = [False]
+        g = gen()
+        utils.drain_and_close(g, read_limit=13)
+        self.assertTrue(drained[0])
+        self.assertIsNone(g.gi_frame)
+
+        drained = [False]
+        g = gen()
+        utils.drain_and_close(g, read_limit=12)
+        # this would need *one more* call to next
+        self.assertFalse(drained[0])
+        self.assertIsNone(g.gi_frame)
+
+        drained = [False]
+        # not even close to the whole thing
+        g = gen()
+        utils.drain_and_close(g, read_limit=3)
+        self.assertFalse(drained[0])
+        self.assertIsNone(g.gi_frame)
+
+        drained = [False]
+        # default is to drain; no limit!
+        g = gen()
+        utils.drain_and_close(g)
+        self.assertIsNone(g.gi_frame)
+        self.assertTrue(drained[0])
+
+    def test_friendly_close_small_body(self):
+
+        def small_body_iter():
+            yield 'a small body'
+            drained[0] = True
+
+        drained = [False]
+        utils.friendly_close(small_body_iter())
+        self.assertTrue(drained[0])
+
+    def test_friendly_close_large_body(self):
+        def large_body_iter():
+            for i in range(10):
+                chunk = chr(97 + i) * 64 * 2 ** 10
+                yielded_chunks.append(chunk)
+                yield chunk
+            drained[0] = True
+
+        drained = [False]
+        yielded_chunks = []
+        utils.friendly_close(large_body_iter())
+        self.assertFalse(drained[0])
+        self.assertEqual(['a' * 65536], yielded_chunks)
+
+    def test_friendly_close_exploding_body(self):
+
+        class ExplodingBody(object):
+
+            def __init__(self):
+                self.yielded_chunks = []
+                self.close_calls = []
+                self._body = self._exploding_iter()
+
+            def _exploding_iter(self):
+                chunk = 'a' * 63 * 2 ** 10
+                self.yielded_chunks.append(chunk)
+                yield chunk
+                raise Exception('kaboom!')
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._body)
+
+            next = __next__  # py2
+
+            def close(self):
+                self.close_calls.append(True)
+
+        body = ExplodingBody()
+        with self.assertRaises(Exception) as ctx:
+            utils.friendly_close(body)
+        self.assertEqual('kaboom!', str(ctx.exception))
+        self.assertEqual(['a' * 64512], body.yielded_chunks)
+        self.assertEqual([True], body.close_calls)
 
     def test_backwards(self):
         # Test swift.common.utils.backward
@@ -2478,7 +2573,7 @@ cluster_dfw1 = http://dfw1.host/v1/
             self.assertEqual(v, v.lower())
 
     def test_transform_to_set(self):
-        self.assertIsNone(utils.transform_to_set(None))
+        self.assertEqual(set(), utils.transform_to_set(None))
         self.assertEqual(set(), utils.transform_to_set([]))
 
         self.assertEqual({1}, utils.transform_to_set(1))
@@ -2495,6 +2590,9 @@ cluster_dfw1 = http://dfw1.host/v1/
                          utils.transform_to_set(['x', 'x', 1]))
         self.assertEqual({'x', 'y'},
                          utils.transform_to_set(('x', 'y')))
+        self.assertEqual({'xyz'}, utils.transform_to_set('xyz'))
+        self.assertEqual({''}, utils.transform_to_set(''))
+        self.assertEqual({0}, utils.transform_to_set(0))
 
     def test_config_true_value(self):
         orig_trues = utils.TRUE_VALUES
@@ -8723,6 +8821,37 @@ class TestShardRange(unittest.TestCase):
         actual = utils.ShardRange.make_path(
             'a', 'root', 'parent', ts.internal, '3')
         self.assertEqual('a/root-%s-%s-3' % (parent_hash, ts.internal), actual)
+
+    def test_sort_key_order(self):
+        self.assertEqual(utils.ShardRange.sort_key_order(
+            "test", 10, 20, "active"), (20, "active", 10, "test"))
+
+    def test_sort_key(self):
+        orig_shard_ranges = [
+            utils.ShardRange('a/c', next(self.ts_iter), '', '',
+                             state=utils.ShardRange.SHARDED),
+            utils.ShardRange('.a/c1', next(self.ts_iter), 'a', 'd',
+                             state=utils.ShardRange.CREATED),
+            utils.ShardRange('.a/c0', next(self.ts_iter), '', 'a',
+                             state=utils.ShardRange.CREATED),
+            utils.ShardRange('.a/c2b', next(self.ts_iter), 'd', 'f',
+                             state=utils.ShardRange.SHARDING),
+            utils.ShardRange('.a/c2', next(self.ts_iter), 'c', 'f',
+                             state=utils.ShardRange.SHARDING),
+            utils.ShardRange('.a/c2a', next(self.ts_iter), 'd', 'f',
+                             state=utils.ShardRange.SHARDING),
+            utils.ShardRange('.a/c4', next(self.ts_iter), 'f', '',
+                             state=utils.ShardRange.ACTIVE)
+        ]
+        shard_ranges = list(orig_shard_ranges)
+        shard_ranges.sort(key=utils.ShardRange.sort_key)
+        self.assertEqual(shard_ranges[0], orig_shard_ranges[2])
+        self.assertEqual(shard_ranges[1], orig_shard_ranges[1])
+        self.assertEqual(shard_ranges[2], orig_shard_ranges[4])
+        self.assertEqual(shard_ranges[3], orig_shard_ranges[5])
+        self.assertEqual(shard_ranges[4], orig_shard_ranges[3])
+        self.assertEqual(shard_ranges[5], orig_shard_ranges[6])
+        self.assertEqual(shard_ranges[6], orig_shard_ranges[0])
 
     def test_is_child_of(self):
         # Set up some shard ranges in relational hierarchy:

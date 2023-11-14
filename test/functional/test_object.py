@@ -536,9 +536,9 @@ class TestObject(unittest.TestCase):
         # check to see object has expired
         self.assertEqual(resp.status, 404)
 
-        resp = retry(get, extra_headers={'X-Open-Expired': True})
         dt = datetime.datetime.now()
         delete_time = str(int(time.mktime(dt.timetuple())) + 2)
+        resp = retry(get, extra_headers={'X-Open-Expired': True})
         resp.read()
         headers = HeaderKeyDict(resp.getheaders())
         # read the expired object with magic x-open-expired header
@@ -581,6 +581,7 @@ class TestObject(unittest.TestCase):
         # verify object is not updated and remains deleted
         self.assertEqual(resp.status, 404)
 
+        # object got restored with magic x-open-expired header
         resp = retry(post, extra_headers={'X-Open-Expired': True,
                                           'X-Object-Meta-Test': 'restored!'})
         resp.read()
