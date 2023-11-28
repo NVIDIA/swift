@@ -4806,17 +4806,22 @@ class TestContainerBroker(test_db.TestDbBase):
         do_test([ShardRange.SHARDED], [])
 
     @with_tempdir
-    def test_get_namespaces_root_container(self, tempdir):
+    def test_get_namespaces_root_container_fill_gap(self, tempdir):
+        # Test GET namespaces from a root container with full namespace.
         own_shard_range = ShardRange('a/c', next(
             self.ts), '', '', state=ShardRange.SHARDED)
         shard_ranges = [
-            ShardRange('.a/c0', next(self.ts), 'a',
+            ShardRange('.a/c0', next(self.ts), '',
+                       'a', state=ShardRange.CREATED),
+            ShardRange('.a/c1', next(self.ts), 'a',
                        'c', state=ShardRange.CREATED),
-            ShardRange('.a/c1', next(self.ts), 'c',
+            ShardRange('.a/c2', next(self.ts), 'c',
                        'd', state=ShardRange.CREATED),
-            ShardRange('.a/c2', next(self.ts), 'd', 'f',
+            ShardRange('.a/c3', next(self.ts), 'd', 'f',
                        state=ShardRange.ACTIVE),
             ShardRange('.a/c4', next(self.ts), 'f', 'h',
+                       state=ShardRange.SHARDING),
+            ShardRange('.a/c5', next(self.ts), 'h', '',
                        state=ShardRange.SHARDING),
         ]
         broker = self._setup_broker_with_shard_ranges(
@@ -4830,8 +4835,13 @@ class TestContainerBroker(test_db.TestDbBase):
         actual_ns = broker.get_namespaces(fill_gaps=True)
         expected_ns = [Namespace(sr.name, sr.lower, sr.upper)
                        for sr in undeleted]
-        filler = [Namespace('a/c', 'h', '')]
-        self.assertEqual(expected_ns + filler, actual_ns)
+        self.assertEqual(expected_ns, actual_ns)
+        # test optimization will skip ``get_own_shard_range`` call.
+        with mock.patch.object(
+                broker, 'get_own_shard_range') as mock_get_own_sr:
+            actual_ns = broker.get_namespaces(fill_gaps=True)
+        mock_get_own_sr.assert_not_called()
+        self.assertEqual(expected_ns, actual_ns)
         # test get all undeleted namespaces w/o gap filled.
         actual_ns = broker.get_namespaces()
         self.assertEqual(expected_ns, actual_ns)

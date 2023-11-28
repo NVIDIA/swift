@@ -412,6 +412,7 @@ class FakeMemcache(object):
 
     def __init__(self, error_on_set=None, error_on_get=None):
         self.store = {}
+        self.times = {}
         self.calls = []
         self.error_on_incr = False
         self.error_on_get = error_on_get or []
@@ -442,6 +443,7 @@ class FakeMemcache(object):
         else:
             assert isinstance(value, (str, bytes))
         self.store[key] = value
+        self.times[key] = time
         return True
 
     @track
@@ -465,12 +467,14 @@ class FakeMemcache(object):
     def delete(self, key):
         try:
             del self.store[key]
+            del self.times[key]
         except Exception:
             pass
         return True
 
     def delete_all(self):
         self.store.clear()
+        self.times.clear()
 
 
 # This decorator only makes sense in the context of FakeMemcache;

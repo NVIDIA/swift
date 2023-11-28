@@ -8823,8 +8823,13 @@ class TestShardRange(unittest.TestCase):
         self.assertEqual('a/root-%s-%s-3' % (parent_hash, ts.internal), actual)
 
     def test_sort_key_order(self):
-        self.assertEqual(utils.ShardRange.sort_key_order(
-            "test", 10, 20, "active"), (20, "active", 10, "test"))
+        self.assertEqual(
+            utils.ShardRange.sort_key_order(
+                name="a/c",
+                lower='lower',
+                upper='upper',
+                state=utils.ShardRange.ACTIVE),
+            ('upper', utils.ShardRange.ACTIVE, 'lower', "a/c"))
 
     def test_sort_key(self):
         orig_shard_ranges = [

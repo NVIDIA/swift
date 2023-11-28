@@ -41,7 +41,8 @@ import swift
 from swift.common import utils, swob, exceptions
 from swift.common.exceptions import ChunkWriteTimeout, ShortReadError, \
     ChunkReadTimeout
-from swift.common.utils import Timestamp, list_from_csv, md5, FileLikeIter
+from swift.common.utils import Timestamp, list_from_csv, md5, FileLikeIter, \
+    ShardRange, Namespace
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers import obj
 from swift.proxy.controllers.base import \
@@ -49,13 +50,13 @@ from swift.proxy.controllers.base import \
     NodeIter
 from swift.common.storage_policy import POLICIES, ECDriverError, \
     StoragePolicy, ECStoragePolicy
-from swift.common.swob import Request
+from swift.common.swob import Request, wsgi_to_str
 from test.debug_logger import debug_logger
 from test.unit import (
     FakeRing, fake_http_connect, patch_policies, SlowBody, FakeStatus,
     DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub,
     fake_ec_node_response, StubResponse, mocked_http_conn,
-    quiet_eventlet_exceptions, FakeSource)
+    quiet_eventlet_exceptions, FakeSource, make_timestamp_iter)
 from test.unit.proxy.test_server import node_error_count
 
 
@@ -432,6 +433,67 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
+
+    def test_object_DELETE_backend_update_container_ip_default(self):
+        self.policy.object_ring = FakeRing(separate_replication=True)
+        self.app.container_ring = FakeRing(separate_replication=True)
+        # sanity, devs have different ip & replication_ip
+        for ring in (self.policy.object_ring, self.app.container_ring):
+            for dev in ring.devs:
+                self.assertNotEqual(dev['ip'], dev['replication_ip'])
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        codes = [204] * self.replicas()
+        with mocked_http_conn(*codes) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 204)
+
+        # sanity, object hosts use node ip/port
+        object_hosts = {'%(ip)s:%(port)s' % req for req in log.requests}
+        object_ring = self.app.get_object_ring(int(self.policy))
+        part, object_nodes = object_ring.get_nodes('a', 'c', 'o')
+        expected_object_hosts = {'%(ip)s:%(port)s' % n for n in object_nodes}
+        self.assertEqual(object_hosts, expected_object_hosts)
+
+        # container hosts use node ip/port
+        container_hosts = {req['headers']['x-container-host']
+                           for req in log.requests}
+        part, container_nodes = self.app.container_ring.get_nodes('a', 'c')
+        expected_container_hosts = {'%(ip)s:%(port)s' % n
+                                    for n in container_nodes}
+        self.assertEqual(container_hosts, expected_container_hosts)
+
+    def test_repl_object_DELETE_backend_update_container_repl_ip(self):
+        self.policy.object_ring = FakeRing(separate_replication=True)
+        self.app.container_ring = FakeRing(separate_replication=True)
+        # sanity, devs have different ip & replication_ip
+        for ring in (self.policy.object_ring, self.app.container_ring):
+            for dev in ring.devs:
+                self.assertNotEqual(dev['ip'], dev['replication_ip'])
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='DELETE', headers={
+                'x-backend-use-replication-network': 'true'})
+        codes = [204] * self.replicas()
+        with mocked_http_conn(*codes) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 204)
+
+        # sanity, object hosts use node replication ip/port
+        object_hosts = {'%(ip)s:%(port)s' % req for req in log.requests}
+        object_ring = self.app.get_object_ring(int(self.policy))
+        part, object_nodes = object_ring.get_nodes('a', 'c', 'o')
+        expected_object_hosts = {
+            '%(replication_ip)s:%(replication_port)s' % n
+            for n in object_nodes}
+        self.assertEqual(object_hosts, expected_object_hosts)
+
+        # container hosts use node replication ip/port
+        container_hosts = {req['headers']['x-container-host']
+                           for req in log.requests}
+        part, container_nodes = self.app.container_ring.get_nodes('a', 'c')
+        expected_container_hosts = {
+            '%(replication_ip)s:%(replication_port)s' % n
+            for n in container_nodes}
+        self.assertEqual(container_hosts, expected_container_hosts)
 
     def test_DELETE_missing_one(self):
         # Obviously this test doesn't work if we're testing 1 replica.
@@ -7276,6 +7338,246 @@ class TestECFragGetter(BaseObjectControllerMixin, unittest.TestCase):
             fragments = list(next(it)['part_iter'])
         self.assertEqual(fragments, [b'abcd1234', b'efgh5678'])
         self.assertEqual(range_headers, [None, 'bytes=8-'])
+
+
+@patch_policies()
+class TestGetUpdatingShardRanges(BaseObjectControllerMixin, unittest.TestCase):
+    def setUp(self):
+        super(TestGetUpdatingShardRanges, self).setUp()
+        self.ctrl = obj.BaseObjectController(self.app, 'a', 'c', 'o')
+
+    def _create_response_data(self, shards, includes=None):
+        if includes is None:
+            shards = [Namespace(sr.name, sr.lower, sr.upper) for sr in shards]
+            resp_headers = {'X-Backend-Record-Type': 'shard',
+                            'X-Backend-Record-Shard-Format': 'namespace'}
+        else:
+            # TODO: these can also be namespaces once backend servers return
+            #   namespaces for requests with 'includes' param
+            shards = [sr for sr in shards if includes in sr]
+            resp_headers = {'X-Backend-Record-Type': 'shard',
+                            'X-Backend-Record-Shard-Format': 'full'}
+        body = json.dumps([dict(sr) for sr in shards]).encode('ascii')
+        return body, resp_headers
+
+    def test_get_shard_ranges_for_object_put_caching(self):
+        # verify case when complete set of shards is returned
+        ts_iter = make_timestamp_iter()
+        shard_ranges = [ShardRange(
+            '.sharded_a/sr%d' % i, next(ts_iter), '%d_lower' % i,
+            '%d_upper' % i, object_count=i, bytes_used=1024 * i,
+            meta_timestamp=next(ts_iter))
+            for i in range(3)]
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        body, resp_headers = self._create_response_data(shard_ranges)
+        with mocked_http_conn(
+                200, 200, body_iter=iter([b'', body]),
+                headers=resp_headers) as fake_conn:
+            # NB: no 'includes'
+            actual, resp = self.ctrl._get_updating_shard_ranges(
+                req, 'a', 'c')
+        self.assertEqual(200, resp.status_int)
+
+        # account info
+        captured = fake_conn.requests
+        self.assertEqual('HEAD', captured[0]['method'])
+        self.assertEqual('a', captured[0]['path'][7:])
+        # container GET
+        self.assertEqual('GET', captured[1]['method'])
+        self.assertEqual('a/c', captured[1]['path'][7:])
+        params = sorted(captured[1]['qs'].split('&'))
+        self.assertEqual(
+            ['format=json', 'states=updating'], params)
+        captured_hdrs = captured[1]['headers']
+        self.assertEqual('shard', captured_hdrs.get('X-Backend-Record-Type'))
+        self.assertEqual('namespace',
+                         captured_hdrs.get('X-Backend-Record-Shard-Format'))
+        # backend returns Namespace dicts but proxy instantiates ShardRanges
+        exp_dicts = [dict(ShardRange(**data)) for data in json.loads(body)]
+        self.assertEqual(exp_dicts, [dict(sr) for sr in actual])
+        self.assertFalse(self.app.logger.get_lines_for_level('error'))
+
+    def test_get_shard_ranges_for_object_put(self):
+        # verify case when specific shard is returned
+        ts_iter = make_timestamp_iter()
+        shard_ranges = [ShardRange(
+            '.sharded_a/sr%d' % i, next(ts_iter), '%d_lower' % i,
+            '%d_upper' % i, object_count=i, bytes_used=1024 * i,
+            meta_timestamp=next(ts_iter))
+            for i in range(3)]
+        sr_dicts = [dict(sr) for sr in shard_ranges]
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        body, resp_headers = self._create_response_data(shard_ranges, '1_test')
+        with mocked_http_conn(
+                200, 200, body_iter=iter([b'', body]),
+                headers=resp_headers) as fake_conn:
+            actual, resp = self.ctrl._get_updating_shard_ranges(
+                req, 'a', 'c', '1_test')
+        self.assertEqual(200, resp.status_int)
+
+        # account info
+        captured = fake_conn.requests
+        self.assertEqual('HEAD', captured[0]['method'])
+        self.assertEqual('a', captured[0]['path'][7:])
+        # container GET
+        self.assertEqual('GET', captured[1]['method'])
+        self.assertEqual('a/c', captured[1]['path'][7:])
+        params = sorted(captured[1]['qs'].split('&'))
+        self.assertEqual(
+            ['format=json', 'includes=1_test', 'states=updating'], params)
+        captured_hdrs = captured[1]['headers']
+        self.assertEqual('shard', captured_hdrs.get('X-Backend-Record-Type'))
+        self.assertEqual('full',
+                         captured_hdrs.get('X-Backend-Record-Shard-Format'))
+        self.assertEqual(sr_dicts[1:2], [dict(pr) for pr in actual])
+        self.assertFalse(self.app.logger.get_lines_for_level('error'))
+
+    def test_get_shard_ranges_for_utf8_object_put(self):
+        ts_iter = make_timestamp_iter()
+        shard_ranges = [ShardRange(
+            '.sharded_a/sr%d' % i, next(ts_iter), u'\u1234%d_lower' % i,
+            u'\u1234%d_upper' % i, object_count=i, bytes_used=1024 * i,
+            meta_timestamp=next(ts_iter))
+            for i in range(3)]
+        sr_dicts = [dict(sr) for sr in shard_ranges]
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        body, resp_headers = self._create_response_data(
+            shard_ranges, wsgi_to_str('\xe1\x88\xb41_test'))
+        with mocked_http_conn(
+                200, 200, body_iter=iter([b'', body]),
+                headers=resp_headers) as fake_conn:
+            actual, resp = self.ctrl._get_updating_shard_ranges(
+                req, 'a', 'c', wsgi_to_str('\xe1\x88\xb41_test'))
+        self.assertEqual(200, resp.status_int)
+
+        # account info
+        captured = fake_conn.requests
+        self.assertEqual('HEAD', captured[0]['method'])
+        self.assertEqual('a', captured[0]['path'][7:])
+        # container GET
+        self.assertEqual('GET', captured[1]['method'])
+        self.assertEqual('a/c', captured[1]['path'][7:])
+        params = sorted(captured[1]['qs'].split('&'))
+        self.assertEqual(
+            ['format=json', 'includes=%E1%88%B41_test', 'states=updating'],
+            params)
+        captured_hdrs = captured[1]['headers']
+        self.assertEqual('shard', captured_hdrs.get('X-Backend-Record-Type'))
+        self.assertEqual('full',
+                         captured_hdrs.get('X-Backend-Record-Shard-Format'))
+        self.assertEqual(sr_dicts[1:2], [dict(pr) for pr in actual])
+        self.assertFalse(self.app.logger.get_lines_for_level('error'))
+
+
+class TestGetShardRangesLegacy(TestGetUpdatingShardRanges):
+    def _create_response_data(self, shards, includes=None):
+        # older container servers never return the shorter 'namespace' format
+        # nor the 'X-Backend-Record-Shard-Format' header
+        resp_headers = {'X-Backend-Record-Type': 'shard'}
+        if includes is not None:
+            shards = [sr for sr in shards if includes in sr]
+        body = json.dumps([dict(sr) for sr in shards]).encode('ascii')
+        return body, resp_headers
+
+
+@patch_policies()
+class TestGetUpdatingShardRangesErrors(BaseObjectControllerMixin,
+                                       unittest.TestCase):
+    def setUp(self):
+        super(TestGetUpdatingShardRangesErrors, self).setUp()
+        self.ctrl = obj.BaseObjectController(self.app, 'a', 'c', 'o')
+
+    def _check_get_shard_ranges_bad_data(self, body):
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        # empty response
+        resp_headers = {'X-Backend-Record-Type': 'shard'}
+        with mocked_http_conn(200, 200, body_iter=iter([b'', body]),
+                              headers=resp_headers):
+            actual, resp = self.ctrl._get_updating_shard_ranges(
+                req, 'a', 'c', '1_test')
+        self.assertEqual(200, resp.status_int)
+        self.assertIsNone(actual)
+        lines = self.app.logger.get_lines_for_level('error')
+        return lines
+
+    def test_get_shard_ranges_empty_body(self):
+        error_lines = self._check_get_shard_ranges_bad_data(b'')
+        self.assertIn('Problem with listing response', error_lines[0])
+        if six.PY2:
+            self.assertIn('No JSON', error_lines[0])
+        else:
+            self.assertIn('JSONDecodeError', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_shard_ranges_not_a_list(self):
+        body = json.dumps({}).encode('ascii')
+        error_lines = self._check_get_shard_ranges_bad_data(body)
+        self.assertIn('Problem with listing response', error_lines[0])
+        self.assertIn('not a list', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_shard_ranges_key_missing(self):
+        body = json.dumps([{}]).encode('ascii')
+        error_lines = self._check_get_shard_ranges_bad_data(body)
+        self.assertIn('Failed to get shard ranges', error_lines[0])
+        self.assertIn('TypeError', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_shard_ranges_invalid_shard_range(self):
+        sr = ShardRange('a/c', Timestamp.now())
+        bad_sr_data = dict(sr, name='bad_name')
+        body = json.dumps([bad_sr_data]).encode('ascii')
+        error_lines = self._check_get_shard_ranges_bad_data(body)
+        self.assertIn('Failed to get shard ranges', error_lines[0])
+        self.assertIn('ValueError', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_shard_ranges_missing_record_type(self):
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        sr = ShardRange('a/c', Timestamp.now())
+        body = json.dumps([dict(sr)]).encode('ascii')
+        with mocked_http_conn(
+                200, 200, body_iter=iter([b'', body])):
+            actual, resp = self.ctrl._get_updating_shard_ranges(
+                req, 'a', 'c', '1_test')
+        self.assertEqual(200, resp.status_int)
+        self.assertIsNone(actual)
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertIn('Failed to get shard ranges', error_lines[0])
+        self.assertIn('unexpected record type', error_lines[0])
+        self.assertIn('/a/c', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_shard_ranges_wrong_record_type(self):
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        sr = ShardRange('a/c', Timestamp.now())
+        body = json.dumps([dict(sr)]).encode('ascii')
+        headers = {'X-Backend-Record-Type': 'object'}
+        with mocked_http_conn(
+                200, 200, body_iter=iter([b'', body]),
+                headers=headers):
+            actual, resp = self.ctrl._get_updating_shard_ranges(
+                req, 'a', 'c', '1_test')
+        self.assertEqual(200, resp.status_int)
+        self.assertIsNone(actual)
+        error_lines = self.app.logger.get_lines_for_level('error')
+        self.assertIn('Failed to get shard ranges', error_lines[0])
+        self.assertIn('unexpected record type', error_lines[0])
+        self.assertIn('/a/c', error_lines[0])
+        self.assertFalse(error_lines[1:])
+
+    def test_get_shard_ranges_request_failed(self):
+        req = Request.blank('/v1/a/c/o', method='PUT')
+        with mocked_http_conn(200, 404, 404, 404):
+            actual, resp = self.ctrl._get_updating_shard_ranges(
+                req, 'a', 'c', '1_test')
+        self.assertEqual(404, resp.status_int)
+        self.assertIsNone(actual)
+        self.assertFalse(self.app.logger.get_lines_for_level('error'))
+        warning_lines = self.app.logger.get_lines_for_level('warning')
+        self.assertIn('Failed to get container listing', warning_lines[0])
+        self.assertIn('/a/c', warning_lines[0])
+        self.assertFalse(warning_lines[1:])
 
 
 if __name__ == '__main__':

@@ -1741,7 +1741,7 @@ class ContainerBroker(DatabaseBroker):
         namespaces = [Namespace(row[0], row[1], row[2]) for row in namespaces]
 
         if fill_gaps and not (
-            namespaces and namespaces[-1].upper == Namespace.MaxBound
+            namespaces and namespaces[-1].upper == Namespace.MAX
         ):
             # If there is a gap in the last, insert a modified copy of own
             # shard range to fill any gap between the end of any found and the

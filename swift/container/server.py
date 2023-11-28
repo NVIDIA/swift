@@ -551,7 +551,7 @@ class ContainerController(BaseStorageServer):
                           wsgi_to_str(req.headers.get('x-meta-timestamp')))
         return HTTPCreated(request=req)
 
-    def _create_PUT_response(self, req, broker, created):
+    def _create_ok_resp(self, req, broker, created):
         if created:
             return HTTPCreated(request=req,
                                headers={'x-backend-storage-policy-index':
@@ -578,7 +578,7 @@ class ContainerController(BaseStorageServer):
             # TODO: consider writing the shard ranges into the pending
             # file, but if so ensure an all-or-none semantic for the write
             broker.merge_shard_ranges(shard_ranges)
-        return self._create_PUT_response(req, broker, created)
+        return self._create_ok_resp(req, broker, created)
 
     @timing_stats()
     def PUT_container(self, req, broker, account, container, req_timestamp):
@@ -598,7 +598,7 @@ class ContainerController(BaseStorageServer):
         resp = self.account_update(req, account, container, broker)
         if resp:
             return resp
-        return self._create_PUT_response(req, broker, created)
+        return self._create_ok_resp(req, broker, created)
 
     @public
     @timing_stats(sample_rate=0.1)
@@ -632,10 +632,10 @@ class ContainerController(BaseStorageServer):
         Return the shard_range database record as a dict, the keys will depend
         on the database fields provided in the record.
 
-        :param record: shard entry record
+        :param record: shard entry record, either ShardRange or Namespace.
         :param shard_record_full: boolean, when true the timestamp field is
                                   added as "last_modified" in iso format.
-        :returns: modified record
+        :returns: dict suitable for listing responses
         """
         response = dict(record)
         if shard_record_full:
@@ -810,10 +810,6 @@ class ContainerController(BaseStorageServer):
             'x-backend-record-shard-format', 'full').lower()
         include_deleted = config_true_value(
             req.headers.get('x-backend-include-deleted', False))
-        if include_deleted and shard_format == 'namespace':
-            # Namespace doesn't support 'deleted' attribute.
-            return HTTPBadRequest(request=req,
-                                  body='No include_deleted for namespace GET')
 
         # For record type of 'shard', user can specify an additional header
         # to ask for list of Namespaces instead of full ShardRanges.
@@ -854,10 +850,6 @@ class ContainerController(BaseStorageServer):
             # shard audit; if the shard is shrinking then it needs to get
             # acceptor shard ranges, which may be the root container
             # itself, so use include_own.
-            # For 'namespace' record type, container server only supports
-            # listing of states using 'updating' or 'listing', 'auditing'
-            # is not supported, for which caller should set
-            # 'x-backend-record-shard-format' to 'full' instead.
             include_own = 'auditing' in states
             try:
                 states = broker.resolve_shard_range_states(states)
@@ -865,6 +857,15 @@ class ContainerController(BaseStorageServer):
                 return HTTPBadRequest(request=req, body='Bad state')
 
         if shard_format == 'namespace':
+            # Namespace GET supports a subset of functions of Shard Range GET,
+            # for example, it doesn't support 'x-backend-include-deleted'
+            # header, nor 'auditing' state query parameter.
+            if include_deleted:
+                return HTTPBadRequest(
+                    request=req, body='No include_deleted for namespace GET')
+            if include_own:
+                return HTTPBadRequest(
+                    request=req, body='No auditing state for namespace GET')
             shard_format_full = False
             container_list = broker.get_namespaces(states, fill_gaps)
         else:

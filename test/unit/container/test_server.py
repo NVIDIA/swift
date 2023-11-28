@@ -3762,7 +3762,7 @@ class TestContainerController(unittest.TestCase):
 
         # Test namespace GET with 'include' or 'marker/end_marker' or 'reverse'
         # parameters which are not supported.
-        def check_shard_GET(expected_shard_ranges, path, params=''):
+        def check_namespace_GET(expected_shard_ranges, path, params=''):
             req = Request.blank(
                 '/sda1/p/%s?format=json%s' % (path, params), method='GET',
                 headers={
@@ -3783,19 +3783,22 @@ class TestContainerController(unittest.TestCase):
             self.assertEqual(
                 'full', resp.headers['X-Backend-Record-Shard-Format'])
 
-        check_shard_GET(shard_ranges[:3], 'a/c',
-                        params='&states=listing&end_marker=pickle')
-        check_shard_GET(
+        check_namespace_GET(
+            shard_ranges[:3], 'a/c',
+            params='&states=listing&end_marker=pickle')
+        check_namespace_GET(
             reversed(shard_ranges[:3]), 'a/c',
             params='&states=listing&reverse=true&marker=pickle')
-        check_shard_GET(shard_ranges[1:4], 'a/c',
-                        params='&states=updating&end_marker=treacle')
-        check_shard_GET(
+        check_namespace_GET(shard_ranges[1:4], 'a/c',
+                            params='&states=updating&end_marker=treacle')
+        check_namespace_GET(
             reversed(shard_ranges[1:4]), 'a/c',
             params='&states=updating&reverse=true&marker=treacle')
-        check_shard_GET(shard_ranges[1:2], 'a/c', params='&includes=cheese')
-        check_shard_GET(shard_ranges[1:2], 'a/c', params='&includes=ham')
-        check_shard_GET(reversed(shard_ranges), 'a/c', params='&reverse=true')
+        check_namespace_GET(shard_ranges[1:2],
+                            'a/c', params='&includes=cheese')
+        check_namespace_GET(shard_ranges[1:2], 'a/c', params='&includes=ham')
+        check_namespace_GET(reversed(shard_ranges),
+                            'a/c', params='&reverse=true')
 
         # Test namespace GET with 'X-Backend-Include-Deleted' header.
         req = Request.blank(
@@ -3809,6 +3812,18 @@ class TestContainerController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status, '400 Bad Request')
         self.assertEqual(resp.body, b'No include_deleted for namespace GET')
+
+        # Test namespace GET with 'auditing' state in query params.
+        req = Request.blank(
+            '/sda1/p/%s?format=json%s' % ('a/c', '&states=auditing'),
+            method='GET',
+            headers={
+                "X-Backend-Record-Type": "shard",
+                "X-Backend-Record-shard-format": "namespace",
+            })
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status, '400 Bad Request')
+        self.assertEqual(resp.body, b'No auditing state for namespace GET')
 
     def test_GET_auto_record_type(self):
         # make a container
