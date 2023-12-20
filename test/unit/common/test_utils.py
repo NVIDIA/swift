@@ -4455,6 +4455,9 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertRaises(
             TypeError, md5, None, usedforsecurity=False)
 
+    def test_get_my_ppid(self):
+        self.assertEqual(os.getppid(), utils.get_ppid(os.getpid()))
+
 
 class ResellerConfReader(unittest.TestCase):
 
@@ -7688,7 +7691,23 @@ class TestShardName(unittest.TestCase):
             utils.ShardName.create('a', 'root', None, '1235678', 'bad')
 
 
-class TestNamespace(unittest.TestCase):
+class BaseNamespaceShardRange(object):
+
+    def _check_name_account_container(self, nsr, exp_name):
+        # check that the name, account, container properties are consistent
+        exp_account, exp_container = exp_name.split('/')
+        if six.PY2:
+            self.assertEqual(exp_name.encode('utf8'), nsr.name)
+            self.assertEqual(exp_account.encode('utf8'), nsr.account)
+            self.assertEqual(exp_container.encode('utf8'), nsr.container)
+        else:
+            self.assertEqual(exp_name, nsr.name)
+            self.assertEqual(exp_account, nsr.account)
+            self.assertEqual(exp_container, nsr.container)
+
+
+class TestNamespace(unittest.TestCase, BaseNamespaceShardRange):
+
     def test_lower_setter(self):
         ns = utils.Namespace('a/c', 'b', '')
         # sanity checks
@@ -7819,6 +7838,27 @@ class TestNamespace(unittest.TestCase):
         self.assertEqual(exp_upper, ns.upper)
         self.assertEqual(exp_upper, ns.upper_str)
         self.assertEqual(exp_upper + '\x00', ns.end_marker)
+
+    def test_name(self):
+        # constructor
+        path = 'a/c'
+        ns = utils.Namespace(path, 'l', 'u')
+        self._check_name_account_container(ns, path)
+
+        # constructor
+        path = u'\u1234a/\N{SNOWMAN}'
+        ns = utils.Namespace(path, 'l', 'u')
+        self._check_name_account_container(ns, path)
+        ns = utils.Namespace(path.encode('utf8'), 'l', 'u')
+        self._check_name_account_container(ns, path)
+
+    def test_name_unexpected_format(self):
+        # name is not a/c format
+        ns = utils.Namespace('foo', 'l', 'u')
+        self.assertEqual('foo', ns.name)
+        self.assertEqual('foo', ns.account)
+        with self.assertRaises(IndexError):
+            ns.container
 
     def test_unicode_name(self):
         shard_bounds = ('', 'ham', 'pie', u'\N{SNOWMAN}', u'\U0001F334', '')
@@ -7963,7 +8003,7 @@ class TestNamespace(unittest.TestCase):
         self.assertFalse(atof < start_to_l)
         self.assertFalse(start_to_l < entire)
 
-        # Now test ShardRange.overlaps(other)
+        # Now test overlaps(other)
         self.assertTrue(atof.overlaps(atof))
         self.assertFalse(atof.overlaps(ftol))
         self.assertFalse(ftol.overlaps(atof))
@@ -8169,7 +8209,7 @@ class TestNamespaceBoundList(unittest.TestCase):
         self.assertEqual(namespace_list.bounds, self.lowerbounds)
 
 
-class TestShardRange(unittest.TestCase):
+class TestShardRange(unittest.TestCase, BaseNamespaceShardRange):
     def setUp(self):
         self.ts_iter = make_timestamp_iter()
 
@@ -8408,18 +8448,6 @@ class TestShardRange(unittest.TestCase):
         self._check_to_from_dict('l', 'u')
         self._check_to_from_dict('', '')
 
-    def _check_name_account_container(self, sr, exp_name):
-        # check that the name, account, container properties are consistent
-        exp_account, exp_container = exp_name.split('/')
-        if six.PY2:
-            self.assertEqual(exp_name.encode('utf8'), sr.name)
-            self.assertEqual(exp_account.encode('utf8'), sr.account)
-            self.assertEqual(exp_container.encode('utf8'), sr.container)
-        else:
-            self.assertEqual(exp_name, sr.name)
-            self.assertEqual(exp_account, sr.account)
-            self.assertEqual(exp_container, sr.container)
-
     def test_name(self):
         # constructor
         path = 'a/c'
@@ -8431,31 +8459,44 @@ class TestShardRange(unittest.TestCase):
         self._check_name_account_container(sr, path)
 
         # constructor
-        path = u'\u1234a/\n{SNOWMAN}'
+        path = u'\u1234a/\N{SNOWMAN}'
         sr = utils.ShardRange(path, 0, 'l', 'u')
+        self._check_name_account_container(sr, path)
+        sr = utils.ShardRange(path.encode('utf8'), 0, 'l', 'u')
         self._check_name_account_container(sr, path)
         # name setter
-        path = u'\n{SNOWMAN}/\u1234c'
+        path = u'\N{SNOWMAN}/\u1234c'
         sr.name = path
         self._check_name_account_container(sr, path)
-
-    def test_account(self):
-        path = 'a/c'
-        sr = utils.ShardRange(path, 0, 'l', 'u')
+        sr.name = path.encode('utf-8')
         self._check_name_account_container(sr, path)
-        sr.account = 'a2'
-        self._check_name_account_container(sr, 'a2/c')
-        sr.account = u'\n{SNOWMAN}'
-        self._check_name_account_container(sr, u'\n{SNOWMAN}/c')
 
-    def test_container(self):
-        path = 'a/c'
-        sr = utils.ShardRange(path, 0, 'l', 'u')
-        self._check_name_account_container(sr, path)
-        sr.container = 'c2'
-        self._check_name_account_container(sr, 'a/c2')
-        sr.container = u'\n{SNOWMAN}'
-        self._check_name_account_container(sr, u'a/\n{SNOWMAN}')
+    def test_name_validation(self):
+        def check_invalid(call, *args):
+            with self.assertRaises(ValueError) as cm:
+                call(*args)
+            self.assertIn(
+                "Name must be of the form '<account>/<container>'",
+                str(cm.exception))
+
+        ts = next(self.ts_iter)
+        check_invalid(utils.ShardRange, '', ts, 'l', 'u')
+        check_invalid(utils.ShardRange, 'a', ts, 'l', 'u')
+        check_invalid(utils.ShardRange, b'a', ts, 'l', 'u')
+        check_invalid(utils.ShardRange, 'a/', ts, 'l', 'u')
+        check_invalid(utils.ShardRange, b'a/', ts, 'l', 'u')
+        check_invalid(utils.ShardRange, '/', ts, 'l', 'u')
+        check_invalid(utils.ShardRange, '/c', ts, 'l', 'u')
+        check_invalid(utils.ShardRange, b'/c', ts, 'l', 'u')
+        check_invalid(utils.ShardRange, None, ts, 'l', 'u')
+
+        ns = utils.ShardRange('a/c', ts, 'l', 'u')
+        check_invalid(setattr, ns, 'name', b'')
+        check_invalid(setattr, ns, 'name', b'a')
+        check_invalid(setattr, ns, 'name', b'a/')
+        check_invalid(setattr, ns, 'name', b'/')
+        check_invalid(setattr, ns, 'name', b'/c')
+        check_invalid(setattr, ns, 'name', None)
 
     def test_timestamp_setter(self):
         ts_1 = next(self.ts_iter)

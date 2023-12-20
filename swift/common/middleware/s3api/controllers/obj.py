@@ -29,7 +29,32 @@ from swift.common.middleware.s3api.utils import S3Timestamp, sysmeta_header
 from swift.common.middleware.s3api.controllers.base import Controller
 from swift.common.middleware.s3api.s3response import S3NotImplemented, \
     InvalidRange, NoSuchKey, NoSuchVersion, InvalidArgument, HTTPNoContent, \
-    PreconditionFailed, KeyTooLongError
+    PreconditionFailed, KeyTooLongError, InvalidPartNumber, InvalidPartArgument
+
+
+def _update_non_slo_part_num_response(part_number, resp):
+    """
+    Swift ignores part_number for non-slo objects, s3api only allows the
+    query param for non-MPU if it's exactly 1.
+
+    When the query param *is* exactly 1, as a side-effect this function updates
+    the response status code an headers.
+
+    :raises: InvalidPartNumber
+    """
+    try:
+        part_number = int(part_number)
+        if part_number < 1 or part_number > 10000:
+            raise ValueError
+    except ValueError:
+        raise InvalidPartArgument(part_number)  # 400
+    if part_number > 1:
+        raise InvalidPartNumber()  # 416
+    # part-num=1 queries against regular objects should return 206
+    resp.status = HTTP_PARTIAL_CONTENT
+    resp.headers['Content-Range'] = \
+        'bytes 0-%d/%s' % (int(resp.headers['Content-Length']) - 1,
+                           resp.headers['Content-Length'])
 
 
 class ObjectController(Controller):
@@ -87,11 +112,17 @@ class ObjectController(Controller):
 
         object_name = req.object_name
         version_id = req.params.get('versionId')
+        part_number = req.params.get('partNumber')
         if version_id not in ('null', None) and \
                 'object_versioning' not in get_swift_info():
             raise S3NotImplemented()
 
-        query = {} if version_id is None else {'version-id': version_id}
+        query = {}
+        if version_id is not None:
+            query['version-id'] = version_id
+        if part_number is not None:
+            query['part-number'] = part_number
+
         if version_id not in ('null', None):
             container_info = req.get_container_info(self.app)
             if not container_info.get(
@@ -101,10 +132,15 @@ class ObjectController(Controller):
 
         resp = req.get_response(self.app, query=query)
 
-        stored_upload_id = resp.sysmeta_headers.get(
-            sysmeta_header('object', 'upload-id'))
-        if self.conf.annotate_with_upload_id and stored_upload_id:
-            resp.headers['x-swift-s3api-upload-id'] = stored_upload_id
+        if part_number:
+            if resp.is_slo:
+                try:
+                    if int(part_number) > 10000:
+                        raise InvalidPartArgument(part_number)
+                except (ValueError, TypeError):
+                    raise InvalidPartArgument(part_number)
+            else:
+                _update_non_slo_part_num_response(part_number, resp)
 
         if req.method == 'HEAD':
             resp.app_iter = None

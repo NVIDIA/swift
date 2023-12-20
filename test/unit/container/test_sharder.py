@@ -14,7 +14,7 @@
 # limitations under the License.
 import json
 import random
-from argparse import Namespace
+import argparse
 
 import eventlet
 import os
@@ -47,7 +47,7 @@ from swift.container.sharder import ContainerSharder, sharding_enabled, \
     update_own_shard_range_stats
 from swift.common.utils import ShardRange, Timestamp, hash_path, \
     encode_timestamps, parse_db_filename, quorum_size, Everything, md5, \
-    ShardName
+    ShardName, Namespace
 from test import annotate_failure
 
 from test.debug_logger import debug_logger
@@ -205,6 +205,7 @@ class TestSharder(BaseTestSharder):
             '/etc/swift/internal-client.conf', 'Swift Container Sharder', 3,
             use_replication_network=True,
             global_conf={'log_name': 'container-sharder-ic'})
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
 
         # non-default shard_container_threshold influences other defaults
         conf = {'shard_container_threshold': 20000000}
@@ -219,6 +220,7 @@ class TestSharder(BaseTestSharder):
             '/etc/swift/internal-client.conf', 'Swift Container Sharder', 3,
             use_replication_network=True,
             global_conf={'log_name': 'container-sharder-ic'})
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
 
         # non-default values
         conf = {
@@ -238,7 +240,6 @@ class TestSharder(BaseTestSharder):
             'request_tries': 2,
             'internal_client_conf_path': '/etc/swift/my-sharder-ic.conf',
             'recon_cache_path': '/var/cache/swift-alt',
-            'auto_create_account_prefix': '...',
             'auto_shard': 'yes',
             'recon_candidates_limit': 10,
             'recon_sharded_timeout': 7200,
@@ -265,7 +266,7 @@ class TestSharder(BaseTestSharder):
             'cleave_batch_size': 4,
             'shard_scanner_batch_size': 8,
             'rcache': '/var/cache/swift-alt/container.recon',
-            'shards_account_prefix': '...shards_',
+            'shards_account_prefix': '.shards_',
             'auto_shard': True,
             'recon_candidates_limit': 10,
             'recon_sharded_timeout': 7200,
@@ -280,24 +281,14 @@ class TestSharder(BaseTestSharder):
             '/etc/swift/my-sharder-ic.conf', 'Swift Container Sharder', 2,
             use_replication_network=True,
             global_conf={'log_name': 'container-sharder-ic'})
-        self.assertEqual(self.logger.get_lines_for_level('warning'), [
-            'Option auto_create_account_prefix is deprecated. '
-            'Configure auto_create_account_prefix under the '
-            'swift-constraints section of swift.conf. This option '
-            'will be ignored in a future release.'])
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
 
         expected.update({'shard_replication_quorum': 3,
                          'existing_shard_replication_quorum': 3})
         conf.update({'shard_replication_quorum': 4,
                      'existing_shard_replication_quorum': 4})
         self._do_test_init(conf, expected)
-        warnings = self.logger.get_lines_for_level('warning')
-        self.assertEqual(warnings[:1], [
-            'Option auto_create_account_prefix is deprecated. '
-            'Configure auto_create_account_prefix under the '
-            'swift-constraints section of swift.conf. This option '
-            'will be ignored in a future release.'])
-        self.assertEqual(warnings[1:], [
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [
             'shard_replication_quorum of 4 exceeds replica count 3, '
             'reducing to 3',
             'existing_shard_replication_quorum of 4 exceeds replica count 3, '
@@ -1279,6 +1270,10 @@ class TestSharder(BaseTestSharder):
         do_test('')
         do_test(json.dumps({}))
         do_test(json.dumps([{'account': 'a', 'container': 'c'}]))
+        do_test(json.dumps([dict(Namespace('a/c', 'l', 'u'))]))
+        sr_dict = dict(ShardRange('a/c', next(self.ts_iter), 'l', 'u'))
+        sr_dict.pop('object_count')
+        do_test(json.dumps([sr_dict]))
 
     def test_fetch_shard_ranges_ok(self):
         def do_test(mock_resp_body, params):
@@ -5108,10 +5103,10 @@ class TestSharder(BaseTestSharder):
             self.assertEqual(2, len(broker.get_shard_ranges()))
             expected_ranges = [
                 ShardRange(
-                    ShardRange.make_path('.int_shards_a', 'c', cont, now, 0),
+                    ShardRange.make_path('.shards_a', 'c', cont, now, 0),
                     now, lower, objects[98][0], 99),
                 ShardRange(
-                    ShardRange.make_path('.int_shards_a', 'c', cont, now, 1),
+                    ShardRange.make_path('.shards_a', 'c', cont, now, 1),
                     now, objects[98][0], upper, 1),
             ]
             self._assert_shard_ranges_equal(expected_ranges,
@@ -5122,8 +5117,7 @@ class TestSharder(BaseTestSharder):
             account, cont, lower, upper)
         with self._mock_sharder(conf={'shard_container_threshold': 199,
                                       'minimum_shard_size': 1,
-                                      'shrink_threshold': 0,
-                                      'auto_create_account_prefix': '.int_'}
+                                      'shrink_threshold': 0}
                                 ) as sharder:
             with mock_timestamp_now() as now:
                 num_found = sharder._find_shard_ranges(broker)
@@ -5139,8 +5133,7 @@ class TestSharder(BaseTestSharder):
         # second invocation finds none
         with self._mock_sharder(conf={'shard_container_threshold': 199,
                                       'minimum_shard_size': 1,
-                                      'shrink_threshold': 0,
-                                      'auto_create_account_prefix': '.int_'}
+                                      'shrink_threshold': 0}
                                 ) as sharder:
             num_found = sharder._find_shard_ranges(broker)
         self.assertEqual(0, num_found)
@@ -5211,10 +5204,10 @@ class TestSharder(BaseTestSharder):
             self.assertEqual(2, len(broker.get_shard_ranges()))
             expected_ranges = [
                 ShardRange(
-                    ShardRange.make_path('.int_shards_a', 'c', cont, now, 0),
+                    ShardRange.make_path('.shards_a', 'c', cont, now, 0),
                     now, lower, objects[98][0], 99),
                 ShardRange(
-                    ShardRange.make_path('.int_shards_a', 'c', cont, now, 1),
+                    ShardRange.make_path('.shards_a', 'c', cont, now, 1),
                     now, objects[98][0], upper, 1),
             ]
             self._assert_shard_ranges_equal(expected_ranges,
@@ -5225,8 +5218,7 @@ class TestSharder(BaseTestSharder):
             account, cont, lower, upper)
         with self._mock_sharder(conf={'shard_container_threshold': 199,
                                       'minimum_shard_size': 1,
-                                      'shrink_threshold': 0,
-                                      'auto_create_account_prefix': '.int_'}
+                                      'shrink_threshold': 0},
                                 ) as sharder:
             with mock_timestamp_now() as now:
                 num_found = sharder._find_shard_ranges(broker)
@@ -5240,8 +5232,7 @@ class TestSharder(BaseTestSharder):
         self.assertGreaterEqual(stats['max_time'], stats['min_time'])
 
         # second invocation finds none
-        with self._mock_sharder(conf={'shard_container_threshold': 199,
-                                      'auto_create_account_prefix': '.int_'}
+        with self._mock_sharder(conf={'shard_container_threshold': 199}
                                 ) as sharder:
             num_found = sharder._find_shard_ranges(broker)
         self.assertEqual(0, num_found)
@@ -10624,11 +10615,11 @@ class TestContainerSharderConf(unittest.TestCase):
         # given namespace
         def assert_bad(conf):
             with self.assertRaises(ValueError):
-                ContainerSharderConf.validate_conf(Namespace(**conf))
+                ContainerSharderConf.validate_conf(argparse.Namespace(**conf))
 
         def assert_ok(conf):
             try:
-                ContainerSharderConf.validate_conf(Namespace(**conf))
+                ContainerSharderConf.validate_conf(argparse.Namespace(**conf))
             except ValueError as err:
                 self.fail('Unexpected ValueError: %s' % err)
 

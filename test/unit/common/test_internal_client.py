@@ -247,7 +247,6 @@ class TestInternalClient(unittest.TestCase):
 
         [app:proxy-server]
         use = egg:swift#proxy
-        auto_create_account_prefix = -
 
         [filter:cache]
         use = egg:swift#memcache
@@ -269,11 +268,6 @@ class TestInternalClient(unittest.TestCase):
             with mock.patch('swift.proxy.server.get_logger',
                             lambda *a, **kw: logger):
                 client = internal_client.InternalClient(conf_path, 'test', 1)
-            self.assertEqual(logger.get_lines_for_level('warning'), [
-                'Option auto_create_account_prefix is deprecated. '
-                'Configure auto_create_account_prefix under the '
-                'swift-constraints section of swift.conf. This option will '
-                'be ignored in a future release.'])
             self.assertEqual(client.account_ring,
                              client.app.app.app.account_ring)
             self.assertEqual(client.account_ring.serialized_path,
@@ -287,7 +281,6 @@ class TestInternalClient(unittest.TestCase):
                              object_ring)
             self.assertEqual(object_ring.serialized_path,
                              object_ring_path)
-            self.assertEqual(client.auto_create_account_prefix, '-')
 
     @mock.patch('swift.common.utils.HASH_PATH_SUFFIX', new=b'endcap')
     @with_tempdir
@@ -311,7 +304,6 @@ class TestInternalClient(unittest.TestCase):
 
         [app:proxy-server]
         use = egg:swift#proxy
-        auto_create_account_prefix = -
 
         [filter:cache]
         use = egg:swift#memcache
@@ -340,7 +332,6 @@ class TestInternalClient(unittest.TestCase):
 
         [app:proxy-server]
         use = egg:swift#proxy
-        auto_create_account_prefix = -
 
         [filter:cache]
         use = egg:swift#memcache
@@ -369,7 +360,6 @@ class TestInternalClient(unittest.TestCase):
 
         [app:proxy-server]
         use = egg:swift#proxy
-        auto_create_account_prefix = -
 
         [filter:cache]
         use = egg:swift#memcache

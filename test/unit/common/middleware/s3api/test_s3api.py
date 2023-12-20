@@ -40,7 +40,7 @@ from keystoneauth1.access import AccessInfoV2
 
 from test.debug_logger import debug_logger, FakeStatsdClient
 from test.unit.common.middleware.s3api import S3ApiTestCase
-from test.unit.common.middleware.s3api.helpers import FakeSwift
+from test.unit.common.middleware.helpers import FakeSwift
 from test.unit.common.middleware.s3api.test_s3token import \
     GOOD_RESPONSE_V2, GOOD_RESPONSE_V3
 from swift.common.middleware.s3api.s3request import SigV4Request, S3Request
@@ -1582,8 +1582,6 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         # after PUT container so we need to register the resposne here
         self.swift.register('POST', '/v1/AUTH_TENANT_ID/bucket',
                             swob.HTTPNoContent, {}, None)
-        self.swift.register('TEST', '/v1/AUTH_TENANT_ID',
-                            swob.HTTPMethodNotAllowed, {}, None)
         with patch.object(self.s3_token, '_json_request') as mock_req:
             mock_resp = requests.Response()
             mock_resp._content = json.dumps(GOOD_RESPONSE_V2).encode('ascii')

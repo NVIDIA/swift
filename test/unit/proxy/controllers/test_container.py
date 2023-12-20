@@ -557,7 +557,7 @@ class TestGetShardedContainer(BaseTestContainerController):
     def _check_GET_shard_listing(self, mock_responses, expected_objects,
                                  expected_requests, query_string='',
                                  reverse=False, expected_status=200,
-                                 memcache=False):
+                                 memcache=False, req_headers=None):
         # mock_responses is a list of tuples (status, json body, headers)
         # expected objects is a list of dicts
         # expected_requests is a list of tuples (path, hdrs dict, params dict)
@@ -577,6 +577,8 @@ class TestGetShardedContainer(BaseTestContainerController):
                        for resp in mock_responses])
         exp_headers = [resp[2] for resp in mock_responses]
         request = Request.blank(container_path)
+        if req_headers:
+            request.headers.update(req_headers)
         if memcache:
             # memcache exists, which causes backend to ignore constraints and
             # reverse params for shard range GETs
@@ -638,6 +640,7 @@ class TestGetShardedContainer(BaseTestContainerController):
                          int(resp.headers['X-Container-Object-Count']))
         self.assertEqual(exp_sharding_state,
                          resp.headers['X-Backend-Sharding-State'])
+        self.assertNotIn('X-Backend-Record-Type', resp.headers)
         for k, v in root_resp_hdrs.items():
             if k.lower().startswith('x-container-meta'):
                 self.assertEqual(v, resp.headers[k])
@@ -725,6 +728,18 @@ class TestGetShardedContainer(BaseTestContainerController):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests)
         # root object count will overridden by actual length of listing
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
+
+        resp = self._check_GET_shard_listing(
+            mock_responses, expected_objects, expected_requests,
+            req_headers={'X-Backend-Record-Type': 'auto'})
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
+
+        resp = self._check_GET_shard_listing(
+            mock_responses, expected_objects, expected_requests,
+            req_headers={'X-Backend-Record-Type': 'banana'})
         self.check_listing_response(resp, root_resp_hdrs,
                                     expected_objects=expected_objects)
 
@@ -1095,6 +1110,18 @@ class TestGetShardedContainer(BaseTestContainerController):
         resp = self._check_GET_shard_listing(
             mock_responses, expected_objects, expected_requests, memcache=True)
         # root object count will overridden by actual length of listing
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
+
+        resp = self._check_GET_shard_listing(
+            mock_responses, expected_objects, expected_requests, memcache=True,
+            req_headers={'X-Backend-Record-Type': 'auto'})
+        self.check_listing_response(resp, root_resp_hdrs,
+                                    expected_objects=expected_objects)
+
+        resp = self._check_GET_shard_listing(
+            mock_responses, expected_objects, expected_requests, memcache=True,
+            req_headers={'X-Backend-Record-Type': 'banana'})
         self.check_listing_response(resp, root_resp_hdrs,
                                     expected_objects=expected_objects)
 
@@ -2648,9 +2675,25 @@ class TestGetPathShardCaching(BaseTestContainerController):
             'X-Container-Bytes-Used': '12',
             'X-Backend-Storage-Policy-Index': '0'}
 
-    def _do_test_caching(self, record_type, exp_recheck_listing):
+    def _do_test_caching(self, record_type, exp_recheck_listing,
+                         exp_record_type, extra_backend_req_hdrs=None):
         # this test gets shard ranges into cache and then reads from cache
+        exp_backend_req_hdrs = {
+            'X-Backend-Record-Type': record_type,
+            'X-Backend-Override-Shard-Name-Filter': 'sharded'}
+        if extra_backend_req_hdrs:
+            exp_backend_req_hdrs.update(extra_backend_req_hdrs)
         sharding_state = 'sharded'
+        exp_resp_headers = {
+            'X-Backend-Recheck-Container-Existence': '60',
+            'X-Backend-Sharding-State': sharding_state}
+        if exp_record_type:
+            exp_resp_headers['X-Backend-Record-Type'] = exp_record_type
+        exp_cache_resp_headers = {
+            'X-Backend-Cached-Results': 'true',
+            'X-Backend-Sharding-State': sharding_state}
+        if exp_record_type:
+            exp_cache_resp_headers['X-Backend-Record-Type'] = exp_record_type
         self.memcache.delete_all()
         # container is sharded but proxy does not have that state cached;
         # expect a backend request and expect shard ranges to be cached
@@ -2664,13 +2707,8 @@ class TestGetPathShardCaching(BaseTestContainerController):
              'X-Backend-Sharding-State': sharding_state,
              'X-Backend-Override-Shard-Name-Filter': 'true'})
         self._check_backend_req(
-            req, backend_req,
-            extra_hdrs={'X-Backend-Record-Type': record_type,
-                        'X-Backend-Override-Shard-Name-Filter': 'sharded'})
-        self._check_response(resp, self.ns_dicts, {
-            'X-Backend-Recheck-Container-Existence': '60',
-            'X-Backend-Record-Type': 'shard',
-            'X-Backend-Sharding-State': sharding_state})
+            req, backend_req, extra_hdrs=exp_backend_req_hdrs)
+        self._check_response(resp, self.ns_dicts, exp_resp_headers)
 
         cache_key = 'shard-listing-v2/a/c'
         self.assertEqual(
@@ -2704,13 +2742,8 @@ class TestGetPathShardCaching(BaseTestContainerController):
              'X-Backend-Sharding-State': sharding_state,
              'X-Backend-Override-Shard-Name-Filter': 'true'})
         self._check_backend_req(
-            req, backend_req,
-            extra_hdrs={'X-Backend-Record-Type': record_type,
-                        'X-Backend-Override-Shard-Name-Filter': 'sharded'})
-        self._check_response(resp, self.ns_dicts, {
-            'X-Backend-Recheck-Container-Existence': '60',
-            'X-Backend-Record-Type': 'shard',
-            'X-Backend-Sharding-State': sharding_state})
+            req, backend_req, extra_hdrs=exp_backend_req_hdrs)
+        self._check_response(resp, self.ns_dicts, exp_resp_headers)
         self.assertEqual(
             [mock.call.get('container/a/c'),
              mock.call.get(cache_key, raise_on_error=True),
@@ -2737,10 +2770,7 @@ class TestGetPathShardCaching(BaseTestContainerController):
         req = self._build_request({'X-Backend-Record-Type': record_type},
                                   {'states': 'listing'}, {})
         resp = req.get_response(self.app)
-        self._check_response(resp, self.ns_dicts, {
-            'X-Backend-Cached-Results': 'true',
-            'X-Backend-Record-Type': 'shard',
-            'X-Backend-Sharding-State': sharding_state})
+        self._check_response(resp, self.ns_dicts, exp_cache_resp_headers)
         self.assertEqual(
             [mock.call.get('container/a/c'),
              mock.call.get(cache_key, raise_on_error=True)],
@@ -2768,13 +2798,8 @@ class TestGetPathShardCaching(BaseTestContainerController):
                  'X-Backend-Sharding-State': sharding_state,
                  'X-Backend-Override-Shard-Name-Filter': 'true'})
         self._check_backend_req(
-            req, backend_req,
-            extra_hdrs={'X-Backend-Record-Type': record_type,
-                        'X-Backend-Override-Shard-Name-Filter': 'sharded'})
-        self._check_response(resp, self.ns_dicts, {
-            'X-Backend-Recheck-Container-Existence': '60',
-            'X-Backend-Record-Type': 'shard',
-            'X-Backend-Sharding-State': sharding_state})
+            req, backend_req, extra_hdrs=exp_backend_req_hdrs)
+        self._check_response(resp, self.ns_dicts, exp_resp_headers)
         self.assertEqual(
             [mock.call.get('container/a/c'),
              mock.call.set(cache_key, self.ns_bound_list.bounds,
@@ -2800,10 +2825,7 @@ class TestGetPathShardCaching(BaseTestContainerController):
                                   {'states': 'listing'}, {})
         with mock.patch('random.random', return_value=0.11):
             resp = req.get_response(self.app)
-        self._check_response(resp, self.ns_dicts, {
-            'X-Backend-Cached-Results': 'true',
-            'X-Backend-Record-Type': 'shard',
-            'X-Backend-Sharding-State': sharding_state})
+        self._check_response(resp, self.ns_dicts, exp_cache_resp_headers)
         self.assertEqual(
             [mock.call.get('container/a/c'),
              mock.call.get(cache_key, raise_on_error=True)],
@@ -2827,10 +2849,7 @@ class TestGetPathShardCaching(BaseTestContainerController):
             infocache=req.environ['swift.infocache'])
         with mock.patch('random.random', return_value=0.11):
             resp = req.get_response(self.app)
-        self._check_response(resp, self.ns_dicts, {
-            'X-Backend-Cached-Results': 'true',
-            'X-Backend-Record-Type': 'shard',
-            'X-Backend-Sharding-State': sharding_state})
+        self._check_response(resp, self.ns_dicts, exp_cache_resp_headers)
         self.assertEqual([], self.memcache.calls)
         self.assertIn('swift.infocache', req.environ)
         self.assertIn(cache_key, req.environ['swift.infocache'])
@@ -2943,10 +2962,10 @@ class TestGetPathShardCaching(BaseTestContainerController):
     def test_GET_shard_ranges(self):
         self._setup_shard_range_stubs()
         # expect shard ranges cache time to be default value of 600
-        self._do_test_caching('shard', 600)
+        self._do_test_caching('shard', 600, 'shard')
         # expect shard ranges cache time to be configured value of 120
         self.app.recheck_listing_shard_ranges = 120
-        self._do_test_caching('shard', 120)
+        self._do_test_caching('shard', 120, 'shard')
 
         def mock_get_from_shards(self, req, resp):
             # for the purposes of these tests we override _get_from_shards so
@@ -2960,7 +2979,9 @@ class TestGetPathShardCaching(BaseTestContainerController):
                         'ContainerController._get_from_shards',
                         mock_get_from_shards):
             self.app.recheck_listing_shard_ranges = 600
-            self._do_test_caching('auto', 600)
+            extra_req_headers = {'X-Backend-Record-Shard-Format': 'namespace'}
+            self._do_test_caching('auto', 600, exp_record_type=None,
+                                  extra_backend_req_hdrs=extra_req_headers)
 
     def test_GET_shard_ranges_404_response(self):
         # pre-warm cache with container info but not shard ranges so that the
@@ -3088,6 +3109,8 @@ class TestGetPathShardCaching(BaseTestContainerController):
         def mock_get_from_shards(self, req, resp):
             return resp
 
+        # request with record-type=auto does not expect record-type in response
+        del exp_hdrs['X-Backend-Record-Type']
         with mock.patch('swift.proxy.controllers.container.'
                         'ContainerController._get_from_shards',
                         mock_get_from_shards):
@@ -3110,7 +3133,8 @@ class TestGetPathShardCaching(BaseTestContainerController):
                 {'states': 'listing', 'includes': 'egg'}, 'auto')
             self._check_response(resp, self.ns_dicts[:1], exp_hdrs)
 
-    def _do_test_GET_shard_ranges_write_to_cache(self, params, record_type):
+    def _do_test_GET_shard_ranges_write_to_cache(
+            self, params, record_type, extra_backend_req_hdrs=None):
         # verify that shard range listing are written to cache when appropriate
         self.logger.clear()
         self.memcache.delete_all()
@@ -3124,11 +3148,14 @@ class TestGetPathShardCaching(BaseTestContainerController):
                      'X-Backend-Sharding-State': 'sharded'}
         backend_req, resp = self._capture_backend_request(
             req, 200, self._stub_shards_dump, resp_hdrs)
+        extra_hdrs = {'X-Backend-Record-Type': record_type,
+                      'X-Backend-Override-Shard-Name-Filter': 'sharded'}
+        if extra_backend_req_hdrs:
+            extra_hdrs.update(extra_backend_req_hdrs)
         self._check_backend_req(
             req, backend_req,
             extra_params=params,
-            extra_hdrs={'X-Backend-Record-Type': record_type,
-                        'X-Backend-Override-Shard-Name-Filter': 'sharded'})
+            extra_hdrs=extra_hdrs)
         expected_hdrs = {'X-Backend-Recheck-Container-Existence': '60'}
         expected_hdrs.update(resp_hdrs)
         self.assertEqual(
@@ -3183,26 +3210,33 @@ class TestGetPathShardCaching(BaseTestContainerController):
         def mock_get_from_shards(self, req, resp):
             return resp
 
+        # request with record-type=auto does not expect record-type in response
+        del exp_hdrs['X-Backend-Record-Type']
+        extra_req_headers = {'X-Backend-Record-Shard-Format': 'namespace'}
         with mock.patch('swift.proxy.controllers.container.'
                         'ContainerController._get_from_shards',
                         mock_get_from_shards):
             resp = self._do_test_GET_shard_ranges_write_to_cache(
-                {'states': 'listing', 'reverse': 'true'}, 'auto')
+                {'states': 'listing', 'reverse': 'true'}, 'auto',
+                extra_backend_req_hdrs=extra_req_headers)
             exp_shards = list(self.ns_dicts)
             exp_shards.reverse()
             self._check_response(resp, exp_shards, exp_hdrs)
 
             resp = self._do_test_GET_shard_ranges_write_to_cache(
-                {'states': 'listing', 'marker': 'jam'}, 'auto')
+                {'states': 'listing', 'marker': 'jam'}, 'auto',
+                extra_backend_req_hdrs=extra_req_headers)
+
             self._check_response(resp, self.ns_dicts[1:], exp_hdrs)
 
             resp = self._do_test_GET_shard_ranges_write_to_cache(
                 {'states': 'listing', 'marker': 'jam', 'end_marker': 'kale'},
-                'auto')
+                'auto', extra_backend_req_hdrs=extra_req_headers)
             self._check_response(resp, self.ns_dicts[1:2], exp_hdrs)
 
             resp = self._do_test_GET_shard_ranges_write_to_cache(
-                {'states': 'listing', 'includes': 'egg'}, 'auto')
+                {'states': 'listing', 'includes': 'egg'}, 'auto',
+                extra_backend_req_hdrs=extra_req_headers)
             self._check_response(resp, self.ns_dicts[:1], exp_hdrs)
 
     def test_GET_shard_ranges_write_to_cache_with_x_newest(self):

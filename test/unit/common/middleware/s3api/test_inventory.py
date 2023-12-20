@@ -19,6 +19,7 @@ from swift.common.middleware.s3api.controllers.inventory import \
 from swift.common.swob import Request, HTTPNoContent, HTTPNotFound
 from swift.common.middleware.s3api.etree import fromstring, tostring, \
     DocumentInvalid
+from swift.common.utils import list_from_csv
 from test.unit import mock_timestamp_now
 from test.unit.common.middleware.s3api import S3ApiTestCase
 
@@ -197,8 +198,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertIn(b'Not implemented.', body)
 
     def test_GET_inventory_not_configured(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         self.swift.register(
             'HEAD', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
 
@@ -217,8 +217,8 @@ class TestS3ApiInventory(S3ApiTestCase):
 
     def _do_test_GET_inventory_enabled(self, config, expected_schedule,
                                        exp_dest_bucket):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.swift.clear_calls()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         resp_headers = {
             'X-Container-Sysmeta-Inventory-0-Config': json.dumps(config)
         }
@@ -303,7 +303,7 @@ class TestS3ApiInventory(S3ApiTestCase):
                                             'destination-bucket')
 
     def test_GET_inventory_deleted(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         config = {
             'period': 'Daily',
             'source': 's3api',
@@ -312,7 +312,6 @@ class TestS3ApiInventory(S3ApiTestCase):
             'enabled': True,
             'deleted': True,
         }
-        self.make_app()
         resp_headers = {
             'X-Container-Sysmeta-Inventory-0-Config': json.dumps(config)
         }
@@ -333,8 +332,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertIn(b'The specified configuration does not exist.', body)
 
     def _do_test_GET_inventory_list(self, config, expected_schedule):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         resp_headers = {
             'X-Container-Sysmeta-Inventory-0-Config': json.dumps(config)
         }
@@ -391,8 +389,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self._do_test_GET_inventory_list(config, 'Weekly')
 
     def test_GET_inventory_list_int_period_unsupported(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         config = {
             'period': 3600,  # unsupported period -> empty list
             'source': 's3api',
@@ -404,7 +401,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self._do_test_GET_inventory_list(config, 'Unknown')
 
     def test_GET_inventory_list_deleted(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         config = {
             'period': 'Daily',
             'source': 's3api',
@@ -413,7 +410,6 @@ class TestS3ApiInventory(S3ApiTestCase):
             'enabled': True,
             'deleted': True,
         }
-        self.make_app()
         resp_headers = {
             'X-Container-Sysmeta-Inventory-0-Config': json.dumps(config)
         }
@@ -438,8 +434,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual('false', root.find('./IsTruncated').text)
 
     def test_GET_inventory_list_empty(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         self.swift.register(
             'HEAD', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
 
@@ -471,8 +466,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual([], self.swift.calls_with_headers)
 
     def test_PUT_enable_inventory(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         self.swift.register(
             'POST', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
 
@@ -503,8 +497,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             json.loads(actual_hdrs['X-Container-Sysmeta-Inventory-0-Config']))
 
     def test_PUT_enable_inventory_abbreviated_dest_bucket(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         self.swift.register(
             'POST', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
 
@@ -540,8 +533,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             json.loads(actual_hdrs['X-Container-Sysmeta-Inventory-0-Config']))
 
     def test_PUT_disable_inventory(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         self.swift.register(
             'POST', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
 
@@ -576,8 +568,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             json.loads(actual_hdrs['X-Container-Sysmeta-Inventory-0-Config']))
 
     def test_PUT_missing_fields(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         req = Request.blank('/bucket?inventory&id=0',
                             environ={'REQUEST_METHOD': 'PUT'},
                             headers={'Authorization': 'AWS test:tester:hmac',
@@ -595,7 +586,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             "</Message></Error>".encode('utf8'), body)
 
     def test_DELETE_inventory(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         config = {
             'period': 'Daily',
             'source': 's3api',
@@ -604,7 +595,6 @@ class TestS3ApiInventory(S3ApiTestCase):
             'enabled': True,
             'deleted': False,
         }
-        self.make_app()
         resp_headers = {
             'X-Container-Sysmeta-Inventory-0-Config': json.dumps(config)
         }
@@ -652,8 +642,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertIn(b'The specified configuration does not exist.', body)
 
     def test_PUT_unsupported_inventory_id(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
 
         req = Request.blank(
             '/bucket?inventory&id=unsupported',
@@ -665,8 +654,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual('400', status.split()[0])
 
     def test_PUT_valid_fields(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
 
         def do_test(method, body):
             req = Request.blank(
@@ -689,8 +677,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         do_test('PUT', body)
 
     def test_PUT_invalid_fields(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
 
         def do_test(method, body):
             req = Request.blank(
@@ -738,12 +725,12 @@ class TestS3ApiInventory(S3ApiTestCase):
         do_test('PUT', body)
 
     def test_PUT_allowed_paths(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
 
         def do_test(allowed_paths):
             if allowed_paths is not None:
-                self.conf['s3_inventory_allowed_paths'] = allowed_paths
-            self.make_app()
+                self.s3api.conf['s3_inventory_allowed_paths'] = \
+                    list_from_csv(allowed_paths)
             self.swift.register(
                 'POST', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
             req = Request.blank(
@@ -770,7 +757,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual('204', do_test(None))
 
     def test_DELETE_allowed_paths(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         config = {
             'period': 'Daily',
             'source': 's3api',
@@ -785,8 +772,8 @@ class TestS3ApiInventory(S3ApiTestCase):
 
         def do_test(allowed_paths):
             if allowed_paths is not None:
-                self.conf['s3_inventory_allowed_paths'] = allowed_paths
-            self.make_app()
+                self.s3api.conf['s3_inventory_allowed_paths'] = \
+                    list_from_csv(allowed_paths)
             self.swift.register(
                 'HEAD', '/v1/AUTH_test/bucket', HTTPNoContent, resp_headers,
                 None)
@@ -818,7 +805,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual('204', do_test(None))
 
     def test_GET_allowed_paths(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         config = {
             'period': 'Daily',
             'source': 's3api',
@@ -833,8 +820,8 @@ class TestS3ApiInventory(S3ApiTestCase):
 
         def do_test(allowed_paths):
             if allowed_paths is not None:
-                self.conf['s3_inventory_allowed_paths'] = allowed_paths
-            self.make_app()
+                self.s3api.conf['s3_inventory_allowed_paths'] = \
+                    list_from_csv(allowed_paths)
             self.swift.register(
                 'HEAD', '/v1/AUTH_test/bucket', HTTPNoContent, resp_headers,
                 None)
@@ -858,8 +845,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual('200', do_test(None))
 
     def test_bucket_does_not_exist_404(self):
-        self.conf['s3_inventory_enabled'] = 'yes'
-        self.make_app()
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
         self.swift.register('POST', '/v1/AUTH_test/not-a-bucket',
                             HTTPNotFound, {}, None)
         self.swift.register('GET', '/v1/AUTH_test/not-a-bucket',

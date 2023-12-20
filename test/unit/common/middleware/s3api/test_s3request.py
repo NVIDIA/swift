@@ -95,7 +95,6 @@ class TestRequest(S3ApiTestCase):
     def setUp(self):
         super(TestRequest, self).setUp()
         self.s3api.conf.s3_acl = True
-        self.swift.s3_acl = True
 
     @patch('swift.common.middleware.s3api.acl_handlers.ACL_MAP', Fake_ACL_MAP)
     @patch('swift.common.middleware.s3api.s3request.S3AclRequest.authenticate',
@@ -122,7 +121,6 @@ class TestRequest(S3ApiTestCase):
 
     def test_get_response_without_s3_acl(self):
         self.s3api.conf.s3_acl = False
-        self.swift.s3_acl = False
         mock_get_resp, m_check_permission, s3_resp = \
             self._test_get_response('HEAD')
         self.assertFalse(hasattr(s3_resp, 'bucket_acl'))
@@ -1005,7 +1003,6 @@ class TestSigV4Request(S3ApiTestCase):
     def setUp(self):
         super(TestSigV4Request, self).setUp()
         self.s3api.conf.s3_acl = True
-        self.swift.s3_acl = True
 
     def test_init_header_authorization(self):
         environ = {
@@ -1207,7 +1204,7 @@ class TestSigV4Request(S3ApiTestCase):
             return SigV4Request(req.environ, None, config)
 
         s3req = make_s3req(Config(), '/bkt', {'partNumber': '3'})
-        self.assertEqual(controllers.multi_upload.PartController,
+        self.assertEqual(controllers.ObjectController,
                          s3req.controller)
 
         s3req = make_s3req(Config(), '/bkt', {'uploadId': '4'})
@@ -1236,6 +1233,41 @@ class TestSigV4Request(S3ApiTestCase):
         s3req = make_s3req(Config({'allow_multipart_uploads': False}), '/',
                            {'partNumber': '3'})
         self.assertEqual(controllers.ServiceController,
+                         s3req.controller)
+
+    def test_controller_for_multipart_upload_requests(self):
+        environ = {
+            'HTTP_HOST': 'bucket.s3.test.com',
+            'REQUEST_METHOD': 'PUT'}
+        x_amz_date = self.get_v4_amz_date_header()
+        auth = ('AWS4-HMAC-SHA256 '
+                'Credential=test/%s/us-east-1/s3/aws4_request,'
+                'SignedHeaders=host;x-amz-content-sha256;x-amz-date,'
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0])
+        headers = {
+            'Authorization': auth,
+            'X-Amz-Content-SHA256': '0123456789',
+            'Date': self.get_date_header(),
+            'X-Amz-Date': x_amz_date}
+
+        def make_s3req(config, path, params):
+            req = Request.blank(path, environ=environ, headers=headers,
+                                params=params)
+            return SigV4Request(req.environ, None, config)
+
+        s3req = make_s3req(Config(), '/bkt', {'partNumber': '3',
+                                              'uploadId': '4'})
+        self.assertEqual(controllers.multi_upload.PartController,
+                         s3req.controller)
+
+        s3req = make_s3req(Config(), '/bkt', {'partNumber': '3'})
+        self.assertEqual(controllers.multi_upload.PartController,
+                         s3req.controller)
+
+        s3req = make_s3req(Config(), '/bkt', {'uploadId': '4',
+                                              'partNumber': '3',
+                                              'copySource': 'bkt2/obj2'})
+        self.assertEqual(controllers.multi_upload.PartController,
                          s3req.controller)
 
 
