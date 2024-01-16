@@ -195,6 +195,7 @@ class BaseTestContainerSharding(ReplProbeTest):
             self.assertEqual('object', resp_record_type)
         else:
             self.assertIsNone(resp_record_type)
+        self.assertNotIn('X-Backend-Record-Shard-Format', resp.headers)
         return json.loads(resp.body)
 
     def get_container_shard_ranges(self, account=None, container=None,
@@ -204,7 +205,21 @@ class BaseTestContainerSharding(ReplProbeTest):
         resp = self.get_container_listing(account, container, headers,
                                           params=params)
         self.assertEqual('shard', resp.headers.get('X-Backend-Record-Type'))
+        self.assertEqual('full',
+                         resp.headers.get('X-Backend-Record-Shard-Format'))
         return [ShardRange.from_dict(sr) for sr in json.loads(resp.body)]
+
+    def get_container_namespaces(self, account=None, container=None,
+                                 headers=None, params=None):
+        headers = dict(headers) if headers else {}
+        headers.update({'X-Backend-Record-Type': 'shard',
+                        'X-Backend-Record-Shard-Format': 'namespace'})
+        resp = self.get_container_listing(account, container, headers,
+                                          params=params)
+        self.assertEqual('shard', resp.headers.get('X-Backend-Record-Type'))
+        self.assertEqual('namespace',
+                         resp.headers.get('X-Backend-Record-Shard-Format'))
+        return [Namespace(**ns) for ns in json.loads(resp.body)]
 
     def direct_get_container_shard_ranges(self, account=None, container=None,
                                           expect_failure=False):
@@ -3100,6 +3115,8 @@ class TestShardedAPI(BaseTestContainerSharding):
 
         orig_shard_ranges = self.get_container_shard_ranges()
         self.assertEqual(2, len(orig_shard_ranges))
+        namespaces = self.get_container_namespaces()
+        self._assert_namespace_equivalence(orig_shard_ranges, namespaces)
 
         # the container is sharded so *all* shard ranges should satisfy
         # updating and listing state aliases
@@ -3131,33 +3148,57 @@ class TestShardedAPI(BaseTestContainerSharding):
         shard_ranges = self.get_container_shard_ranges(
             params={'includes': all_obj_names[1]})
         self._assert_namespace_equivalence(orig_shard_ranges[:1], shard_ranges)
+        namespaces = self.get_container_namespaces(
+            params={'includes': all_obj_names[1]})
+        self._assert_namespace_equivalence(shard_ranges, namespaces)
 
         shard_ranges = self.get_container_shard_ranges(
             # override 'includes'
             headers={'X-Backend-Override-Shard-Name-Filter': 'sharded'},
             params={'includes': all_obj_names[1]})
         self._assert_namespace_equivalence(orig_shard_ranges, shard_ranges)
+        namespaces = self.get_container_namespaces(
+            # override 'includes'
+            headers={'X-Backend-Override-Shard-Name-Filter': 'sharded'},
+            params={'includes': all_obj_names[1]})
+        self._assert_namespace_equivalence(shard_ranges, namespaces)
 
         shard_ranges = self.get_container_shard_ranges(
             params={'end_marker': all_obj_names[1]})
         self._assert_namespace_equivalence(orig_shard_ranges[:1], shard_ranges)
+        namespaces = self.get_container_namespaces(
+            params={'end_marker': all_obj_names[1]})
+        self._assert_namespace_equivalence(shard_ranges, namespaces)
 
         shard_ranges = self.get_container_shard_ranges(
             # override 'end_marker'
             headers={'X-Backend-Override-Shard-Name-Filter': 'sharded'},
             params={'end_marker': all_obj_names[1]})
         self._assert_namespace_equivalence(orig_shard_ranges, shard_ranges)
+        namespaces = self.get_container_namespaces(
+            # override 'end_marker'
+            headers={'X-Backend-Override-Shard-Name-Filter': 'sharded'},
+            params={'end_marker': all_obj_names[1]})
+        self._assert_namespace_equivalence(shard_ranges, namespaces)
 
         shard_ranges = self.get_container_shard_ranges(
             params={'reverse': 'true'})
         self._assert_namespace_equivalence(list(reversed(orig_shard_ranges)),
                                            shard_ranges)
+        namespaces = self.get_container_namespaces(
+            params={'reverse': 'true'})
+        self._assert_namespace_equivalence(shard_ranges, namespaces)
 
         shard_ranges = self.get_container_shard_ranges(
             # override 'reverse'
             headers={'X-Backend-Override-Shard-Name-Filter': 'sharded'},
             params={'reverse': 'true'})
         self._assert_namespace_equivalence(orig_shard_ranges, shard_ranges)
+        namespaces = self.get_container_namespaces(
+            # override 'reverse'
+            headers={'X-Backend-Override-Shard-Name-Filter': 'sharded'},
+            params={'reverse': 'true'})
+        self._assert_namespace_equivalence(shard_ranges, namespaces)
 
         objs = self.get_container_objects()
         self.assertEqual(all_obj_names, [obj['name'] for obj in objs])

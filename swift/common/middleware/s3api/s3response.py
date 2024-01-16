@@ -454,9 +454,9 @@ class InvalidObjectState(ErrorResponse):
 class InvalidPartArgument(InvalidArgument):
     _code = 'InvalidArgument'
 
-    def __init__(self, value):
+    def __init__(self, max_parts, value):
         err_msg = ('Part number must be an integer between '
-                   '1 and 10000, inclusive')
+                   '1 and %s, inclusive' % max_parts)
         super(InvalidArgument, self).__init__(err_msg,
                                               argument_name='partNumber',
                                               argument_value=value)

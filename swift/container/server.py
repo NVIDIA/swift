@@ -791,6 +791,14 @@ class ContainerController(BaseStorageServer):
         :param out_content_type: content type as a string.
         :returns: an instance of :class:`swift.common.swob.Response`
         """
+        override_deleted = info and config_true_value(
+            req.headers.get('x-backend-override-deleted', False))
+        resp_headers = gen_resp_headers(
+            info, is_deleted=is_deleted and not override_deleted)
+
+        if is_deleted and not override_deleted:
+            return HTTPNotFound(request=req, headers=resp_headers)
+
         marker = params.get('marker', '')
         end_marker = params.get('end_marker')
         reverse = config_true_value(params.get('reverse'))
@@ -800,27 +808,6 @@ class ContainerController(BaseStorageServer):
             'x-backend-record-shard-format', 'full').lower()
         include_deleted = config_true_value(
             req.headers.get('x-backend-include-deleted', False))
-
-        # For record type of 'shard', user can specify an additional header
-        # to ask for list of Namespaces instead of full ShardRanges.
-        # This will allow proxy server who is going to retrieve Namespace
-        # to talk to older version of container servers who don't support
-        # Namespace yet during upgrade.
-        # Note: there is no support of 'includes', 'marker', 'end_marker'
-        # or 'reverse' for 'namespace' GET.
-        if shard_format == "namespace" and not (
-            includes or marker or end_marker or reverse
-        ):
-            override_deleted = False
-        else:
-            shard_format = 'full'
-            override_deleted = info and config_true_value(
-                req.headers.get('x-backend-override-deleted', False))
-
-        resp_headers = gen_resp_headers(
-            info, is_deleted=is_deleted and not override_deleted)
-        if is_deleted and not override_deleted:
-            return HTTPNotFound(request=req, headers=resp_headers)
 
         resp_headers['X-Backend-Record-Type'] = 'shard'
         resp_headers['X-Backend-Record-Shard-Format'] = shard_format
@@ -846,10 +833,20 @@ class ContainerController(BaseStorageServer):
             except ValueError:
                 return HTTPBadRequest(request=req, body='Bad state')
 
+        # For record type of 'shard', user can specify an additional header
+        # to ask for list of Namespaces instead of full ShardRanges.
+        # This will allow proxy server who is going to retrieve Namespace
+        # to talk to older version of container servers who don't support
+        # Namespace yet during upgrade.
+        shard_format = req.headers.get(
+            'x-backend-record-shard-format', 'full').lower()
         if shard_format == 'namespace':
-            # Namespace GET supports a subset of functions of Shard Range GET,
-            # for example, it doesn't support 'x-backend-include-deleted'
-            # header, nor 'auditing' state query parameter.
+            resp_headers['X-Backend-Record-Shard-Format'] = 'namespace'
+            # Namespace GET does not support all the options of Shard Range
+            # GET: 'x-backend-include-deleted' cannot be supported because
+            # there is no way for a Namespace to indicate the deleted state;
+            # the 'auditing' state query parameter is not supported because it
+            # is specific to the sharder which only requests full shard ranges.
             if include_deleted:
                 return HTTPBadRequest(
                     request=req, body='No include_deleted for namespace GET')
@@ -857,8 +854,10 @@ class ContainerController(BaseStorageServer):
                 return HTTPBadRequest(
                     request=req, body='No auditing state for namespace GET')
             shard_format_full = False
-            container_list = broker.get_namespaces(states, fill_gaps)
+            container_list = broker.get_namespaces(
+                marker, end_marker, includes, reverse, states, fill_gaps)
         else:
+            resp_headers['X-Backend-Record-Shard-Format'] = 'full'
             shard_format_full = True
             container_list = broker.get_shard_ranges(
                 marker, end_marker, includes, reverse, states=states,

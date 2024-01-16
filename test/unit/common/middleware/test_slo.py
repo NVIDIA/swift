@@ -1972,13 +1972,14 @@ class SloGETorHEADTestCase(SloTestCase):
         """
         This manifest's segments are all regular objects.
         """
-        _bb_manifest = [
+        _single_segment_manifest = [
             {'name': '/gettest/b_50', 'hash': md5hex('b' * 50), 'bytes': '50',
              'content_type': 'text/plain'},
         ]
-        self._setup_manifest('single-segment', _bb_manifest, extra_headers={
-            'X-Object-Meta-Nature': 'Regular',
-        }, container='gettest')
+        self._setup_manifest(
+            'single-segment', _single_segment_manifest,
+            extra_headers={'X-Object-Meta-Nature': 'Regular'},
+            container='gettest')
 
     def _setup_manifest_data(self):
         _data_manifest = [

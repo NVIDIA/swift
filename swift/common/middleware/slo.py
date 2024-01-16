@@ -270,11 +270,27 @@ A GET request with the query parameters::
 will return the contents of the original manifest as it was sent by the client.
 The main purpose for both calls is solely debugging.
 
-When the manifest object is uploaded you are more or less guaranteed that
-every segment in the manifest exists and matched the specifications.
-However, there is nothing that prevents the user from breaking the
-SLO download by deleting/replacing a segment referenced in the manifest. It is
-left to the user to use caution in handling the segments.
+A GET request to a manifest object with the query parameter::
+
+    ?part-number=<n>
+
+will return the contents of the ``nth`` segment. Segments are indexed from 1,
+so ``n`` must be an integer between 1 and the total number of segments in the
+manifest. The response status will be ``206 Partial Content`` and its headers
+will include: an ``X-Parts-Count`` header equal to the total number of
+segments; a ``Content-Length`` header equal to the length of the specified
+segment; a ``Content-Range`` header describing the byte range of the specified
+part within the SLO. A HEAD request with a ``part-number`` parameter will also
+return a response with status ``206 Partial Content`` and the same headers.
+
+.. note::
+
+    When the manifest object is uploaded you are more or less guaranteed that
+    every segment in the manifest exists and matched the specifications.
+    However, there is nothing that prevents the user from breaking the SLO
+    download by deleting/replacing a segment referenced in the manifest. It is
+    left to the user to use caution in handling the segments.
+
 
 -----------------------
 Deleting a Large Object
@@ -618,6 +634,39 @@ def calculate_byteranges(req, segments, resp_attrs, part_num):
     return byteranges
 
 
+def get_valid_part_num(req):
+    """
+    Any non-range GET or HEAD request for a SLO object may include a
+    part-number parameter in query string.  If the passed in request
+    includes a part-number parameter it will be parsed into a valid integer
+    and returned.  If the passed in request does not include a part-number
+    param we will return None.  If the part-number parameter is invalid for
+    the given request we will raise the appropriate HTTP exception
+
+    :param req: the request object
+
+    :returns: validated part-number value or None
+    :raises HTTPBadRequest: if request or part-number param is not valid
+    """
+    part_number_param = get_param(req, 'part-number')
+    if part_number_param is None:
+        return None
+    try:
+        part_number = int(part_number_param)
+        if part_number <= 0:
+            raise ValueError
+    except ValueError:
+        raise HTTPBadRequest('Part number must be an integer greater '
+                             'than 0')
+
+    if req.range:
+        raise HTTPBadRequest(req=req,
+                             body='Range requests are not supported '
+                                  'with part number queries')
+
+    return part_number
+
+
 class RespAttrs(object):
     """
     Encapsulate properties of a GET or HEAD response that are pertinent to
@@ -739,6 +788,7 @@ class SloGetContext(WSGIContext):
             method='GET',
             headers={'x-auth-token': req.headers.get('x-auth-token')},
             agent='%(orig)s SLO MultipartGET', swift_source='SLO')
+        params_copy = dict(req.params)
         params_copy.pop('part-number', None)
         sub_req.params = params_copy
         sub_resp = sub_req.get_response(self.slo.app)
@@ -1026,7 +1076,7 @@ class SloGetContext(WSGIContext):
             resp_attrs.update_from_segments(segments)
             headers['Etag'] = '"%s"' % resp_attrs.slo_etag
             headers['Content-Length'] = str(resp_attrs.slo_size)
-            part_num = self.get_valid_part_num(req)
+            part_num = get_valid_part_num(req)
             if part_num:
                 headers['X-Parts-Count'] = len(segments)
 
@@ -1174,7 +1224,7 @@ class SloGetContext(WSGIContext):
         if resp_attrs.is_slo and not is_manifest_get:
             try:
                 # only validate part-number if the request is to an SLO
-                part_num = self.get_valid_part_num(req)
+                part_num = get_valid_part_num(req)
             except HTTPException:
                 friendly_close(resp_iter)
                 raise

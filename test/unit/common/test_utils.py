@@ -9437,15 +9437,19 @@ class TestFallocateWithReserve(unittest.TestCase):
                         sys_posix_fallocate_mock, get_errno_mock):
         sys_fallocate_mock.available = True
         sys_fallocate_mock.return_value = 0
+        # Note that we want to have zero reserve so we don't even get as far
+        # as doing the statvfs -- we aren't actually mocking that out, so we
+        # can get different results depending on whether our test runner is
+        # capturing stdout/stderr (and blocking stdin, fd=0!) or not
         with self.assertRaises(ValueError):
-            utils.fallocate_with_reserve(0, 1, True, 1 << 64, 0)
+            utils.fallocate_with_reserve(0, 0, True, 1 << 64, 0)
         with self.assertRaises(ValueError):
-            utils.fallocate_with_reserve(0, 1, True, 0, -1)
+            utils.fallocate_with_reserve(0, 0, True, 0, -1)
         with self.assertRaises(ValueError):
-            utils.fallocate_with_reserve(0, 1, True, 0, 1 << 64)
+            utils.fallocate_with_reserve(0, 0, True, 0, 1 << 64)
         self.assertEqual([], sys_fallocate_mock.mock_calls)
         # sanity check
-        utils.fallocate_with_reserve(0, 1, True, 0, 0)
+        utils.fallocate_with_reserve(0, 0, True, 0, 0)
         self.assertEqual(
             [mock.call(0, utils.libc.FALLOC_FL_KEEP_SIZE, mock.ANY, mock.ANY)],
             sys_fallocate_mock.mock_calls)
@@ -9456,7 +9460,7 @@ class TestFallocateWithReserve(unittest.TestCase):
         sys_fallocate_mock.reset_mock()
 
         # negative size will be adjusted as 0
-        utils.fallocate_with_reserve(0, 1, True, -1, 0)
+        utils.fallocate_with_reserve(0, 0, True, -1, 0)
         self.assertEqual(
             [mock.call(0, utils.libc.FALLOC_FL_KEEP_SIZE, mock.ANY, mock.ANY)],
             sys_fallocate_mock.mock_calls)

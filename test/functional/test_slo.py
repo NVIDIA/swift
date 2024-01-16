@@ -413,6 +413,7 @@ class TestSlo(Base):
             end = start + seg_info['size_bytes'] - 1
             self.assertEqual(headers['content-range'],
                              'bytes %d-%d/%d' % (start, end, total_size), i)
+            self.assertEqual(headers['x-parts-count'], '5')
             start = end + 1
 
     def test_head_part_number_simple_manifest(self):
@@ -446,6 +447,7 @@ class TestSlo(Base):
             end = start + seg_info['size_bytes'] - 1
             self.assertEqual(headers['content-range'],
                              'bytes %d-%d/%d' % (start, end, total_size), i)
+            self.assertEqual(headers['x-parts-count'], '5')
             start = end + 1
 
     def test_slo_container_listing(self):

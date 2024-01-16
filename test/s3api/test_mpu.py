@@ -161,6 +161,23 @@ class BaseMultiPartUploadTestCase(BaseS3TestCase):
 
 class TestMultiPartUpload(BaseMultiPartUploadTestCase):
 
+    def setUp(self):
+        super(TestMultiPartUpload, self).setUp()
+
+    def _discover_max_part_num(self):
+        key_name = self.create_name('discover-max-part-num')
+        self.upload_mpu(key_name)
+        with self.assertRaises(ClientError) as cm:
+            self.client.get_object(Bucket=self.bucket_name,
+                                   Key=key_name, PartNumber=0)
+        err_resp = cm.exception.response
+        self.assertEqual(400, err_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual('InvalidArgument', err_resp['Error']['Code'])
+        err_msg = err_resp['Error']['Message']
+        preamble = 'Part number must be an integer between 1 and '
+        self.assertIn(preamble, err_msg)
+        return int(err_msg[len(preamble):].split(',')[0])
+
     def test_basic_upload(self):
         key_name = self.create_name('key')
         create_mpu_resp = self.client.create_multipart_upload(
@@ -198,7 +215,8 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
         self.assertEqual(200, complete_mpu_resp[
             'ResponseMetadata']['HTTPStatusCode'])
 
-    def _check_part_num_invalid_exc(self, exc, val, is_head=False):
+    def _check_part_num_invalid_exc(self, exc, val, max_part_num,
+                                    is_head=False):
         err_resp = exc.response
         self.assertEqual(400, err_resp['ResponseMetadata']['HTTPStatusCode'])
         if is_head:
@@ -207,7 +225,7 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
         else:
             err_code = 'InvalidArgument'
             err_msg = 'Part number must be an integer between ' \
-                      '1 and 10000, inclusive'
+                      '1 and %d, inclusive' % max_part_num
         self.assertEqual(err_code, err_resp['Error']['Code'], err_resp)
         self.assertEqual(err_msg, err_resp['Error']['Message'])
         if is_head:
@@ -216,9 +234,6 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
         else:
             self.assertEqual('partNumber', err_resp['Error']['ArgumentName'])
             self.assertEqual(str(val), err_resp['Error']['ArgumentValue'])
-
-    def _check_part_num_zero_exc(self, exc, is_head=False):
-        self._check_part_num_invalid_exc(exc, 0, is_head=is_head)
 
     def _check_part_num_out_of_range_exc(self, exc, is_head=False):
         err_resp = exc.response
@@ -233,6 +248,7 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
         self.assertEqual(err_msg, err_resp['Error']['Message'], err_resp)
 
     def test_get_object_partNumber_errors(self):
+        max_part_num = self._discover_max_part_num()
         key_name = self.create_name('invalid-part-num-test')
         mpu_etag = self.upload_mpu(key_name)
 
@@ -240,7 +256,7 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
         with self.assertRaises(ClientError) as caught:
             self.client.get_object(Bucket=self.bucket_name,
                                    Key=key_name, PartNumber=0)
-        self._check_part_num_zero_exc(caught.exception)
+        self._check_part_num_invalid_exc(caught.exception, 0, max_part_num)
 
         # all other partNumber args are valid
         self._verify_part_num_response(
@@ -251,19 +267,25 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
                                    Key=key_name, PartNumber=self.num_parts + 1)
         self._check_part_num_out_of_range_exc(caught.exception)
 
+        with self.assertRaises(ClientError) as caught:
+            self.client.get_object(Bucket=self.bucket_name,
+                                   Key=key_name, PartNumber=max_part_num)
+        self._check_part_num_out_of_range_exc(caught.exception)
+
         # because of ParamValidationError we can't test 'foo'
         val = -1
         with self.assertRaises(ClientError) as caught:
             self.client.get_object(Bucket=self.bucket_name,
                                    Key=key_name, PartNumber=val)
-        self._check_part_num_invalid_exc(caught.exception, val)
-        val = 10001
+        self._check_part_num_invalid_exc(caught.exception, val, max_part_num)
+        val = max_part_num + 1
         with self.assertRaises(ClientError) as caught:
             self.client.get_object(Bucket=self.bucket_name,
                                    Key=key_name, PartNumber=val)
-        self._check_part_num_invalid_exc(caught.exception, val)
+        self._check_part_num_invalid_exc(caught.exception, val, max_part_num)
 
     def test_head_object_partNumber_errors(self):
+        max_part_num = self._discover_max_part_num()
         key_name = self.create_name('invalid-part-num-head')
         mpu_etag = self.upload_mpu(key_name)
 
@@ -271,7 +293,8 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
         with self.assertRaises(ClientError) as caught:
             self.client.head_object(Bucket=self.bucket_name,
                                     Key=key_name, PartNumber=0)
-        self._check_part_num_zero_exc(caught.exception, is_head=True)
+        self._check_part_num_invalid_exc(caught.exception, 0, max_part_num,
+                                         is_head=True)
 
         # all other partNumber args are valid
         self._verify_part_num_response(
@@ -282,19 +305,27 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
                                     PartNumber=self.num_parts + 1)
         self._check_part_num_out_of_range_exc(caught.exception, is_head=True)
 
+        with self.assertRaises(ClientError) as caught:
+            self.client.head_object(Bucket=self.bucket_name, Key=key_name,
+                                    PartNumber=max_part_num)
+        self._check_part_num_out_of_range_exc(caught.exception, is_head=True)
+
         # because of ParamValidationError we can't test 'foo'
         val = -1
         with self.assertRaises(ClientError) as caught:
             self.client.head_object(Bucket=self.bucket_name, Key=key_name,
                                     PartNumber=val)
-        self._check_part_num_invalid_exc(caught.exception, val, is_head=True)
-        val = 10001
+        self._check_part_num_invalid_exc(caught.exception, val, max_part_num,
+                                         is_head=True)
+        val = max_part_num + 1
         with self.assertRaises(ClientError) as caught:
             self.client.head_object(Bucket=self.bucket_name, Key=key_name,
                                     PartNumber=val)
-        self._check_part_num_invalid_exc(caught.exception, val, is_head=True)
+        self._check_part_num_invalid_exc(caught.exception, val, max_part_num,
+                                         is_head=True)
 
     def test_part_number_non_slo(self):
+        max_part_num = self._discover_max_part_num()
         key_name = self.create_name('part-num-non-mpu')
         self.client.put_object(Bucket=self.bucket_name,
                                Key=key_name,
@@ -339,27 +370,29 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
             self.client.get_object(Bucket=self.bucket_name,
                                    Key=key_name,
                                    PartNumber=0)
-        self._check_part_num_zero_exc(caught.exception)
+        self._check_part_num_invalid_exc(caught.exception, 0, max_part_num)
 
         with self.assertRaises(ClientError) as caught:
             self.client.head_object(Bucket=self.bucket_name,
                                     Key=key_name,
                                     PartNumber=0)
-        self._check_part_num_zero_exc(caught.exception, is_head=True)
+        self._check_part_num_invalid_exc(caught.exception, 0, max_part_num,
+                                         is_head=True)
 
         invalid_part_num = 10001
         with self.assertRaises(ClientError) as caught:
             self.client.get_object(Bucket=self.bucket_name,
                                    Key=key_name,
                                    PartNumber=invalid_part_num)
-        self._check_part_num_invalid_exc(caught.exception, invalid_part_num)
+        self._check_part_num_invalid_exc(caught.exception, invalid_part_num,
+                                         max_part_num)
 
         with self.assertRaises(ClientError) as caught:
             self.client.head_object(Bucket=self.bucket_name,
                                     Key=key_name,
-                                    PartNumber=10001)
+                                    PartNumber=invalid_part_num)
         self._check_part_num_invalid_exc(caught.exception, invalid_part_num,
-                                         is_head=True)
+                                         max_part_num, is_head=True)
 
     def test_upload_part_copy(self):
         self.num_parts = 4

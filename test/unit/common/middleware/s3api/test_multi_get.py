@@ -16,6 +16,7 @@
 import binascii
 import string
 import json
+import mock
 
 from swift.common import swob, utils
 from swift.common.request_helpers import get_reserved_name
@@ -175,9 +176,10 @@ class TestMpuGETorHEAD(S3ApiTestCase):
             expected_calls.insert(0, ('HEAD', '/v1/AUTH_test/bucket/mpu'))
         self.assertEqual(self.swift.calls, expected_calls)
 
-    def test_mpu_GET_out_of_range_part_num(self):
+    def _do_test_mpu_GET_out_of_range_part_num(self, part_number):
+        self.swift.clear_calls()
         req = swob.Request.blank('/bucket/mpu', params={
-            'partNumber': '5',
+            'partNumber': str(part_number),
         }, headers={
             'Authorization': 'AWS test:tester:hmac',
             'Date': self.get_date_header()
@@ -188,11 +190,59 @@ class TestMpuGETorHEAD(S3ApiTestCase):
         expected_calls = [
             # s3api.controller.obj doesn't know yet if it's SLO, we delegate
             # param validation
-            ('GET', '/v1/AUTH_test/bucket/mpu?part-number=5'),
+            ('GET', '/v1/AUTH_test/bucket/mpu?part-number=%s' % part_number),
         ]
         if self.s3_acl:
             expected_calls.insert(0, ('HEAD', '/v1/AUTH_test/bucket/mpu'))
         self.assertEqual(self.swift.calls, expected_calls)
+
+    def test_mpu_GET_out_of_range_part_num(self):
+        self._do_test_mpu_GET_out_of_range_part_num(4)
+        self._do_test_mpu_GET_out_of_range_part_num(10000)
+
+    def test_existing_part_number_greater_than_max_parts_allowed(self):
+        part_number = 3
+        max_parts = 2
+        req = swob.Request.blank('/bucket/mpu', params={
+            'partNumber': str(part_number),
+        }, headers={
+            'Authorization': 'AWS test:tester:hmac',
+            'Date': self.get_date_header()
+        })
+        bad_req = swob.Request.blank('/bucket/mpu', params={
+            'partNumber': str(part_number + 1),
+        }, headers={
+            'Authorization': 'AWS test:tester:hmac',
+            'Date': self.get_date_header()
+        })
+        with mock.patch.object(self.s3api.conf,
+                               'max_upload_part_num', max_parts):
+            # num_parts >= part number > max parts
+            status, headers, body = self.call_s3api(req)
+            self.assertEqual(status.split()[0], '206')
+            # part number > num parts > max parts
+            status, headers, body = self.call_s3api(bad_req)
+            self.assertEqual(status.split()[0], '400')
+            self.assertIn('must be an integer between 1 and 3, inclusive',
+                          self._get_error_message(body))
+
+        max_parts = part_number + 1
+        with mock.patch.object(self.s3api.conf,
+                               'max_upload_part_num', max_parts):
+            # max_parts > num_parts >= part number
+            status, headers, body = self.call_s3api(req)
+            self.assertEqual(status.split()[0], '206')
+            # max_parts >= part number > num parts
+            status, headers, body = self.call_s3api(bad_req)
+            self.assertEqual(status.split()[0], '416')
+            self.assertIn('The requested partnumber is not satisfiable',
+                          self._get_error_message(body))
+            # part number > max_parts > num parts
+            bad_req.params = {'partNumber': str(max_parts + 1)}
+            status, headers, body = self.call_s3api(bad_req)
+            self.assertEqual(status.split()[0], '400')
+            self.assertIn('must be an integer between 1 and 4, inclusive',
+                          self._get_error_message(body))
 
     def test_mpu_GET_huge_part_num(self):
         req = swob.Request.blank('/bucket/mpu', params={
@@ -257,9 +307,10 @@ class TestMpuGETorHEAD(S3ApiTestCase):
             ('HEAD', '/v1/AUTH_test/bucket/mpu?part-number=0'),
         ])
 
-    def test_mpu_HEAD_out_of_range_part_num(self):
+    def _do_test_mpu_HEAD_out_of_range_part_num(self, part_number):
+        self.swift.clear_calls()
         req = swob.Request.blank('/bucket/mpu', method='HEAD', params={
-            'partNumber': '5',
+            'partNumber': str(part_number),
         }, headers={
             'Authorization': 'AWS test:tester:hmac',
             'Date': self.get_date_header()
@@ -267,10 +318,14 @@ class TestMpuGETorHEAD(S3ApiTestCase):
         status, headers, _ = self.call_s3api(req)
         self.assertEqual(status.split()[0], '416')
         self.assertEqual(self.swift.calls, [
-            ('HEAD', '/v1/AUTH_test/bucket/mpu?part-number=5'),
+            ('HEAD', '/v1/AUTH_test/bucket/mpu?part-number=%s' % part_number),
             # SLO has to refetch to *see* if it's out-of-bounds
-            ('GET', '/v1/AUTH_test/bucket/mpu?part-number=5'),
+            ('GET', '/v1/AUTH_test/bucket/mpu?part-number=%s' % part_number),
         ])
+
+    def test_mpu_HEAD_out_of_range_part_num(self):
+        self._do_test_mpu_HEAD_out_of_range_part_num(4)
+        self._do_test_mpu_HEAD_out_of_range_part_num(10000)
 
     def test_mpu_HEAD_huge_part_num(self):
         req = swob.Request.blank('/bucket/mpu', method='HEAD', params={

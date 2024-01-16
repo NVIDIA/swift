@@ -132,15 +132,19 @@ class ObjectController(Controller):
 
         resp = req.get_response(self.app, query=query)
 
-        if part_number:
-            if resp.is_slo:
-                try:
-                    if int(part_number) > 10000:
-                        raise InvalidPartArgument(part_number)
-                except (ValueError, TypeError):
-                    raise InvalidPartArgument(part_number)
-            else:
-                _update_non_slo_part_num_response(part_number, resp)
+        if not resp.is_slo:
+            # SLO ignores part_number for non-slo objects, but s3api only
+            # allows the query param for non-MPU if it's exactly 1.
+            part_number = req.validate_part_number(
+                max_parts=self.conf.max_upload_part_num, parts_count=1)
+            if part_number == 1:
+                # When the query param *is* exactly 1 the response status code
+                # and headers are updated.
+                resp.status = HTTP_PARTIAL_CONTENT
+                resp.headers['Content-Range'] = \
+                    'bytes 0-%d/%s' % (int(resp.headers['Content-Length']) - 1,
+                                       resp.headers['Content-Length'])
+            # else: part_number is None
 
         if req.method == 'HEAD':
             resp.app_iter = None

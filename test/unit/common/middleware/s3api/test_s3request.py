@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 import hashlib
 from mock import patch, MagicMock
 import unittest
@@ -32,7 +32,8 @@ from swift.common.middleware.s3api.s3request import S3Request, \
     S3AclRequest, SigV4Request, SIGV4_X_AMZ_DATE_FORMAT, HashingInput
 from swift.common.middleware.s3api.s3response import InvalidArgument, \
     NoSuchBucket, InternalError, ServiceUnavailable, \
-    AccessDenied, SignatureDoesNotMatch, RequestTimeTooSkewed, BadDigest
+    AccessDenied, SignatureDoesNotMatch, RequestTimeTooSkewed, BadDigest, \
+    InvalidPartArgument, InvalidPartNumber
 from swift.common.utils import md5
 
 from test.debug_logger import debug_logger
@@ -470,12 +471,12 @@ class TestRequest(S3ApiTestCase):
 
         # near-past X-Amz-Date headers
         date_header = {'X-Amz-Date': self.get_v4_amz_date_header(
-            datetime.utcnow() - timedelta(minutes=10)
+            timedelta(minutes=-10)
         )}
         self._test_request_timestamp_sigv4(date_header)
 
         date_header = {'X-Amz-Date': self.get_v4_amz_date_header(
-            datetime.utcnow() - timedelta(minutes=10)
+            timedelta(minutes=-10)
         )}
         with self.assertRaises(RequestTimeTooSkewed) as cm, \
                 patch.object(self.s3api.conf, 'allowable_clock_skew', 300):
@@ -483,19 +484,19 @@ class TestRequest(S3ApiTestCase):
 
         # near-future X-Amz-Date headers
         date_header = {'X-Amz-Date': self.get_v4_amz_date_header(
-            datetime.utcnow() + timedelta(minutes=10)
+            timedelta(minutes=10)
         )}
         self._test_request_timestamp_sigv4(date_header)
 
         date_header = {'X-Amz-Date': self.get_v4_amz_date_header(
-            datetime.utcnow() + timedelta(minutes=10)
+            timedelta(minutes=10)
         )}
         with self.assertRaises(RequestTimeTooSkewed) as cm, \
                 patch.object(self.s3api.conf, 'allowable_clock_skew', 300):
             self._test_request_timestamp_sigv4(date_header)
 
         date_header = {'X-Amz-Date': self.get_v4_amz_date_header(
-            datetime.utcnow() + timedelta(days=1)
+            timedelta(days=1)
         )}
         with self.assertRaises(RequestTimeTooSkewed) as cm:
             self._test_request_timestamp_sigv4(date_header)
@@ -997,6 +998,66 @@ class TestRequest(S3ApiTestCase):
         self.assertTrue(
             sigv4_req._canonical_request().endswith(sha256_of_nothing.upper()))
         self.assertTrue(sigv4_req.check_signature('secret'))
+
+    def test_validate_part_number(self):
+        sw_req = Request.blank('/nojunk',
+                               environ={'REQUEST_METHOD': 'GET'},
+                               headers={
+                                   'Authorization': 'AWS test:tester:hmac',
+                                   'Date': self.get_date_header()})
+        req = S3Request(sw_req.environ)
+        self.assertIsNone(req.validate_part_number(10000))
+
+        # ok
+        sw_req = Request.blank('/nojunk?partNumber=102',
+                               environ={'REQUEST_METHOD': 'GET'},
+                               headers={
+                                   'Authorization': 'AWS test:tester:hmac',
+                                   'Date': self.get_date_header()})
+        req = S3Request(sw_req.environ)
+        self.assertEqual(102, req.validate_part_number(10000))
+        self.assertEqual(102, req.validate_part_number(100, 102))
+        self.assertEqual(102, req.validate_part_number(102, 102))
+
+        def check_invalid_argument(part_num, max_parts, parts_count, exp_max):
+            sw_req = Request.blank('/nojunk?partNumber=%s' % part_num,
+                                   environ={'REQUEST_METHOD': 'GET'},
+                                   headers={
+                                       'Authorization': 'AWS test:tester:hmac',
+                                       'Date': self.get_date_header()})
+            req = S3Request(sw_req.environ)
+            with self.assertRaises(InvalidPartArgument) as cm:
+                req.validate_part_number(max_parts, parts_count=parts_count)
+            self.assertEqual('400 Bad Request', str(cm.exception))
+            self.assertIn(
+                b'Part number must be an integer between 1 and %d' % exp_max,
+                cm.exception.body)
+
+        check_invalid_argument(102, 99, None, 99)
+        check_invalid_argument(102, 100, 99, 100)
+        check_invalid_argument(102, 100, 101, 101)
+        check_invalid_argument(102, 101, 100, 101)
+        check_invalid_argument(102, 101, 101, 101)
+        check_invalid_argument('banana', 1000, None, 1000)
+        check_invalid_argument(0, 10000, None, 10000)
+
+        def check_invalid_part_num(part_num, max_parts, parts_count):
+            sw_req = Request.blank('/nojunk?partNumber=%s' % part_num,
+                                   environ={'REQUEST_METHOD': 'GET'},
+                                   headers={
+                                       'Authorization': 'AWS test:tester:hmac',
+                                       'Date': self.get_date_header()})
+            req = S3Request(sw_req.environ)
+            with self.assertRaises(InvalidPartNumber) as cm:
+                req.validate_part_number(max_parts, parts_count=parts_count)
+            self.assertEqual('416 Requested Range Not Satisfiable',
+                             str(cm.exception))
+            self.assertIn(b'The requested partnumber is not satisfiable',
+                          cm.exception.body)
+
+        check_invalid_part_num(102, 10000, 1)
+        check_invalid_part_num(102, 102, 101)
+        check_invalid_part_num(102, 10000, 101)
 
 
 class TestSigV4Request(S3ApiTestCase):

@@ -270,25 +270,6 @@ def backward(f, blocksize=4096):
 TRUE_VALUES = {'true', '1', 'yes', 'on', 't', 'y'}
 
 
-def transform_to_set(value):
-    """
-    Transform either a single value or a collection of values to a set of
-    unique values.
-
-    :param value: An object to transform.
-    :return: A set. If ``value`` is an instance of a ``list``, ``tuple`` or
-        ``set`` then a set containing the items in ``value`` is returned; if
-        value is ``None`` then an empty set is returned; otherwise a set
-        containing the single ``value`` is returned.
-    """
-    if value is None:
-        return set()
-    elif isinstance(value, (list, tuple, set)):
-        return set(value)
-    else:
-        return {value}
-
-
 def non_negative_float(value):
     """
     Check that the value casts to a float and is non-negative.
