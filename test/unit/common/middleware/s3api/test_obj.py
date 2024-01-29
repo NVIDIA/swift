@@ -439,69 +439,6 @@ class BaseS3ApiObj(object):
         body = self._do_test_non_slo_object_part_num_invalid('HEAD', 'foo')
         self.assertEqual(body, b'')
 
-    def test_non_slo_object_GET_part_num(self):
-        self._test_object_GETorHEAD('GET', query='?partNumber=1')
-
-    def test_non_slo_object_HEAD_part_num(self):
-        self._test_object_GETorHEAD('HEAD', query='?partNumber=1')
-
-    def _do_test_non_slo_object_part_num_not_satisfiable(self, method,
-                                                         part_number):
-        req = Request.blank('/bucket/object',
-                            params={'partNumber': part_number},
-                            headers={'Authorization': 'AWS test:tester:hmac',
-                                     'Date': self.get_date_header()})
-        req.method = method
-        status, headers, body = self.call_s3api(req)
-        self.assertEqual(status.split()[0], '416')
-        return body
-
-    def test_non_slo_object_GET_part_num_not_satisfiable(self):
-        body = self._do_test_non_slo_object_part_num_not_satisfiable(
-            'GET', '2')
-        self.assertEqual(self._get_error_code(body), 'InvalidPartNumber')
-        body = self._do_test_non_slo_object_part_num_not_satisfiable(
-            'GET', '10000')
-        self.assertEqual(self._get_error_code(body), 'InvalidPartNumber')
-
-    def test_non_slo_object_HEAD_part_num_not_satisfiable(self):
-        body = self._do_test_non_slo_object_part_num_not_satisfiable(
-            'HEAD', '2')
-        self.assertEqual(body, b'')
-        body = self._do_test_non_slo_object_part_num_not_satisfiable(
-            'HEAD', '10000')
-        self.assertEqual(body, b'')
-
-    def _do_test_non_slo_object_part_num_invalid(self, method, part_number):
-        req = Request.blank('/bucket/object',
-                            params={'partNumber': part_number},
-                            headers={'Authorization': 'AWS test:tester:hmac',
-                                     'Date': self.get_date_header()})
-        req.method = method
-        status, headers, body = self.call_s3api(req)
-        self.assertEqual(status.split()[0], '400')
-        return body
-
-    def test_non_slo_object_GET_part_num_invalid(self):
-        body = self._do_test_non_slo_object_part_num_invalid('GET', '0')
-        self.assertEqual(self._get_error_code(body), 'InvalidArgument')
-        body = self._do_test_non_slo_object_part_num_invalid('GET', '-1')
-        self.assertEqual(self._get_error_code(body), 'InvalidArgument')
-        body = self._do_test_non_slo_object_part_num_invalid('GET', '10001')
-        self.assertEqual(self._get_error_code(body), 'InvalidArgument')
-        body = self._do_test_non_slo_object_part_num_invalid('GET', 'foo')
-        self.assertEqual(self._get_error_code(body), 'InvalidArgument')
-
-    def test_non_slo_object_HEAD_part_num_invalid(self):
-        body = self._do_test_non_slo_object_part_num_invalid('HEAD', '0')
-        self.assertEqual(body, b'')
-        body = self._do_test_non_slo_object_part_num_invalid('HEAD', '-1')
-        self.assertEqual(body, b'')
-        body = self._do_test_non_slo_object_part_num_invalid('HEAD', '10001')
-        self.assertEqual(body, b'')
-        body = self._do_test_non_slo_object_part_num_invalid('HEAD', 'foo')
-        self.assertEqual(body, b'')
-
     def test_object_GET_Range(self):
         req = Request.blank('/bucket/object',
                             environ={'REQUEST_METHOD': 'GET'},
