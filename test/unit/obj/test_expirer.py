@@ -286,21 +286,83 @@ class TestObjectExpirer(TestCase):
             x.get_process_values(vals)
         self.assertEqual(str(ctx.exception), expected_msg)
 
+    def test_init_per_container_grace_period_with_slash(self):
+        # Multiple "/" or invalid parsing
+        conf = {
+            'grace_period_A_U_TH_foo_bar/my-container_name/with/slash': 60400,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_A_U_TH_foo_bar/my-container_name/with/slash '
+            'should be in the form grace_period_<account> '
+            'or grace_period_<account>/<container> '
+            '(at most one "/" is allowed)',
+            str(ctx.exception))
+        conf = {
+            'grace_period_': 60400
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_ '
+            'should be in the form grace_period_<account> '
+            'or grace_period_<account>/<container> '
+            '(at most one "/" is allowed)',
+            str(ctx.exception))
+
+        # Leading and trailing "/"
+        conf = {
+            'grace_period_/a': 60400,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_/a '
+            'should be in the form grace_period_<account> '
+            'or grace_period_<account>/<container> '
+            '(leading or trailing "/" is not allowed)',
+            str(ctx.exception))
+
+        conf = {
+            'grace_period_a/': 60400,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_a/ '
+            'should be in the form grace_period_<account> '
+            'or grace_period_<account>/<container> '
+            '(leading or trailing "/" is not allowed)',
+            str(ctx.exception))
+
+        conf = {
+            'grace_period_/a/c/': 60400,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_/a/c/ '
+            'should be in the form grace_period_<account> '
+            'or grace_period_<account>/<container> '
+            '(leading or trailing "/" is not allowed)',
+            str(ctx.exception))
+
     def test_init_grace_period(self):
         conf = {}
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.acct_grace_periods, {})
+        self.assertEqual(x.grace_periods, {})
         # there is no global grace_period
         conf = {
             'grace_period': 0.0,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.acct_grace_periods, {})
+        self.assertEqual(x.grace_periods, {})
         conf = {
             'grace_period_a': 1.0,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.acct_grace_periods, {'a': 1.0})
+        self.assertEqual(x.grace_periods, {('a', None): 1.0})
 
         # test configure multi-account grace_period
         conf = {
@@ -310,13 +372,28 @@ class TestObjectExpirer(TestCase):
             u'grace_period_AUTH_aBáC': 555,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.acct_grace_periods, {
-            'a': 1.0,
-            'b': 259200.0,
-            'AUTH_aBC': 999,
-            u'AUTH_aBáC': 555,
+        self.assertEqual(x.grace_periods, {
+            ('a', None): 1.0,
+            ('b', None): 259200.0,
+            ('AUTH_aBC', None): 999,
+            (u'AUTH_aBáC', None): 555,
+        })
+        # test configure multi-account grace_period with containers
+        conf = {
+            'grace_period_a/test': 1.0,
+            'grace_period_b': '259200.0',
+            'grace_period_AUTH_aBC/test2': 999,
+            u'grace_period_AUTH_aBáC/tést': 555,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.grace_periods, {
+            ('a', 'test'): 1.0,
+            ('b', None): 259200.0,
+            ('AUTH_aBC', 'test2'): 999,
+            (u'AUTH_aBáC', u'tést'): 555,
         })
 
+    def test_init_invalid_grace_period(self):
         # negative tests
         conf = {
             'grace_period_a': -1.0,
@@ -342,6 +419,49 @@ class TestObjectExpirer(TestCase):
         self.assertEqual(
             'grace_period_a must be a float greater than or equal to 0',
             str(ctx.exception))
+
+        # negative tests with containers
+        conf = {
+            'grace_period_a/b': -100.0
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_a/b must be a float greater than or equal to 0',
+            str(ctx.exception))
+        conf = {
+            'grace_period_a/b': '-259200.0'
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_a/b must be a float greater than or equal to 0',
+            str(ctx.exception))
+        conf = {
+            'grace_period_a/b': 'foo'
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'grace_period_a/b must be a float greater than or equal to 0',
+            str(ctx.exception))
+
+    def test_get_grace_period(self):
+        conf = {
+            'grace_period_a': 1.0,
+            'grace_period_a/test': 2.0,
+            'grace_period_b': '259200.0',
+            'grace_period_c/test': '3.0'
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(1.0, x.get_grace_period('a', None))
+        self.assertEqual(1.0, x.get_grace_period('a', 'not-test'))
+        self.assertEqual(2.0, x.get_grace_period('a', 'test'))
+        self.assertEqual(259200.0, x.get_grace_period('b', None))
+        self.assertEqual(259200.0, x.get_grace_period('b', 'test'))
+        self.assertEqual(3.0, x.get_grace_period('c', 'test'))
+        self.assertEqual(0.0, x.get_grace_period('c', 'not-test'))
+        self.assertEqual(0.0, x.get_grace_period('no-conf', 'test'))
 
     def test_init_concurrency_too_small(self):
         conf = {
@@ -812,11 +932,13 @@ class TestObjectExpirer(TestCase):
                     # tasks well past ready for execution
                     {'name': self.past_time + '-a0/c0/o0'},
                     {'name': self.past_time + '-a1/c1/o1'},
+                    {'name': self.past_time + '-a1/c2/o2'},
                 ],
                 self.just_past_time: [
                     # tasks only just ready for execution
                     {'name': self.just_past_time + '-a0/c0/o0'},
                     {'name': self.just_past_time + '-a1/c1/o1'},
+                    {'name': self.just_past_time + '-a1/c2/o2'},
                 ],
             }
         }
@@ -831,6 +953,7 @@ class TestObjectExpirer(TestCase):
                 swob.wsgi_to_str(tgt) for tgt in (
                     'a0/c0/o0',
                     'a1/c1/o1',
+                    'a1/c2/o2',
                 )
             )
         ] + [
@@ -839,6 +962,7 @@ class TestObjectExpirer(TestCase):
                 swob.wsgi_to_str(tgt) for tgt in (
                     'a0/c0/o0',
                     'a1/c1/o1',
+                    'a1/c2/o2',
                 )
             )
         ]
@@ -861,6 +985,7 @@ class TestObjectExpirer(TestCase):
                 swob.wsgi_to_str(tgt) for tgt in (
                     'a0/c0/o0',
                     'a1/c1/o1',
+                    'a1/c2/o2',
                 )
             )
         ] + [
@@ -868,6 +993,65 @@ class TestObjectExpirer(TestCase):
             for target_path in (
                 swob.wsgi_to_str(tgt) for tgt in (
                     'a0/c0/o0',
+                )
+            )
+        ]
+        observed = list(x.iter_task_to_expire(
+            task_account_container_list, 0, 1))
+        self.assertEqual(expected, observed)
+
+        # configure grace for account a1 and for account a1 and container c2
+        # container a1/c2 expires expires almost immediately
+        # but other containers in account a1 remain (a1/c1 and a1/c3)
+        self.conf['grace_period_a1'] = 300.0
+        self.conf['grace_period_a1/c2'] = 0.1
+        x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                  swift=fake_swift)
+        # ... and we don't expect *recent* a1 tasks, excluding c2
+        expected = [
+            self.make_task(self.past_time, target_path)
+            for target_path in (
+                swob.wsgi_to_str(tgt) for tgt in (
+                    'a0/c0/o0',
+                    'a1/c1/o1',
+                    'a1/c2/o2',
+                )
+            )
+        ] + [
+            self.make_task(self.just_past_time, target_path)
+            for target_path in (
+                swob.wsgi_to_str(tgt) for tgt in (
+                    'a0/c0/o0',
+                    'a1/c2/o2',
+                )
+            )
+        ]
+        observed = list(x.iter_task_to_expire(
+            task_account_container_list, 0, 1))
+        self.assertEqual(expected, observed)
+
+        # configure grace for account a1 and for account a1 and container c2
+        # container a1/c2 does not expire but others in account a1 do
+        self.conf['grace_period_a1'] = 0.1
+        self.conf['grace_period_a1/c2'] = 300.0
+        x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                  swift=fake_swift)
+        # ... and we don't expect *recent* a1 tasks, excluding c2
+        expected = [
+            self.make_task(self.past_time, target_path)
+            for target_path in (
+                swob.wsgi_to_str(tgt) for tgt in (
+                    'a0/c0/o0',
+                    'a1/c1/o1',
+                    'a1/c2/o2',
+                )
+            )
+        ] + [
+            self.make_task(self.just_past_time, target_path)
+            for target_path in (
+                swob.wsgi_to_str(tgt) for tgt in (
+                    'a0/c0/o0',
+                    'a1/c1/o1',
                 )
             )
         ]
