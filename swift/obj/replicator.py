@@ -498,7 +498,7 @@ class ObjectReplicator(Daemon):
                 return False
         return True
 
-    def update_deleted(self, job):
+    def revert(self, job):
         """
         High-level method that replicates a single partition that doesn't
         belong on this node.
@@ -527,7 +527,7 @@ class ObjectReplicator(Daemon):
             with df_mgr.partition_lock(job['device'], job['policy'],
                                        job['partition'], name='replication',
                                        timeout=0.2):
-                batches_deleted = []
+                all_batches_synced_successfully = True
                 suffixes = tpool.execute(tpool_get_suffixes, job['path'])
                 random.shuffle(suffixes)
                 for suffixes_to_revert in distribute_evenly(
@@ -561,29 +561,29 @@ class ObjectReplicator(Daemon):
                         else:
                             delete_objs = delete_objs & cand_objs
 
-                    if self.handoff_delete:
-                        # delete handoff if we had handoff_delete successes
-                        successes_count = sum(1 for resp in responses if resp)
-                        delete_handoff = successes_count >= self.handoff_delete
-                    else:
-                        # delete handoff if all syncs were successful
-                        delete_handoff = (len(responses) == len(job['nodes'])
-                                          and all(responses))
-                    if delete_handoff:
+                    successes_count = sum(1 for resp in responses if resp)
+                    required_successes = self.handoff_delete or len(job['nodes'])
+                    if successes_count >= required_successes:
                         stats.remove += 1
                         if (self.conf.get('sync_method', 'rsync') == 'ssync'
                                 and delete_objs is not None):
-                            delete_handoff = False  # not deleting *everything*
+                            # multi-region ssync will send at most one replica
+                            # per region, with the hope that intra-region
+                            # replication will resolve any other disparities
+                            # more cheaply by our next cycle. Progressively
+                            # delete anything that we see *has* been fully
+                            # replicated though.
+                            all_batches_synced_successfully = False
                             self.logger.info("Removing %s objects",
                                              len(delete_objs))
                             _junk, error_paths = self.delete_handoff_objs(
                                 job, delete_objs)
-                            # if replication works for a hand-off device and it
-                            # failed, the remote devices which are target of
-                            # the replication from the hand-off device will be
-                            # marked. Because cleanup after replication failed
-                            # means replicator needs to replicate again with
-                            # the same info.
+                            # error_paths will have stuff that successfully
+                            # replicated but couldn't be deleted (most likely,
+                            # the remote indicated it didn't need it, or we
+                            # would have hit some error during read).
+                            # Since it was some kind of failure,  flag the
+                            # remotes (!?) in failure_devs_info.
                             if error_paths:
                                 failure_devs_info.update(
                                     [(failure_dev['replication_ip'],
@@ -592,10 +592,10 @@ class ObjectReplicator(Daemon):
                         else:
                             self.delete_suffixes(
                                 job['path'], suffixes_to_revert)
+                    else:
+                        all_batches_synced_successfully = False
 
-                    batches_deleted.append(delete_handoff)
-
-                if all(batches_deleted):
+                if all_batches_synced_successfully:
                     self.delete_partition(job['path'])
                     handoff_partition_deleted = True
         except PartitionLockTimeout:
@@ -630,8 +630,8 @@ class ObjectReplicator(Daemon):
                     # Don't worry if there was a race to create or delete,
                     # or some disk corruption that happened after the sync
                     raise
-            else:
-                invalidate_hash(suffix_dir, removed=True)
+            finally:
+                invalidate_hash(suffix_dir)
 
     def delete_partition(self, path):
         self.logger.info("Removing partition: %s", path)
@@ -656,6 +656,10 @@ class ObjectReplicator(Daemon):
                 success_paths.append(object_path)
             except OSError as e:
                 if e.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+                    # TODO: Can't we just quarantine?
+                    # At this point, we should know everything's fully
+                    # durable anyway, and then we could stop trying to
+                    # track success/error_paths at all
                     error_paths.append(object_path)
                     self.logger.exception(
                         "Unexpected error trying to cleanup suffix dir %r",
@@ -1023,7 +1027,7 @@ class ObjectReplicator(Daemon):
                 except OSError:
                     continue
                 if job['delete']:
-                    self.run_pool.spawn(self.update_deleted, job)
+                    self.run_pool.spawn(self.revert, job)
                 else:
                     self.run_pool.spawn(self.update, job)
             current_nodes = None

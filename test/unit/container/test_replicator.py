@@ -1489,17 +1489,22 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
             if exp_warning:
                 self.assertEqual(len(lines), 1, lines)
                 self.assertIn("Ignoring remote osr w/o epoch", lines[0])
+                self.assertIn("own_sr: ", lines[0])
+                self.assertIn("'epoch': '%s'" % local_osr.epoch.normal,
+                              lines[0])
+                self.assertIn("remote_sr: ", lines[0])
+                self.assertIn("'epoch': None", lines[0])
                 hash_ = os.path.splitext(os.path.basename(broker.db_file))[0]
                 url = "%s/%s/%s/%s" % (
                     remote_node['ip'], remote_node['device'], part, hash_)
-                self.assertIn("from: %s" % url, lines[0])
+                self.assertIn("source: %s" % url, lines[0])
             else:
                 self.assertFalse(lines)
             lines = self.rpc.logger.get_lines_for_level('warning')
             if exp_rpc_warning:
                 self.assertEqual(len(lines), 1, lines)
                 self.assertIn("Ignoring remote osr w/o epoch", lines[0])
-                self.assertIn("from: repl_req", lines[0])
+                self.assertIn("source: repl_req", lines[0])
             else:
                 self.assertFalse(lines)
 
@@ -1519,11 +1524,14 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         default_osr_newer = ShardRange(**dict(default_osr))
         default_osr_newer.timestamp = Timestamp.now()
 
+        # local_osr, remote_osr, exp_merge, exp_warning, exp_rpc_warning
         tests = (
             # First the None case, ie no osrs
             (None, None, False, False, False),
             # Default and not the other
             (None, default_osr, True, False, False),
+            (default_osr, None, False, False, False),
+            (default_osr, default_osr, True, False, False),
             (default_osr, None, False, False, False),
             # With an epoch and no OSR is also fine
             (None, osr_with_epoch, True, False, False),
@@ -1531,9 +1539,9 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
             # even with the same or different epochs
             (osr_with_epoch, osr_with_epoch, True, False, False),
             (osr_with_epoch, osr_with_different_epoch, True, False, False),
-            # But if local does have an epoch but the remote doesn't don't
-            # merge it (the warning is logged).
-            (osr_with_epoch, default_osr, False, True, False),
+            # But if local does have an epoch but the remote doesn't: false
+            # positive, nothing will merge anyway, no warning.
+            (osr_with_epoch, default_osr, False, False, False),
             # It's also OK if the remote has an epoch but not the local,
             # this also works on the RPC side because merge_shards happen on
             # to local then sends updated shards to the remote. So if the
@@ -1545,8 +1553,8 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
             # so wil fail to merge
             (default_osr_newer, osr_with_epoch, False, False, True),
         )
-        for params in tests:
-            with annotate_failure(params):
+        for i, params in enumerate(tests):
+            with annotate_failure((i, params)):
                 do_test(*params)
 
     def test_sync_shard_ranges(self):

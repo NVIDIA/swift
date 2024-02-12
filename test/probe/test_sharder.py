@@ -1478,27 +1478,6 @@ class TestContainerSharding(BaseAutoContainerSharding):
         if errors:
             self.fail('\n'.join(errors))
 
-    def get_async_files(self):
-        # The async dir lives outside the datadir, so we just need the
-        # devices dir to final all async pendings
-        conf = utils.readconf(self.configs['object-server'][1],
-                              section_name='app:object-server')
-        devices = conf['devices']
-        async_paths = set()
-
-        for node in self.brain.nodes:
-            async_dir = os.path.join(devices, node['device'], 'async_pending')
-            if os.path.exists(async_dir):
-                for suffix in os.listdir(async_dir):
-                    suffix_dir = os.path.join(async_dir, suffix)
-                    if not os.path.isdir(suffix_dir):
-                        continue
-                    for async_file in os.listdir(suffix_dir):
-                        async_file = os.path.join(suffix_dir, async_file)
-                        if os.path.isfile(async_file):
-                            async_paths.add(async_file)
-        return async_paths
-
     def test_async_pendings(self):
         obj_names = self._make_object_names(self.max_shard_size * 2)
 
@@ -1513,7 +1492,8 @@ class TestContainerSharding(BaseAutoContainerSharding):
             self.brain.servers.start(number=n)
 
         # Check the async pendings, they are unsharded so that's the db_state
-        async_files = self.get_async_files()
+        async_files = self.gather_async_pendings()
+        self.assertTrue(async_files)
         for af in async_files:
             self.assertInAsyncFile(af, {'db_state': 'unsharded'})
             self.assertNotInAsyncFile(af, ['container_path'])
@@ -1601,7 +1581,7 @@ class TestContainerSharding(BaseAutoContainerSharding):
         # Run updaters to clear the async pendings
         Manager(['object-updater']).once()
 
-        async_files = self.get_async_files()
+        async_files = self.gather_async_pendings()
         self.assertFalse(async_files)
 
         # Our "big" dbs didn't take updates
@@ -1677,7 +1657,8 @@ class TestContainerSharding(BaseAutoContainerSharding):
         self.put_objects(more_obj_names)
         self.brain.servers.start()
 
-        async_files = self.get_async_files()
+        async_files = self.gather_async_pendings()
+        self.assertTrue(async_files)
         for af in async_files:
             # They should have a sharded db_state
             self.assertInAsyncFile(af, {'db_state': 'sharded'})
@@ -1701,7 +1682,7 @@ class TestContainerSharding(BaseAutoContainerSharding):
                          obj_names + more_obj_names)
 
         # And they're cleared up
-        async_files = self.get_async_files()
+        async_files = self.gather_async_pendings()
         self.assertFalse(async_files)
 
         # If we take 1/2 the nodes offline when we add some more objects,
@@ -1714,7 +1695,8 @@ class TestContainerSharding(BaseAutoContainerSharding):
         self.put_objects(even_more_obj_names)
         self.brain.start_primary_half()
 
-        async_files = self.get_async_files()
+        async_files = self.gather_async_pendings()
+        self.assertTrue(async_files)
         for af in async_files:
             # They should have a sharded db_state AND container_path
             self.assertInAsyncFile(af, {'db_state': 'sharded',
@@ -1723,7 +1705,7 @@ class TestContainerSharding(BaseAutoContainerSharding):
         Manager(['object-updater']).once()
 
         # And they're cleared up
-        async_files = self.get_async_files()
+        async_files = self.gather_async_pendings()
         self.assertFalse(async_files)
 
     def test_shrinking(self):
@@ -1903,8 +1885,7 @@ class TestContainerSharding(BaseAutoContainerSharding):
 
             self.put_objects([beta])
             self.brain.servers.start()
-            async_pendings = self.gather_async_pendings(
-                self.get_all_object_nodes())
+            async_pendings = self.gather_async_pendings()
             num_container_replicas = len(self.brain.nodes)
             num_obj_replicas = self.policy.object_ring.replica_count
             expected_num_updates = num_container_updates(
@@ -2571,8 +2552,7 @@ class TestContainerSharding(BaseAutoContainerSharding):
         self.put_objects(['alpha'])
         self.assert_container_listing(['alpha'])
         self.assert_container_object_count(0)
-        self.assertLengthEqual(
-            self.gather_async_pendings(self.get_all_object_nodes()), 1)
+        self.assertLengthEqual(self.gather_async_pendings(), 1)
         self.brain.servers.start(number=shard_nodes[2])
 
         # run sharder on root to discover first shrink candidate
@@ -2619,8 +2599,7 @@ class TestContainerSharding(BaseAutoContainerSharding):
         self.put_objects(['beta'])
         self.assert_container_listing(['beta'])
         self.assert_container_object_count(1)
-        self.assertLengthEqual(
-            self.gather_async_pendings(self.get_all_object_nodes()), 2)
+        self.assertLengthEqual(self.gather_async_pendings(), 2)
         self.brain.servers.start(number=shard_nodes[2])
 
         # run sharder on root to discover second shrink candidate - root is not
@@ -3124,17 +3103,14 @@ class TestShardedAPI(BaseTestContainerSharding):
             params={'states': 'updating'})
         self._assert_namespace_equivalence(orig_shard_ranges, shard_ranges)
 
-        # XXX the states=listing param provokes the proxy to cache the backend
-        # values and then respond to the client with the cached *namespaces* !!
-        # shard_ranges = self.get_container_shard_ranges(
-        #     params={'states': 'listing'})
-        # self._assert_namespace_equivalence(orig_shard_ranges, shard_ranges)
+        shard_ranges = self.get_container_shard_ranges(
+            params={'states': 'listing'})
+        self._assert_namespace_equivalence(orig_shard_ranges, shard_ranges)
 
-        # XXX ditto...
-        # shard_ranges = self.get_container_shard_ranges(
-        #     headers={'X-Newest': 'true'},
-        #     params={'states': 'listing'})
-        # self._assert_namespace_equivalence(orig_shard_ranges, shard_ranges)
+        shard_ranges = self.get_container_shard_ranges(
+            headers={'X-Newest': 'true'},
+            params={'states': 'listing'})
+        self._assert_namespace_equivalence(orig_shard_ranges, shard_ranges)
 
         # this is what the sharder requests...
         shard_ranges = self.get_container_shard_ranges(
@@ -4188,8 +4164,9 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
 
         # sanity check: we don't have nearly enough objects for this to shard
         # automatically
-        self.sharders_once(number=self.brain.node_numbers[0],
-                           additional_args='--partitions=%s' % self.brain.part)
+        self.sharders_once_non_auto(
+            number=self.brain.node_numbers[0],
+            additional_args='--partitions=%s' % self.brain.part)
         self.assert_container_state(self.brain.nodes[0], 'unsharded', 0)
 
         self.assert_subprocess_success([
@@ -4202,7 +4179,8 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         # "Run container-replicator to replicate them to other nodes."
         self.replicators.once()
         # "Run container-sharder on all nodes to shard the container."
-        self.sharders_once(additional_args='--partitions=%s' % self.brain.part)
+        self.sharders_once_non_auto(
+            additional_args='--partitions=%s' % self.brain.part)
 
         # Everybody's settled
         self.assert_container_state(self.brain.nodes[0], 'sharded', 2)
@@ -4223,7 +4201,8 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
 
         # let's replicate
         self.replicators.once()
-        self.sharders_once(additional_args='--partitions=%s' % self.brain.part)
+        self.sharders_once_non_auto(
+            additional_args='--partitions=%s' % self.brain.part)
 
         # let's now check the handoff broker it should have all the shards
         handoff_broker = ContainerBroker(dir_content['normal_dbs'][0])
@@ -4243,8 +4222,9 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
 
         # sanity check: we don't have nearly enough objects for this to shard
         # automatically
-        self.sharders_once(number=self.brain.node_numbers[0],
-                           additional_args='--partitions=%s' % self.brain.part)
+        self.sharders_once_non_auto(
+            number=self.brain.node_numbers[0],
+            additional_args='--partitions=%s' % self.brain.part)
         self.assert_container_state(self.brain.nodes[0], 'unsharded', 0)
 
         self.assert_subprocess_success([
@@ -4257,7 +4237,8 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         # "Run container-replicator to replicate them to other nodes."
         self.replicators.once()
         # "Run container-sharder on all nodes to shard the container."
-        self.sharders_once(additional_args='--partitions=%s' % self.brain.part)
+        self.sharders_once_non_auto(
+            additional_args='--partitions=%s' % self.brain.part)
 
         # Everybody's settled
         self.assert_container_state(self.brain.nodes[0], 'sharded', 2)
@@ -4285,7 +4266,8 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         self.assertEqual(len(dir_content['shard_dbs']), 2)
 
         # run the sharders incase this will trigger a reset osr
-        self.sharders_once(additional_args='--partitions=%s' % self.brain.part)
+        self.sharders_once_non_auto(
+            additional_args='--partitions=%s' % self.brain.part)
         new_primary_broker = self.get_broker(self.brain.part, new_primary)
         # Nope, still no default/reset osr
         self.assertIsNone(
@@ -4316,8 +4298,10 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         self.assertIsNone(new_osr.epoch)
         self.assertGreater(new_osr.timestamp, old_osr.timestamp)
 
-    def test_mange_shard_ranges_missing_epoch_false_postives(self):
-        # verify shard range compaction using swift-manage-shard-ranges
+    def test_manage_shard_ranges_missing_epoch_no_false_positives(self):
+        # when one replica of a shard is sharding before the others, it's epoch
+        # is not None but it is normal for the other replica to replicate to it
+        # sending their own shard ranges with epoch=None until they also shard
         obj_names = self._make_object_names(4)
         self.put_objects(obj_names)
         client.post_container(self.url, self.admin_token, self.container_name,
@@ -4335,10 +4319,11 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         # "Run container-replicator to replicate them to other nodes."
         self.replicators.once()
         # "Run container-sharder on all nodes to shard the container."
-        self.sharders_once(additional_args='--partitions=%s' % self.brain.part)
+        self.sharders_once_non_auto(
+            additional_args='--partitions=%s' % self.brain.part)
         # Run them again, just so the shards themselves can pull down the
         # latest sharded versions of their OSRs.
-        self.sharders_once()
+        self.sharders_once_non_auto()
 
         # Everybody's settled
         self.assert_container_state(self.brain.nodes[0], 'sharded', 2)
@@ -4380,9 +4365,8 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
             shard_node_numbers[0], {})
         warnings = replicator.logger.get_lines_for_level('warning')
 
-        self.assertTrue(any(
-            [True for w in warnings
-             if expected_false_positive_line_snippet in w]))
+        self.assertFalse([w for w in warnings
+                          if expected_false_positive_line_snippet in w])
 
         # But it does send the new OSR with an epoch so the others should all
         # have it now.

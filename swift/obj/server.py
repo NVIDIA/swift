@@ -152,9 +152,7 @@ class ObjectController(BaseStorageServer):
             config_true_value(conf.get('keep_cache_private', 'false'))
         self.keep_cache_slo_manifest = \
             config_true_value(conf.get('keep_cache_slo_manifest', 'false'))
-        self.cooperative_period = int(conf.get("cooperative_period", -1))
-        self.sleep_in_call = config_true_value(
-            conf.get('sleep_in_call', 'false'))
+        self.cooperative_period = int(conf.get("cooperative_period", 0))
 
         default_allowed_headers = '''
             content-disposition,
@@ -375,7 +373,7 @@ class ObjectController(BaseStorageServer):
         contdevices = [d.strip() for d in
                        headers_in.get('X-Container-Device', '').split(',')]
         contpartition = headers_in.get('X-Container-Partition', '')
-        contdbstate = headers_in.get('X-Container-Db-State', '')
+        contdbstate = headers_in.get('X-Container-Root-Db-State')
 
         if len(conthosts) != len(contdevices):
             # This shouldn't happen unless there's a bug in the proxy,

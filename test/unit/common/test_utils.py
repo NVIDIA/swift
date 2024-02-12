@@ -2128,10 +2128,8 @@ log_name = %(yarr)s'''
             utils.capture_stdio(logger)
             self.assertTrue(utils.sys.excepthook is not None)
             self.assertEqual(utils.os.closed_fds, utils.sys.stdio_fds)
-            self.assertTrue(
-                isinstance(utils.sys.stdout, utils.LoggerFileObject))
-            self.assertTrue(
-                isinstance(utils.sys.stderr, utils.LoggerFileObject))
+            self.assertIsInstance(utils.sys.stdout, utils.LoggerFileObject)
+            self.assertIsInstance(utils.sys.stderr, utils.LoggerFileObject)
 
             # reset; test same args, but exc when trying to close stdio
             utils.os = MockOs(raise_funcs=('dup2',))
@@ -2141,10 +2139,8 @@ log_name = %(yarr)s'''
             utils.capture_stdio(logger)
             self.assertTrue(utils.sys.excepthook is not None)
             self.assertEqual(utils.os.closed_fds, [])
-            self.assertTrue(
-                isinstance(utils.sys.stdout, utils.LoggerFileObject))
-            self.assertTrue(
-                isinstance(utils.sys.stderr, utils.LoggerFileObject))
+            self.assertIsInstance(utils.sys.stdout, utils.LoggerFileObject)
+            self.assertIsInstance(utils.sys.stderr, utils.LoggerFileObject)
 
             # reset; test some other args
             utils.os = MockOs()
@@ -3606,7 +3602,7 @@ cluster_dfw1 = http://dfw1.host/v1/
                     utils.fsync_dir(tempdir)
             self.assertTrue(_mock_fsync.called)
             self.assertTrue(_mock_close.called)
-            self.assertTrue(isinstance(_mock_fsync.call_args[0][0], int))
+            self.assertIsInstance(_mock_fsync.call_args[0][0], int)
             self.assertEqual(_mock_fsync.call_args[0][0],
                              _mock_close.call_args[0][0])
 
@@ -4906,8 +4902,7 @@ class TestStatsdLogging(unittest.TestCase):
         logger = utils.get_logger({'log_statsd_host': 'some.host.com'},
                                   'some-name', log_route='some-route')
         # white-box construction validation
-        self.assertTrue(isinstance(logger.logger.statsd_client,
-                                   utils.StatsdClient))
+        self.assertIsInstance(logger.logger.statsd_client, utils.StatsdClient)
         self.assertEqual(logger.logger.statsd_client._host, 'some.host.com')
         self.assertEqual(logger.logger.statsd_client._port, 8125)
         self.assertEqual(logger.logger.statsd_client._prefix, 'some-name.')
@@ -8167,6 +8162,15 @@ class TestNamespaceBoundList(unittest.TestCase):
         self.end_ns = utils.Namespace('a/z-', 'z', '')
         self.lowerbounds = [start, atof, ftol, ltor, rtoz, end]
 
+    def test_eq(self):
+        this = utils.NamespaceBoundList(self.lowerbounds)
+        that = utils.NamespaceBoundList(self.lowerbounds)
+        self.assertEqual(this, that)
+        that = utils.NamespaceBoundList(self.lowerbounds[:1])
+        self.assertNotEqual(this, that)
+        self.assertNotEqual(this, None)
+        self.assertNotEqual(this, self.lowerbounds)
+
     def test_get_namespace(self):
         namespace_list = utils.NamespaceBoundList(self.lowerbounds)
         self.assertEqual(namespace_list.bounds, self.lowerbounds)
@@ -9601,7 +9605,7 @@ class TestWatchdog(unittest.TestCase):
 
         now = time.time()
         timeout_value = 1.0
-        with patch('eventlet.greenthread.getcurrent', return_value=gth),\
+        with patch('eventlet.greenthread.getcurrent', return_value=gth), \
                 patch('time.time', return_value=now):
             # On first call, _next_expiration is None, it should unblock
             # greenthread that is blocked for ever
@@ -9802,7 +9806,7 @@ class TestCooperativeIterator(unittest.TestCase):
         it.close()
         self.assertTrue(closeable.close.called)
 
-    def test_next(self):
+    def test_sleeps(self):
         def do_test(it, period):
             results = []
             for i in range(period):
@@ -9833,8 +9837,21 @@ class TestCooperativeIterator(unittest.TestCase):
         self.assertEqual(list(range(7)), actual)
         actual = do_test(utils.CooperativeIterator(itertools.count(), 1), 1)
         self.assertEqual(list(range(3)), actual)
-        actual = do_test(utils.CooperativeIterator(itertools.count(), 0), 0)
-        self.assertEqual(list(range(2)), actual)
+
+    def test_no_sleeps(self):
+        def do_test(period):
+            it = utils.CooperativeIterator(itertools.count(), period)
+            results = []
+            with mock.patch('swift.common.utils.sleep') as mock_sleep:
+                for i in range(100):
+                    results.append(next(it))
+                    self.assertFalse(mock_sleep.called, i)
+            self.assertEqual(list(range(100)), results)
+
+        do_test(0)
+        do_test(-1)
+        do_test(-111)
+        do_test(None)
 
 
 class TestContextPool(unittest.TestCase):

@@ -58,7 +58,7 @@ from test.unit import (
     connect_tcp, readuntil2crlfs, fake_http_connect, FakeRing,
     FakeMemcache, patch_policies, write_fake_ring, mocked_http_conn,
     DEFAULT_TEST_EC_TYPE, make_timestamp_iter, skip_if_no_xattrs,
-    FakeHTTPResponse)
+    FakeHTTPResponse, node_error_count, node_last_error, set_node_errors)
 from test.unit.helpers import setup_servers, teardown_servers
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers.obj import ReplicatedObjectController
@@ -154,31 +154,6 @@ def parse_headers_string(headers_str):
             else:
                 headers_dict[header.decode('utf8')] = value.decode('utf8')
     return headers_dict
-
-
-def get_node_error_stats(proxy_app, ring_node):
-    node_key = proxy_app.error_limiter.node_key(ring_node)
-    return proxy_app.error_limiter.stats.get(node_key) or {}
-
-
-def node_error_count(proxy_app, ring_node):
-    # Reach into the proxy's internals to get the error count for a
-    # particular node
-    return get_node_error_stats(proxy_app, ring_node).get('errors', 0)
-
-
-def node_last_error(proxy_app, ring_node):
-    # Reach into the proxy's internals to get the last error for a
-    # particular node
-    return get_node_error_stats(proxy_app, ring_node).get('last_error')
-
-
-def set_node_errors(proxy_app, ring_node, value, last_error):
-    # Set the node's error count to value
-    node_key = proxy_app.error_limiter.node_key(ring_node)
-    stats = {'errors': value,
-             'last_error': last_error}
-    proxy_app.error_limiter.stats[node_key] = stats
 
 
 @contextmanager
@@ -2367,6 +2342,7 @@ class BaseTestObjectController(object):
     A root of TestObjController that implements helper methods for child
     TestObjControllers.
     """
+
     def setUp(self):
         # clear proxy logger result for each test
         _test_servers[0].logger._clear()
@@ -2589,6 +2565,7 @@ class TestReplicatedObjectController(
     """
     Test suite for replication policy
     """
+
     def setUp(self):
         skip_if_no_xattrs()
         _test_servers[0].error_limiter.stats.clear()  # clear out errors
@@ -7357,7 +7334,7 @@ class TestReplicatedObjectController(
         header_list = kwargs.pop('header_list', ['X-Container-Device',
                                                  'X-Container-Host',
                                                  'X-Container-Partition',
-                                                 'X-Container-Db-State'])
+                                                 'X-Container-Root-Db-State'])
         seen_headers = []
 
         def capture_headers(ipaddr, port, device, partition, method,
@@ -7400,9 +7377,9 @@ class TestReplicatedObjectController(
         }
         shardrange = ShardRange('.sharded_a/c_something', 0, 'm', 'z')
 
-        # We should always get X-Container-Db-State with the current db_state
-        # and when db_state is either sharding or sharded we should also get
-        # an X-Backend-Quoted-Container-Path with a shard name.
+        # We should always get X-Container-Root-Db-State with the current
+        # db_state and when db_state is either sharding or sharded we should
+        # also get an X-Backend-Quoted-Container-Path with a shard name.
         for db_state, expect_cont_path in (
                 (NOTFOUND, False), (UNSHARDED, False), (SHARDING, True),
                 (SHARDED, True), (COLLAPSED, False)):
@@ -7416,20 +7393,20 @@ class TestReplicatedObjectController(
 
             exp_seen_header_list = [
                 'X-Container-Device', 'X-Container-Host',
-                'X-Container-Partition', 'X-Container-Db-State']
+                'X-Container-Partition', 'X-Container-Root-Db-State']
             expected_headers = [
                 {'X-Container-Host': '10.0.0.0:1000',
                     'X-Container-Partition': '0',
                     'X-Container-Device': 'sda',
-                    'X-Container-Db-State': db_state},
+                    'X-Container-Root-Db-State': db_state},
                 {'X-Container-Host': '10.0.0.1:1001',
                     'X-Container-Partition': '0',
                     'X-Container-Device': 'sdb',
-                    'X-Container-Db-State': db_state},
+                    'X-Container-Root-Db-State': db_state},
                 {'X-Container-Host': '10.0.0.2:1002',
                     'X-Container-Partition': '0',
                     'X-Container-Device': 'sdc',
-                    'X-Container-Db-State': db_state}]
+                    'X-Container-Root-Db-State': db_state}]
             if expect_cont_path:
                 exp_seen_header_list.append('X-Backend-Quoted-Container-Path')
                 for headers in expected_headers:
@@ -7460,15 +7437,15 @@ class TestReplicatedObjectController(
                 {'X-Container-Host': '10.0.0.0:1000',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sda',
-                 'X-Container-Db-State': 'unsharded'},
+                 'X-Container-Root-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.1:1001',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sdb',
-                 'X-Container-Db-State': 'unsharded'},
+                 'X-Container-Root-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.2:1002',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sdc',
-                 'X-Container-Db-State': 'unsharded'}])
+                 'X-Container-Root-Db-State': 'unsharded'}])
 
     def test_PUT_x_container_headers_with_fewer_container_replicas(self):
         self.app.container_ring.set_replicas(2)
@@ -7486,15 +7463,15 @@ class TestReplicatedObjectController(
                 {'X-Container-Host': '10.0.0.0:1000',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sda',
-                 'X-Container-Db-State': 'unsharded'},
+                 'X-Container-Root-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.1:1001',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sdb',
-                 'X-Container-Db-State': 'unsharded'},
+                 'X-Container-Root-Db-State': 'unsharded'},
                 {'X-Container-Host': None,
                  'X-Container-Partition': None,
                  'X-Container-Device': None,
-                 'X-Container-Db-State': None}])
+                 'X-Container-Root-Db-State': None}])
 
     def test_PUT_x_container_headers_with_many_object_replicas(self):
         POLICIES[0].object_ring.set_replicas(11)
@@ -7514,19 +7491,20 @@ class TestReplicatedObjectController(
             {(('X-Container-Db-State', 'unsharded'),
               ('X-Container-Device', 'sda'),
               ('X-Container-Host', '10.0.0.0:1000'),
-              ('X-Container-Partition', '0')): 3,
-             (('X-Container-Db-State', 'unsharded'),
-              ('X-Container-Device', 'sdb'),
+              ('X-Container-Partition', '0'),
+              ('X-Container-Root-Db-State', 'unsharded')): 3,
+             (('X-Container-Device', 'sdb'),
               ('X-Container-Host', '10.0.0.1:1001'),
-              ('X-Container-Partition', '0')): 2,
-             (('X-Container-Db-State', 'unsharded'),
-              ('X-Container-Device', 'sdc'),
+              ('X-Container-Partition', '0'),
+              ('X-Container-Root-Db-State', 'unsharded')): 2,
+             (('X-Container-Device', 'sdc'),
               ('X-Container-Host', '10.0.0.2:1002'),
-              ('X-Container-Partition', '0')): 2,
-             (('X-Container-Db-State', None),
-              ('X-Container-Device', None),
+              ('X-Container-Partition', '0'),
+              ('X-Container-Root-Db-State', 'unsharded')): 2,
+             (('X-Container-Device', None),
               ('X-Container-Host', None),
-              ('X-Container-Partition', None),): 4})
+              ('X-Container-Partition', None),
+              ('X-Container-Root-Db-State', None)): 4})
 
     def test_PUT_x_container_headers_with_more_container_replicas(self):
         self.app.container_ring.set_replicas(4)
@@ -7544,15 +7522,15 @@ class TestReplicatedObjectController(
                 {'X-Container-Host': '10.0.0.0:1000,10.0.0.3:1003',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sda,sdd',
-                 'X-Container-Db-State': 'unsharded'},
+                 'X-Container-Root-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.1:1001',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sdb',
-                 'X-Container-Db-State': 'unsharded'},
+                 'X-Container-Root-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.2:1002',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sdc',
-                 'X-Container-Db-State': 'unsharded'}])
+                 'X-Container-Root-Db-State': 'unsharded'}])
 
     def test_POST_x_container_headers_with_more_container_replicas(self):
         self.app.container_ring.set_replicas(4)
@@ -7571,15 +7549,15 @@ class TestReplicatedObjectController(
                 {'X-Container-Host': '10.0.0.0:1000,10.0.0.3:1003',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sda,sdd',
-                 'X-Container-Db-State': 'unsharded'},
+                 'X-Container-Root-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.1:1001',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sdb',
-                 'X-Container-Db-State': 'unsharded'},
+                 'X-Container-Root-Db-State': 'unsharded'},
                 {'X-Container-Host': '10.0.0.2:1002',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sdc',
-                 'X-Container-Db-State': 'unsharded'}])
+                 'X-Container-Root-Db-State': 'unsharded'}])
 
     def test_DELETE_x_container_headers_with_more_container_replicas(self):
         self.app.container_ring.set_replicas(4)
@@ -7598,15 +7576,15 @@ class TestReplicatedObjectController(
             {'X-Container-Host': '10.0.0.0:1000,10.0.0.3:1003',
              'X-Container-Partition': '0',
              'X-Container-Device': 'sda,sdd',
-             'X-Container-Db-State': 'unsharded'},
+             'X-Container-Root-Db-State': 'unsharded'},
             {'X-Container-Host': '10.0.0.1:1001',
              'X-Container-Partition': '0',
              'X-Container-Device': 'sdb',
-             'X-Container-Db-State': 'unsharded'},
+             'X-Container-Root-Db-State': 'unsharded'},
             {'X-Container-Host': '10.0.0.2:1002',
              'X-Container-Partition': '0',
              'X-Container-Device': 'sdc',
-             'X-Container-Db-State': 'unsharded'}
+             'X-Container-Root-Db-State': 'unsharded'}
         ])
 
     @mock.patch('time.time', new=lambda: STATIC_TIME)
@@ -11802,6 +11780,7 @@ class TestAccountControllerFakeGetResponse(unittest.TestCase):
     Test all the faked-out GET responses for accounts that don't exist. They
     have to match the responses for empty accounts that really exist.
     """
+
     def setUp(self):
         conf = {'account_autocreate': 'yes'}
         self.app = listing_formats.ListingFilter(

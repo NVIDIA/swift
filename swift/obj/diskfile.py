@@ -429,22 +429,23 @@ def consolidate_hashes(partition_dir):
     with lock_path(partition_dir):
         hashes = read_hashes(partition_dir)
 
-        found_invalidation_entry = False
+        found_invalidation_entry = hashes_updated = False
         try:
             with open(invalidations_file, 'r') as inv_fh:
                 for line in inv_fh:
                     found_invalidation_entry = True
                     suffix = line.strip()
-                    if line.startswith('!'):
-                        hashes.pop(suffix[1:], None)
-                    else:
-                        hashes[suffix] = None
+                    if not valid_suffix(suffix):
+                        continue
+                    hashes_updated = True
+                    hashes[suffix] = None
         except (IOError, OSError) as e:
             if e.errno != errno.ENOENT:
                 raise
 
-        if found_invalidation_entry:
+        if hashes_updated:
             write_hashes(partition_dir, hashes)
+        if found_invalidation_entry:
             # Now that all the invalidations are reflected in hashes.pkl, it's
             # safe to clear out the invalidations file.
             with open(invalidations_file, 'wb') as inv_fh:
@@ -2122,7 +2123,7 @@ class BaseDiskFileReader(object):
     def __init__(self, fp, data_file, obj_size, etag,
                  disk_chunk_size, keep_cache_size, device_path, logger,
                  quarantine_hook, use_splice, pipe_size, diskfile,
-                 keep_cache=False, cooperative_period=None):
+                 keep_cache=False, cooperative_period=0):
         # Parameter tracking
         self._fp = fp
         self._data_file = data_file
@@ -2166,14 +2167,8 @@ class BaseDiskFileReader(object):
             self._iter_etag.update(chunk)
 
     def __iter__(self):
-        inner_iter = self._inner_iter()
-        if (
-            self._cooperative_period is not None
-            and self._cooperative_period >= 0
-        ):
-            inner_iter = CooperativeIterator(
-                inner_iter, period=self._cooperative_period)
-        return inner_iter
+        return CooperativeIterator(
+            self._inner_iter(), period=self._cooperative_period)
 
     def _inner_iter(self):
         """Returns an iterator over the data file."""
@@ -2994,7 +2989,7 @@ class BaseDiskFile(object):
         with self.open(current_time=current_time):
             return self.get_metadata()
 
-    def reader(self, keep_cache=False, cooperative_period=None,
+    def reader(self, keep_cache=False, cooperative_period=0,
                _quarantine_hook=lambda m: None):
         """
         Return a :class:`swift.common.swob.Response` class compatible
@@ -3006,7 +3001,7 @@ class BaseDiskFile(object):
 
         :param keep_cache: caller's preference for keeping data read in the
                            OS buffer cache
-        :param cooperative_period: the period parameter when does cooperative
+        :param cooperative_period: the period parameter for cooperative
                                    yielding during file read
         :param _quarantine_hook: 1-arg callable called when obj quarantined;
                                  the arg is the reason for quarantine.
@@ -3183,7 +3178,7 @@ class ECDiskFileReader(BaseDiskFileReader):
     def __init__(self, fp, data_file, obj_size, etag,
                  disk_chunk_size, keep_cache_size, device_path, logger,
                  quarantine_hook, use_splice, pipe_size, diskfile,
-                 keep_cache=False, cooperative_period=None):
+                 keep_cache=False, cooperative_period=0):
         super(ECDiskFileReader, self).__init__(
             fp, data_file, obj_size, etag,
             disk_chunk_size, keep_cache_size, device_path, logger,

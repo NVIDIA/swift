@@ -20,7 +20,8 @@ from eventlet import Timeout
 from random import choice
 
 from swift.container.sync_store import ContainerSyncStore
-from swift.container.backend import ContainerBroker, DATADIR, SHARDED
+from swift.container.backend import ContainerBroker, DATADIR, SHARDED, \
+    merge_shards
 from swift.container.reconciler import (
     MISPLACED_OBJECTS_ACCOUNT, incorrect_policy_index,
     get_reconciler_container_name, get_row_to_q_entry_translator)
@@ -42,13 +43,19 @@ def check_merge_own_shard_range(shards, broker, logger, source):
     :param source: string to log as source of shards
     :return: a list of ShardRanges to actually merge
     """
-    if broker.get_own_shard_range().epoch is None:
+    # work-around for https://bugs.launchpad.net/swift/+bug/1980451
+    own_sr = broker.get_own_shard_range()
+    if own_sr.epoch is None:
         return shards
     to_merge = []
     for shard in shards:
-        if shard['name'] == broker.path and shard['epoch'] is None:
-            logger.warning('Ignoring remote osr w/o epoch: %r, from: %s',
-                           shard, source)
+        if shard['name'] == own_sr.name and not shard['epoch']:
+            shard_copy = dict(shard)
+            new_content = merge_shards(shard_copy, dict(own_sr))
+            if new_content and shard_copy['epoch'] is None:
+                logger.warning(
+                    'Ignoring remote osr w/o epoch, own_sr: %r, remote_sr: %r,'
+                    ' source: %s', dict(own_sr), shard, source)
             continue
         to_merge.append(shard)
     return to_merge

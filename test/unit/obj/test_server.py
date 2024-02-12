@@ -970,7 +970,7 @@ class TestObjectController(BaseTestCase):
             'X-Container-Host': 'chost:cport',
             'X-Container-Partition': 'cpartition',
             'X-Container-Device': 'cdevice',
-            'X-Container-Db-State': 'unsharded'}
+            'X-Container-Root-Db-State': 'unsharded'}
         if policy.policy_type == EC_POLICY:
             put_headers.update({
                 'X-Object-Sysmeta-Ec-Frag-Index': '2',
@@ -1022,7 +1022,7 @@ class TestObjectController(BaseTestCase):
             'X-Container-Host': 'chost:cport',
             'X-Container-Partition': 'cpartition',
             'X-Container-Device': 'cdevice',
-            'X-Container-Db-State': 'unsharded'}
+            'X-Container-Root-Db-State': 'unsharded'}
         req = Request.blank('/sda1/p/a/c/o',
                             environ={'REQUEST_METHOD': 'POST'},
                             headers=post_headers)
@@ -1121,14 +1121,14 @@ class TestObjectController(BaseTestCase):
             'X-Container-Host': 'chost:3200',
             'X-Container-Partition': '99',
             'X-Container-Device': 'cdevice',
-            'X-Container-Db-State': 'unsharded'}
+            'X-Container-Root-Db-State': 'unsharded'}
 
         if container_path:
             # the proxy may include either header
             hdr = ('X-Backend-Container-Path' if old_style
                    else 'X-Backend-Quoted-Container-Path')
             put_headers[hdr] = container_path
-            put_headers['X-Container-Db-State'] = 'sharded'
+            put_headers['X-Container-Root-Db-State'] = 'sharded'
             expected_update_path = '/cdevice/99/%s/o' % container_path
         else:
             expected_update_path = '/cdevice/99/a/c/o'
@@ -1146,7 +1146,7 @@ class TestObjectController(BaseTestCase):
                         'X-Backend-Redirect-Timestamp': next(self.ts).internal}
 
         with mocked_http_conn(301, headers=[resp_headers]) as conn, \
-                mock.patch('swift.common.utils.HASH_PATH_PREFIX', b''),\
+                mock.patch('swift.common.utils.HASH_PATH_PREFIX', b''), \
                 fake_spawn():
             resp = req.get_response(self.object_controller)
 
@@ -4355,7 +4355,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=True, cooperative_period=-1)
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4379,7 +4379,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=True, cooperative_period=-1)
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have 'X-Storage-Token'.
@@ -4390,7 +4390,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=True, cooperative_period=-1)
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have both 'X-Auth-Token' and 'X-Storage-Token'.
@@ -4402,7 +4402,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=True, cooperative_period=-1)
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
     def test_GET_keep_cache_private_config_false(self):
@@ -4431,7 +4431,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=True, cooperative_period=-1)
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4455,7 +4455,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=False, cooperative_period=-1)
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have 'X-Storage-Token'.
@@ -4466,7 +4466,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=False, cooperative_period=-1)
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
         # Request headers have both 'X-Auth-Token' and 'X-Storage-Token'.
@@ -4478,7 +4478,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=False, cooperative_period=-1)
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
 
     def test_GET_keep_cache_slo_manifest_no_config(self):
@@ -4509,7 +4509,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=False, cooperative_period=-1)
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4555,7 +4555,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=False, cooperative_period=-1)
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4601,7 +4601,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=True, cooperative_period=-1)
+                keep_cache=True, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4646,7 +4646,7 @@ class TestObjectController(BaseTestCase):
         with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
             resp = req.get_response(obj_controller)
             reader_mock.assert_called_with(
-                keep_cache=False, cooperative_period=-1)
+                keep_cache=False, cooperative_period=0)
         self.assertEqual(resp.status_int, 200)
         etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         self.assertEqual(dict(resp.headers), {
@@ -4669,7 +4669,6 @@ class TestObjectController(BaseTestCase):
                 'cooperative_period': '99'}
         obj_controller = object_server.ObjectController(
             conf, logger=self.logger)
-        obj_controller.bytes_per_sync = 1
 
         timestamp = normalize_timestamp(time())
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -4682,26 +4681,18 @@ class TestObjectController(BaseTestCase):
         req = Request.blank('/sda1/p/a/c/o',
                             headers={'Content-Type': 'application/x-test',
                                      'X-Auth-Token': '2340lsdfhhjl02lxfjj'})
-        reader_mock = mock.Mock(keep_cache=False)
-        with mock.patch('swift.obj.diskfile.BaseDiskFile.reader', reader_mock):
+        with mock.patch(
+            "swift.obj.diskfile.BaseDiskFile.reader"
+        ) as reader_mock:
             resp = req.get_response(obj_controller)
         reader_mock.assert_called_with(keep_cache=False, cooperative_period=99)
         self.assertEqual(resp.status_int, 200)
 
         # Test DiskFile reader actually sleeps when reading chunks. When
-        # cooperative_period is 1, disk reader sleeps once after each next().
+        # cooperative_period is 1, disk reader sleeps once AFTER each next().
         conf['cooperative_period'] = '1'
         obj_controller = object_server.ObjectController(
             conf, logger=self.logger)
-        obj_controller.bytes_per_sync = 1
-
-        timestamp = normalize_timestamp(time())
-        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'X-Timestamp': timestamp,
-                                     'Content-Type': 'application/x-test'})
-        req.body = b'7 bytes'
-        resp = req.get_response(obj_controller)
-        self.assertEqual(resp.status_int, 201)
 
         req = Request.blank('/sda1/p/a/c/o',
                             environ={'REQUEST_METHOD': 'GET'},
@@ -4713,44 +4704,38 @@ class TestObjectController(BaseTestCase):
             self.assertEqual(b' bytes', resp.body)
         self.assertEqual(1, mock_sleep.call_count)
 
-        # Test DiskFile reader actually sleeps when reading chunks. When
-        # cooperative_period is 0, disk reader sleeps once before each next().
+        # Test DiskFile reader actually sleeps when reading chunks. And verify
+        # number of sleeps when 'disk_chunk_size' is set.
+        conf['cooperative_period'] = '2'
+        conf['disk_chunk_size'] = 2
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(b'7 bytes', resp.body)
+        self.assertEqual(2, mock_sleep.call_count)
+
+        conf['cooperative_period'] = '2'
+        conf['disk_chunk_size'] = 3
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(b'7 bytes', resp.body)
+        self.assertEqual(1, mock_sleep.call_count)
+
+        # Test DiskFile reader won't sleep with cooperative_period set as 0.
         conf['cooperative_period'] = '0'
         obj_controller = object_server.ObjectController(
             conf, logger=self.logger)
-        obj_controller.bytes_per_sync = 1
-
-        timestamp = normalize_timestamp(time())
-        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'X-Timestamp': timestamp,
-                                     'Content-Type': 'application/x-test'})
-        req.body = b'7 bytes'
-        resp = req.get_response(obj_controller)
-        self.assertEqual(resp.status_int, 201)
-
-        req = Request.blank('/sda1/p/a/c/o',
-                            environ={'REQUEST_METHOD': 'GET'},
-                            headers={'Range': 'bytes=1-6'})
-        with mock.patch('swift.common.utils.sleep') as mock_sleep:
-            resp = req.get_response(obj_controller)
-            self.assertEqual(resp.status_int, 206)
-            self.assertEqual('bytes 1-6/7', resp.headers.get('Content-Range'))
-            self.assertEqual(b' bytes', resp.body)
-        self.assertEqual(2, mock_sleep.call_count)
-
-        # Test DiskFile reader won't sleep with default cooperative_period.
-        conf.pop('cooperative_period')
-        obj_controller = object_server.ObjectController(
-            conf, logger=self.logger)
-        obj_controller.bytes_per_sync = 1
-
-        timestamp = normalize_timestamp(time())
-        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'X-Timestamp': timestamp,
-                                     'Content-Type': 'application/x-test'})
-        req.body = b'7 bytes'
-        resp = req.get_response(obj_controller)
-        self.assertEqual(resp.status_int, 201)
 
         req = Request.blank('/sda1/p/a/c/o',
                             environ={'REQUEST_METHOD': 'GET'},
@@ -4762,57 +4747,21 @@ class TestObjectController(BaseTestCase):
             self.assertEqual(b' bytes', resp.body)
         self.assertFalse(mock_sleep.called)
 
-    def test_sleep_in_call_config(self):
-        def do_call(method, sleep_in_call):
-            conf = {'devices': self.testdir, 'mount_check': 'false',
-                    'sleep_in_call': sleep_in_call}
-            obj_controller = object_server.ObjectController(
-                conf, logger=self.logger)
-            obj_controller.bytes_per_sync = 1
+        # Test DiskFile reader won't sleep with default cooperative_period
+        # which is also 0.
+        conf.pop('cooperative_period')
+        obj_controller = object_server.ObjectController(
+            conf, logger=self.logger)
 
-            start_time = time()
-            now = [start_time]
-            sleep_calls = [0]
-
-            def fake_time():
-                now[0] += 1
-                return now[0]
-
-            def mock_sleep():
-                sleep_calls[0] += 1
-                now[0] += 12345
-
-            req = Request.blank('/sda1/p/a/c/o',
-                                environ={'REQUEST_METHOD': method})
-            req.headers.update({'X-Timestamp': Timestamp.now().normal,
-                                'Content-Length': '0',
-                                'Content-Type': 'plain/text'})
-
-            with mock.patch(
-                    'swift.obj.server.get_log_line',
-                    return_value='mocked log line') as mock_get_log_line:
-                with mock.patch('swift.common.utils.sleep', mock_sleep):
-                    with mock.patch('swift.obj.server.time.time', fake_time):
-                        with mock.patch.object(obj_controller,
-                                               'logger') as mock_logger:
-                            req.get_response(obj_controller)
-
-            self.assertEqual(1 if sleep_in_call else 0, sleep_calls[0])
-            mock_get_log_line.assert_called_once()
-            log_trans_time = mock_get_log_line.call_args_list[0][0][2]
-
-            mock_logger.timing_since.assert_called_once()
-            stats_start_time = mock_logger.timing_since.call_args_list[0][0][1]
-            stats_elapsed_time = fake_time() - stats_start_time
-            return log_trans_time, stats_elapsed_time
-
-        for method in ('GET', 'HEAD', 'DELETE', 'PUT', 'POST', 'REPLICATE'):
-            log_time, stats_time = do_call(method, False)
-            self.assertLess(log_time, 12345)
-            self.assertLess(stats_time, 12345)
-            log_time, stats_time = do_call(method, True)
-            self.assertGreater(log_time, 12345)
-            self.assertGreater(stats_time, 12345)
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Range': 'bytes=1-6'})
+        with mock.patch('swift.common.utils.sleep') as mock_sleep:
+            resp = req.get_response(obj_controller)
+            self.assertEqual(resp.status_int, 206)
+            self.assertEqual('bytes 1-6/7', resp.headers.get('Content-Range'))
+            self.assertEqual(b' bytes', resp.body)
+        self.assertFalse(mock_sleep.called)
 
     @mock.patch("time.time", mock_time)
     def test_DELETE(self):
@@ -6262,14 +6211,14 @@ class TestObjectController(BaseTestCase):
                 'X-Container-Host': 'chost:cport',
                 'X-Container-Partition': 'cpartition',
                 'X-Container-Device': 'cdevice',
-                'X-Container-Db-State': 'unsharded',
+                'X-Container-Root-Db-State': 'unsharded',
                 'Content-Type': 'text/plain',
                 'X-Object-Sysmeta-Ec-Frag-Index': 0,
                 'X-Backend-Storage-Policy-Index': int(policy),
             }
             if container_path is not None:
                 headers['X-Backend-Container-Path'] = container_path
-                headers['X-Container-Db-State'] = 'sharded'
+                headers['X-Container-Root-Db-State'] = 'sharded'
 
             req = Request.blank('/sda1/0/a/c/o', method='PUT',
                                 headers=headers, body='')
@@ -6357,14 +6306,14 @@ class TestObjectController(BaseTestCase):
                 'X-Container-Host': 'chost:cport',
                 'X-Container-Partition': 'cpartition',
                 'X-Container-Device': 'cdevice',
-                'X-Container-Db-State': 'unsharded',
+                'X-Container-Root-Db-State': 'unsharded',
                 'Content-Type': 'text/plain',
                 'X-Object-Sysmeta-Ec-Frag-Index': 0,
                 'X-Backend-Storage-Policy-Index': int(policy),
             }
             if container_path is not None:
                 headers['X-Backend-Quoted-Container-Path'] = container_path
-                headers['X-Container-Db-State'] = 'sharded'
+                headers['X-Container-Root-Db-State'] = 'sharded'
 
             req = Request.blank('/sda1/0/a/c/o', method='PUT',
                                 headers=headers, body='')
@@ -6436,7 +6385,7 @@ class TestObjectController(BaseTestCase):
                      'X-Container-Host': 'chost:cport',
                      'X-Container-Partition': 'cpartition',
                      'X-Container-Device': 'cdevice',
-                     'X-Container-Db-State': 'unsharded',
+                     'X-Container-Root-Db-State': 'unsharded',
                      'Content-Type': 'text/plain',
                      'X-Object-Sysmeta-Ec-Frag-Index': 0,
                      'X-Backend-Storage-Policy-Index': int(policy)}, body='')
@@ -6501,7 +6450,7 @@ class TestObjectController(BaseTestCase):
                      'X-Container-Partition': '20',
                      'X-Container-Host': '1.2.3.4:5',
                      'X-Container-Device': 'sdb1',
-                     'X-Container-Db-State': 'unsharded'})
+                     'X-Container-Root-Db-State': 'unsharded'})
         with mock.patch.object(object_server, 'spawn', local_fake_spawn), \
                 mock.patch.object(self.object_controller, 'async_update',
                                   local_fake_async_update):

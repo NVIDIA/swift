@@ -390,9 +390,10 @@ class BaseObjectController(Controller):
             if update_shard_ns:
                 partition, nodes = self.app.container_ring.get_nodes(
                     update_shard_ns.account, update_shard_ns.container)
-                return partition, nodes, update_shard_ns.name
+                return partition, nodes, update_shard_ns.name, db_state
 
-        return container_info['partition'], container_info['nodes'], None
+        return (container_info['partition'], container_info['nodes'], None,
+                db_state)
 
     @public
     @cors_validation
@@ -401,8 +402,6 @@ class BaseObjectController(Controller):
         """HTTP POST request handler."""
         container_info = self.container_info(
             self.account_name, self.container_name, req)
-        container_partition, container_nodes, container_path = \
-            self._get_update_target(req, container_info)
         req.acl = container_info['write_acl']
         if config_true_value(req.headers.get('x-open-expired')):
             req.headers['X-Backend-Open-Expired'] = 'true'
@@ -410,7 +409,7 @@ class BaseObjectController(Controller):
             aresp = req.environ['swift.authorize'](req)
             if aresp:
                 return aresp
-        if not container_nodes:
+        if not is_success(container_info.get('status')):
             return HTTPNotFound(request=req)
         error_response = check_metadata(req, 'object')
         if error_response:
@@ -434,18 +433,17 @@ class BaseObjectController(Controller):
         db_state = container_info.get('sharding_state', 'unsharded')
 
         headers = self._backend_requests(
-            req, len(nodes), container_partition, container_nodes,
-            delete_at_container, delete_at_part, delete_at_nodes,
-            db_state, container_path=container_path)
+            req, len(nodes), container_info, delete_at_container,
+            delete_at_part, delete_at_nodes)
         return self._post_object(req, obj_ring, partition, headers)
 
     def _backend_requests(self, req, n_outgoing,
-                          container_partition, containers,
-                          delete_at_container=None, delete_at_partition=None,
-                          delete_at_nodes=None, db_state=None,
-                          container_path=None):
+                          container_info, delete_at_container=None,
+                          delete_at_partition=None, delete_at_nodes=None):
         policy_index = req.headers['X-Backend-Storage-Policy-Index']
         policy = POLICIES.get_by_index(policy_index)
+        container_partition, containers, container_path, db_state = \
+            self._get_update_target(req, container_info)
         headers = [self.generate_request_headers(req, additional=req.headers)
                    for _junk in range(n_outgoing)]
 
@@ -458,7 +456,7 @@ class BaseObjectController(Controller):
             headers[index]['X-Container-Device'] = csv_append(
                 headers[index].get('X-Container-Device'),
                 container_node['device'])
-            headers[index]['X-Container-Db-State'] = db_state
+            headers[index]['X-Container-Root-Db-State'] = db_state
             if container_path:
                 headers[index]['X-Backend-Quoted-Container-Path'] = quote(
                     container_path)
@@ -851,8 +849,6 @@ class BaseObjectController(Controller):
         policy_index = req.headers.get('X-Backend-Storage-Policy-Index',
                                        container_info['storage_policy'])
         obj_ring = self.app.get_object_ring(policy_index)
-        container_partition, container_nodes, container_path = \
-            self._get_update_target(req, container_info)
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
 
@@ -870,7 +866,7 @@ class BaseObjectController(Controller):
             if aresp:
                 return aresp
 
-        if not container_nodes:
+        if not is_success(container_info.get('status')):
             return HTTPNotFound(request=req)
 
         # update content type in case it is missing
@@ -899,9 +895,8 @@ class BaseObjectController(Controller):
         # add special headers to be handled by storage nodes
         db_state = container_info.get('sharding_state', 'unsharded')
         outgoing_headers = self._backend_requests(
-            req, len(nodes), container_partition, container_nodes,
-            delete_at_container, delete_at_part, delete_at_nodes,
-            db_state, container_path=container_path)
+            req, len(nodes), container_info,
+            delete_at_container, delete_at_part, delete_at_nodes)
 
         # send object to storage nodes
         resp = self._store_object(
@@ -924,15 +919,13 @@ class BaseObjectController(Controller):
         next_part_power = getattr(obj_ring, 'next_part_power', None)
         if next_part_power:
             req.headers['X-Backend-Next-Part-Power'] = next_part_power
-        container_partition, container_nodes, container_path = \
-            self._get_update_target(req, container_info)
         req.acl = container_info['write_acl']
         req.environ['swift_sync_key'] = container_info['sync_key']
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
             if aresp:
                 return aresp
-        if not container_nodes:
+        if not is_success(container_info.get('status')):
             return HTTPNotFound(request=req)
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
@@ -955,10 +948,7 @@ class BaseObjectController(Controller):
                 obj_ring, partition, req, policy=policy,
                 local_handoffs_first=True)
 
-        db_state = container_info.get('sharding_state', 'unsharded')
-        headers = self._backend_requests(
-            req, node_count, container_partition, container_nodes,
-            db_state=db_state, container_path=container_path)
+        headers = self._backend_requests(req, node_count, container_info)
         return self._delete_object(req, obj_ring, partition, headers,
                                    node_count=node_count,
                                    node_iterator=node_iterator)

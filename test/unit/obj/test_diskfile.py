@@ -1168,9 +1168,9 @@ class TestDiskFileRouter(unittest.TestCase):
         logger = debug_logger('test-' + self.__class__.__name__)
         df_router = diskfile.DiskFileRouter(conf, logger)
         manager_0 = df_router[POLICIES[0]]
-        self.assertTrue(isinstance(manager_0, diskfile.DiskFileManager))
+        self.assertIsInstance(manager_0, diskfile.DiskFileManager)
         manager_1 = df_router[POLICIES[1]]
-        self.assertTrue(isinstance(manager_1, diskfile.ECDiskFileManager))
+        self.assertIsInstance(manager_1, diskfile.ECDiskFileManager)
 
         # The DiskFileRouter should not have to load the policy again
         with mock.patch('swift.common.storage_policy.BaseStoragePolicy.' +
@@ -1178,7 +1178,7 @@ class TestDiskFileRouter(unittest.TestCase):
             manager_3 = df_router[POLICIES[0]]
             mock_load.assert_not_called()
             self.assertIs(manager_3, manager_0)
-            self.assertTrue(isinstance(manager_3, diskfile.DiskFileManager))
+            self.assertIsInstance(manager_3, diskfile.DiskFileManager)
 
     def test_invalid_policy_config(self):
         # verify that invalid policy diskfile configs are detected when the
@@ -7931,6 +7931,34 @@ class TestSuffixHashes(unittest.TestCase):
                 self.assertEqual(hashes, found_hashes)
             # consolidate hashes
             assert_consolidation([suffix, suffix2])
+
+            # Might get some garbage in your invalidations file
+            part_dir = os.path.dirname(suffix_dir)
+            bad_suffix = "~" + suffix
+            df_mgr.invalidate_hash(os.path.join(part_dir, bad_suffix))
+            # Sure enough, it's in there
+            with open(invalidations_file, 'r') as f:
+                self.assertEqual(bad_suffix + "\n", f.read())
+            # ... but it won't taint your pickle
+            hashes = df_mgr.consolidate_hashes(part_path)
+            self.assertNotIn(bad_suffix, hashes)
+            with open(invalidations_file, 'r') as f:
+                self.assertEqual("", f.read())
+
+            # Old code doesn't have that protection
+            df_mgr.invalidate_hash(os.path.join(part_dir, bad_suffix))
+            with open(invalidations_file, 'r') as f:
+                self.assertEqual(bad_suffix + "\n", f.read())
+            with mock.patch.object(diskfile, 'valid_suffix', lambda s: True):
+                # ... so it would propogate to the pickle when we consolidate,
+                # and we ought to be able to deal with that
+                hashes = assert_consolidation([bad_suffix])
+            self.assertIn(bad_suffix, hashes)
+            self.assertIsNone(hashes[bad_suffix])
+            # When we go to really get hashes, we see the bad,
+            # throw out the existing pickle, and rehash everything
+            hashes = df_mgr.get_hashes('sda1', '0', [], policy)
+            self.assertNotIn(bad_suffix, hashes)
 
     def test_get_hashes_consolidates_suffix_rehash_once(self):
         for policy in self.iter_policies():

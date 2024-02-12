@@ -1005,9 +1005,9 @@ class TestObjectReplicator(unittest.TestCase):
         self.assertEqual(1, self.replicator.handoffs_remaining)
         self.assertEqual(8, self.replicator.job_count)
         self.assertEqual(self.replicator.total_stats.failure, 1)
-        # in addition to the two update_deleted jobs as many as "concurrency"
+        # in addition to the two revert jobs as many as "concurrency"
         # jobs may have been spawned into the pool before the failed
-        # update_deleted job incremented handoffs_remaining and caused the
+        # revert job incremented handoffs_remaining and caused the
         # handoffs_first check to abort the current pass
         self.assertLessEqual(self.replicator.total_stats.attempted,
                              2 + self.replicator.concurrency)
@@ -1875,7 +1875,7 @@ class TestObjectReplicator(unittest.TestCase):
                              (expected_node_count[path_end], len(nodes), path))
         # partitions 0 and 2 attempt 3 calls each per policy to get_hashes = 12
         # partitions 3 attempts 2 calls per policy to get_hashes = 4
-        # partitions 1 dosn't get_hashes because of update_deleted
+        # partitions 1 dosn't get_hashes because of revert
         self.assertEqual(16, self.get_hash_count)
 
         # attempt to 16 times but succeeded only 15 times due to Timeout
@@ -2351,7 +2351,7 @@ class TestObjectReplicator(unittest.TestCase):
             # After 10 cycles every partition is seen exactly once
             self.assertEqual(sorted(range(partitions)), sorted(seen))
 
-    def test_update_deleted_partition_lock_timeout(self):
+    def test_revert_partition_lock_timeout(self):
         self.replicator.handoffs_remaining = 0
         jobs = self.replicator.collect_jobs()
         delete_jobs = [j for j in jobs if j['delete']]
@@ -2360,12 +2360,12 @@ class TestObjectReplicator(unittest.TestCase):
         df_mgr = self.replicator._df_router[job['policy']]
         with mock.patch.object(df_mgr, 'partition_lock',
                                side_effect=PartitionLockTimeout):
-            self.replicator.update_deleted(job)
+            self.replicator.revert(job)
         logs = self.logger.get_lines_for_level('info')
         self.assertEqual(['Unable to lock handoff partition 1 for '
                           'replication on device sda policy 0'], logs)
 
-    def test_update_deleted_can_batch_suffixes(self):
+    def test_revert_can_batch_suffixes(self):
         self.replicator.handoffs_remaining = 0
         self.replicator.sync_batches_per_revert = 4
         jobs = self.replicator.collect_jobs()
@@ -2377,7 +2377,7 @@ class TestObjectReplicator(unittest.TestCase):
         with mock.patch.object(self.replicator, 'sync',
                                return_value=(True, {})) as mock_sync, \
                 mock.patch('shutil.rmtree') as mock_rmtree:
-            self.replicator.update_deleted(job)
+            self.replicator.revert(job)
         self.assertEqual(len(mock_sync.mock_calls), 12)
         self.assertEqual(mock_sync.mock_calls, [
             mock.call(node, job, mock.ANY) for node in job['nodes']] * 4)
@@ -2392,7 +2392,7 @@ class TestObjectReplicator(unittest.TestCase):
             for suffix in range(11)])
         self.assertEqual(mock_rmtree.mock_calls[-1], mock.call(job['path']))
 
-    def test_update_deleted_batch_suffixes_carry_on(self):
+    def test_revert_batch_suffixes_carry_on(self):
         self.replicator.handoffs_remaining = 0
         self.replicator.sync_batches_per_revert = 4
         jobs = self.replicator.collect_jobs()
@@ -2411,7 +2411,7 @@ class TestObjectReplicator(unittest.TestCase):
                                side_effect=sync_returns) as mock_sync, \
                 mock.patch('shutil.rmtree') as mock_rmtree, \
                 mock.patch('random.shuffle', side_effect=lambda x: None):
-            self.replicator.update_deleted(job)
+            self.replicator.revert(job)
         self.assertEqual(len(mock_sync.mock_calls), 12)
         self.assertEqual(mock_sync.mock_calls, [
             mock.call(node, job, mock.ANY) for node in job['nodes']] * 4)

@@ -150,16 +150,11 @@ use = egg:swift#object
 # 'keep_cache_private' is false.
 # keep_cache_slo_manifest = false
 #
-# Cooperative_period defines how frequent object server GET request will perform
-# the cooperative yielding during iterating the disk chunks. For example, value
-# of '5' will insert one sleep() after every 5 chunks read. And value of '-1' will
-# turn off any cooperative yielding.
-# cooperative_period = -1
-#
-# If true, object server will perform cooperative yielding once in the '__call__'
-# function and before handling any actual operation logics. This would get the emitted
-# timing metrics to be closer to reflecting the time spent waiting in accept queues.
-# sleep_in_call = false
+# cooperative_period defines how frequent object server GET request will
+# perform the cooperative yielding during iterating the disk chunks. For
+# example, value of '5' will insert one sleep() after every 5 disk_chunk_size
+# chunk reads. A value of '0' (the default) will turn off cooperative yielding.
+# cooperative_period = 0
 #
 # on PUTs, sync data every n MB
 # mb_per_sync = 512
@@ -325,6 +320,9 @@ use = egg:swift#backend_ratelimit
 # rsync_module = {replication_ip}::object
 #
 # Maximum number of batches to use when syncing a handoff back to primaries.
+# This progressively deletes handoff data as batches complete; it may be
+# useful to increase this when rebalancing a fairly full cluster.
+# Note that this will inflate some progress stats emitted to logs and recon.
 # sync_batches_per_revert = 1
 #
 # node_timeout = <whatever's in the DEFAULT section or 10>

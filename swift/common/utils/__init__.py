@@ -5542,7 +5542,7 @@ class ShardRangeList(UserList):
     def __getitem__(self, index):
         # workaround for py3 - not needed for py2.7,py3.8
         result = self.data[index]
-        return ShardRangeList(result) if type(result) == list else result
+        return ShardRangeList(result) if type(result) is list else result
 
     @property
     def lower(self):
@@ -6440,7 +6440,7 @@ class Watchdog(object):
         :param key: timeout id, as returned by start()
         """
         try:
-            del(self._timeouts[key])
+            del self._timeouts[key]
         except KeyError:
             pass
 
@@ -6525,23 +6525,25 @@ class CooperativeIterator(object):
 
     :param iterable: iterator to wrap.
     :param period: number of items yielded from this iterator between calls to
-        ``sleep()``.
+        ``sleep()``; a negative value or 0 mean that cooperative sleep will be
+        disabled.
     """
     __slots__ = ('period', 'count', 'wrapped_iter')
 
     def __init__(self, iterable, period=5):
         self.wrapped_iter = iterable
         self.count = 0
-        self.period = period
+        self.period = max(0, period or 0)
 
     def __iter__(self):
         return self
 
     def next(self):
-        if self.count >= self.period:
-            self.count = 0
-            sleep()
-        self.count += 1
+        if self.period:
+            if self.count >= self.period:
+                self.count = 0
+                sleep()
+            self.count += 1
         return next(self.wrapped_iter)
 
     __next__ = next
