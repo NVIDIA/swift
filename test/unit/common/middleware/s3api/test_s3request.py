@@ -12,7 +12,8 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import base64
+import io
 from datetime import timedelta
 import hashlib
 from unittest.mock import patch, MagicMock
@@ -22,12 +23,12 @@ from io import BytesIO
 
 from swift.common import swob
 from swift.common.middleware.s3api import s3request, s3response, controllers
+from swift.common.middleware.s3api.exception import S3InputChecksumMismatch
 from swift.common.swob import Request, HTTPNoContent
 from swift.common.middleware.s3api.utils import mktime, Config
 from swift.common.middleware.s3api.acl_handlers import get_acl_handler
 from swift.common.middleware.s3api.subresource import ACL, User, Owner, \
     Grant, encode_acl
-from test.unit.common.middleware.s3api.test_s3api import S3ApiTestCase
 from swift.common.middleware.s3api.s3request import S3Request, \
     S3AclRequest, SigV4Request, SIGV4_X_AMZ_DATE_FORMAT, HashingInput, \
     StreamingInput, S3InputSHA256Mismatch
@@ -35,9 +36,10 @@ from swift.common.middleware.s3api.s3response import InvalidArgument, \
     NoSuchBucket, InternalError, ServiceUnavailable, \
     AccessDenied, SignatureDoesNotMatch, RequestTimeTooSkewed, \
     InvalidPartArgument, InvalidPartNumber, InvalidRequest, \
-    XAmzContentSHA256Mismatch
-
+    XAmzContentSHA256Mismatch, S3NotImplemented
+from swift.common.utils import checksum
 from test.debug_logger import debug_logger
+from test.unit.common.middleware.s3api.test_s3api import S3ApiTestCase
 
 Fake_ACL_MAP = {
     # HEAD Bucket
@@ -1391,7 +1393,7 @@ class TestRequest(S3ApiTestCase):
         sigv4_req = SigV4Request(req.environ)
         # Verify header signature
         self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
-        return req
+        return sigv4_req
 
     def test_check_sig_v4_streaming_aws_hmac_sha256_payload_trailer_ok(self):
         body = 'a;chunk-signature=c9dd07703599d3d0bd51c96193110756d4f7091d5a' \
@@ -1402,9 +1404,10 @@ class TestRequest(S3ApiTestCase):
                '873b4142cf9d815360abc0\r\nuvwxyz\n\r\n' \
                '0;chunk-signature=b1ff1f86dccfbe9bcc80011e2b87b72e43e0c7f543' \
                'bb93612c06f9808ccb772e\r\n' \
-               'x-amz-checksum-sha256:foo\r\n' \
-               'x-amz-trailer-signature:347dd27b77f240eee9904e9aaaa10acb955a' \
-               'd1bd0d6dd2e2c64794195eb5535b\r\n'
+               'x-amz-checksum-sha256:EBCn52FhCYCsWRNZyHH3JN4VDyNEDrtZWaxMBy' \
+               'TJHZE=\r\n' \
+               'x-amz-trailer-signature:1212d72cb487bf08ed25d1329dc93f65fde0' \
+               'dcb21739a48f3182c86cfe79737b\r\n'
         req = self._test_sig_v4_streaming_aws_hmac_sha256_payload_trailer(body)
         self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
                          req.environ['wsgi.input'].read())
@@ -1438,13 +1441,16 @@ class TestRequest(S3ApiTestCase):
         with self.assertRaises(s3request.S3InputChunkSignatureMismatch):
             req.environ['wsgi.input'].read(10)
 
-    @patch.object(S3Request, '_validate_dates', lambda *a: None)
-    def _test_sig_v4_streaming_unsigned_payload_trailer(
-            self, body, x_amz_trailer='x-amz-checksum-sha256'):
+    def _make_sig_v4_streaming_unsigned_payload_trailer_req(
+            self, body=None, wsgi_input=None, extra_headers=None):
         environ = {
             'HTTP_HOST': 's3.test.com',
             'REQUEST_METHOD': 'PUT',
             'RAW_PATH_INFO': '/test/file'}
+        if body:
+            body = body.encode('utf8')
+        elif wsgi_input:
+            environ['wsgi.input'] = wsgi_input
         headers = {
             'Authorization':
                 'AWS4-HMAC-SHA256 '
@@ -1460,24 +1466,36 @@ class TestRequest(S3ApiTestCase):
             'X-Amz-Date': '20220330T095351Z',
             'X-Amz-Decoded-Content-Length': '27',
         }
-        if x_amz_trailer is not None:
-            headers['X-Amz-Trailer'] = x_amz_trailer
-        req = Request.blank(environ['RAW_PATH_INFO'], environ=environ,
-                            headers=headers, body=body.encode('utf8'))
+        if extra_headers:
+            headers.update(extra_headers)
+        return Request.blank(environ['RAW_PATH_INFO'], environ=environ,
+                             headers=headers, body=body)
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def _test_sig_v4_streaming_unsigned_payload_trailer(
+            self, body=None, x_amz_trailer='x-amz-checksum-sha256'):
+        if x_amz_trailer is None:
+            headers = {}
+        else:
+            headers = {'X-Amz-Trailer': x_amz_trailer}
+
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body, extra_headers=headers)
         sigv4_req = SigV4Request(req.environ)
         # Verify header signature
         self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
-        return req
+        return sigv4_req
 
     def test_check_sig_v4_streaming_unsigned_payload_trailer_ok(self):
         body = 'a\r\nabcdefghij\r\n' \
                'a\r\nklmnopqrst\r\n' \
                '7\r\nuvwxyz\n\r\n' \
                '0\r\n' \
-               'x-amz-checksum-sha256:foo\r\n'
-        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+               'x-amz-checksum-sha256:EBCn52FhCYCsWRNZyHH3JN4VDyNEDrtZWaxMB' \
+               'yTJHZE=\r\n'
+        s3req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
         self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
-                         req.environ['wsgi.input'].read())
+                         s3req.environ['wsgi.input'].read())
 
     def test_check_sig_v4_streaming_unsigned_payload_trailer_none_ok(self):
         # verify it's ok to not send any trailer
@@ -1485,10 +1503,10 @@ class TestRequest(S3ApiTestCase):
                'a\r\nklmnopqrst\r\n' \
                '7\r\nuvwxyz\n\r\n' \
                '0\r\n'
-        req = self._test_sig_v4_streaming_unsigned_payload_trailer(
+        s3req = self._test_sig_v4_streaming_unsigned_payload_trailer(
             body, x_amz_trailer=None)
         self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
-                         req.environ['wsgi.input'].read())
+                         s3req.environ['wsgi.input'].read())
 
     def test_check_sig_v4_streaming_unsigned_payload_trailer_undeclared(self):
         body = 'a\r\nabcdefghij\r\n' \
@@ -1496,12 +1514,12 @@ class TestRequest(S3ApiTestCase):
                '7\r\nuvwxyz\n\r\n' \
                '0\r\n' \
                'x-amz-checksum-sha256:undeclared\r\n'
-        req = self._test_sig_v4_streaming_unsigned_payload_trailer(
+        s3req = self._test_sig_v4_streaming_unsigned_payload_trailer(
             body, x_amz_trailer=None)
         self.assertEqual(b'abcdefghijklmnopqrst',
-                         req.environ['wsgi.input'].read(20))
+                         s3req.environ['wsgi.input'].read(20))
         with self.assertRaises(s3request.S3InputIncomplete):
-            req.environ['wsgi.input'].read()
+            s3req.environ['wsgi.input'].read()
 
     def test_check_sig_v4_streaming_unsigned_payload_trailer_multiple(self):
         body = 'a\r\nabcdefghij\r\n' \
@@ -1522,12 +1540,12 @@ class TestRequest(S3ApiTestCase):
                '0\r\n' \
                'x-amz-checksum-not-sha256:foo\r\n' \
                'x-'
-        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        s3req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
         self.assertEqual(b'abcdefghijklmnopqrst',
-                         req.environ['wsgi.input'].read(20))
+                         s3req.environ['wsgi.input'].read(20))
         # trailers are read with penultimate chunk??
         with self.assertRaises(s3request.S3InputMalformedTrailer):
-            req.environ['wsgi.input'].read()
+            s3req.environ['wsgi.input'].read()
 
     def test_check_sig_v4_streaming_unsigned_payload_trailer_missing(self):
         body = 'a\r\nabcdefghij\r\n' \
@@ -1535,12 +1553,12 @@ class TestRequest(S3ApiTestCase):
                '7\r\nuvwxyz\n\r\n' \
                '0\r\n' \
                '\r\n'
-        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        s3req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
         self.assertEqual(b'abcdefghijklmnopqrst',
-                         req.environ['wsgi.input'].read(20))
+                         s3req.environ['wsgi.input'].read(20))
         # trailers are read with penultimate chunk??
         with self.assertRaises(s3request.S3InputMalformedTrailer):
-            req.environ['wsgi.input'].read()
+            s3req.environ['wsgi.input'].read()
 
     def test_check_sig_v4_streaming_unsigned_payload_trailer_extra(self):
         body = 'a\r\nabcdefghij\r\n' \
@@ -1549,12 +1567,12 @@ class TestRequest(S3ApiTestCase):
                '0\r\n' \
                'x-amz-checksum-crc32:foo\r\n' \
                'x-amz-checksum-sha32:foo\r\n'
-        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        s3req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
         self.assertEqual(b'abcdefghijklmnopqrst',
-                         req.environ['wsgi.input'].read(20))
+                         s3req.environ['wsgi.input'].read(20))
         # trailers are read with penultimate chunk??
         with self.assertRaises(s3request.S3InputMalformedTrailer):
-            req.environ['wsgi.input'].read()
+            s3req.environ['wsgi.input'].read()
 
     def test_check_sig_v4_streaming_unsigned_payload_trailer_duplicate(self):
         body = 'a\r\nabcdefghij\r\n' \
@@ -1562,13 +1580,14 @@ class TestRequest(S3ApiTestCase):
                '7\r\nuvwxyz\n\r\n' \
                '0\r\n' \
                'x-amz-checksum-sha256:foo\r\n' \
-               'x-amz-checksum-sha256:bar\r\n'
-        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+               'x-amz-checksum-sha256:EBCn52FhCYCsWRNZyHH3JN4VDyNEDrtZWaxMB' \
+               'yTJHZE=\r\n'
+        s3req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
         self.assertEqual(b'abcdefghijklmnopqrst',
-                         req.environ['wsgi.input'].read(20))
+                         s3req.environ['wsgi.input'].read(20))
         # Reading the rest succeeds! AWS would complain about the checksum,
         # but we aren't looking at it (yet)
-        req.environ['wsgi.input'].read()
+        s3req.environ['wsgi.input'].read()
 
     def test_check_sig_v4_streaming_unsigned_payload_trailer_short(self):
         body = 'a\r\nabcdefghij\r\n' \
@@ -1576,12 +1595,238 @@ class TestRequest(S3ApiTestCase):
                '7\r\nuvwxyz\n\r\n' \
                '0\r\n' \
                'x-amz-checksum-sha256'
-        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        s3req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
         self.assertEqual(b'abcdefghijklmnopqrst',
-                         req.environ['wsgi.input'].read(20))
+                         s3req.environ['wsgi.input'].read(20))
         # trailers are read with penultimate chunk??
         with self.assertRaises(s3request.S3InputIncomplete):
-            req.environ['wsgi.input'].read()
+            s3req.environ['wsgi.input'].read()
+
+    def test_check_sig_v4_streaming_unsigned_payload_trailer_invalid(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n' \
+               'x-amz-checksum-sha256: not=base-64\r\n'
+        s3req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        self.assertEqual(b'abcdefghijklmnopqrst',
+                         s3req.environ['wsgi.input'].read(20))
+        with self.assertRaises(s3request.S3InputChecksumTrailerInvalid):
+            s3req.environ['wsgi.input'].read()
+
+        # ...which in context gets translated to a 400 response
+        with self.assertRaises(s3response.InvalidRequest) as cm, \
+                s3req.translate_read_errors():
+            s3req.environ['wsgi.input'].read()
+        self.assertIn(
+            'Value for x-amz-checksum-sha256 trailing header is invalid.',
+            str(cm.exception.body))
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_hdr_sha256_ok(self):
+        # TODO: do we already have coverage for this?
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        headers = {
+            'x-amz-checksum-sha256':
+                'EBCn52FhCYCsWRNZyHH3JN4VDyNEDrtZWaxMByTJHZE=',
+        }
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body,
+            extra_headers=headers
+        )
+        sigv4_req = SigV4Request(req.environ)
+        self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
+                         sigv4_req.environ['wsgi.input'].read())
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_sha256_mismatch(self):
+        # TODO: do we already have coverage for this?
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        headers = {
+            'x-amz-sdk-checksum-algorithm': 'sha256',
+            'x-amz-checksum-sha256':
+                'BADBADBADBADWRNZyHH3JN4VDyNEDrtZWaxMByTJHZE=',
+        }
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body,
+            extra_headers=headers
+        )
+        sigv4_req = SigV4Request(req.environ)
+        with self.assertRaises(s3request.BadDigest) as cm, \
+                sigv4_req.translate_read_errors():
+            sigv4_req.environ['wsgi.input'].read()
+        self.assertIn('The SHA256 you specified did not match the calculated '
+                      'checksum.', str(cm.exception.body))
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_hdr_crc32_ok(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        crc = base64.b64encode(
+            checksum.crc32(b'abcdefghijklmnopqrstuvwxyz\n').digest())
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body,
+            extra_headers={'x-amz-checksum-crc32': crc}
+        )
+        sigv4_req = SigV4Request(req.environ)
+        self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
+                         sigv4_req.environ['wsgi.input'].read())
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_hdr_crc32_mismatch(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        crc = base64.b64encode(checksum.crc32(b'not-the-body').digest())
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body,
+            extra_headers={'x-amz-checksum-crc32': crc}
+        )
+        sigv4_req = SigV4Request(req.environ)
+        with self.assertRaises(S3InputChecksumMismatch):
+            sigv4_req.environ['wsgi.input'].read()
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_hdr_crc32c_ok(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        crc = base64.b64encode(
+            checksum.crc32c(b'abcdefghijklmnopqrstuvwxyz\n').digest())
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body,
+            extra_headers={'x-amz-checksum-crc32c': crc}
+        )
+        sigv4_req = SigV4Request(req.environ)
+        self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
+                         sigv4_req.environ['wsgi.input'].read())
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_hdr_crc32c_mismatch(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        crc = base64.b64encode(checksum.crc32c(b'not-the-body').digest())
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body,
+            extra_headers={'x-amz-checksum-crc32c': crc}
+        )
+        sigv4_req = SigV4Request(req.environ)
+        with self.assertRaises(S3InputChecksumMismatch):
+            sigv4_req.environ['wsgi.input'].read()
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_hdr_crc64nvme_valid(self):
+        # apparently valid value provokes the not implemented error
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        crc = base64.b64encode(b'12345678')
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body,
+            extra_headers={'x-amz-checksum-crc64nvme': crc}
+        )
+        with self.assertRaises(S3NotImplemented) as cm:
+            SigV4Request(req.environ)
+        self.assertIn(
+            b'The x-amz-checksum-crc64nvme algorithm is not supported.',
+            cm.exception.body)
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_hdr_crc64nvme_invalid(self):
+        # the not implemented error is raised before the value is validated
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body,
+            extra_headers={'x-amz-checksum-crc64nvme': 'not-a-valid-crc'}
+        )
+        with self.assertRaises(S3NotImplemented) as cm:
+            SigV4Request(req.environ)
+        self.assertIn(
+            b'The x-amz-checksum-crc64nvme algorithm is not supported.',
+            cm.exception.body)
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_hdr_sha1_ok(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        crc = base64.b64encode(
+            hashlib.sha1(b'abcdefghijklmnopqrstuvwxyz\n').digest())
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body,
+            extra_headers={'x-amz-checksum-sha1': crc}
+        )
+        sigv4_req = SigV4Request(req.environ)
+        self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
+                         sigv4_req.environ['wsgi.input'].read())
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_hdr_sha1_mismatch(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        crc = base64.b64encode(hashlib.sha1(b'not-the-body').digest())
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            body=body,
+            extra_headers={'x-amz-checksum-sha1': crc}
+        )
+        sigv4_req = SigV4Request(req.environ)
+        with self.assertRaises(S3InputChecksumMismatch):
+            sigv4_req.environ['wsgi.input'].read()
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_multiple_checksum_hdrs(self):
+        wsgi_input = io.BytesIO(b'123')
+        self.assertEqual(0, wsgi_input.tell())
+        headers = {
+            'x-amz-checksum-sha256':
+                'EBCn52FhCYCsWRNZyHH3JN4VDyNEDrtZWaxMByTJHZE=',
+            'x-amz-trailer': 'x-amz-checksum-sha256'
+        }
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            wsgi_input=wsgi_input,
+            extra_headers=headers
+        )
+        with self.assertRaises(InvalidRequest) as cm:
+            SigV4Request(req.environ)
+        self.assertIn('Expecting a single x-amz-checksum- header',
+                      str(cm.exception.body))
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_sig_v4_strm_unsgnd_pyld_trl_checksum_algo_mismatch(self):
+        wsgi_input = io.BytesIO(b'123')
+        self.assertEqual(0, wsgi_input.tell())
+        headers = {
+            'x-amz-sdk-checksum-algorithm': 'crc32',
+            'x-amz-checksum-sha256':
+                'EBCn52FhCYCsWRNZyHH3JN4VDyNEDrtZWaxMByTJHZE=',
+        }
+        req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
+            wsgi_input=wsgi_input,
+            extra_headers=headers
+        )
+        with self.assertRaises(InvalidRequest) as cm:
+            SigV4Request(req.environ)
+        self.assertIn('Value for x-amz-sdk-checksum-algorithm header is '
+                      'invalid.', str(cm.exception.body))
 
 
 class TestSigV4Request(S3ApiTestCase):
