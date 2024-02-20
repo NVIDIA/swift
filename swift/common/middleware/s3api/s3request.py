@@ -26,7 +26,8 @@ from urllib.parse import quote, unquote, parse_qsl
 import string
 
 from swift.common.utils import split_path, json, md5, streq_const_time, \
-    close_if_possible, InputProxy, get_policy_index, list_from_csv
+    close_if_possible, InputProxy, get_policy_index, list_from_csv, \
+    strict_b64decode, base64_str
 from swift.common.registry import get_swift_info
 from swift.common import swob
 from swift.common.http import HTTP_OK, HTTP_CREATED, HTTP_ACCEPTED, \
@@ -62,9 +63,11 @@ from swift.common.middleware.s3api.s3response import AccessDenied, \
 from swift.common.middleware.s3api.exception import NotS3Request, \
     S3InputError, S3InputSizeError, S3InputIncomplete, \
     S3InputChunkSignatureMismatch, S3InputChunkTooSmall, \
-    S3InputMalformedTrailer, S3InputMissingSecret
+    S3InputMalformedTrailer, S3InputMissingSecret, \
+    S3InputSHA256Mismatch, S3InputChecksumMismatch, \
+    S3InputChecksumTrailerInvalid
 from swift.common.middleware.s3api.utils import utf8encode, \
-    S3Timestamp, mktime, MULTIUPLOAD_SUFFIX
+    S3Timestamp, mktime, MULTIUPLOAD_SUFFIX, CHECKSUMS_BY_HEADER
 from swift.common.middleware.s3api.subresource import decode_acl, encode_acl
 from swift.common.middleware.s3api.utils import sysmeta_header, \
     validate_bucket_name, Config
@@ -125,20 +128,6 @@ def _header_acl_property(resource):
                     doc='Get and set the %s acl property' % resource)
 
 
-class S3InputSHA256Mismatch(BaseException):
-    """
-    Client provided a X-Amz-Content-SHA256, but it doesn't match the data.
-
-    Inherit from BaseException (rather than Exception) so it cuts from the
-    proxy-server app (which will presumably be the one reading the input)
-    through all the layers of the pipeline back to us. It should never escape
-    the s3api middleware.
-    """
-    def __init__(self, expected, computed):
-        self.expected = expected
-        self.computed = computed
-
-
 class HashingInput(InputProxy):
     """
     wsgi.input wrapper to verify the SHA256 of the input as it's read.
@@ -174,6 +163,47 @@ class HashingInput(InputProxy):
                 self._expected_hash,
                 self._hasher.hexdigest())
 
+        return chunk
+
+
+class ChecksummingInput(InputProxy):
+    """
+    wsgi.input wrapper to check the X-Amz-Checksum-* of the input as it's read
+    """
+
+    def __init__(self, wsgi_input, content_length,
+                 checksum_info, expected_raw_checksum):
+        super().__init__(wsgi_input)
+        self._expected_length = content_length
+        self.checksum_info = checksum_info
+        self._hasher = self.checksum_info.new_hasher()
+        self.expected_raw_checksum = expected_raw_checksum
+
+    def chunk_update(self, chunk, eof, *args, **kwargs):
+        self._hasher.update(chunk)
+        if self.bytes_received < self._expected_length:
+            error = eof
+        elif self.bytes_received == self._expected_length:
+            if self.expected_raw_checksum is None:
+                # Creator promised we'd get a final value in trailers
+                expected_checksum = self.wsgi_input.trailers.get(
+                    self.checksum_info.client_header)
+                try:
+                    self.expected_raw_checksum = strict_b64decode(
+                        expected_checksum,
+                        exact_size=self._hasher.digest_size,
+                    )
+                except ValueError:
+                    raise S3InputChecksumTrailerInvalid(
+                        self.checksum_info.client_header)
+            error = (self._hasher.digest() != self.expected_raw_checksum)
+        else:
+            error = True
+
+        if error:
+            self.close()
+            # Since we don't return the last chunk, the PUT never completes
+            raise S3InputChecksumMismatch(self.checksum_info.name.upper())
         return chunk
 
 
@@ -437,9 +467,8 @@ class SigChecker(BaseSigChecker):
         return b'\n'.join(buf)
 
     def _check_signature(self):
-        valid_signature = base64.b64encode(hmac.new(
-            self._secret, self.string_to_sign, sha1
-        ).digest()).strip().decode('ascii')
+        valid_signature = base64_str(
+            hmac.new(self._secret, self.string_to_sign, sha1).digest())
         return streq_const_time(self.signature, valid_signature)
 
 
@@ -641,20 +670,23 @@ class SigV4Mixin(object):
                 'x-amz-decoded-content-length'))
             expected_trailers = set()
             if aws_sha256.endswith('-TRAILER'):
-                trailer = self.headers.get('x-amz-trailer')
-                if trailer is None:
+                trailer = self.headers.get('x-amz-trailer', '')
+                trailer_list = [
+                    v.strip() for v in trailer.rstrip(',').split(',')
+                ] if trailer.strip() else []
+                if not trailer_list:
                     pass  # Even if the "SHA" says -TRAILER, it's optional
-                elif any(not v.lower().startswith('x-amz-checksum-')
-                         for v in list_from_csv(trailer)):
+                elif any(v.lower() not in CHECKSUMS_BY_HEADER
+                         for v in trailer_list):
                     raise InvalidRequest(
                         'The value specified in the x-amz-trailer '
                         'header is not supported')
-                elif ',' in trailer:
+                elif len(trailer_list) > 1:
                     raise InvalidRequest(
                         'Expecting a single x-amz-checksum- header. Multiple '
                         'checksum Types are not allowed.')
                 else:
-                    expected_trailers.add(trailer)
+                    expected_trailers.update(trailer_list)
 
                 if aws_sha256 == 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER':
                     expected_trailers.add('x-amz-trailer-signature')
@@ -1000,6 +1032,8 @@ class S3Request(swob.Request):
         self._validate_headers()
         self.sig_checker = self.sig_checker_cls(self)
         self._install_input_wrapper()
+        if self.method == 'PUT':
+            self._install_checksumming_input_wrapper()
 
         # Lock in string-to-sign now, before we start messing with query params
         self.environ['s3api.auth_details'] = {
@@ -1327,6 +1361,83 @@ class S3Request(swob.Request):
         # reject with length-required and we'll translate back to
         # MissingContentLength)
 
+    def _validate_checksum_header_cardinality(self, num_checksum_headers,
+                                              headers_and_trailer=False):
+        if num_checksum_headers > 1:
+            # inconsistent messaging for AWS compatibility...
+            msg = 'Expecting a single x-amz-checksum- header'
+            if not headers_and_trailer:
+                msg += '. Multiple checksum Types are not allowed.'
+            raise InvalidRequest(msg)
+
+    def _validate_checksum_headers(self):
+        checksum_headers = {
+            h.lower(): v
+            for h, v in self.headers.items()
+            if h.lower().startswith('x-amz-checksum-')}
+        if any(h not in CHECKSUMS_BY_HEADER
+               for h in checksum_headers):
+            raise InvalidRequest('The algorithm type you specified in '
+                                 'x-amz-checksum- header is invalid.')
+        self._validate_checksum_header_cardinality(len(checksum_headers))
+        return checksum_headers
+
+    def _validate_trailer_checksum_headers(self):
+        checksum_headers = [
+            h.lower()
+            for h in list_from_csv(self.headers.get('x-amz-trailer'))
+            if h.lower().startswith('x-amz-checksum-')]
+        if any(h not in CHECKSUMS_BY_HEADER
+               for h in checksum_headers):
+            raise InvalidRequest('The value specified in the x-amz-trailer '
+                                 'header is not supported')
+        self._validate_checksum_header_cardinality(len(checksum_headers))
+        return checksum_headers
+
+    def _install_checksumming_input_wrapper(self):
+        checksum_headers = self._validate_checksum_headers()
+        checksum_trailer_headers = self._validate_trailer_checksum_headers()
+        self._validate_checksum_header_cardinality(
+            len(checksum_headers) + len(checksum_trailer_headers),
+            headers_and_trailer=True
+        )
+        checksum_algo = self.headers.get('x-amz-sdk-checksum-algorithm')
+
+        if checksum_headers:
+            header, b64digest = list(checksum_headers.items())[0]
+            checksum_info = CHECKSUMS_BY_HEADER[header]
+            try:
+                expected_raw_checksum = strict_b64decode(
+                    b64digest,
+                    exact_size=checksum_info.digest_size,
+                )
+            except ValueError:
+                raise InvalidRequest('Value for %s header is invalid.' %
+                                     checksum_info.client_header)
+        elif checksum_trailer_headers:
+            checksum_info = CHECKSUMS_BY_HEADER[checksum_trailer_headers[0]]
+            # checksum should appear at end of request in trailers
+            expected_raw_checksum = None
+        elif checksum_algo:
+            raise InvalidRequest(
+                'x-amz-sdk-checksum-algorithm specified, but no '
+                'corresponding x-amz-checksum-* or x-amz-trailer '
+                'headers were found.')
+        else:
+            return
+
+        if checksum_algo and checksum_algo.lower() != checksum_info.name:
+            raise InvalidRequest('Value for x-amz-sdk-checksum-algorithm '
+                                 'header is invalid.')
+
+        checksum_input = ChecksummingInput(
+            self.environ['wsgi.input'],
+            self.content_length,
+            checksum_info,
+            expected_raw_checksum,
+        )
+        self.environ['wsgi.input'] = checksum_input
+
     def _validate_headers(self):
         if 'CONTENT_LENGTH' in self.environ:
             try:
@@ -1443,8 +1554,7 @@ class S3Request(swob.Request):
             raise InvalidRequest('Missing required header for this request: '
                                  'Content-MD5')
 
-        digest = base64.b64encode(md5(
-            body, usedforsecurity=False).digest()).strip().decode('ascii')
+        digest = base64_str(md5(body, usedforsecurity=False).digest())
         if self.environ['HTTP_CONTENT_MD5'] != digest:
             raise BadDigest(content_md5=self.environ['HTTP_CONTENT_MD5'])
 
@@ -1877,6 +1987,13 @@ class S3Request(swob.Request):
                 client_computed_content_s_h_a256=err.expected,
                 s3_computed_content_s_h_a256=err.computed,
             )
+        except S3InputChecksumMismatch as e:
+            raise BadDigest(
+                'The %s you specified did not '
+                'match the calculated checksum.' % e.args[0])
+        except S3InputChecksumTrailerInvalid as e:
+            raise InvalidRequest(
+                'Value for %s trailing header is invalid.' % e.trailer)
         except S3InputChunkSignatureMismatch:
             raise SignatureDoesNotMatch(
                 **self.signature_does_not_match_kwargs())
