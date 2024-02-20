@@ -16,6 +16,7 @@
 
 import base64
 import hashlib
+import io
 import unittest
 from unittest.mock import patch, MagicMock
 import calendar
@@ -347,6 +348,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                 'PATH_INFO': path,
                 'QUERY_STRING': query_string,
                 'HTTP_AUTHORIZATION': 'AWS X:Y:Z',
+                'wsgi.input': io.BytesIO(),
             }
             for header, value in headers.items():
                 header = 'HTTP_' + header.replace('-', '_').upper()
@@ -1406,6 +1408,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                     'Credential=X:Y/20110909/us-east-1/s3/aws4_request, '
                     'SignedHeaders=content-md5;content-type;date, '
                     'Signature=x',
+                'wsgi.input': io.BytesIO(),
             }
             fake_time = calendar.timegm((2011, 9, 9, 23, 36, 0))
             env.update(environ)

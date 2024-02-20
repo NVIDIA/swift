@@ -17,11 +17,13 @@ import base64
 import calendar
 import datetime
 import email.utils
+import hashlib
 import re
 import time
 import uuid
 
 from swift.common import utils
+from swift.common.utils import checksum
 
 MULTIUPLOAD_SUFFIX = '+segments'
 
@@ -192,6 +194,68 @@ def mktime(timestamp_str, time_format='%Y-%m-%dT%H:%M:%S'):
     epoch_time = calendar.timegm(time_tuple) - time_tuple[9]
 
     return epoch_time
+
+
+class ChecksumInfo:
+    digest_size: int
+    name: str
+
+    @property
+    def client_header(self):
+        return f'x-amz-checksum-{self.name}'
+
+    def new_hasher(self):
+        raise NotImplementedError
+
+
+class CRC32Info(ChecksumInfo):
+    digest_size = 4
+    name = 'crc32'
+
+    def new_hasher(self):
+        return checksum.crc32()
+
+
+class CRC32CInfo(ChecksumInfo):
+    digest_size = 4
+    name = 'crc32c'
+
+    def new_hasher(self):
+        return checksum.crc32c()
+
+
+class CRC64NVMEInfo(ChecksumInfo):
+    digest_size = 8
+    name = 'crc64nvme'
+
+    def new_hasher(self):
+        return checksum.crc64nvme()
+
+
+class SHA1Info(ChecksumInfo):
+    digest_size = 20
+    name = 'sha1'
+
+    def new_hasher(self):
+        return hashlib.sha1()  # nosec: B324
+
+
+class SHA256Info(ChecksumInfo):
+    digest_size = 32
+    name = 'sha256'
+
+    def new_hasher(self):
+        return hashlib.sha256()
+
+
+CHECKSUMS = [
+    CRC32Info(),
+    CRC32CInfo(),
+    CRC64NVMEInfo(),
+    SHA1Info(),
+    SHA256Info(),
+]
+CHECKSUMS_BY_HEADER = {info.client_header: info for info in CHECKSUMS}
 
 
 class Config(dict):

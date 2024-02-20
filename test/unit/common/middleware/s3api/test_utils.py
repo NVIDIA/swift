@@ -132,6 +132,17 @@ class TestS3ApiUtils(unittest.TestCase):
             os.environ['TZ'] = orig_tz
             time.tzset()
 
+    def test_checksum_consistency(self):
+        self.assertEqual(set(utils.CHECKSUMS),
+                         set(utils.CHECKSUMS_BY_HEADER.values()))
+
+    def test_checksum_hash_len(self):
+        for info in utils.CHECKSUMS:
+            self.assertEqual(len(info.new_hasher().digest()),
+                             info.digest_size)
+            self.assertEqual(len(info.new_hasher().hexdigest()),
+                             2 * info.digest_size)
+
 
 class TestS3Timestamp(unittest.TestCase):
     def test_s3xmlformat(self):
