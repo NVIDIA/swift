@@ -41,7 +41,7 @@ from swift.common.constraints import check_object_creation, \
 from swift.common.exceptions import ConnectionTimeout, DiskFileQuarantined, \
     DiskFileNotExist, DiskFileCollision, DiskFileNoSpace, DiskFileDeleted, \
     DiskFileDeviceUnavailable, DiskFileExpired, ChunkReadTimeout, \
-    ChunkReadError, DiskFileXattrNotSupported
+    ChunkReadError, DiskFileXattrNotSupported, DiskFileMetadataUnavailable
 from swift.common.request_helpers import resolve_ignore_range_header, \
     OBJECT_SYSMETA_CONTAINER_UPDATE_OVERRIDE_PREFIX
 from swift.obj import ssync_receiver
@@ -56,7 +56,8 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPPreconditionFailed, HTTPRequestTimeout, HTTPUnprocessableEntity, \
     HTTPClientDisconnect, HTTPMethodNotAllowed, Request, Response, \
     HTTPInsufficientStorage, HTTPForbidden, HTTPException, HTTPConflict, \
-    HTTPServerError, bytes_to_wsgi, wsgi_to_bytes, wsgi_to_str, normalize_etag
+    HTTPServerError, bytes_to_wsgi, wsgi_to_bytes, wsgi_to_str, \
+    normalize_etag, HTTPServiceUnavailable
 from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter
 from swift.obj.expirer import build_task_obj
 
@@ -650,6 +651,8 @@ class ObjectController(BaseStorageServer):
             return HTTPInsufficientStorage(drive=device, request=request)
         except (DiskFileNotExist, DiskFileQuarantined):
             return HTTPNotFound(request=request)
+        except DiskFileMetadataUnavailable:
+            return HTTPServiceUnavailable(request=request)
         orig_timestamp = Timestamp(orig_metadata.get('X-Timestamp', 0))
         orig_ctype_timestamp = disk_file.content_type_timestamp
         req_ctype_time = '0'
@@ -809,9 +812,11 @@ class ObjectController(BaseStorageServer):
         except DiskFileDeleted as e:
             orig_metadata = {}
             orig_timestamp = e.timestamp
-        except (DiskFileNotExist, DiskFileQuarantined):
+        except (DiskFileNotExist, DiskFileQuarantined,
+                DiskFileMetadataUnavailable):
             orig_metadata = {}
             orig_timestamp = Timestamp(0)
+
         # Checks for If-None-Match
         if request.if_none_match is not None and orig_metadata:
             if '*' in request.if_none_match:
@@ -1144,6 +1149,8 @@ class ObjectController(BaseStorageServer):
                 headers['X-Backend-Timestamp'] = e.timestamp.internal
             resp = HTTPNotFound(request=request, headers=headers,
                                 conditional_response=True)
+        except DiskFileMetadataUnavailable:
+            resp = HTTPServiceUnavailable(request=request)
         return resp
 
     @public
@@ -1175,6 +1182,8 @@ class ObjectController(BaseStorageServer):
                 headers['X-Backend-Timestamp'] = e.timestamp.internal
             return HTTPNotFound(request=request, headers=headers,
                                 conditional_response=True)
+        except DiskFileMetadataUnavailable:
+            return HTTPServiceUnavailable(request=request)
         conditional_etag = resolve_etag_is_at_header(request, metadata)
         response = Response(request=request, conditional_response=True,
                             conditional_etag=conditional_etag)
@@ -1235,6 +1244,9 @@ class ObjectController(BaseStorageServer):
             orig_timestamp = 0
             orig_metadata = {}
             response_class = HTTPNotFound
+        except DiskFileMetadataUnavailable:
+            # metadata may have X-Delete-At so force client to retry
+            return HTTPServiceUnavailable(request=request)
         else:
             orig_timestamp = disk_file.data_timestamp
             if orig_timestamp < req_timestamp:

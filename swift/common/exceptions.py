@@ -81,6 +81,11 @@ class DiskFileNotExist(DiskFileError):
     pass
 
 
+class DiskFileMetadataUnavailable(DiskFileError):
+    # the DiskFile exists but could not be opened for some transient reason
+    pass
+
+
 class DiskFileDeleted(DiskFileNotExist):
 
     def __init__(self, metadata=None):
