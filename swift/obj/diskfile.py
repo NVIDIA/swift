@@ -72,7 +72,8 @@ from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
     DiskFileDeleted, DiskFileError, DiskFileNotOpen, PathNotDir, \
     ReplicationLockTimeout, DiskFileExpired, DiskFileXattrNotSupported, \
-    DiskFileBadMetadataChecksum, PartitionLockTimeout
+    DiskFileBadMetadataChecksum, PartitionLockTimeout, \
+    DiskFileMetadataUnavailable
 from swift.common.swob import multi_range_iterator
 from swift.common.storage_policy import (
     get_policy_string, split_policy_string, PolicyError, POLICIES,
@@ -200,7 +201,7 @@ def _decode_metadata(metadata, metadata_written_by_py3):
     return {to_str(k): to_str(v, k == b'name') for k, v in metadata.items()}
 
 
-def read_metadata(fd, add_missing_checksum=False):
+def read_file_metadata(fd, add_missing_checksum=False):
     """
     Helper function to read the pickled metadata from an object file.
 
@@ -208,6 +209,10 @@ def read_metadata(fd, add_missing_checksum=False):
     :param add_missing_checksum: if set and checksum is missing, add it
 
     :returns: dictionary of metadata
+    :raises DiskFileXattrNotSupported: if the filesystem does not support xattr
+    :raises DiskFileMetadataUnavailable: if the file metadata could not be read
+    :raises DiskFileBadMetadataChecksum: if the checksum of the read metadata
+        does not match the stored checksum
     """
     metadata = b''
     key = 0
@@ -222,7 +227,7 @@ def read_metadata(fd, add_missing_checksum=False):
             logging.exception(msg, _get_filename(fd))
             raise DiskFileXattrNotSupported(e)
         if e.errno == errno.ENOENT:
-            raise DiskFileNotExist()
+            raise DiskFileMetadataUnavailable()
         # TODO: we might want to re-raise errors that don't denote a missing
         # xattr here.  Seems to be ENODATA on linux and ENOATTR on BSD/OSX.
 
@@ -260,6 +265,29 @@ def read_metadata(fd, add_missing_checksum=False):
     else:
         metadata = pickle.loads(metadata, encoding='bytes')
     return _decode_metadata(metadata, metadata_written_by_py3)
+
+
+def read_metadata(fd, add_missing_checksum=False):
+    """
+    Helper function to read the pickled metadata from an object data file.
+
+    The only difference from ``read_file_metadata`` is that this function
+    raises ``DiskFileNotExist`` when the file cannot be read. That is only
+    appropriate if the file is a data file. For meta files callers should use
+    ``read_file_metadata`` which raises ``DiskFileMetadataUnavailable``.
+
+    :param fd: file descriptor or filename to load the metadata from
+    :param add_missing_checksum: if set and checksum is missing, add it
+    :returns: dictionary of metadata
+    :raises DiskFileXattrNotSupported: if the filesystem does not support xattr
+    :raises DiskFileNotExist: if the file metadata could not be read
+    :raises DiskFileBadMetadataChecksum: if the checksum of the read metadata
+        does not match the stored checksum
+    """
+    try:
+        return read_file_metadata(fd, add_missing_checksum)
+    except DiskFileMetadataUnavailable:
+        raise DiskFileNotExist()
 
 
 def write_metadata(fd, metadata, xattr_size=65536):
@@ -2720,8 +2748,8 @@ class BaseDiskFile(object):
             exc = DiskFileNotExist()
         else:
             try:
-                metadata = self._failsafe_read_metadata(ts_file, ts_file)
-            except DiskFileQuarantined:
+                metadata = self._read_and_validate_metadata(ts_file, ts_file)
+            except (DiskFileQuarantined, DiskFileMetadataUnavailable):
                 # If the tombstone's corrupted, quarantine it and pretend it
                 # wasn't there
                 exc = DiskFileNotExist()
@@ -2819,8 +2847,8 @@ class BaseDiskFile(object):
         self._content_length = obj_size
         return obj_size
 
-    def _failsafe_read_metadata(self, source, quarantine_filename=None,
-                                add_missing_checksum=False):
+    def _read_and_validate_metadata(self, source, quarantine_filename=None,
+                                    add_missing_checksum=False):
         """
         Read metadata from source object file. In case of failure, quarantine
         the file.
@@ -2832,10 +2860,17 @@ class BaseDiskFile(object):
         :param quarantine_filename: full path of file to load the metadata from
         :param add_missing_checksum: if True and no metadata checksum is
             present, generate one and write it down
+        :returns: dictionary of metadata
+        :raises DiskFileXattrNotSupported: if the filesystem does not support
+            xattr
+        :raises DiskFileMetadataUnavailable: if the file metadata could not be
+            read
+        :raises DiskFileQuarantined: if an error occurred that caused the file
+            to be quarantined
         """
         try:
-            return read_metadata(source, add_missing_checksum)
-        except (DiskFileXattrNotSupported, DiskFileNotExist):
+            return read_file_metadata(source, add_missing_checksum)
+        except (DiskFileXattrNotSupported, DiskFileMetadataUnavailable):
             raise
         except DiskFileBadMetadataChecksum as err:
             raise self._quarantine(quarantine_filename, str(err))
@@ -2851,7 +2886,7 @@ class BaseDiskFile(object):
 
         :param ctype_file: An on-disk .meta file
         """
-        ctypefile_metadata = self._failsafe_read_metadata(
+        ctypefile_metadata = self._read_and_validate_metadata(
             ctype_file, ctype_file)
         if ('Content-Type' in ctypefile_metadata
             and (ctypefile_metadata.get('Content-Type-Timestamp', '') >
@@ -2888,12 +2923,18 @@ class BaseDiskFile(object):
             if e.errno == errno.ENOENT:
                 raise DiskFileNotExist()
             raise
-        self._datafile_metadata = self._failsafe_read_metadata(
-            fp, data_file,
-            add_missing_checksum=modernize)
+        try:
+            self._datafile_metadata = self._read_and_validate_metadata(
+                fp, data_file,
+                add_missing_checksum=modernize)
+        except DiskFileMetadataUnavailable:
+            # not expected because an open file descriptor was passed, but
+            # handle it just in case
+            raise DiskFileNotExist()
+
         self._metadata = {}
         if meta_file:
-            self._metafile_metadata = self._failsafe_read_metadata(
+            self._metafile_metadata = self._read_and_validate_metadata(
                 meta_file, meta_file,
                 add_missing_checksum=modernize)
             if ctype_file and ctype_file != meta_file:
