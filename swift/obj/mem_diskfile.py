@@ -426,7 +426,7 @@ class DiskFile(object):
         with self.open(current_time=current_time):
             return self.get_metadata()
 
-    def reader(self, keep_cache=False, cooperative_period=None):
+    def reader(self, keep_cache=False, cooperative_period=0):
         """
         Return a swift.common.swob.Response class compatible "app_iter"
         object. The responsibility of closing the open file is passed to the

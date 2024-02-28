@@ -88,7 +88,7 @@ class BackendRateLimitMiddleware(object):
 
     def _apply_config(self, conf):
         self.current_conf = conf
-        modified = []
+        modified = False
         new_value = non_negative_float(
             conf.get('requests_per_device_per_second',
                      DEFAULT_REQUESTS_PER_DEVICE_PER_SECOND))
@@ -101,7 +101,8 @@ class BackendRateLimitMiddleware(object):
         if new_value != self.requests_per_device_rate_buffer:
             self.requests_per_device_rate_buffer = new_value
             modified = True
-        self._refresh_ratelimiters()
+        if modified:
+            self._refresh_ratelimiters()
         return modified
 
     def _load_config_file(self, warn_if_missing=False):

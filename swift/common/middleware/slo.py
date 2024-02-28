@@ -954,7 +954,8 @@ class SloGetContext(WSGIContext):
         # we can avoid re-fetching the object.
         return first_byte == 0 and last_byte == length - 1
 
-    def _is_manifest_and_need_to_refetch(self, req, resp_attrs, part_num):
+    def _need_to_refetch_manifest(self, req, resp_attrs,
+                                  is_part_num_request):
         """
         Check if the segments will be needed to service the request and update
         the segment_listing_needed attribute.
@@ -965,7 +966,8 @@ class SloGetContext(WSGIContext):
         if req.method == 'HEAD':
             # There may be some cases in the future where a HEAD resp on even a
             # modern manifest should refetch, e.g. lp bug #2029174
-            self.segment_listing_needed = resp_attrs.is_legacy or part_num
+            self.segment_listing_needed = (resp_attrs.is_legacy or
+                                           is_part_num_request)
             # it will always be the case that a HEAD must re-fetch iff
             # segment_listing_needed
             return self.segment_listing_needed
@@ -1229,7 +1231,7 @@ class SloGetContext(WSGIContext):
                 friendly_close(resp_iter)
                 raise
 
-            if self._is_manifest_and_need_to_refetch(
+            if self._need_to_refetch_manifest(
                     req, resp_attrs, part_num):
                 # reset path in case it was modified during original request
                 # (e.g. object versioning might re-write the path)

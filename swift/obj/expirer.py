@@ -98,7 +98,7 @@ def read_conf_for_grace_periods(conf):
             gp = float(conf.get(conf_key))
         except ValueError:
             pass
-        if not gp or gp < 0:
+        if gp is None or gp < 0:
             raise ValueError(
                 '%s must be a float '
                 'greater than or equal to 0' % conf_key)
@@ -173,6 +173,8 @@ class ObjectExpirer(Daemon):
                     'grace_period_%s must be a float '
                     'greater than or equal to 0' % account)
             self.acct_grace_periods[account] = gp
+
+        self.grace_periods = read_conf_for_grace_periods(conf)
 
         self.grace_periods = read_conf_for_grace_periods(conf)
 

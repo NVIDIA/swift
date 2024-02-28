@@ -1139,6 +1139,14 @@ class ByteCountEnforcer(object):
 
 
 class GetterSource(object):
+    """
+    Encapsulates properties of a source from which a GET response is read.
+
+    :param app: a proxy app.
+    :param resp: an instance of ``HTTPResponse``.
+    :param node: a dict describing the node from which the response was
+        returned.
+    """
     __slots__ = ('app', 'resp', 'node', '_parts_iter')
 
     def __init__(self, app, resp, node):
@@ -1175,8 +1183,26 @@ class GetterSource(object):
 
 
 class GetterBase(object):
+    """
+    This base class provides helper methods for handling GET requests to
+    backend servers.
+
+    :param app: a proxy app.
+    :param req: an instance of ``swob.Request``.
+    :param node_iter: an iterator yielding nodes.
+    :param partition: partition.
+    :param policy: the policy instance, or None if Account or Container.
+    :param path: path for the request.
+    :param backend_headers: a dict of headers to be sent with backend requests.
+    :param node_timeout: the timeout value for backend requests.
+    :param resource_type: a string description of the type of resource being
+        accessed; ``resource type`` is used in logs and isn't necessarily the
+        server type.
+    :param logger: a logger instance.
+    """
     def __init__(self, app, req, node_iter, partition, policy,
-                 path, backend_headers, logger=None):
+                 path, backend_headers, node_timeout, resource_type,
+                 logger=None):
         self.app = app
         self.req = req
         self.node_iter = node_iter
@@ -1184,6 +1210,9 @@ class GetterBase(object):
         self.policy = policy
         self.path = path
         self.backend_headers = backend_headers
+        # resource type is used in logs and isn't necessarily the server type
+        self.resource_type = resource_type
+        self.node_timeout = node_timeout
         self.logger = logger or app.logger
         self.bytes_used_from_backend = 0
         self.source = None
@@ -1205,6 +1234,35 @@ class GetterBase(object):
             self.app.error_occurred(self.source.node, err_msg)
             self.source.close()
         return self._find_source()
+
+    def _get_next_response_part(self):
+        # return the next part of the response body; there may only be one part
+        # unless it's a multipart/byteranges response
+        while True:
+            # the loop here is to resume if trying to parse
+            # multipart/byteranges response raises a ChunkReadTimeout
+            # and resets the source_parts_iter
+            try:
+                with WatchdogTimeout(self.app.watchdog, self.node_timeout,
+                                     ChunkReadTimeout):
+                    # If we don't have a multipart/byteranges response,
+                    # but just a 200 or a single-range 206, then this
+                    # performs no IO, and either just returns source or
+                    # raises StopIteration.
+                    # Otherwise, this call to next() performs IO when
+                    # we have a multipart/byteranges response, as it
+                    # will read the MIME boundary and part headers. In this
+                    # case, ChunkReadTimeout may also be raised.
+                    # If StopIteration is raised, it escapes and is
+                    # handled elsewhere.
+                    start_byte, end_byte, length, headers, part = next(
+                        self.source.parts_iter)
+                return (start_byte, end_byte, length, headers, part)
+            except ChunkReadTimeout:
+                if not self._replace_source(
+                        'Trying to read next part of %s multi-part GET '
+                        '(retrying)' % self.resource_type):
+                    raise
 
     def fast_forward(self, num_bytes):
         """
@@ -1311,31 +1369,42 @@ class GetterBase(object):
 
 
 class GetOrHeadHandler(GetterBase):
+    """
+    Handles GET requests to backend servers.
+
+    :param app: a proxy app.
+    :param req: an instance of ``swob.Request``.
+    :param server_type: server type used in logging
+    :param node_iter: an iterator yielding nodes.
+    :param partition: partition.
+    :param path: path for the request.
+    :param backend_headers: a dict of headers to be sent with backend requests.
+    :param concurrency: number of requests to run concurrently.
+    :param policy: the policy instance, or None if Account or Container.
+    :param logger: a logger instance.
+    """
     def __init__(self, app, req, server_type, node_iter, partition, path,
-                 backend_headers, concurrency=1, policy=None,
-                 newest=None, logger=None):
+                 backend_headers, concurrency=1, policy=None, logger=None):
+        newest = config_true_value(req.headers.get('x-newest', 'f'))
+        if server_type == 'Object' and not newest:
+            node_timeout = app.recoverable_node_timeout
+        else:
+            node_timeout = app.node_timeout
         super(GetOrHeadHandler, self).__init__(
-            app=app, req=req, node_iter=node_iter,
-            partition=partition, policy=policy, path=path,
-            backend_headers=backend_headers, logger=logger)
+            app=app, req=req, node_iter=node_iter, partition=partition,
+            policy=policy, path=path, backend_headers=backend_headers,
+            node_timeout=node_timeout, resource_type=server_type.lower(),
+            logger=logger)
+        self.newest = newest
         self.server_type = server_type
         self.used_nodes = []
         self.used_source_etag = None
         self.concurrency = concurrency
         self.latest_404_timestamp = Timestamp(0)
-        if self.server_type == 'Object':
-            self.node_timeout = self.app.recoverable_node_timeout
-        else:
-            self.node_timeout = self.app.node_timeout
         policy_options = self.app.get_policy_options(self.policy)
         self.rebalance_missing_suppression_count = min(
             policy_options.rebalance_missing_suppression_count,
             node_iter.num_primary_nodes - 1)
-
-        if newest is None:
-            self.newest = config_true_value(req.headers.get('x-newest', 'f'))
-        else:
-            self.newest = newest
 
         # populated when finding source
         self.statuses = []
@@ -1346,31 +1415,6 @@ class GetOrHeadHandler(GetterBase):
 
         # populated from response headers
         self.start_byte = self.end_byte = self.length = None
-
-    def _get_next_response_part(self):
-        # return the next part of the response body; there may only be one part
-        # unless it's a multipart/byteranges response
-        while True:
-            try:
-                # This call to next() performs IO when we have a
-                # multipart/byteranges response; it reads the MIME
-                # boundary and part headers.
-                #
-                # If we don't have a multipart/byteranges response,
-                # but just a 200 or a single-range 206, then this
-                # performs no IO, and either just returns source or
-                # raises StopIteration.
-                with WatchdogTimeout(self.app.watchdog, self.node_timeout,
-                                     ChunkReadTimeout):
-                    # if StopIteration is raised, it escapes and is
-                    # handled elsewhere
-                    start_byte, end_byte, length, headers, part = next(
-                        self.source.parts_iter)
-                return (start_byte, end_byte, length, headers, part)
-            except ChunkReadTimeout:
-                if not self._replace_source(
-                        'Trying to read object during GET (retrying)'):
-                    raise
 
     def _iter_bytes_from_response_part(self, part_file, nbytes):
         # yield chunks of bytes from a single response part; if an error
@@ -1416,7 +1460,7 @@ class GetOrHeadHandler(GetterBase):
                     self.bytes_used_from_backend += len(chunk)
                     yield chunk
 
-    def _iter_parts_from_response(self, req):
+    def _iter_parts_from_response(self):
         # iterate over potentially multiple response body parts; for each
         # part, yield an iterator over the part's bytes
         try:
@@ -1441,7 +1485,7 @@ class GetOrHeadHandler(GetterBase):
                            'part_iter': part_iter}
                     self.pop_range()
             except StopIteration:
-                req.environ['swift.non_client_disconnect'] = True
+                self.req.environ['swift.non_client_disconnect'] = True
             finally:
                 if part_iter:
                     part_iter.close()
@@ -1462,7 +1506,8 @@ class GetOrHeadHandler(GetterBase):
                     if end is not None and begin is not None:
                         if end - begin + 1 == self.bytes_used_from_backend:
                             warn = False
-            if not req.environ.get('swift.non_client_disconnect') and warn:
+            if (warn and
+                    not self.req.environ.get('swift.non_client_disconnect')):
                 self.logger.info('Client disconnected on read of %r',
                                  self.path)
             raise
@@ -1486,7 +1531,7 @@ class GetOrHeadHandler(GetterBase):
         else:
             return None
 
-    def _make_node_request(self, node, node_timeout, logger_thread_locals):
+    def _make_node_request(self, node, logger_thread_locals):
         # make a backend request; return True if the response is deemed good
         # (has an acceptable status code), useful (matches any previously
         # discovered etag) and sufficient (a single good response is
@@ -1494,6 +1539,7 @@ class GetOrHeadHandler(GetterBase):
         self.logger.thread_locals = logger_thread_locals
         if node in self.used_nodes:
             return False
+
         req_headers = dict(self.backend_headers)
         ip, port = get_ip_port(node, req_headers)
         start_node_timing = time.time()
@@ -1506,7 +1552,7 @@ class GetOrHeadHandler(GetterBase):
                     query_string=self.req.query_string)
             self.app.set_node_timing(node, time.time() - start_node_timing)
 
-            with Timeout(node_timeout):
+            with Timeout(self.node_timeout):
                 possible_source = conn.getresponse()
                 # See NOTE: swift_conn at top of file about this.
                 possible_source.swift_conn = conn
@@ -1598,14 +1644,10 @@ class GetOrHeadHandler(GetterBase):
 
         nodes = GreenthreadSafeIterator(self.node_iter)
 
-        node_timeout = self.app.node_timeout
-        if self.server_type == 'Object' and not self.newest:
-            node_timeout = self.app.recoverable_node_timeout
-
         pile = GreenAsyncPile(self.concurrency)
 
         for node in nodes:
-            pile.spawn(self._make_node_request, node, node_timeout,
+            pile.spawn(self._make_node_request, node,
                        self.logger.thread_locals)
             _timeout = self.app.get_policy_options(
                 self.policy).concurrency_timeout \
@@ -1641,13 +1683,12 @@ class GetOrHeadHandler(GetterBase):
             return True
         return False
 
-    def _make_app_iter(self, req):
+    def _make_app_iter(self):
         """
         Returns an iterator over the contents of the source (via its read
         func).  There is also quite a bit of cleanup to ensure garbage
         collection works and the underlying socket of the source is closed.
 
-        :param req: incoming request object
         :return: an iterator that yields chunks of response body bytes
         """
 
@@ -1664,7 +1705,7 @@ class GetOrHeadHandler(GetterBase):
             # furnished one for us, so we'll just re-use it
             boundary = dict(content_type_attrs)["boundary"]
 
-        parts_iter = self._iter_parts_from_response(req)
+        parts_iter = self._iter_parts_from_response()
 
         def add_content_type(response_part):
             response_part["content_type"] = \
@@ -1675,15 +1716,15 @@ class GetOrHeadHandler(GetterBase):
             (add_content_type(pi) for pi in parts_iter),
             boundary, is_multipart, self.logger)
 
-    def get_working_response(self, req):
+    def get_working_response(self):
         res = None
         if self._replace_source():
-            res = Response(request=req)
+            res = Response(request=self.req)
             res.status = self.source.resp.status
             update_headers(res, self.source.resp.getheaders())
-            if req.method == 'GET' and \
+            if self.req.method == 'GET' and \
                     self.source.resp.status in (HTTP_OK, HTTP_PARTIAL_CONTENT):
-                res.app_iter = self._make_app_iter(req)
+                res.app_iter = self._make_app_iter()
                 # See NOTE: swift_conn at top of file about this.
                 res.swift_conn = self.source.resp.swift_conn
             if not res.environ:
@@ -2285,7 +2326,7 @@ class Controller(object):
                                    partition, path, backend_headers,
                                    concurrency, policy=policy,
                                    logger=self.logger)
-        res = handler.get_working_response(req)
+        res = handler.get_working_response()
 
         if not res:
             res = self.best_response(

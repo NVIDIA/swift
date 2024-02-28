@@ -388,7 +388,7 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                        'requests_per_device_rate_buffer': "2.4"}
         factory = backend_ratelimit.filter_factory(filter_conf)
 
-        # expect warning during init
+        # expect NO warning during init
         with mock.patch('swift.common.middleware.backend_ratelimit.time.time',
                         return_value=now):
             with mock.patch(

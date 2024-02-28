@@ -364,6 +364,19 @@ class TestObjectExpirer(TestCase):
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(x.grace_periods, {('a', None): 1.0})
 
+        # allow grace_period to be 0
+        conf = {
+            'grace_period_a': 0.0,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.grace_periods, {('a', None): 0.0})
+
+        conf = {
+            'grace_period_a/b': 0.0,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.grace_periods, {('a', 'b'): 0.0})
+
         # test configure multi-account grace_period
         conf = {
             'grace_period_a': 1.0,
@@ -451,6 +464,7 @@ class TestObjectExpirer(TestCase):
             'grace_period_a': 1.0,
             'grace_period_a/test': 2.0,
             'grace_period_b': '259200.0',
+            'grace_period_b/a': '0.0',
             'grace_period_c/test': '3.0'
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
@@ -458,6 +472,7 @@ class TestObjectExpirer(TestCase):
         self.assertEqual(1.0, x.get_grace_period('a', 'not-test'))
         self.assertEqual(2.0, x.get_grace_period('a', 'test'))
         self.assertEqual(259200.0, x.get_grace_period('b', None))
+        self.assertEqual(0.0, x.get_grace_period('b', 'a'))
         self.assertEqual(259200.0, x.get_grace_period('b', 'test'))
         self.assertEqual(3.0, x.get_grace_period('c', 'test'))
         self.assertEqual(0.0, x.get_grace_period('c', 'not-test'))

@@ -154,9 +154,10 @@ use = egg:swift#backend_ratelimit
 # backend-ratelimit.conf-sample file for details of available config options.
 # backend_ratelimit_conf_path = /etc/swift/backend-ratelimit.conf
 
-# The minimum interval between attempts to reload the config file while the
-# server is running. A value of 0 means that the file is loaded at start-up but
-# not subsequently reloaded.
+# The minimum interval between attempts to reload any config file at
+# backend_ratelimit_conf_path while the server is running. A value of 0 means
+# that the file is loaded at start-up but not subsequently reloaded. Note that
+# config options in this section are never reloaded after start-up.
 # config_reload_interval = 60
 
 [container-replicator]
