@@ -98,6 +98,7 @@ from swift.common.utils import (get_logger, get_remote_client,
                                 InputProxy, list_from_csv, get_policy_index,
                                 split_path, StrAnonymizer, StrFormatTime,
                                 LogStringFormatter)
+from swift.common.statsd_client import get_labeled_statsd_client
 
 from swift.common.storage_policy import POLICIES
 from swift.common.registry import get_sensitive_headers, \
@@ -140,19 +141,17 @@ class ProxyLoggingMiddleware(object):
                      'GET,HEAD,POST,PUT,DELETE,COPY,OPTIONS'))
         self.valid_methods = [m.strip().upper() for m in
                               self.valid_methods.split(',') if m.strip()]
-        access_log_conf = {}
-        for key in ('log_facility', 'log_name', 'log_level', 'log_udp_host',
-                    'log_udp_port', 'log_statsd_host', 'log_statsd_port',
-                    'log_statsd_default_sample_rate',
-                    'log_statsd_sample_rate_factor',
-                    'log_statsd_metric_prefix'):
-            value = conf.get('access_' + key, conf.get(key, None))
-            if value:
-                access_log_conf[key] = value
+        log_conf = dict(conf)
+        access_prefix_len = len('access_')
+        for k, v in conf.items():
+            if k.startswith('access_log_'):
+                log_conf[k[access_prefix_len:]] = v
         self.access_logger = logger or get_logger(
-            access_log_conf,
+            log_conf,
             log_route=conf.get('access_log_route', 'proxy-access'),
             statsd_tail_prefix='proxy-server')
+        self.statsd = get_labeled_statsd_client(
+            log_conf, self.access_logger.logger)
         self.reveal_sensitive_prefix = int(
             conf.get('reveal_sensitive_prefix', 16))
         self.check_log_msg_template_validity()
@@ -333,9 +332,9 @@ class ProxyLoggingMiddleware(object):
         metric_name_policy = self.statsd_metric_name_policy(req, status_int,
                                                             method,
                                                             policy_index)
+
         # Only log data for valid controllers (or SOS) to keep the metric count
         # down (egregious errors will get logged by the proxy server itself).
-
         if metric_name:
             self.access_logger.timing(metric_name + '.timing',
                                       (end_time - start_time) * 1000)
@@ -346,6 +345,26 @@ class ProxyLoggingMiddleware(object):
                                       (end_time - start_time) * 1000)
             self.access_logger.update_stats(metric_name_policy + '.xfer',
                                             bytes_received + bytes_sent)
+
+        labels = self.statsd_metric_labels(
+            req, method, status_int=status_int,
+            acc=acc, cont=cont, policy_index=policy_index)
+        if labels is not None:
+            self.statsd.timing(
+                'swift_proxy_request_timing',
+                (end_time - start_time) * 1000,
+                labels=labels,
+            )
+            self.statsd.update_stats(
+                'swift_proxy_request_body_bytes',
+                bytes_received,
+                labels=labels,
+            )
+            self.statsd.update_stats(
+                'swift_proxy_response_body_bytes',
+                bytes_sent,
+                labels=labels,
+            )
 
     def get_aco_from_path(self, swift_path):
         try:
@@ -394,6 +413,29 @@ class ProxyLoggingMiddleware(object):
         else:
             return None
 
+    def statsd_metric_labels(self, req, method, status_int=None,
+                             acc=None, cont=None, policy_index=None):
+        server_type = self.get_metric_name_type(req)
+        if server_type is None:
+            return None
+
+        labels = {
+            'type': server_type,
+            'method': (method if method in self.valid_methods
+                       else 'BAD_METHOD'),
+        }
+        if status_int:
+            labels['status'] = status_int
+        if acc:
+            labels['account'] = acc
+        if cont:
+            labels['container'] = cont
+        if labels['type'] == 'object' and \
+                policy_index is not None and \
+                POLICIES.get_by_index(policy_index) is not None:
+            labels['policy'] = policy_index
+        return labels
+
     def __call__(self, env, start_response):
         if self.req_already_logged(env):
             return self.app(env, start_response)
@@ -401,6 +443,7 @@ class ProxyLoggingMiddleware(object):
         self.mark_req_logged(env)
 
         start_response_args = [None]
+
         input_proxy = InputProxy(env['wsgi.input'])
         env['wsgi.input'] = input_proxy
         start_time = time.time()
@@ -440,14 +483,22 @@ class ProxyLoggingMiddleware(object):
             resp_headers = dict(start_response_args[0][1])
             start_response(*start_response_args[0])
 
+            swift_path = req.environ.get('swift.backend_path', req.path)
+            acc, cont, _ = self.get_aco_from_path(swift_path)
+
+            policy_index = get_policy_index(req.headers, resp_headers)
+            labels = self.statsd_metric_labels(
+                req, method, status_int=wire_status_int,
+                acc=acc, cont=cont, policy_index=policy_index)
+
             # Log timing information for time-to-first-byte (GET requests only)
             ttfb = 0.0
             if method == 'GET':
-                policy_index = get_policy_index(req.headers, resp_headers)
                 metric_name = self.statsd_metric_name(
                     req, wire_status_int, method)
                 metric_name_policy = self.statsd_metric_name_policy(
                     req, wire_status_int, method, policy_index)
+
                 ttfb = time.time() - start_time
                 if metric_name:
                     self.access_logger.timing(
@@ -455,6 +506,13 @@ class ProxyLoggingMiddleware(object):
                 if metric_name_policy:
                     self.access_logger.timing(
                         metric_name_policy + '.first-byte.timing', ttfb * 1000)
+
+                if labels is not None:
+                    self.statsd.timing(
+                        'swift_proxy_request_ttfb',
+                        ttfb * 1000,
+                        labels=labels,
+                    )
 
             bytes_sent = 0
             try:
