@@ -933,6 +933,10 @@ class TestUtilsLogs(unittest.TestCase):
         self.assertRaises(ValueError, utils.StrAnonymizer,
                           'Swift is great!', 'sha257', '')
 
+        anon = utils.StrAnonymizer(None, 'sha1', 'salty_secret')
+        self.assertEqual(anon, '')
+        self.assertEqual(anon.anonymized, '')
+
     def test_str_anonymizer_python_maddness(self):
         with mock.patch('swift.common.utils.base.hashlib') as mocklib:
             if six.PY2:
