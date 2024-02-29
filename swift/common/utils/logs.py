@@ -814,6 +814,10 @@ class StrAnonymizer(str):
             return '{%s%s}%s' % ('S' if self.salt else '', self.method.upper(),
                                  h.hexdigest())
 
+    def __deepcopy__(self, memo):
+        return type(self).__new__(
+            type(self), str(self), self.method, self.salt)
+
 
 class StrFormatTime(object):
     """
