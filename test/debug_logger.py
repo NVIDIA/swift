@@ -108,6 +108,70 @@ class FakeStatsdClient(statsd_client.StatsdClient):
         return dict(counts)
 
 
+class FakeLabeledStatsdClient(statsd_client.LabeledStatsdClient):
+    def __init__(self, *args, **kwargs):
+        super(FakeLabeledStatsdClient, self).__init__(*args, **kwargs)
+        self.clear()
+
+        # Capture then call parent pubic stat functions
+        self.update_stats = self._capture("update_stats")
+        self.increment = self._capture("increment")
+        self.decrement = self._capture("decrement")
+        self.timing = self._capture("timing")
+        self.timing_since = self._capture("timing_since")
+        self.transfer_rate = self._capture("transfer_rate")
+
+    def _capture(self, func_name):
+        func = getattr(super(FakeLabeledStatsdClient, self), func_name)
+
+        def wrapper(*args, **kwargs):
+            self.calls[func_name].append((args, kwargs))
+            return func(*args, **kwargs)
+        return wrapper
+
+    def _determine_sock_family(self, host, port):
+        return None, None
+
+    def _open_socket(self):
+        return self.recording_socket
+
+    def _send(self, *args, **kwargs):
+        self.send_calls.append((args, kwargs))
+        super(FakeLabeledStatsdClient, self)._send(*args, **kwargs)
+
+    def clear(self):
+        self.send_calls = []
+        self.calls = defaultdict(list)
+        self.recording_socket = RecordingSocket()
+
+    @property
+    def sendto_calls(self):
+        return self.recording_socket.sendto_calls
+
+    def get_increments(self):
+        return [call[0][0] for call in self.calls['increment']]
+
+    def get_increment_counts(self):
+        # note: this method reports the sum of stats sent via the increment
+        # method only; consider using get_stats_counts instead to get the sum
+        # of stats sent via both the increment and update_stats methods
+        counts = defaultdict(int)
+        for metric in self.get_increments():
+            counts[metric] += 1
+        # convert to normal dict for better failure messages
+        return dict(counts)
+
+    def get_update_stats(self):
+        return [call[0][:2] for call in self.calls['update_stats']]
+
+    def get_stats_counts(self):
+        counts = defaultdict(int)
+        for metric, step in self.get_update_stats():
+            counts[metric] += step
+        # convert to normal dict for better failure messages
+        return dict(counts)
+
+
 class CaptureLog(object):
     """
     Captures log records passed to the ``handle`` method and provides accessor
@@ -272,6 +336,20 @@ class DebugLogAdapter(utils.LogAdapter):
 def debug_logger(name='test'):
     """get a named adapted debug logger"""
     return DebugLogAdapter(DebugLogger(), name)
+
+
+def debug_statsd_client(conf):
+    """get a configured statsd client"""
+    with mock.patch('swift.common.statsd_client.StatsdClient',
+                    FakeStatsdClient):
+        return statsd_client.get_statsd_client(conf)
+
+
+def debug_labeled_statsd_client(conf):
+    """get a configured labeled statsd client"""
+    with mock.patch('swift.common.statsd_client.LabeledStatsdClient',
+                    FakeLabeledStatsdClient):
+        return statsd_client.get_labeled_statsd_client(conf)
 
 
 class ForwardingLogHandler(logging.NullHandler):
