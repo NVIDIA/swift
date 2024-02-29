@@ -88,6 +88,7 @@ bandwidth usage will want to only sum up logs with no ``swift.source``.
 import os
 import time
 
+from swift.common.constraints import valid_api_version
 from swift.common.middleware.catch_errors import enforce_byte_count
 from swift.common.request_helpers import get_log_info
 from swift.common.swob import Request
@@ -97,6 +98,7 @@ from swift.common.utils import (get_logger, get_remote_client,
                                 InputProxy, list_from_csv, get_policy_index,
                                 split_path, StrAnonymizer, StrFormatTime,
                                 LogStringFormatter)
+from swift.common.statsd_client import get_labeled_statsd_client
 
 from swift.common.storage_policy import POLICIES
 from swift.common.registry import get_sensitive_headers, \
@@ -148,10 +150,17 @@ class ProxyLoggingMiddleware(object):
             value = conf.get('access_' + key, conf.get(key, None))
             if value:
                 access_log_conf[key] = value
+        for key in ('statsd_label_mode',
+                    'statsd_emit_legacy'):
+            value = conf.get(key, None)
+            if value:
+                access_log_conf[key] = value
         self.access_logger = logger or get_logger(
             access_log_conf,
             log_route=conf.get('access_log_route', 'proxy-access'),
             statsd_tail_prefix='proxy-server')
+        self.statsd = get_labeled_statsd_client(
+            access_log_conf, self.access_logger.logger)
         self.reveal_sensitive_prefix = int(
             conf.get('reveal_sensitive_prefix', 16))
         self.check_log_msg_template_validity()
@@ -271,10 +280,8 @@ class ProxyLoggingMiddleware(object):
         duration_time_str = "%.4f" % (end_time - start_time)
         policy_index = get_policy_index(req.headers, resp_headers)
 
-        acc, cont, obj = None, None, None
         swift_path = req.environ.get('swift.backend_path', req.path)
-        if swift_path.startswith('/v1/'):
-            _, acc, cont, obj = split_path(swift_path, 1, 4, True)
+        acc, cont, obj = self.get_aco_from_path(swift_path)
 
         replacements = {
             # Time information
@@ -334,9 +341,9 @@ class ProxyLoggingMiddleware(object):
         metric_name_policy = self.statsd_metric_name_policy(req, status_int,
                                                             method,
                                                             policy_index)
+
         # Only log data for valid controllers (or SOS) to keep the metric count
         # down (egregious errors will get logged by the proxy server itself).
-
         if metric_name:
             self.access_logger.timing(metric_name + '.timing',
                                       (end_time - start_time) * 1000)
@@ -348,9 +355,41 @@ class ProxyLoggingMiddleware(object):
             self.access_logger.update_stats(metric_name_policy + '.xfer',
                                             bytes_received + bytes_sent)
 
+        labels = self.statsd_metric_labels(
+            req, method, status_int=status_int,
+            acc=replacements['account'],
+            cont=replacements['container'],
+            policy_index=policy_index)
+        if labels is not None:
+            self.statsd.timing(
+                'swift_proxy_request_timing',
+                (end_time - start_time) * 1000,
+                labels=labels,
+            )
+            self.statsd.update_stats(
+                'swift_proxy_request_body_bytes',
+                bytes_received,
+                labels=labels,
+            )
+            self.statsd.update_stats(
+                'swift_proxy_response_body_bytes',
+                bytes_sent,
+                labels=labels,
+            )
+
+    def get_aco_from_path(self, swift_path):
+        try:
+            version, acc, cont, obj = split_path(swift_path, 1, 4, True)
+            if not valid_api_version(version):
+                raise ValueError
+        except ValueError:
+            version, acc, cont, obj = None, None, None, None
+        return acc, cont, obj
+
     def get_metric_name_type(self, req):
         swift_path = req.environ.get('swift.backend_path', req.path)
-        if swift_path.startswith('/v1/'):
+        acc, cont, obj = self.get_aco_from_path(swift_path)
+        if acc:
             try:
                 stat_type = [None, 'account', 'container',
                              'object'][swift_path.strip('/').count('/')]
@@ -385,6 +424,29 @@ class ProxyLoggingMiddleware(object):
         else:
             return None
 
+    def statsd_metric_labels(self, req, method, status_int=None,
+                             acc=None, cont=None, policy_index=None):
+        server_type = self.get_metric_name_type(req)
+        if server_type is None:
+            return None
+
+        labels = {
+            'type': server_type,
+            'method': (method if method in self.valid_methods
+                       else 'BAD_METHOD'),
+        }
+        if status_int:
+            labels['status'] = status_int
+        if acc:
+            labels['account'] = acc
+        if cont:
+            labels['container'] = cont
+        if labels['type'] == 'object' and \
+                policy_index is not None and \
+                POLICIES.get_by_index(policy_index) is not None:
+            labels['policy'] = policy_index
+        return labels
+
     def __call__(self, env, start_response):
         if self.req_already_logged(env):
             return self.app(env, start_response)
@@ -392,6 +454,14 @@ class ProxyLoggingMiddleware(object):
         self.mark_req_logged(env)
 
         start_response_args = [None]
+        req = Request(env)
+        swift_path = req.environ.get('swift.backend_path', req.path)
+        acc, cont, obj = self.get_aco_from_path(swift_path)
+        acc = StrAnonymizer(acc, self.anonymization_method,
+                            self.anonymization_salt)
+        cont = StrAnonymizer(cont, self.anonymization_method,
+                             self.anonymization_salt)
+
         input_proxy = InputProxy(env['wsgi.input'])
         env['wsgi.input'] = input_proxy
         start_time = time.time()
@@ -431,14 +501,19 @@ class ProxyLoggingMiddleware(object):
             resp_headers = dict(start_response_args[0][1])
             start_response(*start_response_args[0])
 
+            policy_index = get_policy_index(req.headers, resp_headers)
+            labels = self.statsd_metric_labels(
+                req, method, status_int=wire_status_int,
+                acc=acc, cont=cont, policy_index=policy_index)
+
             # Log timing information for time-to-first-byte (GET requests only)
             ttfb = 0.0
             if method == 'GET':
-                policy_index = get_policy_index(req.headers, resp_headers)
                 metric_name = self.statsd_metric_name(
                     req, wire_status_int, method)
                 metric_name_policy = self.statsd_metric_name_policy(
                     req, wire_status_int, method, policy_index)
+
                 ttfb = time.time() - start_time
                 if metric_name:
                     self.access_logger.timing(
@@ -446,6 +521,13 @@ class ProxyLoggingMiddleware(object):
                 if metric_name_policy:
                     self.access_logger.timing(
                         metric_name_policy + '.first-byte.timing', ttfb * 1000)
+
+                if labels is not None:
+                    self.statsd.timing(
+                        'swift_proxy_request_ttfb',
+                        ttfb * 1000,
+                        labels=labels,
+                    )
 
             bytes_sent = 0
             try:
