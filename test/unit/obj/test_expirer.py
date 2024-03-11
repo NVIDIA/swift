@@ -101,6 +101,62 @@ class FakeInternalClient(object):
         return swob.HTTPNoContent()
 
 
+class TestExpirerHelpers(TestCase):
+
+    def test_add_expirer_bytes_to_ctype(self):
+        self.assertEqual(
+            'text/plain;swift_expirer_bytes=10',
+            expirer.embed_expirer_bytes_in_ctype('text/plain', 10))
+        self.assertEqual(
+            'text/plain;some_foo=bar;swift_expirer_bytes=10',
+            expirer.embed_expirer_bytes_in_ctype(
+                'text/plain;some_foo=bar', 10))
+
+    def test_extract_expirer_bytes_from_ctype(self):
+        self.assertEqual(10, expirer.extract_expirer_bytes_from_ctype(
+            'text/plain;swift_expirer_bytes=10'))
+        self.assertEqual(10, expirer.extract_expirer_bytes_from_ctype(
+            'text/plain;swift_expirer_bytes=10;some_foo=bar'))
+
+    def test_inverse_add_extract_bytes_from_ctype(self):
+        ctype_bytes = [
+            ('null', 0),
+            ('text/plain', 10),
+            ('application/octet-stream', 42),
+            ('application/json', 512),
+            ('gzip', 1000044),
+        ]
+        for ctype, expirer_bytes in ctype_bytes:
+            embedded_ctype = expirer.embed_expirer_bytes_in_ctype(
+                ctype, expirer_bytes)
+            found_bytes = expirer.extract_expirer_bytes_from_ctype(
+                embedded_ctype)
+            self.assertEqual(expirer_bytes, found_bytes)
+
+    def test_add_invalid_expirer_bytes_to_ctype(self):
+        self.assertRaises(TypeError,
+                          expirer.embed_expirer_bytes_in_ctype, 'nill', None)
+        self.assertRaises(ValueError,
+                          expirer.embed_expirer_bytes_in_ctype, 'bar', 'foo')
+        # perhaps could be an error
+        self.assertEqual(
+            'weird/float;swift_expirer_bytes=15',
+            expirer.embed_expirer_bytes_in_ctype('weird/float', 15.9))
+
+    def test_extract_missing_bytes_from_ctype(self):
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype('text/plain'))
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype(
+                'text/plain;swift_bytes=10'))
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype(
+                'text/plain;bytes=21'))
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype(
+                'text/plain;some_foo=bar;other-baz=buz'))
+
+
 class TestObjectExpirer(TestCase):
     maxDiff = None
     internal_client = None
