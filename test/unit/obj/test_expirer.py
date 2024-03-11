@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from time import time
 from unittest import main, TestCase
 from test.debug_logger import debug_logger
@@ -29,7 +30,7 @@ from six.moves import urllib
 
 from swift.common import internal_client, utils, swob
 from swift.common.utils import Timestamp
-from swift.obj import expirer
+from swift.obj import expirer, diskfile
 
 
 def not_random():
@@ -93,6 +94,129 @@ class FakeInternalClient(object):
 
     def delete_object(*a, **kw):
         pass
+
+
+class TestExpirerHelpers(TestCase):
+
+    def test_add_expirer_bytes_to_ctype(self):
+        self.assertEqual(
+            'text/plain;swift_expirer_bytes=10',
+            expirer.embed_expirer_bytes_in_ctype(
+                'text/plain', {'Content-Length': 10}))
+        self.assertEqual(
+            'text/plain;some_foo=bar;swift_expirer_bytes=10',
+            expirer.embed_expirer_bytes_in_ctype(
+                'text/plain;some_foo=bar', {'Content-Length': '10'}))
+
+    def test_extract_expirer_bytes_from_ctype(self):
+        self.assertEqual(10, expirer.extract_expirer_bytes_from_ctype(
+            'text/plain;swift_expirer_bytes=10'))
+        self.assertEqual(10, expirer.extract_expirer_bytes_from_ctype(
+            'text/plain;swift_expirer_bytes=10;some_foo=bar'))
+
+    def test_inverse_add_extract_bytes_from_ctype(self):
+        ctype_bytes = [
+            ('null', 0),
+            ('text/plain', 10),
+            ('application/octet-stream', 42),
+            ('application/json', 512),
+            ('gzip', 1000044),
+        ]
+        for ctype, expirer_bytes in ctype_bytes:
+            embedded_ctype = expirer.embed_expirer_bytes_in_ctype(
+                ctype, {'Content-Length': expirer_bytes})
+            found_bytes = expirer.extract_expirer_bytes_from_ctype(
+                embedded_ctype)
+            self.assertEqual(expirer_bytes, found_bytes)
+
+    def test_add_invalid_expirer_bytes_to_ctype(self):
+        self.assertRaises(AttributeError,
+                          expirer.embed_expirer_bytes_in_ctype, 'nill', None)
+        self.assertRaises(AttributeError,
+                          expirer.embed_expirer_bytes_in_ctype, 'bar', 'foo')
+        self.assertRaises(KeyError,
+                          expirer.embed_expirer_bytes_in_ctype, 'nill', {})
+        self.assertRaises(TypeError,
+                          expirer.embed_expirer_bytes_in_ctype, 'nill',
+                          {'Content-Length': None})
+        self.assertRaises(ValueError,
+                          expirer.embed_expirer_bytes_in_ctype, 'nill',
+                          {'Content-Length': 'foo'})
+        # perhaps could be an error
+        self.assertEqual(
+            'weird/float;swift_expirer_bytes=15',
+            expirer.embed_expirer_bytes_in_ctype('weird/float',
+                                                 {'Content-Length': 15.9}))
+
+    def test_embed_expirer_bytes_from_diskfile_metadata(self):
+        self.logger = debug_logger('test-expirer')
+        self.ts = make_timestamp_iter()
+        self.devices = mkdtemp()
+        self.conf = {
+            'mount_check': 'false',
+            'devices': self.devices,
+        }
+        self.df_mgr = diskfile.DiskFileManager(self.conf, logger=self.logger)
+        utils.mkdirs(os.path.join(self.devices, 'sda1'))
+        df = self.df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o', policy=0)
+
+        ts = next(self.ts)
+        with df.create() as writer:
+            writer.write(b'test')
+            writer.put({
+                # wrong key/case here would KeyError
+                'X-Timestamp': ts.internal,
+                # wrong key/case here would cause quarantine on read
+                'Content-Length': '4',
+            })
+
+        metadata = df.read_metadata()
+        # the Content-Type in the metadata is irrelevant; this method is used
+        # to create the content_type of an expirer queue task object
+        embeded_ctype_entry = expirer.embed_expirer_bytes_in_ctype(
+            'text/plain', metadata)
+        self.assertEqual('text/plain;swift_expirer_bytes=4',
+                         embeded_ctype_entry)
+
+    def test_embed_expirer_bytes_from_mpu_metadata(self):
+        metadata = {
+            'X-Timestamp': '1715981937.86913',
+            'Content-Type': 'application/octet-stream;swift_bytes=15728640',
+            'Content-Length': '936',
+            'ETag': '61f6468389e276b0a36fb11e0669189a',
+            'X-Object-Sysmeta-S3Api-Acl': '{"Owner":"test:tester","Grant":['
+            '{"Permission":"FULL_CONTROL","Grantee":"test:tester"}]}',
+            'X-Object-Sysmeta-S3Api-Upload-Id':
+            'MDZhYjljYTgtMjdkYy00ZjVmLThjZDYtNTY4ZTZjNzA0ODg0',
+            'X-Object-Sysmeta-S3Api-Etag':
+            'fd453aaf14ea07844745550b30b084d7-3',
+            'X-Object-Sysmeta-Container-Update-Override-Etag':
+            '61f6468389e276b0a36fb11e0669189a; '
+            's3_etag=fd453aaf14ea07844745550b30b084d7-3; '
+            'slo_etag=2cdb89ae568d0aa7f4fcea57cc2c3ae4',
+            'X-Object-Sysmeta-Slo-Etag': '2cdb89ae568d0aa7f4fcea57cc2c3ae4',
+            'X-Object-Sysmeta-Slo-Size': '15728640',
+            'X-Static-Large-Object': 'True',
+            'name': '/AUTH_test/'
+            'bucket-6fc0fac3-e5aa-42ad-9df7-653c6884e540/'
+            'mpu-6c541365-4cf2-4842-8ad9-af30784556d2'
+        }
+        self.assertEqual('text/plain;swift_expirer_bytes=15728640',
+                         expirer.embed_expirer_bytes_in_ctype(
+                             'text/plain', metadata))
+
+    def test_extract_missing_bytes_from_ctype(self):
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype('text/plain'))
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype(
+                'text/plain;swift_bytes=10'))
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype(
+                'text/plain;bytes=21'))
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype(
+                'text/plain;some_foo=bar;other-baz=buz'))
 
 
 class TestObjectExpirer(TestCase):

@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import Counter
 import json
+import os
 import random
+from tempfile import mkdtemp
 import time
 import uuid
 import unittest
@@ -22,12 +25,17 @@ from io import BytesIO
 from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.manager import Manager
 from swift.common.utils import Timestamp, config_true_value
+from swift.common import direct_client
+from swift.obj.expirer import extract_expirer_bytes_from_ctype
 
 from test.probe.common import ReplProbeTest, ENABLED_POLICIES
 from test.probe.brain import BrainSplitter
 
 from swiftclient import client
 from swiftclient.exceptions import ClientException
+
+from test.s3api import get_s3_client
+from boto3.s3.transfer import TransferConfig
 
 
 class TestObjectExpirer(ReplProbeTest):
@@ -470,6 +478,203 @@ class TestObjectExpirer(ReplProbeTest):
                 acceptable_statuses=(2,),
                 headers={'X-Backend-Open-Expired': True})
         self.assertEqual(e.exception.resp.status_int, 404)
+
+    def test_expirer_object_bytes_eventual_consistency(self):
+        obj_brain = BrainSplitter(self.url, self.token, self.container_name,
+                                  self.object_name, 'object', self.policy)
+
+        obj_brain.put_container()
+
+        def put_object(content_length=0):
+            try:
+                self.client.upload_object(BytesIO(bytes(content_length)),
+                                          self.account, self.container_name,
+                                          self.object_name)
+            except UnexpectedResponse as e:
+                self.fail(
+                    'Expected 201 for PUT object but got %s' % e.resp.status)
+
+        t0_content_length = 24
+        put_object(content_length=t0_content_length)
+
+        try:
+            metadata = self.client.get_object_metadata(
+                self.account, self.container_name, self.object_name)
+        except UnexpectedResponse as e:
+            self.fail(
+                'Expected 200 for HEAD object but got %s' % e.resp.status)
+
+        assert metadata['content-length'] == str(t0_content_length)
+        t0 = metadata['x-timestamp']
+
+        obj_brain.stop_primary_half()
+
+        t1_content_length = 32
+        put_object(content_length=t1_content_length)
+
+        try:
+            metadata = self.client.get_object_metadata(
+                self.account, self.container_name, self.object_name)
+        except UnexpectedResponse as e:
+            self.fail(
+                'Expected 200 for HEAD object but got %s' % e.resp.status)
+
+        assert metadata['content-length'] == str(t1_content_length)
+        t1 = metadata['x-timestamp']
+
+        # some object servers recovered
+        obj_brain.start_primary_half()
+
+        head_responses = []
+
+        for node in obj_brain.ring.devs:
+            metadata = direct_client.direct_head_object(
+                node, obj_brain.part, self.account, self.container_name,
+                self.object_name)
+            head_responses.append(metadata)
+
+        timestamp_counts = Counter([
+            resp['X-Timestamp'] for resp in head_responses
+        ])
+        expected_counts = {t0: 2, t1: 2}
+        self.assertEqual(expected_counts, timestamp_counts)
+
+        # Do a POST to update object metadata (timestamp x-delete-at)
+        # POST will create an expiry queue entry with 2 landing on t0, 1 on t1
+        self.client.set_object_metadata(
+            self.account, self.container_name, self.object_name,
+            metadata={'X-Delete-After': '5'}, acceptable_statuses=(2,)
+        )
+
+        # Run the container updater once to register new container containing
+        # expirey queue entry
+        Manager(['container-updater']).once()
+
+        # Find the name of the container containing the expiring object
+        expiring_containers = list(
+            self.client.iter_containers('.expiring_objects')
+        )
+        self.assertEqual(1, len(expiring_containers))
+
+        expiring_container = expiring_containers[0]
+        expiring_container_name = expiring_container['name']
+
+        # Verify that there is one expiring object
+        expiring_objects = list(
+            self.client.iter_objects('.expiring_objects',
+                                     expiring_container_name)
+        )
+        self.assertEqual(1, len(expiring_objects))
+
+        # Get the nodes of the expiring container
+        expiring_container_part_num, expiring_container_nodes = \
+            self.client.container_ring.get_nodes('.expiring_objects',
+                                                 expiring_container_name)
+
+        # Verify that there are only 3 such nodes
+        self.assertEqual(3, len(expiring_container_nodes))
+
+        listing_records = []
+        for node in expiring_container_nodes:
+            metadata, container_data = direct_client.direct_get_container(
+                node, expiring_container_part_num, '.expiring_objects',
+                expiring_container_name)
+            # Verify there is metadata for only one object
+            self.assertEqual(1, len(container_data))
+            listing_records.append(container_data[0])
+
+        # Check for inconsistent metadata
+        byte_size_counts = Counter([
+            extract_expirer_bytes_from_ctype(resp['content_type'])
+            for resp in listing_records
+        ])
+        expected_byte_size_counts = {
+            t0_content_length: 2,
+            t1_content_length: 1
+        }
+
+        self.assertEqual(expected_byte_size_counts, byte_size_counts)
+
+        # Run the replicator to update expirey queue entries
+        Manager(['container-replicator']).once()
+
+        listing_records = []
+        for node in expiring_container_nodes:
+            metadata, container_data = direct_client.direct_get_container(
+                node, expiring_container_part_num, '.expiring_objects',
+                expiring_container_name)
+            self.assertEqual(1, len(container_data))
+            listing_records.append(container_data[0])
+
+        # Ensure that metadata is now consistent
+        byte_size_counts = Counter([
+            extract_expirer_bytes_from_ctype(resp['content_type'])
+            for resp in listing_records
+        ])
+        expected_byte_size_counts = {t1_content_length: 3}
+
+        self.assertEqual(expected_byte_size_counts, byte_size_counts)
+
+    def test_expirer_object_bytes_s3api_mpu(self):
+        # a mpu is a form an swift SLO, this same test applies but we create
+        # the SLO using boto3 for extra coverage
+        s3api_info = self.cluster_info.get('s3api', {})
+        if not s3api_info:
+            raise unittest.SkipTest('s3api not enabled')
+
+        self.s3 = get_s3_client(1)
+
+        self.bucket_name = 'bucket-%s' % uuid.uuid4()
+        self.mpu_name = 'mpu-%s' % uuid.uuid4()
+
+        self.s3.create_bucket(Bucket=self.bucket_name)
+
+        chunksize = 5 * 2 ** 20
+        num_chunks = 3
+
+        self.tempdir = mkdtemp()
+        filename = os.path.join(self.tempdir, 'big.file')
+        with open(filename, 'wb') as f:
+            c = 'a'
+            for i in range(num_chunks):
+                c = chr(ord(c) + i)
+                chunk = c.encode() * chunksize
+                f.write(chunk)
+        expected_size = chunksize * num_chunks
+
+        config = TransferConfig(multipart_threshold=chunksize,
+                                multipart_chunksize=chunksize)
+        self.s3.upload_file(filename, self.bucket_name, self.mpu_name,
+                            Config=config)
+
+        # set expiration using swift API
+        client.post_object(self.url, self.token,
+                           self.bucket_name, self.mpu_name,
+                           headers={
+                               'X-Delete-After': '1',
+                           })
+
+        # Run the container updater once to register new container containing
+        # expirey queue entry
+        Manager(['container-updater']).once()
+
+        # Find the name of the container containing the expiring object
+        expiring_containers = list(
+            self.client.iter_containers('.expiring_objects')
+        )
+        self.assertEqual(1, len(expiring_containers))
+        expiring_container = expiring_containers[0]
+        expiring_container_name = expiring_container['name']
+
+        # Verify that there is one expiring object
+        expiring_objects = list(
+            self.client.iter_objects('.expiring_objects',
+                                     expiring_container_name)
+        )
+        self.assertEqual(1, len(expiring_objects))
+        found_bytes = extract_expirer_bytes_from_ctype(
+            expiring_objects[0]['content_type'])
+        self.assertEqual(found_bytes, expected_size)
 
     def _test_expirer_delete_outdated_object_version(self, object_exists):
         # This test simulates a case where the expirer tries to delete

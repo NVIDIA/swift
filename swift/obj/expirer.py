@@ -29,7 +29,7 @@ from swift.common.daemon import Daemon
 from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.utils import get_logger, dump_recon_cache, split_path, \
     Timestamp, config_true_value, normalize_delete_at_timestamp, \
-    RateLimitedIterator, md5, non_negative_float
+    RateLimitedIterator, md5, non_negative_float, parse_content_type
 from swift.common.http import HTTP_NOT_FOUND, HTTP_CONFLICT, \
     HTTP_PRECONDITION_FAILED
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
@@ -65,6 +65,41 @@ def parse_task_obj(task_obj):
     target_account, target_container, target_obj = \
         split_path('/' + target_path, 3, 3, True)
     return timestamp, target_account, target_container, target_obj
+
+
+def extract_expirer_bytes_from_ctype(content_type):
+    """
+    Parse a content-type and return the number of bytes.
+
+    :param content_type: a content-type string
+    :return: int or None
+    """
+    content_type, params = parse_content_type(content_type)
+    bytes_size = None
+    for k, v in params:
+        if k == 'swift_expirer_bytes':
+            bytes_size = int(v)
+    return bytes_size
+
+
+def embed_expirer_bytes_in_ctype(content_type, metadata):
+    """
+    Embed number of bytes into content-type.  The bytes can come from
+    content-length on regular objects of the swift_bytes in the objects
+    content-length when the object is an MPU/SLO.
+
+    :param content_type: a content-type string
+    :param metadata: a dict, from Diskfile metadata
+    :return: str
+    """
+    # all new SLO will have this key
+    slo_size = metadata.get('X-Object-Sysmeta-Slo-Size')
+    if slo_size is not None:
+        report_bytes = slo_size
+    else:
+        # as best I can tell this key is required by df.open
+        report_bytes = metadata['Content-Length']
+    return "%s;swift_expirer_bytes=%d" % (content_type, int(report_bytes))
 
 
 def read_conf_for_delay_reaping_times(conf):
