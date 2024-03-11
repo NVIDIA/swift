@@ -709,7 +709,7 @@ class TestMemcached(unittest.TestCase):
             '[Errno 32] Broken pipe',
             'Error limiting server 1.2.3.4:11211',
             'Error connecting to memcached: ALL: with key_prefix some_key, '
-            'method set: All memcached servers error-limited',
+            'method set: No more memcached servers to try',
         ])
         self.logger.clear()
 
@@ -718,7 +718,7 @@ class TestMemcached(unittest.TestCase):
             memcache_client.set('some_key', [1, 2, 3])
         self.assertEqual(self.logger.get_lines_for_level('error'), [
             'Error connecting to memcached: ALL: with key_prefix some_key, '
-            'method set: All memcached servers error-limited',
+            'method set: No more memcached servers to try',
         ] * 12)
         self.logger.clear()
 
@@ -726,7 +726,7 @@ class TestMemcached(unittest.TestCase):
         self.assertIsNone(memcache_client.get('some_key'))
         self.assertEqual(self.logger.get_lines_for_level('error'), [
             'Error connecting to memcached: ALL: with key_prefix some_key, '
-            'method get: All memcached servers error-limited',
+            'method get: No more memcached servers to try',
         ])
 
     def test_error_disabled(self):
@@ -844,7 +844,7 @@ class TestMemcached(unittest.TestCase):
             '[Errno 32] Broken pipe',
             'Error limiting server 1.2.3.5:11211',
             'Error connecting to memcached: ALL: with key_prefix some_key, '
-            'method set: All memcached servers error-limited',
+            'method set: No more memcached servers to try',
         ])
 
         # with default error_limit_time of 60, one call per 6 secs, error limit
@@ -869,7 +869,7 @@ class TestMemcached(unittest.TestCase):
             '[Errno 32] Broken pipe',
             'Error limiting server 1.2.3.5:11211',
             'Error connecting to memcached: ALL: with key_prefix some_key, '
-            'method set: All memcached servers error-limited'])
+            'method set: No more memcached servers to try'])
 
         # with error_limit_time of 70, one call per 6 secs, error_limit_count
         # of 11, 13th call triggers error limit
@@ -884,7 +884,7 @@ class TestMemcached(unittest.TestCase):
             '[Errno 32] Broken pipe',
             'Error limiting server 1.2.3.5:11211',
             'Error connecting to memcached: ALL: with key_prefix some_key, '
-            'method set: All memcached servers error-limited'])
+            'method set: No more memcached servers to try'])
 
     def test_delete(self):
         memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],

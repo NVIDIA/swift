@@ -345,6 +345,14 @@ use = egg:swift#proxy
 # the environment (default). For more information, see
 # https://bugs.launchpad.net/liberasurecode/+bug/1886088
 # write_legacy_ec_crc =
+#
+# Setting 'enable_open_expired' to 'true' allows the 'x-open-expired' header
+# to be used with HEAD, GET, or POST requests to access expired objects that
+# have not yet been deleted from disk. This can be useful in conjunction with
+# the object-expirer 'grace period' feature.
+# This flag is set to false by default, so it must be changed to access
+# expired objects.
+# enable_open_expired = true
 
 # The pyeclib/liberasure used by swift can be made to do EC fragment metadata checks
 # before attempting to decode. To enable set pyeclib_force_metadata_check to true to enable it.

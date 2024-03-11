@@ -324,7 +324,7 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
         self._check_part_num_invalid_exc(caught.exception, val, max_part_num,
                                          is_head=True)
 
-    def test_part_number_non_slo(self):
+    def test_part_number_non_mpu(self):
         max_part_num = self._discover_max_part_num()
         key_name = self.create_name('part-num-non-mpu')
         self.client.put_object(Bucket=self.bucket_name,
@@ -393,6 +393,48 @@ class TestMultiPartUpload(BaseMultiPartUploadTestCase):
                                     PartNumber=invalid_part_num)
         self._check_part_num_invalid_exc(caught.exception, invalid_part_num,
                                          max_part_num, is_head=True)
+
+    def test_get_object_partNumber_and_range(self):
+        # partNumber not allowed with Range even for non-mpu object
+        key_name = self.create_name('part-num-mpu')
+        self._upload_mpu(key_name)
+        with self.assertRaises(ClientError) as caught:
+            self.client.get_object(Bucket=self.bucket_name,
+                                   Key=key_name,
+                                   PartNumber=1,
+                                   Range='bytes=1-2')
+        err_resp = caught.exception.response
+        self.assertEqual(400, err_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual('InvalidRequest', err_resp['Error']['Code'], err_resp)
+        self.assertEqual('Cannot specify both Range header and partNumber '
+                         'query parameter', err_resp['Error']['Message'])
+
+        key_name = self.create_name('part-num-non-mpu')
+        self.client.put_object(Bucket=self.bucket_name,
+                               Key=key_name,
+                               Body=b'non-mpu-object')
+        with self.assertRaises(ClientError) as caught:
+            self.client.get_object(Bucket=self.bucket_name,
+                                   Key=key_name,
+                                   PartNumber=1,
+                                   Range='bytes=1-2')
+        err_resp = caught.exception.response
+        self.assertEqual(400, err_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual('InvalidRequest', err_resp['Error']['Code'], err_resp)
+        self.assertEqual('Cannot specify both Range header and partNumber '
+                         'query parameter', err_resp['Error']['Message'])
+
+        # partNumber + Range error trumps bad partNumber
+        with self.assertRaises(ClientError) as caught:
+            self.client.get_object(Bucket=self.bucket_name,
+                                   Key=key_name,
+                                   PartNumber=0,
+                                   Range='bytes=1-2')
+        err_resp = caught.exception.response
+        self.assertEqual(400, err_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual('InvalidRequest', err_resp['Error']['Code'], err_resp)
+        self.assertEqual('Cannot specify both Range header and partNumber '
+                         'query parameter', err_resp['Error']['Message'])
 
     def test_upload_part_copy(self):
         self.num_parts = 4

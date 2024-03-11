@@ -250,7 +250,8 @@ class BaseObjectController(Controller):
         policy = POLICIES.get_by_index(policy_index)
         obj_ring = self.app.get_object_ring(policy_index)
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
-        if config_true_value(req.headers.get('x-open-expired')):
+        if (config_true_value(self.app.enable_open_expired) and
+                config_true_value(req.headers.get('x-open-expired'))):
             req.headers['X-Backend-Open-Expired'] = 'true'
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
@@ -403,7 +404,8 @@ class BaseObjectController(Controller):
         container_info = self.container_info(
             self.account_name, self.container_name, req)
         req.acl = container_info['write_acl']
-        if config_true_value(req.headers.get('x-open-expired')):
+        if (config_true_value(self.app.enable_open_expired) and
+                config_true_value(req.headers.get('x-open-expired'))):
             req.headers['X-Backend-Open-Expired'] = 'true'
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
@@ -2121,6 +2123,16 @@ class ECGetResponseBucket(object):
         self._durable = False
         self.status = self.headers = None
 
+    def __repr__(self):
+        return '%s(%s)' % (
+            type(self).__name__,
+            ', '.join(
+                '%s: %r' % (a, getattr(self, a)) for a in (
+                    'policy', 'timestamp', 'gets',
+                    'durable', 'status', 'headers')
+            ),
+        )
+
     def set_durable(self):
         self._durable = True
 
@@ -2248,6 +2260,15 @@ class ECGetResponseCollection(object):
         self.default_bad_bucket = ECGetResponseBucket(self.policy, None)
         self.bad_buckets = {}
         self.node_iter_count = 0
+
+    def __repr__(self):
+        return '%s(%s)' % (
+            type(self).__name__,
+            ', '.join(
+                '%s: %r' % (a, getattr(self, a)) for a in (
+                    'policy', 'buckets', 'bad_buckets', 'node_iter_count')
+            ),
+        )
 
     def _get_bucket(self, timestamp):
         """
@@ -2975,13 +2996,18 @@ class ECObjectController(BaseObjectController):
                         bodies.append(getter.body)
                         headers.append(getter.source_headers)
 
-            if not statuses and is_success(best_bucket.status) and \
-                    not best_bucket.durable:
-                # pretend that non-durable bucket was 404s
-                statuses.append(404)
-                reasons.append('404 Not Found')
-                bodies.append(b'')
-                headers.append({})
+            if not statuses:
+                best_status = best_bucket.status
+                if best_status is None:
+                    # WTF
+                    self.logger.error(
+                        'best_bucket.status is None?? buckets=%r', buckets)
+                elif is_success(best_status) and not best_bucket.durable:
+                    # pretend that non-durable bucket was 404s
+                    statuses.append(404)
+                    reasons.append('404 Not Found')
+                    bodies.append(b'')
+                    headers.append({})
 
             resp = self.best_response(
                 req, statuses, reasons, bodies, 'Object',

@@ -178,6 +178,8 @@ class ObjectExpirer(Daemon):
 
         self.grace_periods = read_conf_for_grace_periods(conf)
 
+        self.grace_periods = read_conf_for_grace_periods(conf)
+
     def read_conf_for_queue_access(self, swift):
         self.expiring_objects_account = AUTO_CREATE_ACCOUNT_PREFIX + \
             (self.conf.get('expiring_objects_account_name') or

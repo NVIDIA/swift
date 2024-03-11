@@ -196,8 +196,7 @@ class PartController(Controller):
             raise InvalidArgument('ResourceType', 'partNumber',
                                   'Unexpected query string parameter')
 
-        part_number = req.validate_part_number(
-            max_parts=self.conf.max_upload_part_num)
+        part_number = req.validate_part_number()
 
         upload_id = get_param(req, 'uploadId')
         _get_upload_info(req, self.app, upload_id)

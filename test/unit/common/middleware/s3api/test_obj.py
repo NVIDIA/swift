@@ -439,6 +439,44 @@ class BaseS3ApiObj(object):
         body = self._do_test_non_slo_object_part_num_invalid('HEAD', 'foo')
         self.assertEqual(body, b'')
 
+    def test_non_slo_object_GET_part_num_and_range(self):
+        req = Request.blank('/bucket/object',
+                            params={'partNumber': '1'},
+                            headers={'Range': 'bytes=1-2',
+                                     'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        req.method = 'GET'
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '400')
+        self.assertEqual(self._get_error_code(body), 'InvalidRequest')
+        self.assertEqual(
+            self._get_error_message(body),
+            'Cannot specify both Range header and partNumber query parameter')
+
+        # partNumber + Range error trumps bad partNumber
+        req = Request.blank('/bucket/object',
+                            params={'partNumber': '0'},
+                            headers={'Range': 'bytes=1-2',
+                                     'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        req.method = 'GET'
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '400')
+        self.assertEqual(self._get_error_code(body), 'InvalidRequest')
+        self.assertEqual(
+            self._get_error_message(body),
+            'Cannot specify both Range header and partNumber query parameter')
+
+    def test_non_slo_object_HEAD_part_num_and_range(self):
+        req = Request.blank('/bucket/object',
+                            params={'partNumber': '1'},
+                            headers={'Range': 'bytes=1-2',
+                                     'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        req.method = 'HEAD'
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '400')
+
     def test_object_GET_Range(self):
         req = Request.blank('/bucket/object',
                             environ={'REQUEST_METHOD': 'GET'},

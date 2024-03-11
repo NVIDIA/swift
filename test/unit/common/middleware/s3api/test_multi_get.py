@@ -148,14 +148,7 @@ class TestMpuGETorHEAD(S3ApiTestCase):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '400')
         self.assertEqual(self._get_error_code(body), 'InvalidArgument')
-        expected_calls = [
-            # s3api.controller.obj doesn't know yet if it's SLO, we delegate
-            # param validation
-            ('GET', '/v1/AUTH_test/bucket/mpu?part-number=foo'),
-        ]
-        if self.s3_acl:
-            expected_calls.insert(0, ('HEAD', '/v1/AUTH_test/bucket/mpu'))
-        self.assertEqual(self.swift.calls, expected_calls)
+        self.assertEqual(self.swift.calls, [])
 
     def test_mpu_GET_zero_part_num(self):
         req = swob.Request.blank('/bucket/mpu', params={
@@ -167,14 +160,7 @@ class TestMpuGETorHEAD(S3ApiTestCase):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '400')
         self.assertEqual(self._get_error_code(body), 'InvalidArgument')
-        expected_calls = [
-            # s3api.controller.obj doesn't know yet if it's SLO, we delegate
-            # param validation
-            ('GET', '/v1/AUTH_test/bucket/mpu?part-number=0'),
-        ]
-        if self.s3_acl:
-            expected_calls.insert(0, ('HEAD', '/v1/AUTH_test/bucket/mpu'))
-        self.assertEqual(self.swift.calls, expected_calls)
+        self.assertEqual(self.swift.calls, [])
 
     def _do_test_mpu_GET_out_of_range_part_num(self, part_number):
         self.swift.clear_calls()
@@ -290,9 +276,7 @@ class TestMpuGETorHEAD(S3ApiTestCase):
         })
         status, headers, _ = self.call_s3api(req)
         self.assertEqual(status.split()[0], '400')
-        self.assertEqual(self.swift.calls, [
-            ('HEAD', '/v1/AUTH_test/bucket/mpu?part-number=foo'),
-        ])
+        self.assertEqual(self.swift.calls, [])
 
     def test_mpu_HEAD_zero_part_num(self):
         req = swob.Request.blank('/bucket/mpu', method='HEAD', params={
@@ -303,9 +287,7 @@ class TestMpuGETorHEAD(S3ApiTestCase):
         })
         status, headers, _ = self.call_s3api(req)
         self.assertEqual(status.split()[0], '400')
-        self.assertEqual(self.swift.calls, [
-            ('HEAD', '/v1/AUTH_test/bucket/mpu?part-number=0'),
-        ])
+        self.assertEqual(self.swift.calls, [])
 
     def _do_test_mpu_HEAD_out_of_range_part_num(self, part_number):
         self.swift.clear_calls()

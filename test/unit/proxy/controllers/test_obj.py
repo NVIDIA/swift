@@ -33,6 +33,9 @@ import six
 from six import StringIO
 from six.moves import range
 from six.moves.urllib.parse import quote
+
+from swift.proxy.controllers.obj import ECGetResponseCollection
+
 if six.PY2:
     from email.parser import FeedParser as EmailFeedParser
 else:
@@ -834,7 +837,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         self.assertEqual(resp.status_int, 404)
         return fake_conn.requests
 
-    def test_x_open_expired(self):
+    def test_x_open_expired_default_config(self):
         for method, num_reqs in (
                 ('GET',
                  self.obj_ring.replicas + self.obj_ring.max_more_nodes),
@@ -850,8 +853,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                 method, num_reqs, headers={'X-Open-Expired': 'true'})
             for r in requests:
                 self.assertEqual(r['headers']['X-Open-Expired'], 'true')
-                self.assertEqual(r['headers']['X-Backend-Open-Expired'],
-                                 'true')
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
 
             requests = self._test_x_open_expired(
                 method, num_reqs, headers={'X-Open-Expired': 'false'})
@@ -876,6 +878,57 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         for r in fake_conn.requests:
             self.assertEqual(r['headers']['X-Open-Expired'], 'true')
             self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+    def test_x_open_expired_custom_config(self):
+        # Enable open expired
+        # Override app configuration
+        conf = {'enable_open_expired': 'true'}
+        # Create a new proxy instance for test with config
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=None)
+        # Use the same container info as the app used in other tests
+        self.app.container_info = dict(self.container_info)
+        self.obj_ring = self.app.get_object_ring(int(self.policy))
+
+        for method, num_reqs in (
+                ('GET',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('HEAD',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('POST', self.obj_ring.replicas)):
+            requests = self._test_x_open_expired(
+                method, num_reqs, headers={'X-Open-Expired': 'true'})
+            for r in requests:
+                # If the proxy server config is has enable_open_expired set
+                # to true, then we set x-backend-open-expired to true
+                self.assertEqual(r['headers']['X-Open-Expired'], 'true')
+                self.assertEqual(r['headers']['X-Backend-Open-Expired'],
+                                 'true')
+
+        # Disable open expired
+        conf = {'enable_open_expired': 'false'}
+        # Create a new proxy instance for test with config
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=None)
+        # Use the same container info as the app used in other tests
+        self.app.container_info = dict(self.container_info)
+        self.obj_ring = self.app.get_object_ring(int(self.policy))
+
+        for method, num_reqs in (
+                ('GET',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('HEAD',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('POST', self.obj_ring.replicas)):
+            # This case is different: we never add the 'X-Backend-Open-Expired'
+            # header if the proxy server config disables this feature
+            requests = self._test_x_open_expired(
+                method, num_reqs, headers={'X-Open-Expired': 'true'})
+            for r in requests:
+                self.assertEqual(r['headers']['X-Open-Expired'], 'true')
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
 
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD')
@@ -2375,6 +2428,14 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                 self.assertIn('X-Delete-At-Partition', given_headers)
                 self.assertIn('X-Delete-At-Container', given_headers)
 
+        # Check when enable_open_expired config is set to true
+        conf = {'enable_open_expired': 'true'}
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=None)
+        self.app.container_info = dict(self.container_info)
+        self.obj_ring = self.app.get_object_ring(int(self.policy))
+
         post_headers = []
         do_post({})
         for given_headers in post_headers:
@@ -2390,6 +2451,29 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         for given_headers in post_headers:
             self.assertEqual(given_headers.get('X-Backend-Open-Expired'),
                              'true')
+
+        # Check when enable_open_expired config is set to false
+        conf = {'enable_open_expired': 'false'}
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=None)
+        self.app.container_info = dict(self.container_info)
+        self.obj_ring = self.app.get_object_ring(int(self.policy))
+
+        post_headers = []
+        do_post({})
+        for given_headers in post_headers:
+            self.assertNotIn('X-Backend-Open-Expired', given_headers)
+
+        post_headers = []
+        do_post({'X-Open-Expired': 'false'})
+        for given_headers in post_headers:
+            self.assertNotIn('X-Backend-Open-Expired', given_headers)
+
+        post_headers = []
+        do_post({'X-Open-Expired': 'true'})
+        for given_headers in post_headers:
+            self.assertNotIn('X-Backend-Open-Expired', given_headers)
 
     def test_PUT_converts_delete_after_to_delete_at(self):
         req = swob.Request.blank('/v1/a/c/o', method='PUT', body=b'',
@@ -3231,6 +3315,29 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         with set_http_connect():
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
+
+    def test_GET_best_bucket_status_is_none(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        orig_choose_best_bucket = ECGetResponseCollection.choose_best_bucket
+
+        def fake_choose_best_bucket(inst):
+            # we don't yet understand the scenario in which a bucket would be
+            # chosen with status == None so just pretend it happened
+            bucket = orig_choose_best_bucket(inst)
+            bucket.status = None
+            return bucket
+
+        with set_http_connect():
+            with mock.patch(
+                    'swift.proxy.controllers.obj.ECGetResponseCollection.'
+                    'choose_best_bucket', fake_choose_best_bucket):
+                resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+        lines = self.logger.get_lines_for_level('error')
+        self.assertTrue(lines)
+        self.assertIn('best_bucket.status is None??', lines[-2])
+        self.assertIn('status: None', lines[-2])
+        self.assertIn('Object returning 503 for []', lines[-1])
 
     def test_feed_remaining_primaries(self):
         controller = self.controller_cls(

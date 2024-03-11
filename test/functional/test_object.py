@@ -536,19 +536,27 @@ class TestObject(unittest.TestCase):
         # check to see object has expired
         self.assertEqual(resp.status, 404)
 
+        enable_open_expired = tf.cluster_info['swift']['enable_open_expired']
+
+        if enable_open_expired:
+            expected_resp_status = 200
+        else:
+            expected_resp_status = 404
+
         dt = datetime.datetime.now()
         delete_time = str(int(time.mktime(dt.timetuple())) + 2)
         resp = retry(get, extra_headers={'X-Open-Expired': True})
         resp.read()
         headers = HeaderKeyDict(resp.getheaders())
         # read the expired object with magic x-open-expired header
-        self.assertEqual(resp.status, 200)
-        self.assertTrue(delete_time > headers['X-Delete-At'])
+        self.assertEqual(resp.status, expected_resp_status)
+        if enable_open_expired:
+            self.assertTrue(delete_time > headers['X-Delete-At'])
 
         resp = retry(head, extra_headers={'X-Open-Expired': True})
         resp.read()
         # head expired object with magic x-open-expired header
-        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.status, expected_resp_status)
 
         resp = retry(get)
         resp.read()
@@ -562,9 +570,10 @@ class TestObject(unittest.TestCase):
 
         resp = retry(get, extra_headers={'X-Open-Expired': True})
         resp.read()
-        self.assertEqual(resp.status, 200)
-        headers = HeaderKeyDict(resp.getheaders())
-        self.assertTrue(delete_time > headers['X-Delete-At'])
+        self.assertEqual(resp.status, expected_resp_status)
+        if enable_open_expired:
+            headers = HeaderKeyDict(resp.getheaders())
+            self.assertTrue(delete_time > headers['X-Delete-At'])
 
         resp = retry(head, extra_headers={'X-Open-Expired': False})
         resp.read()
@@ -572,9 +581,10 @@ class TestObject(unittest.TestCase):
 
         resp = retry(head, extra_headers={'X-Open-Expired': True})
         resp.read()
-        headers = HeaderKeyDict(resp.getheaders())
-        self.assertEqual(resp.status, 200)
-        self.assertTrue(delete_time > headers['X-Delete-At'])
+        self.assertEqual(resp.status, expected_resp_status)
+        if enable_open_expired:
+            headers = HeaderKeyDict(resp.getheaders())
+            self.assertTrue(delete_time > headers['X-Delete-At'])
 
         resp = retry(post, extra_headers={'X-Open-Expired': False})
         resp.read()
@@ -585,21 +595,25 @@ class TestObject(unittest.TestCase):
         resp = retry(post, extra_headers={'X-Open-Expired': True,
                                           'X-Object-Meta-Test': 'restored!'})
         resp.read()
-        self.assertEqual(resp.status, 202)
+        if enable_open_expired:
+            self.assertEqual(resp.status, 202)
+        else:
+            self.assertEqual(resp.status, 404)
 
-        # verify object is restored and you can do normal GET
-        resp = retry(get)
-        resp.read()
-        self.assertEqual(resp.status, 200)
-        self.assertIn('X-Object-Meta-Test', resp.headers)
-        self.assertEqual(resp.headers['x-object-meta-test'], 'restored!')
+        if enable_open_expired:
+            # verify object cccccbkb restored and you can do normal GET
+            resp = retry(get)
+            resp.read()
+            self.assertEqual(resp.status, 200)
+            self.assertIn('X-Object-Meta-Test', resp.headers)
+            self.assertEqual(resp.headers['x-object-meta-test'], 'restored!')
 
-        # verify object is restored and you can do normal HEAD
-        resp = retry(head)
-        resp.read()
-        self.assertEqual(resp.status, 200)
-        # verify object is updated with advanced delete time
-        self.assertIn('X-Delete-At', resp.headers)
+            # verify object is restored and you can do normal HEAD
+            resp = retry(head)
+            resp.read()
+            self.assertEqual(resp.status, 200)
+            # verify object is updated with advanced delete time
+            self.assertIn('X-Delete-At', resp.headers)
 
         # To avoid an error when the object deletion in tearDown(),
         # the object is added again.

@@ -33,7 +33,7 @@ from swift.common.middleware.s3api.s3request import S3Request, \
 from swift.common.middleware.s3api.s3response import InvalidArgument, \
     NoSuchBucket, InternalError, ServiceUnavailable, \
     AccessDenied, SignatureDoesNotMatch, RequestTimeTooSkewed, BadDigest, \
-    InvalidPartArgument, InvalidPartNumber
+    InvalidPartArgument, InvalidPartNumber, InvalidRequest
 from swift.common.utils import md5
 
 from test.debug_logger import debug_logger
@@ -1006,7 +1006,7 @@ class TestRequest(S3ApiTestCase):
                                    'Authorization': 'AWS test:tester:hmac',
                                    'Date': self.get_date_header()})
         req = S3Request(sw_req.environ)
-        self.assertIsNone(req.validate_part_number(10000))
+        self.assertIsNone(req.validate_part_number())
 
         # ok
         sw_req = Request.blank('/nojunk?partNumber=102',
@@ -1015,19 +1015,25 @@ class TestRequest(S3ApiTestCase):
                                    'Authorization': 'AWS test:tester:hmac',
                                    'Date': self.get_date_header()})
         req = S3Request(sw_req.environ)
-        self.assertEqual(102, req.validate_part_number(10000))
-        self.assertEqual(102, req.validate_part_number(100, 102))
-        self.assertEqual(102, req.validate_part_number(102, 102))
+        self.assertEqual(102, req.validate_part_number())
+        req = S3Request(sw_req.environ,
+                        conf=Config({'max_upload_part_num': 100}))
+        self.assertEqual(102, req.validate_part_number(102))
+        req = S3Request(sw_req.environ,
+                        conf=Config({'max_upload_part_num': 102}))
+        self.assertEqual(102, req.validate_part_number(102))
 
+    def test_validate_part_number_invalid_argument(self):
         def check_invalid_argument(part_num, max_parts, parts_count, exp_max):
             sw_req = Request.blank('/nojunk?partNumber=%s' % part_num,
                                    environ={'REQUEST_METHOD': 'GET'},
                                    headers={
                                        'Authorization': 'AWS test:tester:hmac',
                                        'Date': self.get_date_header()})
-            req = S3Request(sw_req.environ)
+            req = S3Request(sw_req.environ,
+                            conf=Config({'max_upload_part_num': max_parts}))
             with self.assertRaises(InvalidPartArgument) as cm:
-                req.validate_part_number(max_parts, parts_count=parts_count)
+                req.validate_part_number(parts_count=parts_count)
             self.assertEqual('400 Bad Request', str(cm.exception))
             self.assertIn(
                 b'Part number must be an integer between 1 and %d' % exp_max,
@@ -1041,15 +1047,17 @@ class TestRequest(S3ApiTestCase):
         check_invalid_argument('banana', 1000, None, 1000)
         check_invalid_argument(0, 10000, None, 10000)
 
+    def test_validate_part_number_invalid_part_number(self):
         def check_invalid_part_num(part_num, max_parts, parts_count):
             sw_req = Request.blank('/nojunk?partNumber=%s' % part_num,
                                    environ={'REQUEST_METHOD': 'GET'},
                                    headers={
                                        'Authorization': 'AWS test:tester:hmac',
                                        'Date': self.get_date_header()})
-            req = S3Request(sw_req.environ)
+            req = S3Request(sw_req.environ,
+                            conf=Config({'max_upload_part_num': max_parts}))
             with self.assertRaises(InvalidPartNumber) as cm:
-                req.validate_part_number(max_parts, parts_count=parts_count)
+                req.validate_part_number(parts_count=parts_count)
             self.assertEqual('416 Requested Range Not Satisfiable',
                              str(cm.exception))
             self.assertIn(b'The requested partnumber is not satisfiable',
@@ -1058,6 +1066,36 @@ class TestRequest(S3ApiTestCase):
         check_invalid_part_num(102, 10000, 1)
         check_invalid_part_num(102, 102, 101)
         check_invalid_part_num(102, 10000, 101)
+
+    def test_validate_part_number_with_range_header(self):
+        sw_req = Request.blank('/nojunk?partNumber=1',
+                               environ={'REQUEST_METHOD': 'GET'},
+                               headers={
+                                   'Range': 'bytes=1-2',
+                                   'Authorization': 'AWS test:tester:hmac',
+                                   'Date': self.get_date_header()})
+        req = S3Request(sw_req.environ)
+        with self.assertRaises(InvalidRequest) as cm:
+            req.validate_part_number()
+        self.assertEqual('400 Bad Request',
+                         str(cm.exception))
+        self.assertIn(b'Cannot specify both Range header and partNumber query '
+                      b'parameter', cm.exception.body)
+
+        # bad part number AND Range header
+        sw_req = Request.blank('/nojunk?partNumber=0',
+                               environ={'REQUEST_METHOD': 'GET'},
+                               headers={
+                                   'Range': 'bytes=1-2',
+                                   'Authorization': 'AWS test:tester:hmac',
+                                   'Date': self.get_date_header()})
+        req = S3Request(sw_req.environ)
+        with self.assertRaises(InvalidRequest) as cm:
+            req.validate_part_number()
+        self.assertEqual('400 Bad Request',
+                         str(cm.exception))
+        self.assertIn(b'Cannot specify both Range header and partNumber query '
+                      b'parameter', cm.exception.body)
 
 
 class TestSigV4Request(S3ApiTestCase):

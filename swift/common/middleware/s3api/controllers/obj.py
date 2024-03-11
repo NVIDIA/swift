@@ -116,6 +116,7 @@ class ObjectController(Controller):
         if version_id not in ('null', None) and \
                 'object_versioning' not in get_swift_info():
             raise S3NotImplemented()
+        part_number = req.validate_part_number(check_max=False)
 
         query = {}
         if version_id is not None:
@@ -135,8 +136,7 @@ class ObjectController(Controller):
         if not resp.is_slo:
             # SLO ignores part_number for non-slo objects, but s3api only
             # allows the query param for non-MPU if it's exactly 1.
-            part_number = req.validate_part_number(
-                max_parts=self.conf.max_upload_part_num, parts_count=1)
+            part_number = req.validate_part_number(parts_count=1)
             if part_number == 1:
                 # When the query param *is* exactly 1 the response status code
                 # and headers are updated.
