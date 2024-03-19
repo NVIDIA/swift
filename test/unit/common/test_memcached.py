@@ -219,6 +219,49 @@ class MockMemcached(object):
         pass
 
 
+class TestableMemcacheRing(memcached.MemcacheRing):
+
+    def __init__(self, servers, **kwargs):
+        self.inject_incr_error = kwargs.pop('inject_incr_error', False)
+        self.inject_set_error = kwargs.pop('inject_set_error', False)
+        self.inject_get_error = kwargs.pop('inject_get_error', False)
+        self.inject_del_error = kwargs.pop('inject_del_error', False)
+        super(TestableMemcacheRing, self).__init__(servers, **kwargs)
+        self.set_calls = []
+        self.incr_calls = []
+        self.get_calls = []
+        self.del_calls = []
+
+    def incr(self, key, delta=1, time=0):
+        self.incr_calls.append((key, delta, time))
+        if self.inject_incr_error:
+            raise MemcacheConnectionError
+        return super(TestableMemcacheRing, self).incr(key, delta, time)
+
+    def set(self, key, value, serialize=True, time=0,
+            min_compress_len=0, raise_on_error=False):
+        self.set_calls.append((key, value, time))
+        if self.inject_set_error:
+            raise MemcacheConnectionError
+        super(TestableMemcacheRing, self).set(
+            key, value, serialize, time, min_compress_len, raise_on_error)
+
+    def get(self, key, raise_on_error=False):
+        self.get_calls.append((key))
+        if self.inject_get_error:
+            if raise_on_error:
+                raise MemcacheConnectionError
+            else:
+                return None
+        return super(TestableMemcacheRing, self).get(key, raise_on_error)
+
+    def delete(self, key):
+        self.del_calls.append((key))
+        if self.inject_del_error:
+            raise MemcacheConnectionError
+        super(TestableMemcacheRing, self).delete(key)
+
+
 class TestMemcacheCommand(unittest.TestCase):
     def test_init(self):
         cmd = MemcacheCommand("set", "shard-updating-v2/a/c")
