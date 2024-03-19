@@ -1321,6 +1321,195 @@ def cache_from_env(env, allow_none=False):
     return item_from_env(env, 'swift.cache', allow_none)
 
 
+class CooperativeCachePopulator(object):
+    """
+    Cooperative token is used to avoid the thundering herd problem when caching
+    is used in front of slow backend. Here it how it works, when lots of
+    in-flight requests try to get the cached item specified by a key from
+    memcache and get cache misses, only the first a few number (limited by by
+    ``num_tokens``) of query requests will be able to get the cooperative
+    tokens by creating or incrementing an internal memcache key, and then those
+    callers with tokens can send backend requests to fetch data from backend
+    servers and be able set data into memcache; all other cache miss requests
+    without a token should wait for cache filling to finish, instead of all
+    querying the backend servers at the same time. After those requests with
+    token are done, they will release the token by deleting the internal cache
+    key and finish this usage session.
+
+    Cooperative cache populator uses ``num_tokens`` to define the minimum limit
+    of tokens during one usage session, default to be 3. This is used to
+    increase fault tolerance in the distributed environment, when one request
+    with token hangs or exits, any other requests with token still can set new
+    fetched data into memcache and finish the whole usage session. In the rare
+    case of all 3 requests with tokens fails, the existing usage session ends
+    after ``token_ttl`` period is reached and the token key expires, then other
+    pending requests which have no token will exit waiting by the same order of
+    entering the token session, fall back to query the backend and set data in
+    the memcached; after any of those request w/o token successfully set data
+    in the new memcached, the following requests in waiting still could fetch
+    data from the memcached when continue retrying; the ``token_ttl`` is
+    designed to be a back-off time window for retrying backend, it will work
+    for the same purpose in this case as well. When one token session ends
+    after ``token_ttl``, requests which see cache miss will start a new round
+    of cooperation token session.
+
+    :param infocache: the infocache instance.
+    :param memcache: the memcache instance.
+    :param cache_key: the cache key.
+    :param cache_ttl: time-to-live of the data fetched from backend to set into
+        memcached.
+    :param do_fetch_backend: a callable object to be called to fetch data from
+        the backend; it needs to return a tuple of (data, response).
+    :param cache_encoder: a callable object to be called to convert the data
+        retrieved from the backend to a different format to store in memcache.
+    :param cache_decoder: a callable object to be called to convert the data
+        retrieved from memcache to the same format as returned from backend.
+    :param retry_interval: the basic interval to retry getting data from cache
+        when waiting for other requests to populate the cache, suggest to be
+        set as the average time spent on ``do_fetch_backend``.
+    :param num_tokens: the minimum limit of tokens per each usage sesssion,
+        also the the minimum limit of in-flight requests allowed to fetch data
+        from backend; default to be 3, which give redundancy when any request
+        with token fails to fetch data from the backend or fails to set new
+        data into memcached.
+    """
+
+    def __init__(self, infocache, memcache,
+                 cache_key, cache_ttl, do_fetch_backend, retry_interval,
+                 cache_encoder=None, cache_decoder=None, num_tokens=3):
+        self._infocache = infocache
+        self._memcache = memcache
+        self._cache_key = cache_key
+        self._cache_ttl = cache_ttl
+        self._token_key = '_cache_token/%s' % cache_key
+        self._retry_interval = retry_interval
+        # Time-to-live of the cooperative token when set in memcached, default
+        # to be 10 times of the average time spent on ``do_fetch_backend``.
+        self._token_ttl = retry_interval * 10
+        self._num_tokens = num_tokens
+        self._do_fetch_backend = do_fetch_backend
+        self._cache_encoder = cache_encoder
+        self._cache_decoder = cache_decoder
+        # the status of cache set operations used internally.
+        self.set_cache_state = None
+        # Indicates if this request has acquired one token.
+        self.token_acquired = False
+        # indicates if this request is served out of Memcached.
+        self.req_served_from_cache = False
+        # the HttpResponse object returned by ``do_fetch_backend``.
+        self.backend_response = None
+
+    def query_backend_and_set_cache(self):
+        """
+        Fetch data from the backedn and set the value in the Memcached.
+
+        :returns: value of the data fetched from backend; None if not exist.
+        """
+        data, self.backend_response = self._do_fetch_backend()
+        if not data:
+            return None
+
+        if self._infocache is not None:
+            self._infocache[self._cache_key] = data
+        try:
+            encoded_data = self._cache_encoder(
+                data) if self._cache_encoder else data
+            self._memcache.set(
+                self._cache_key, encoded_data,
+                time=self._cache_ttl, raise_on_error=True)
+        except swift.common.exceptions.MemcacheConnectionError:
+            self.set_cache_state = 'set_error'
+        else:
+            self.set_cache_state = 'set'
+        return data
+
+    def _sleep_and_retry_memcache(self):
+        """
+        Wait for cache value to be set by other requests with intermittent and
+        limited number of sleeps.
+
+        :returns: value of the data fetched from Memcached; None if not exist.
+        """
+        cur_time = time.time()
+        cutoff_time = cur_time + self._token_ttl
+        retry_interval = self._retry_interval * 1.5
+        while cur_time < cutoff_time:
+            eventlet.sleep(retry_interval)
+            cache_data = self._memcache.get(
+                self._cache_key, raise_on_error=False)
+            if cache_data:
+                # cache hit.
+                self.req_served_from_cache = True
+                decoded_data = self._cache_decoder(
+                    cache_data) if self._cache_decoder else cache_data
+                return decoded_data
+            # cache miss, retry again with exponential backoff
+            retry_interval *= 2
+            cur_time = time.time()
+            continue
+        return None
+
+    def fetch_data(self):
+        """
+        Coalescing all requests which are asking for the same data from the
+        backend into a few with cooperative token.
+
+        :returns: value of the data fetched from backend or memcache; None if
+            not exist.
+        """
+        data = None
+        if not self._memcache:
+            data, self.backend_response = self._do_fetch_backend()
+            return data
+
+        # Try to get a cooperative token by using memcache increments.
+        total_requests = 0
+        try:
+            total_requests = self._memcache.incr(
+                self._token_key, delta=1, time=self._token_ttl)
+        except swift.common.exceptions.MemcacheConnectionError:
+            self.set_cache_state = 'inc_error'
+
+        if not total_requests:
+            # Couldn't connect to the memcache to increment the token key
+            data = self.query_backend_and_set_cache()
+        elif total_requests <= self._num_tokens:
+            # Acquired a cooperative token, go fetching data from backend and
+            # set the data in memcache.
+            self.token_acquired = True
+            data = self.query_backend_and_set_cache()
+            if self.set_cache_state == 'set':
+                # Since the successful finish of one whole cooperative token
+                # session only depends on a single successful request. So when
+                # any request with a token finishes both backend fetching and
+                # memcache set successful, it can remove all cooperative tokens
+                #  of this token session.
+                self._memcache.delete(self._token_key)
+        else:
+            # No token acquired, it means that there are requests in-flight
+            # which will fetch data form the backend servers and update them in
+            # cache, let's wait for them to finish with limited retires.
+            data = self._sleep_and_retry_memcache()
+            if not data:
+                # Still no cache data fetched.
+                data = self.query_backend_and_set_cache()
+
+        return data
+
+    def is_token_request_done(self):
+        """
+        Indicates if this request has acquired one token and finished all
+        operations, both backend and memcache, successfully.
+
+        :returns: a boolean value.
+        """
+        return (
+            self.token_acquired
+            and self.set_cache_state is not None
+            and self.set_cache_state == "set"
+        )
+
+
 def write_pickle(obj, dest, tmp=None, pickle_protocol=0):
     """
     Ensure that a pickle file gets written to disk.  The file
