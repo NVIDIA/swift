@@ -22,6 +22,8 @@ import itertools
 from test.debug_logger import debug_logger
 from test.unit import temptree, make_timestamp_iter, with_tempdir, \
     mock_timestamp_now, FakeIterable
+from test.unit.common.test_memcached import MockedMemcachePool, \
+    MockMemcached, TestableMemcacheRing
 
 import contextlib
 import errno
@@ -66,7 +68,8 @@ from uuid import uuid4
 from swift.common.exceptions import Timeout, LockTimeout, \
     ReplicationLockTimeout, MimeInvalid
 from swift.common import utils
-from swift.common.utils import set_swift_dir, md5, ShardRangeList
+from swift.common.utils import set_swift_dir, md5, ShardRangeList, \
+    CooperativeCachePopulator
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import POLICIES, reload_storage_policies
@@ -2879,6 +2882,752 @@ cluster_dfw1 = http://dfw1.host/v1/
 
     def test_get_my_ppid(self):
         self.assertEqual(os.getppid(), utils.get_ppid(os.getpid()))
+
+
+class TestCooperativeCachePopulator(unittest.TestCase):
+
+    def setUp(self):
+        self.logger = debug_logger()
+        self.memcache = TestableMemcacheRing(
+            ['1.2.3.4:11211'], logger=self.logger)
+        mock_cache = MockMemcached()
+        self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock_cache, mock_cache)] * 2)
+        self.infocache = {}
+        self.cache_key = "test_key"
+        self.token_key = "_cache_token/%s" % self.cache_key
+        self.cache_ttl = 60
+        self.do_fetch_backend = mock.Mock(
+            return_value=("backend data", "response"))
+        self.retry_interval = 0.001
+
+    def test_populator_constructor(self):
+        # Test the first request will acquire the token, fetch data from
+        # the backend and set it into Memcached.
+        obj = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+            num_tokens=10
+        )
+        self.assertEqual(obj._infocache, self.infocache)
+        self.assertEqual(obj._memcache, self.memcache)
+        self.assertEqual(obj._cache_key, self.cache_key)
+        self.assertEqual(obj._cache_ttl, self.cache_ttl)
+        self.assertEqual(obj._token_key, '_cache_token/%s' % self.cache_key)
+        self.assertEqual(obj._retry_interval, self.retry_interval)
+        self.assertEqual(obj._token_ttl, self.retry_interval * 10)
+        self.assertEqual(obj._num_tokens, 10)
+        self.assertEqual(obj._do_fetch_backend, self.do_fetch_backend)
+        self.assertIsNone(obj._cache_encoder)
+        self.assertIsNone(obj._cache_decoder)
+        self.assertIsNone(obj.set_cache_state)
+        self.assertFalse(obj.is_token_request_done())
+        self.assertFalse(obj.req_served_from_cache)
+        self.assertIsNone(obj.backend_response)
+
+    def test_first_request_with_token(self):
+        # Test the first request will acquire the token, fetch data from
+        # the backend and set it into Memcached.
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+        )
+        data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.do_fetch_backend.assert_called_once()
+        self.assertEqual(populator.set_cache_state, "set")
+        self.assertTrue(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertEqual(self.infocache[self.cache_key], "backend data")
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)]
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "backend data", self.cache_ttl)]
+        )
+        self.assertEqual(self.memcache.del_calls, [(self.token_key)])
+
+    def test_first_request_with_token_with_encoder(self):
+        # Test the processing of first request with cache encoder and decoder.
+        self.cache_encoder = lambda s: s.upper()
+        self.cache_decoder = lambda s: s.lower()
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+            self.cache_encoder,
+            self.cache_decoder,
+        )
+        data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.do_fetch_backend.assert_called_once()
+        self.assertEqual(populator.set_cache_state, "set")
+        self.assertTrue(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertEqual(self.infocache[self.cache_key], "backend data")
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)]
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "BACKEND DATA", self.cache_ttl)]
+        )
+        self.assertEqual(self.memcache.del_calls, [(self.token_key)])
+
+    def test_no_memcached(self):
+        # Test when Memcached is not available.
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            None,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+        )
+        data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.do_fetch_backend.assert_called_once()
+        self.assertIsNone(populator.set_cache_state)
+        self.assertFalse(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertEqual(self.infocache, {})
+        self.assertEqual(self.memcache.incr_calls, [])
+        self.assertEqual(self.memcache.set_calls, [])
+        self.assertEqual(self.memcache.del_calls, [])
+
+    def test_following_request_with_token(self):
+        # Test the following request (not the first one) which also acquires
+        # the token, fetch data from the backend and set it into Memcached.
+        # Simulate that there are 1 or 2 requests who have acquired the tokens.
+        prior_reqs_with_token = random.randint(1, 2)
+        total_requests = self.memcache.incr(
+            self.token_key, delta=prior_reqs_with_token, time=10)
+        self.assertEqual(total_requests, prior_reqs_with_token)
+        # Test the following request to get the token.
+        self.memcache.incr_calls = []
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+        )
+        data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.do_fetch_backend.assert_called_once()
+        self.assertEqual(populator.set_cache_state, "set")
+        self.assertTrue(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertEqual(self.infocache[self.cache_key], "backend data")
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)]
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "backend data", self.cache_ttl)]
+        )
+        self.assertEqual(self.memcache.del_calls, [(self.token_key)])
+
+    def test_fetch_data_cache_hit_without_token(self):
+        # Test the request which doesn't acquire the token, then keep sleeping
+        # and trying to fetch data from the Memcached until it succeeds.
+        num_tokens_per_session = random.randint(1, 3)
+        total_retries = random.randint(1, 10)
+        retries = [0]
+
+        class CustomizedCache(TestableMemcacheRing):
+            def get(self, key, raise_on_error=False):
+                retries[0] += 1
+                if retries[0] <= total_retries:
+                    value = super(CustomizedCache, self).get("NOT_EXISTED_YET")
+                    return value
+                else:
+                    return super(CustomizedCache, self).get(key)
+
+        self.memcache = CustomizedCache(['1.2.3.4:11211'], logger=self.logger)
+        mock_cache = MockMemcached()
+        self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock_cache, mock_cache)] * 2)
+        # Simulate that there were 'num_tokens_per_session' requests who have
+        # acquired the tokens.
+        total_requests = self.memcache.incr(
+            self.token_key, delta=num_tokens_per_session, time=10)
+        self.assertEqual(total_requests, num_tokens_per_session)
+        self.memcache.set(self.cache_key, [1, 2, 3])
+        # Test the request without a token
+        self.memcache.incr_calls = []
+        self.memcache.set_calls = []
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+            None,
+            None,
+            num_tokens_per_session
+        )
+        populator._token_ttl = 10
+        data = populator.fetch_data()
+        self.assertEqual(data, [1, 2, 3])
+        self.assertIsNone(populator.backend_response)
+        self.assertIsNone(populator.set_cache_state)
+        self.assertEqual(self.infocache, {})
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, populator._token_ttl)]
+        )
+        self.assertEqual(self.memcache.set_calls, [])
+        self.assertEqual(retries[0], total_retries + 1)
+        if retries[0] == 1:
+            self.assertEqual(
+                self.memcache.get_calls, [(self.token_key)])
+        else:
+            self.assertEqual(
+                self.memcache.get_calls,
+                [('NOT_EXISTED_YET')] * (retries[0] - 1) + [(self.cache_key)]
+            )
+        self.do_fetch_backend.assert_not_called()
+        self.assertFalse(populator.is_token_request_done())
+        self.assertTrue(populator.req_served_from_cache)
+
+    def test_fetch_data_cache_miss_without_token(self):
+        # Test the request which doesn't acquire the token, then keep sleeping
+        # and trying to fetch data from the Memcached, but enventually all
+        # retries exhausted with cache misses.
+        num_tokens_per_session = random.randint(1, 3)
+        retries = [0]
+
+        class CustomizedCache(TestableMemcacheRing):
+            def get(self, key, raise_on_error=False):
+                retries[0] += 1
+                return super(CustomizedCache, self).get("NOT_EXISTED_YET")
+
+        self.memcache = CustomizedCache(['1.2.3.4:11211'], logger=self.logger)
+        mock_cache = MockMemcached()
+        self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock_cache, mock_cache)] * 2)
+        # Simulate that there are 'num_tokens_per_session' requests who have
+        # acquired the tokens.
+        total_requests = self.memcache.incr(
+            self.token_key, delta=num_tokens_per_session, time=10)
+        self.assertEqual(total_requests, num_tokens_per_session)
+        self.memcache.set(self.cache_key, [1, 2, 3])
+        # Test the request without a token
+        self.memcache.incr_calls = []
+        self.memcache.set_calls = []
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+            None,
+            None,
+            num_tokens_per_session
+        )
+        data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.do_fetch_backend.assert_called_once()
+        self.assertEqual(populator.set_cache_state, "set")
+        self.assertFalse(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertFalse(populator.req_lacks_enough_retries)
+        self.assertEqual(self.infocache[self.cache_key], "backend data")
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)]
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "backend data", self.cache_ttl)]
+        )
+        self.assertGreater(retries[0], 1)
+        self.assertEqual(
+            self.memcache.get_calls, [('NOT_EXISTED_YET')] * retries[0])
+        self.assertEqual(self.memcache.del_calls, [])
+
+    def test_fetch_data_req_lacks_enough_retries(self):
+        # Test the request which doesn't acquire the token, then keep sleeping
+        # and trying to fetch data from the Memcached, but doesn't get enough
+        # retries.
+        retries = [0]
+
+        class CustomizedCache(TestableMemcacheRing):
+            def get(self, key, raise_on_error=False):
+                retries[0] += 1
+                return super(CustomizedCache, self).get("NOT_EXISTED_YET")
+
+        self.memcache = CustomizedCache(['1.2.3.4:11211'], logger=self.logger)
+        mock_cache = MockMemcached()
+        self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock_cache, mock_cache)] * 2)
+        # Simulate that there are three requests who have acquired the tokens.
+        total_requests = self.memcache.incr(self.token_key, delta=3, time=10)
+        self.assertEqual(total_requests, 3)
+        self.memcache.set(self.cache_key, [1, 2, 3])
+        # Test the request without a token
+        self.memcache.incr_calls = []
+        self.memcache.set_calls = []
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+        )
+        with patch('time.time', ) as mock_time:
+            mock_time.side_effect = itertools.count(4000.99, 1.0)
+            data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.do_fetch_backend.assert_called_once()
+        self.assertEqual(populator.set_cache_state, "set")
+        self.assertFalse(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertTrue(populator.req_lacks_enough_retries)
+        self.assertEqual(self.infocache[self.cache_key], "backend data")
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)]
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "backend data", self.cache_ttl)]
+        )
+        self.assertGreater(retries[0], 1)
+        self.assertEqual(
+            self.memcache.get_calls, [('NOT_EXISTED_YET')] * retries[0])
+        self.assertEqual(self.memcache.del_calls, [])
+
+    def test_get_token_connection_error(self):
+        # Test the request which couldn't acquire the token due to memcached
+        # connection error.
+        self.memcache = TestableMemcacheRing(
+            ['1.2.3.4:11211'], logger=self.logger, inject_incr_error=True)
+        mock_cache = MockMemcached()
+        self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock_cache, mock_cache)] * 2)
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+        )
+        data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.set_cache_state, "set")
+        self.do_fetch_backend.assert_called_once()
+        self.assertFalse(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertEqual(self.infocache[self.cache_key], "backend data")
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)]
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "backend data", self.cache_ttl)]
+        )
+        self.assertEqual(self.memcache.del_calls, [])
+
+    def test_set_data_connection_error(self):
+        # Test the request which is able to acquire the token, but fails to set
+        # the fetched backend data into memcached due to memcached connection
+        # error.
+        self.memcache = TestableMemcacheRing(
+            ['1.2.3.4:11211'], logger=self.logger, inject_set_error=True)
+        mock_cache = MockMemcached()
+        self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock_cache, mock_cache)] * 2)
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+        )
+        data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.set_cache_state, "set_error")
+        self.do_fetch_backend.assert_called_once()
+        self.assertFalse(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertEqual(self.infocache[self.cache_key], "backend data")
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)]
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "backend data", self.cache_ttl)]
+        )
+        self.assertEqual(self.memcache.del_calls, [])
+
+    def test_get_token_data_set_connection_errors(self):
+        # Test the request which couldn't acquire the token due to memcached
+        # connection error, and then couldn't set the backend data into cache
+        # due to memcached connection error too.
+        self.memcache = TestableMemcacheRing(
+            ['1.2.3.4:11211'], logger=self.logger,
+            inject_incr_error=True, inject_set_error=True)
+        mock_cache = MockMemcached()
+        self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock_cache, mock_cache)] * 2)
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+        )
+        data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.set_cache_state, "set_error")
+        self.do_fetch_backend.assert_called_once()
+        self.assertFalse(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertEqual(self.infocache[self.cache_key], "backend data")
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)]
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "backend data", self.cache_ttl)]
+        )
+        self.assertEqual(self.memcache.del_calls, [])
+
+    def test_fetch_data_from_cache_connection_error(self):
+        # Test the request which doesn't acquire the token, then keep sleeping
+        # and trying to fetch data from the Memcached, but enventually all
+        # retries exhausted with memcached connection errors.
+        self.memcache = TestableMemcacheRing(
+            ['1.2.3.4:11211'], logger=self.logger, inject_get_error=True)
+        mock_cache = MockMemcached()
+        self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock_cache, mock_cache)] * 2)
+        # Simulate that there are three requests who have acquired the tokens.
+        total_requests = self.memcache.incr(self.token_key, delta=3, time=10)
+        self.assertEqual(total_requests, 3)
+        self.memcache.set(self.cache_key, [1, 2, 3])
+        # Test the request without a token
+        self.memcache.incr_calls = []
+        self.memcache.set_calls = []
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+        )
+        data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.do_fetch_backend.assert_called_once()
+        self.assertEqual(populator.set_cache_state, "set")
+        self.assertFalse(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertEqual(self.infocache[self.cache_key], "backend data")
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)]
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "backend data", self.cache_ttl)]
+        )
+        self.assertEqual(
+            self.memcache.get_calls[0], self.cache_key)
+        self.assertEqual(self.memcache.del_calls, [])
+
+    def test_concurrent_requests(self):
+        # Simulate multiple concurrent threads, each of them issues a
+        # "fetch_data" request cooperatively.
+        self.retry_interval = 0.01
+        num_processes = 100
+        counts = {
+            'num_requests_with_token': 0,
+            'num_requests_served_from_cache': 0,
+        }
+
+        def worker_process():
+
+            def delayed_do_fetch_backend():
+                eventlet.sleep(self.retry_interval)
+                return "backend data", "response"
+
+            # Initialize new populator instance in each process.
+            populator = CooperativeCachePopulator(
+                {},
+                self.memcache,
+                self.cache_key,
+                self.cache_ttl,
+                delayed_do_fetch_backend,
+                self.retry_interval,
+            )
+            data = populator.fetch_data()
+
+            # Data retrieved successfully
+            self.assertEqual(data, "backend data")
+            if populator.set_cache_state == 'set':
+                counts['num_requests_with_token'] += 1
+                self.assertTrue(populator.is_token_request_done())
+                self.assertFalse(populator.req_served_from_cache)
+                self.assertEqual(
+                    populator._infocache[self.cache_key], "backend data")
+                self.assertEqual(populator.backend_response, "response")
+            else:
+                counts['num_requests_served_from_cache'] += 1
+                self.assertTrue(populator.req_served_from_cache)
+                self.assertEqual(populator._infocache, {})
+                self.assertIsNone(populator.backend_response)
+
+        # Issue those parallel requests "at the same time".
+        pool = eventlet.GreenPool()
+        for i in range(num_processes):
+            pool.spawn(worker_process)
+
+        # Wait for all requests to complete
+        pool.waitall()
+        self.assertEqual(counts['num_requests_with_token'], 3)
+        self.assertEqual(counts['num_requests_served_from_cache'], 97)
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)] * 100
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "backend data", self.cache_ttl)] * 3
+        )
+        self.assertEqual(self.memcache.del_calls, [(self.token_key)] * 3)
+
+    def test_concurrent_requests_all_token_requests_fail(self):
+        # Simulate multiple concurrent threads issued into a cooperative token
+        # session, each thread will issue a "fetch_data" request cooperatively.
+        # And the first three requests will acquire the token, but fail to get
+        # data from the backend. This test also demostrates that even though
+        # all token requests fail to go through, other requests who arrive at
+        # the late stage of same token session and won't get a token still
+        # could be served out of the memcached.
+        self.retry_interval = 0.1
+        counts = {
+            'num_backend_success': 0,
+            'num_requests_served_from_cache': 0,
+            'num_backend_failures': 0,
+        }
+
+        def worker_process(exec_delay=0, backend_delay=0,
+                           fetch_backend_failure=False):
+
+            def delayed_do_fetch_backend(backend_delay=0,
+                                         fetch_backend_failure=False):
+                if backend_delay:
+                    eventlet.sleep(backend_delay)
+                if fetch_backend_failure:
+                    return None, None
+                else:
+                    return "backend data", "response"
+
+            # Initialize new populator instance in each process.
+            mocked_fetch_backend = partial(
+                delayed_do_fetch_backend,
+                backend_delay=backend_delay,
+                fetch_backend_failure=fetch_backend_failure
+            )
+            populator = CooperativeCachePopulator(
+                {},
+                self.memcache,
+                self.cache_key,
+                self.cache_ttl,
+                mocked_fetch_backend,
+                self.retry_interval,
+            )
+            if exec_delay:
+                eventlet.sleep(exec_delay)
+            data = populator.fetch_data()
+
+            if fetch_backend_failure:
+                self.assertIsNone(data)
+            else:
+                self.assertEqual(data, "backend data")
+            if populator.set_cache_state == 'set':
+                counts['num_backend_success'] += 1
+                self.assertFalse(populator.req_served_from_cache)
+                self.assertEqual(
+                    populator._infocache[self.cache_key], "backend data")
+                self.assertEqual(populator.backend_response, "response")
+            elif not fetch_backend_failure:
+                counts['num_requests_served_from_cache'] += 1
+                self.assertTrue(populator.req_served_from_cache)
+                self.assertEqual(populator._infocache, {})
+                self.assertIsNone(populator.backend_response)
+            else:
+                counts['num_backend_failures'] += 1
+
+        # Issue those parallel requests at different time within this
+        # cooperative token session.
+        pool = eventlet.GreenPool()
+        # The first three requests will get the token but fails.
+        for i in range(3):
+            pool.spawn(worker_process, 0, self.retry_interval * 15, True)
+        # The 4th request won't get a token, but after it exits its waiting
+        # cycles, it will fetch the data from the backend and set the data into
+        # the memcached.
+        pool.spawn(worker_process, 0, 0)
+        # The remaining 16 requests won't get a token, but will be served out
+        # of the memcached because the 4th request will finish within their
+        # waiting cycles.
+        for i in range(16):
+            pool.spawn(
+                worker_process,
+                random.uniform(self.retry_interval * 3,
+                               self.retry_interval * 6),
+                self.retry_interval
+            )
+
+        # Wait for all requests to complete
+        pool.waitall()
+        # The first three requests of the first token session failed to get
+        # data from the backend.
+        self.assertEqual(counts['num_backend_failures'], 3)
+        self.assertEqual(counts['num_backend_success'], 1)
+        self.assertEqual(counts['num_requests_served_from_cache'], 16)
+        self.assertEqual(len(self.memcache.incr_calls), 20)
+        self.assertEqual(len(self.memcache.del_calls), 0)
+
+    def test_concurrent_requests_pass_token_ttl(self):
+        # Simulate multiple concurrent threads across two cooperative token
+        # sessions, each thread will issue a "fetch_data" request
+        # cooperatively. The very first three requests which will acquire the
+        # token, but fail to fetch data from backend.
+        self.retry_interval = 0.1
+        counts = {
+            'num_backend_success': 0,
+            'num_requests_served_from_cache': 0,
+            'num_backend_failures': 0,
+        }
+
+        def worker_process(exec_delay=0, backend_delay=0,
+                           fetch_backend_failure=False):
+
+            def delayed_do_fetch_backend(backend_delay=0,
+                                         fetch_backend_failure=False):
+                if backend_delay:
+                    eventlet.sleep(backend_delay)
+                if fetch_backend_failure:
+                    return None, None
+                else:
+                    return "backend data", "response"
+
+            # Initialize new populator instance in each process.
+            mocked_fetch_backend = partial(
+                delayed_do_fetch_backend,
+                backend_delay=backend_delay,
+                fetch_backend_failure=fetch_backend_failure
+            )
+            populator = CooperativeCachePopulator(
+                {},
+                self.memcache,
+                self.cache_key,
+                self.cache_ttl,
+                mocked_fetch_backend,
+                self.retry_interval,
+            )
+            if exec_delay:
+                eventlet.sleep(exec_delay)
+            data = populator.fetch_data()
+
+            if fetch_backend_failure:
+                self.assertIsNone(data)
+            else:
+                self.assertEqual(data, "backend data")
+            if populator.set_cache_state == 'set':
+                counts['num_backend_success'] += 1
+                self.assertFalse(populator.req_served_from_cache)
+                self.assertEqual(
+                    populator._infocache[self.cache_key], "backend data")
+                self.assertEqual(populator.backend_response, "response")
+            elif not fetch_backend_failure:
+                counts['num_requests_served_from_cache'] += 1
+                self.assertTrue(populator.req_served_from_cache)
+                self.assertEqual(populator._infocache, {})
+                self.assertIsNone(populator.backend_response)
+            else:
+                counts['num_backend_failures'] += 1
+
+        # Issue the parallel requests for the first token session.
+        pool = eventlet.GreenPool()
+        for i in range(3):
+            pool.spawn(worker_process, 0, self.retry_interval * 15, True)
+        for i in range(17):
+            pool.spawn(
+                worker_process,
+                random.uniform(0, self.retry_interval * 10),
+                self.retry_interval
+            )
+
+        # Issue the parallel requests for the second token session.
+        for i in range(3):
+            pool.spawn(
+                worker_process,
+                self.retry_interval * 10,
+                self.retry_interval * 5
+            )
+        for i in range(17):
+            pool.spawn(
+                worker_process,
+                random.uniform(self.retry_interval * 10,
+                               self.retry_interval * 11),
+                self.retry_interval
+            )
+        # Wait for all requests to complete
+        pool.waitall()
+        # The first three requests of the first token session failed to get
+        # data from the backend.
+        self.assertEqual(counts['num_backend_failures'], 3)
+        self.assertGreaterEqual(counts['num_backend_success'], 3)
+        self.assertEqual(
+            counts['num_requests_served_from_cache'],
+            40 - counts['num_backend_failures'] -
+            counts['num_backend_success']
+        )
+        self.assertEqual(len(self.memcache.incr_calls), 40)
+        # The first three requests of the second token session will delete the
+        # token after fetching data from the backend and set it in cache.
+        self.assertEqual(len(self.memcache.del_calls), 3)
 
 
 class TestUnlinkOlder(unittest.TestCase):
