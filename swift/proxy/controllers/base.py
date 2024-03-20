@@ -860,6 +860,34 @@ def _get_info_from_caches(app, env, account, container=None):
     return info, cache_state
 
 
+def namespace_bounds_to_list(bounds):
+    """
+    This function converts the namespaces bounds to ``NamespaceBoundList``.
+
+    :param  bounds: a list of namespaces bounds(tuple of lower and name).
+    :returns: the object instance of ``NamespaceBoundList``; None if ``bounds``
+        is None or empty.
+    """
+    ns_bound_list = None
+    if bounds:
+        ns_bound_list = NamespaceBoundList(bounds)
+    return ns_bound_list
+
+
+def namespace_list_to_bounds(ns_bound_list):
+    """
+    This function converts ``NamespaceBoundList`` to the namespaces bounds.
+
+    :param  ns_bound_list: an object instance of ``NamespaceBoundList``.
+    :returns: a list of namespaces bounds(tuple of lower and name); None if
+        ``ns_bound_list`` is None or empty.
+    """
+    bounds = None
+    if ns_bound_list:
+        bounds = ns_bound_list.bounds
+    return bounds
+
+
 def get_namespaces_from_cache(req, cache_key, skip_chance):
     """
     Get cached namespaces from infocache or memcache.
@@ -880,8 +908,6 @@ def get_namespaces_from_cache(req, cache_key, skip_chance):
 
     # then try get them from memcache
     memcache = cache_from_env(req.environ, True)
-    if not memcache:
-        return None, 'disabled'
     if skip_chance and random.random() < skip_chance:
         return None, 'skip'
     try:
@@ -891,11 +917,9 @@ def get_namespaces_from_cache(req, cache_key, skip_chance):
         bounds = None
         cache_state = 'error'
 
-    if bounds:
-        ns_bound_list = NamespaceBoundList(bounds)
+    ns_bound_list = namespace_bounds_to_list(bounds)
+    if ns_bound_list:
         infocache[cache_key] = ns_bound_list
-    else:
-        ns_bound_list = None
     return ns_bound_list, cache_state
 
 
@@ -905,17 +929,18 @@ def set_namespaces_in_cache(req, cache_key, ns_bound_list, time):
 
     :param req: a :class:`swift.common.swob.Request` object.
     :param cache_key: the cache key for both infocache and memcache.
-    :param ns_bound_list: a :class:`swift.common.utils.NamespaceBoundList`.
+    :param ns_bound_list: a :class:`swift.common.utils.NamespaceBoundList`;
+                          must be not None or empty.
     :param time: how long the namespaces should remain in memcache.
     :return: the cache_state.
     """
     infocache = req.environ.setdefault('swift.infocache', {})
     infocache[cache_key] = ns_bound_list
     memcache = cache_from_env(req.environ, True)
-    if memcache and ns_bound_list:
+    if memcache:
+        bounds = namespace_list_to_bounds(ns_bound_list)
         try:
-            memcache.set(cache_key, ns_bound_list.bounds, time=time,
-                         raise_on_error=True)
+            memcache.set(cache_key, bounds, time=time, raise_on_error=True)
         except MemcacheConnectionError:
             cache_state = 'set_error'
         else:
