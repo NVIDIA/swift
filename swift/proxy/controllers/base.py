@@ -799,6 +799,43 @@ def record_cache_op_metrics(
                 server_type, op_type, cache_state))
 
 
+def record_cooperative_token_metrics(logger, cache_populator, op_type):
+    """
+    Record related metrics after a cooperative token request has finished.
+
+    :param  logger: the metrics logger.
+    :param  cache_populator: the instance of ``CooperativeCachePopulator``.
+    :param  op_type: the name of the operation type, includes 'shard_listing',
+              'shard_updating', and etc.
+    """
+    # Total number of requests equals to 'cache_served_reqs' plus
+    # 'backend_reqs.with_token' and 'backend_reqs.no_token'.
+    resp = cache_populator.backend_response
+    if cache_populator.token_acquired:
+        # Request with token acquired.
+        if resp:
+            logger.increment('token.%s.backend_reqs.with_token.%d' %
+                             (op_type, resp.status_int))
+        if cache_populator.is_token_request_done():
+            # Request who has acquired a token, retrieved the data from backend
+            # , and has successfully set the data into the memcached.
+            logger.increment('token.%s.done_token_reqs' % op_type)
+        return
+
+    # Request with no token acquired.
+    if cache_populator.req_lacks_enough_retries:
+        # Request who didn't get enough retries when waiting for other requests
+        # to fill in the data into cache, could be 'cache_served_reqs' if the
+        # makeup retry works in the end, or 'backend_reqs.no_token' if not.
+        logger.increment('token.%s.lack_retries' % op_type)
+    if cache_populator.req_served_from_cache:
+        logger.increment('token.%s.cache_served_reqs' % op_type)
+    else:
+        if resp:
+            logger.increment('token.%s.backend_reqs.no_token.%d' %
+                             (op_type, resp.status_int))
+
+
 def _get_info_from_memcache(app, env, account, container=None):
     """
     Get cached account or container information from memcache
@@ -860,6 +897,34 @@ def _get_info_from_caches(app, env, account, container=None):
     return info, cache_state
 
 
+def namespace_bounds_to_list(bounds):
+    """
+    This function converts the namespaces bounds to ``NamespaceBoundList``.
+
+    :param  bounds: a list of namespaces bounds(tuple of lower and name).
+    :returns: the object instance of ``NamespaceBoundList``; None if ``bounds``
+        is None or empty.
+    """
+    ns_bound_list = None
+    if bounds:
+        ns_bound_list = NamespaceBoundList(bounds)
+    return ns_bound_list
+
+
+def namespace_list_to_bounds(ns_bound_list):
+    """
+    This function converts ``NamespaceBoundList`` to the namespaces bounds.
+
+    :param  ns_bound_list: an object instance of ``NamespaceBoundList``.
+    :returns: a list of namespaces bounds(tuple of lower and name); None if
+        ``ns_bound_list`` is None or empty.
+    """
+    bounds = None
+    if ns_bound_list:
+        bounds = ns_bound_list.bounds
+    return bounds
+
+
 def get_namespaces_from_cache(req, cache_key, skip_chance):
     """
     Get cached namespaces from infocache or memcache.
@@ -891,11 +956,9 @@ def get_namespaces_from_cache(req, cache_key, skip_chance):
         bounds = None
         cache_state = 'error'
 
-    if bounds:
-        ns_bound_list = NamespaceBoundList(bounds)
+    ns_bound_list = namespace_bounds_to_list(bounds)
+    if ns_bound_list:
         infocache[cache_key] = ns_bound_list
-    else:
-        ns_bound_list = None
     return ns_bound_list, cache_state
 
 
@@ -913,9 +976,9 @@ def set_namespaces_in_cache(req, cache_key, ns_bound_list, time):
     infocache[cache_key] = ns_bound_list
     memcache = cache_from_env(req.environ, True)
     if memcache and ns_bound_list:
+        bounds = namespace_list_to_bounds(ns_bound_list)
         try:
-            memcache.set(cache_key, ns_bound_list.bounds, time=time,
-                         raise_on_error=True)
+            memcache.set(cache_key, bounds, time=time, raise_on_error=True)
         except MemcacheConnectionError:
             cache_state = 'set_error'
         else:
