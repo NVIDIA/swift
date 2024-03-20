@@ -4372,7 +4372,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertIsNone(obj._cache_encoder)
         self.assertIsNone(obj._cache_decoder)
         self.assertIsNone(obj.set_cache_state)
-        self.assertFalse(obj.token_request_done)
+        self.assertFalse(obj.done_reqs_with_token)
         self.assertFalse(obj.req_served_from_cache)
         self.assertIsNone(obj.backend_response)
 
@@ -4392,7 +4392,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
-        self.assertTrue(populator.token_request_done)
+        self.assertTrue(populator.done_reqs_with_token)
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4424,7 +4424,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
-        self.assertTrue(populator.token_request_done)
+        self.assertTrue(populator.done_reqs_with_token)
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4452,7 +4452,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertIsNone(populator.set_cache_state)
-        self.assertFalse(populator.token_request_done)
+        self.assertFalse(populator.done_reqs_with_token)
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache, {})
         self.assertEqual(self.memcache.incr_calls, [])
@@ -4482,7 +4482,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
-        self.assertTrue(populator.token_request_done)
+        self.assertTrue(populator.done_reqs_with_token)
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4550,7 +4550,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                 [('NOT_EXISTED_YET')] * (retries[0] - 1) + [(self.cache_key)]
             )
         self.do_fetch_backend.assert_not_called()
-        self.assertFalse(populator.token_request_done)
+        self.assertFalse(populator.done_reqs_with_token)
         self.assertTrue(populator.req_served_from_cache)
 
     def test_fetch_data_cache_miss_without_token(self):
@@ -4588,7 +4588,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
-        self.assertFalse(populator.token_request_done)
+        self.assertFalse(populator.done_reqs_with_token)
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4625,7 +4625,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.assertEqual(populator.set_cache_state, "set")
         self.do_fetch_backend.assert_called_once()
-        self.assertFalse(populator.token_request_done)
+        self.assertFalse(populator.done_reqs_with_token)
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4660,7 +4660,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.assertEqual(populator.set_cache_state, "set_error")
         self.do_fetch_backend.assert_called_once()
-        self.assertFalse(populator.token_request_done)
+        self.assertFalse(populator.done_reqs_with_token)
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4696,7 +4696,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.assertEqual(populator.set_cache_state, "set_error")
         self.do_fetch_backend.assert_called_once()
-        self.assertFalse(populator.token_request_done)
+        self.assertFalse(populator.done_reqs_with_token)
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4738,7 +4738,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
-        self.assertFalse(populator.token_request_done)
+        self.assertFalse(populator.done_reqs_with_token)
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4784,7 +4784,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             self.assertEqual(data, "backend data")
             if populator.set_cache_state == 'set':
                 counts['num_requests_with_token'] += 1
-                self.assertTrue(populator.token_request_done)
+                self.assertTrue(populator.done_reqs_with_token)
                 self.assertFalse(populator.req_served_from_cache)
                 self.assertEqual(
                     populator._infocache[self.cache_key], "backend data")
