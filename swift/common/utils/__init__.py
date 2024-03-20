@@ -3667,6 +3667,12 @@ class NamespaceBoundList(object):
             return False
         return self.bounds == other.bounds
 
+    def __len__(self):
+        """
+        Return the number of namespaces in the NamespaceBoundList.
+        """
+        return len(self.bounds)
+
     @classmethod
     def parse(cls, namespaces):
         """
