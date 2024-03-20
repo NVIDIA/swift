@@ -41,6 +41,7 @@ from greenlet import GreenletExit
 from eventlet import GreenPile
 from eventlet.queue import Queue, Empty
 from eventlet.timeout import Timeout
+from functools import partial
 
 from swift.common.utils import (
     clean_content_type, config_true_value, ContextPool, csv_append,
@@ -48,7 +49,8 @@ from swift.common.utils import (
     normalize_delete_at_timestamp, public, get_expirer_container,
     document_iters_to_http_response_body, parse_content_range,
     quorum_size, reiterate, close_if_possible, safe_json_loads, md5,
-    NamespaceBoundList, CooperativeIterator)
+    NamespaceBoundList, CooperativeIterator, cache_from_env,
+    CooperativeCachePopulator)
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_metadata, check_object_creation
 from swift.common import constraints
@@ -69,7 +71,8 @@ from swift.proxy.controllers.base import Controller, delay_denial, \
     cors_validation, update_headers, bytes_to_skip, ByteCountEnforcer, \
     record_cache_op_metrics, get_cache_key, GetterBase, GetterSource, \
     is_good_source, NodeIter, get_namespaces_from_cache, \
-    set_namespaces_in_cache
+    set_namespaces_in_cache, namespace_bounds_to_list, \
+    namespace_list_to_bounds, record_cooperative_token_metrics
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestEntityTooLarge, HTTPRequestTimeout, \
     HTTPServerError, HTTPServiceUnavailable, HTTPClientDisconnect, \
@@ -284,7 +287,7 @@ class BaseObjectController(Controller):
         """Handler for HTTP HEAD requests."""
         return self.GETorHEAD(req)
 
-    def _get_updating_namespaces(
+    def _do_get_updating_namespaces(
             self, req, account, container, includes=None):
         """
         Fetch namespaces in 'updating' states from given `account/container`.
@@ -324,13 +327,102 @@ class BaseObjectController(Controller):
             or None if the update should go back to the root
         """
         # legacy behavior requests container server for includes=obj
-        namespaces, response = self._get_updating_namespaces(
+        namespaces, response = self._do_get_updating_namespaces(
             req, account, container, includes=obj)
         record_cache_op_metrics(
             self.logger, self.server_type.lower(), 'shard_updating',
             'disabled', response)
         # there will be only one Namespace in the list if any
         return namespaces[0] if namespaces else None
+
+    def _get_backend_updating_namespaces(self, req, account, container):
+        """
+        Retrieve the updating namespaces from the backend.
+
+        :param req: original Request instance.
+        :param account: account from which namespaces should be fetched.
+        :param container: container from which namespaces should be fetched.
+        :return: a tuple of (NamespaceBoundList, response).
+        """
+        # pull full set of updating namespaces from backend
+        namespaces, backend_response = self._do_get_updating_namespaces(
+            req, account, container)
+        ns_bound_list = NamespaceBoundList.parse(namespaces)
+        return ns_bound_list, backend_response
+
+    def _populate_updating_namespaces(self, req, account,
+                                      container, cache_key):
+        """
+        Fetch all updating namespaces from backend and set it into memcache.
+
+        :param req: original Request instance.
+        :param account: account from which shard ranges should be fetched.
+        :param container: container from which shard ranges should be fetched.
+        :param cache_key: the cache key for the updating namespaces.
+        :return: a tuple of (ns_bound_list, response), ns_bound_list is an
+            instance of :class:`swift.common.utils.NamespaceBoundList`,
+            response is the backend response.
+        """
+        ns_bound_list, response = self._get_backend_updating_namespaces(
+            req, account, container)
+        if ns_bound_list:
+            # only store the list of namespace lower bounds and names into
+            # infocache and memcache.
+            set_cache_state = set_namespaces_in_cache(
+                req, cache_key, ns_bound_list,
+                self.app.recheck_updating_shard_ranges)
+            record_cache_op_metrics(
+                self.logger, self.server_type.lower(), 'shard_updating',
+                set_cache_state, None)
+            if set_cache_state == 'set':
+                self.logger.info(
+                    'Caching updating shards for %s (%d shards)',
+                    cache_key, len(ns_bound_list))
+        return ns_bound_list, response
+
+    def _populate_updating_namespaces_cooperatively(self, req, account,
+                                                    container, cache_key):
+        """
+        Fetch all updating namespaces from backend and set it into memcache,
+        with usage of cooperative token.
+
+        :param req: original Request instance.
+        :param account: account from which shard ranges should be fetched.
+        :param container: container from which shard ranges should be fetched.
+        :param cache_key: the cache key for the updating namespaces.
+        :return: a tuple of (ns_bound_list, response), ns_bound_list is an
+            instance of :class:`swift.common.utils.NamespaceBoundList`,
+            response is the backend response.
+        """
+        infocache = req.environ.setdefault('swift.infocache', {})
+        memcache = cache_from_env(req.environ, True)
+        do_fetch_backend = partial(
+            self._get_backend_updating_namespaces, req, account, container)
+        cache_populator = CooperativeCachePopulator(
+            infocache, memcache, cache_key,
+            self.app.recheck_updating_shard_ranges, do_fetch_backend,
+            self.app.namespace_cache_token_retry_interval,
+            namespace_list_to_bounds, namespace_bounds_to_list,
+            self.app.namespace_cache_tokens_per_session)
+        ns_bound_list = cache_populator.fetch_data()
+        if cache_populator.set_cache_state:
+            record_cache_op_metrics(
+                self.logger, self.server_type.lower(), 'shard_updating',
+                cache_populator.set_cache_state, None)
+            if cache_populator.set_cache_state == 'set':
+                message = "Caching updating shards for %s (%d shards)" % (
+                    cache_key, len(ns_bound_list))
+                if cache_populator.token_acquired:
+                    message += " with a finished token"
+                self.logger.info(message)
+        record_cooperative_token_metrics(
+            self.logger, cache_populator, 'shard_updating')
+        if cache_populator.req_served_from_cache:
+            self.logger.debug(
+                'Retrieved updating shards (%d shards) from cache instead '
+                'of backend due to request coalescing by cooperative '
+                'token for %s', len(ns_bound_list), cache_key)
+        return ns_bound_list, cache_populator.backend_response
 
     def _get_update_shard(self, req, account, container, obj):
         """
@@ -353,30 +445,22 @@ class BaseObjectController(Controller):
                 req, account, container, obj)
 
         # caching is enabled, try to get from caches
-        response = None
         cache_key = get_cache_key(account, container, shard='updating')
         skip_chance = self.app.container_updating_shard_ranges_skip_cache
         ns_bound_list, get_cache_state = get_namespaces_from_cache(
             req, cache_key, skip_chance)
+        response = None
         if not ns_bound_list:
-            # namespaces not found in either infocache or memcache so pull full
-            # set of updating shard ranges from backend
-            namespaces, response = self._get_updating_namespaces(
-                req, account, container)
-            if namespaces:
-                # only store the list of namespace lower bounds and names into
-                # infocache and memcache.
-                ns_bound_list = NamespaceBoundList.parse(namespaces)
-                set_cache_state = set_namespaces_in_cache(
-                    req, cache_key, ns_bound_list,
-                    self.app.recheck_updating_shard_ranges)
-                record_cache_op_metrics(
-                    self.logger, self.server_type.lower(), 'shard_updating',
-                    set_cache_state, None)
-                if set_cache_state == 'set':
-                    self.logger.info(
-                        'Caching updating shards for %s (%d shards)',
-                        cache_key, len(namespaces))
+            # namespaces not found in memcache or cache was skipped, so pull
+            # the full set of updating shard ranges from the backend and set in
+            # the memcache.
+            if self.app.namespace_cache_use_token:
+                populate_func = \
+                    self._populate_updating_namespaces_cooperatively
+            else:
+                populate_func = self._populate_updating_namespaces
+            ns_bound_list, response = populate_func(
+                req, account, container, cache_key)
         record_cache_op_metrics(
             self.logger, self.server_type.lower(), 'shard_updating',
             get_cache_state, response)
