@@ -2543,7 +2543,7 @@ class CooperativeCachePopulator(object):
         self.set_cache_state = None
         # Indicates if this request has acquired one token and finished all
         # operations, both backend and memcache, successfully.
-        self.token_request_done = False
+        self.done_reqs_with_token = False
         # indicates if this request is served out of Memcached.
         self.req_served_from_cache = False
         # the HttpResponse object returned by ``do_fetch_backend``.
@@ -2634,7 +2634,7 @@ class CooperativeCachePopulator(object):
                 # memcache set successful, it can remove all cooperative tokens
                 #  of this token session.
                 self._memcache.delete(self._token_key)
-                self.token_request_done = True
+                self.done_reqs_with_token = True
         else:
             # No token acquired, it means that there are requests in-flight
             # which will fetch data form the backend servers and update them in
@@ -4989,6 +4989,12 @@ class NamespaceBoundList(object):
         if not isinstance(other, NamespaceBoundList):
             return False
         return self.bounds == other.bounds
+
+    def __len__(self):
+        """
+        Return the number of namespaces in the NamespaceBoundList.
+        """
+        return len(self.bounds)
 
     @classmethod
     def parse(cls, namespaces):
