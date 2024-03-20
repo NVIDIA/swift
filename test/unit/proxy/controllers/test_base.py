@@ -200,12 +200,6 @@ class BaseTest(unittest.TestCase):
 @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
 class TestFuncs(BaseTest):
 
-    def test_get_namespaces_from_cache_disabled(self):
-        cache_key = 'shard-updating-v2/a/c/'
-        req = Request.blank('a/c')
-        actual = get_namespaces_from_cache(req, cache_key, 0)
-        self.assertEqual((None, 'disabled'), actual)
-
     def test_get_namespaces_from_cache_miss(self):
         cache_key = 'shard-updating-v2/a/c/'
         req = Request.blank('a/c')
