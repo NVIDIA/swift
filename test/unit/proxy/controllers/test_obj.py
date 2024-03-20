@@ -8116,7 +8116,7 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
         resp_headers = {'X-Backend-Record-Type': 'shard'}
         with mocked_http_conn(200, 200, body_iter=iter([b'', body]),
                               headers=resp_headers):
-            actual, resp = self.ctrl._get_updating_namespaces(
+            actual, resp = self.ctrl._do_get_updating_namespaces(
                 req, 'a', 'c', '1_test')
         self.assertEqual(200, resp.status_int)
         self.assertIsNone(actual)
@@ -8174,7 +8174,7 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
         body = json.dumps([dict(sr)]).encode('ascii')
         with mocked_http_conn(
                 200, 200, body_iter=iter([b'', body])):
-            actual, resp = self.ctrl._get_updating_namespaces(
+            actual, resp = self.ctrl._do_get_updating_namespaces(
                 req, 'a', 'c', '1_test')
         self.assertEqual(200, resp.status_int)
         self.assertIsNone(actual)
@@ -8192,7 +8192,7 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
         with mocked_http_conn(
                 200, 200, body_iter=iter([b'', body]),
                 headers=headers):
-            actual, resp = self.ctrl._get_updating_namespaces(
+            actual, resp = self.ctrl._do_get_updating_namespaces(
                 req, 'a', 'c', '1_test')
         self.assertEqual(200, resp.status_int)
         self.assertIsNone(actual)
@@ -8205,7 +8205,7 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
     def test_get_namespaces_request_failed(self):
         req = Request.blank('/v1/a/c/o', method='PUT')
         with mocked_http_conn(200, 404, 404, 404):
-            actual, resp = self.ctrl._get_updating_namespaces(
+            actual, resp = self.ctrl._do_get_updating_namespaces(
                 req, 'a', 'c', '1_test')
         self.assertEqual(404, resp.status_int)
         self.assertIsNone(actual)
