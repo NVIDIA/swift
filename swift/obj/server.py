@@ -112,6 +112,14 @@ def _make_backend_fragments_header(fragments):
     return None
 
 
+def is_backend_open_expired(request):
+    x_backend_open_expired = config_true_value(request.headers.get(
+        'x-backend-open-expired', 'false'))
+    x_backend_replication = config_true_value(request.headers.get(
+        'x-backend-replication', 'false'))
+    return x_backend_open_expired or x_backend_replication
+
+
 class EventletPlungerString(bytes):
     """
     Eventlet won't send headers until it's accumulated at least
@@ -645,9 +653,7 @@ class ObjectController(BaseStorageServer):
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
-                policy=policy, open_expired=config_true_value(
-                    request.headers.get('x-backend-replication',
-                                        'false')) or x_backend_open_expired,
+                policy=policy, open_expired=is_backend_open_expired(request),
                 next_part_power=next_part_power)
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
@@ -1098,9 +1104,7 @@ class ObjectController(BaseStorageServer):
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
                 policy=policy, frag_prefs=frag_prefs,
-                open_expired=config_true_value(
-                    request.headers.get('x-backend-replication',
-                                        'false')) or x_backend_open_expired)
+                open_expired=is_backend_open_expired(request))
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
@@ -1186,9 +1190,7 @@ class ObjectController(BaseStorageServer):
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
                 policy=policy, frag_prefs=frag_prefs,
-                open_expired=config_true_value(
-                    request.headers.get('x-backend-replication',
-                                        'false')) or x_backend_open_expired)
+                open_expired=is_backend_open_expired(request))
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:

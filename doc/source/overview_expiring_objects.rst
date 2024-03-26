@@ -58,23 +58,28 @@ in cluster upgrades.
 Account and Container Level Grace Period Support
 ------------------------------------------------
 
-The ``swift-object-expirer`` offers grace periods on accounts and containers,
-which provide a time period between when an object is marked for deletion and
-when they are actually deleted. When this is set in the object expirer config
-the object expirer leaves expired objects on disk (and in container listings)
-for the length of the grace period. After the grace_period has passed objects
-will be expired as normal.
+Swift's expiring object ``x-delete-at`` feature can be used to have the cluster
+delete user's objects automatically on their behalf when they no longer want
+them stored in their account. In some cases it may be necessary to "intervene"
+in the expected expiration process to prevent accidental or premature data loss
+if an object marked for expiration should NOT be deleted immediately when it
+expires for whatever reason. In these cases ``swift-object-expirer`` offers
+grace periods on accounts and containers, which provide a time period between
+when an object is marked for deletion and when they are actually deleted. When
+this is set in the object expirer config the object expirer leaves expired
+objects on disk (and in container listings) for the length of the grace period.
+After the grace_period has passed objects will be deleted as normal.
 
 The grace period can be set either at a per-account level or a per-container
 level. When set at a per-account level, the object expirer will only delete
 objects within the account after the grace period. A per-container level grace
 period works similarly for containers and overrides a per-account grace period.
 
-Grace periods are set in the config ``object-server.conf``, in the
-``[object-expirer]`` section. They are configured with dynamic config option
-names prefixed with ``grace_period_<ACCT>`` for per-account grace periods and
-``grace_period_<ACCT>/<CNTR>`` for per-container grace periods, with the grace
-period value in seconds.
+Grace periods are set in the ``[object-expirer]`` section in either the
+object-server or object-expirer config files. They are configured with
+dynamic config option names prefixed with ``grace_period_<ACCT>`` for
+per-account grace periods and ``grace_period_<ACCT>/<CNTR>`` for
+per-container grace periods, with the grace period value in seconds.
 
 Here is an example of grace period configs in ``object-expirer``
 section in the ``object-server.conf``::
@@ -95,8 +100,8 @@ Accessing Objects After Expiration
 ----------------------------------
 
 By default, objects that expire become inaccessible, even to the account owner.
-The object may not have been deleted, but any GET/HEAD client request for the
-object will respond 404 Not Found after the ``x-delete-at`` timestamp
+The object may not have been deleted, but any GET/HEAD/POST client request for 
+the object will respond 404 Not Found after the ``x-delete-at`` timestamp
 has passed.
 
 The ``swift-proxy-server`` offers the ability to globally configure a flag to
@@ -113,7 +118,7 @@ this flag is set to false.
 Here is an example in the ``proxy-server`` section in ``proxy-server.conf``::
 
     [proxy-server]
-    enable_open_expired = true
+    enable_open_expired = false
 
 To discover whether this flag is set, you can send a **GET** request to the
 ``/info`` path. This will return configuration data in JSON format where the

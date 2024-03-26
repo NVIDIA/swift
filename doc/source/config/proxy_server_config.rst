@@ -386,8 +386,9 @@ write_affinity_handoff_delete_count             auto             The number of l
                                                                  (replicas - len(local_primary_nodes)).
                                                                  This option may be overridden in a
                                                                  per-policy configuration section.
-enable_open_expired                             false            If true (default is false), an expired
-                                                                 object can be accessed by setting the
+enable_open_expired                             false            If true (default is false), an object that
+                                                                 has expired but not yet been reaped can be
+                                                                 can be accessed by setting the
                                                                  'x-open-expired' header to true in
                                                                  GET, HEAD, and POST requests.
 ==============================================  ===============  =====================================

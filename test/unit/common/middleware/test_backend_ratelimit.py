@@ -852,7 +852,10 @@ class TestBackendRatelimitMiddleware(unittest.TestCase):
                     return_value=debug_logger()):
                 rl = factory(self.swift)
         # conf file value has been applied
-        self.assertEqual(12.3, rl.requests_per_device_per_second)
+        exp_req_per_dev_per_sec = dict(self.default_req_per_dev_per_sec)
+        exp_req_per_dev_per_sec[None] = 12.3
+        self.assertEqual(exp_req_per_dev_per_sec,
+                         rl.requests_per_device_per_second)
         self.assertEqual(2.4, rl.requests_per_device_rate_buffer)
         lines = rl.logger.get_lines_for_level('info')
         self.assertEqual(

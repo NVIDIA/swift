@@ -1145,7 +1145,7 @@ class S3Request(swob.Request):
         Create a Swift request based on this request's environment.
         """
         if self.account is None:
-            account = self.access_key
+            account = swob.str_to_wsgi(self.access_key)
         else:
             account = self.account
 

@@ -286,7 +286,70 @@ class TestObjectExpirer(TestCase):
             x.get_process_values(vals)
         self.assertEqual(str(ctx.exception), expected_msg)
 
-    def test_init_per_container_grace_period_with_slash(self):
+    def test_valid_grace_period(self):
+        conf = {}
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.grace_periods, {})
+
+        conf = {
+            'grace_period_a': 1.0,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.grace_periods, {('a', None): 1.0})
+
+        # allow grace_period to be 0
+        conf = {
+            'grace_period_a': 0.0,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.grace_periods, {('a', None): 0.0})
+
+        conf = {
+            'grace_period_a/b': 0.0,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.grace_periods, {('a', 'b'): 0.0})
+
+        # test configure multi-account grace_period
+        conf = {
+            'grace_period_a': 1.0,
+            'grace_period_b': '259200.0',
+            'grace_period_AUTH_aBC': 999,
+            u'grace_period_AUTH_aBáC': 555,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.grace_periods, {
+            ('a', None): 1.0,
+            ('b', None): 259200.0,
+            ('AUTH_aBC', None): 999,
+            (u'AUTH_aBáC', None): 555,
+        })
+
+        # test configure multi-account grace_period with containers
+        conf = {
+            'grace_period_a': 10.0,
+            'grace_period_a/test': 1.0,
+            'grace_period_b': '259200.0',
+            'grace_period_AUTH_aBC/test2': 999,
+            u'grace_period_AUTH_aBáC/tést': 555,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.grace_periods, {
+            ('a', None): 10.0,
+            ('a', 'test'): 1.0,
+            ('b', None): 259200.0,
+            ('AUTH_aBC', 'test2'): 999,
+            (u'AUTH_aBáC', u'tést'): 555,
+        })
+
+    def test_invalid_grace_period_keys(self):
+        # there is no global grace_period
+        conf = {
+            'grace_period': 0.0,
+        }
+        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(x.grace_periods, {})
+
         # Multiple "/" or invalid parsing
         conf = {
             'grace_period_A_U_TH_foo_bar/my-container_name/with/slash': 60400,
@@ -348,65 +411,7 @@ class TestObjectExpirer(TestCase):
             '(leading or trailing "/" is not allowed)',
             str(ctx.exception))
 
-    def test_init_grace_period(self):
-        conf = {}
-        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {})
-        # there is no global grace_period
-        conf = {
-            'grace_period': 0.0,
-        }
-        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {})
-        conf = {
-            'grace_period_a': 1.0,
-        }
-        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {('a', None): 1.0})
-
-        # allow grace_period to be 0
-        conf = {
-            'grace_period_a': 0.0,
-        }
-        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {('a', None): 0.0})
-
-        conf = {
-            'grace_period_a/b': 0.0,
-        }
-        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {('a', 'b'): 0.0})
-
-        # test configure multi-account grace_period
-        conf = {
-            'grace_period_a': 1.0,
-            'grace_period_b': '259200.0',
-            'grace_period_AUTH_aBC': 999,
-            u'grace_period_AUTH_aBáC': 555,
-        }
-        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {
-            ('a', None): 1.0,
-            ('b', None): 259200.0,
-            ('AUTH_aBC', None): 999,
-            (u'AUTH_aBáC', None): 555,
-        })
-        # test configure multi-account grace_period with containers
-        conf = {
-            'grace_period_a/test': 1.0,
-            'grace_period_b': '259200.0',
-            'grace_period_AUTH_aBC/test2': 999,
-            u'grace_period_AUTH_aBáC/tést': 555,
-        }
-        x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {
-            ('a', 'test'): 1.0,
-            ('b', None): 259200.0,
-            ('AUTH_aBC', 'test2'): 999,
-            (u'AUTH_aBáC', u'tést'): 555,
-        })
-
-    def test_init_invalid_grace_period(self):
+    def test_invalid_grace_period_values(self):
         # negative tests
         conf = {
             'grace_period_a': -1.0,
@@ -955,13 +960,19 @@ class TestObjectExpirer(TestCase):
                     {'name': self.just_past_time + '-a1/c1/o1'},
                     {'name': self.just_past_time + '-a1/c2/o2'},
                 ],
+                self.future_time: [
+                    # tasks not yet ready for execution
+                    {'name': self.future_time + '-a0/c0/o0'},
+                    {'name': self.future_time + '-a1/c1/o1'},
+                    {'name': self.future_time + '-a1/c2/o2'},
+                ],
             }
         }
         fake_swift = FakeInternalClient(aco_dict)
         # sanity, no accounts configured with grace period
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=fake_swift)
-        # ... we expect ALL tasks to yield
+        # ... we expect tasks past time to yield
         expected = [
             self.make_task(self.past_time, target_path)
             for target_path in (
@@ -993,7 +1004,7 @@ class TestObjectExpirer(TestCase):
         self.conf['grace_period_a1'] = 300.0
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=fake_swift)
-        # ... and we don't expect *recent* a1 tasks
+        # ... and we don't expect *recent* a1 tasks or future tasks
         expected = [
             self.make_task(self.past_time, target_path)
             for target_path in (
@@ -1023,6 +1034,7 @@ class TestObjectExpirer(TestCase):
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=fake_swift)
         # ... and we don't expect *recent* a1 tasks, excluding c2
+        # or future tasks
         expected = [
             self.make_task(self.past_time, target_path)
             for target_path in (
@@ -1052,6 +1064,7 @@ class TestObjectExpirer(TestCase):
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=fake_swift)
         # ... and we don't expect *recent* a1 tasks, excluding c2
+        # or future tasks
         expected = [
             self.make_task(self.past_time, target_path)
             for target_path in (

@@ -255,7 +255,7 @@ This middleware understands the following configuration settings:
     incoming requests. Names may optionally end with ``*`` to
     indicate a prefix match. ``incoming_allow_headers`` is a
     list of exceptions to these removals.
-    Default: ``x-timestamp``
+    Default: ``x-timestamp x-open-expired``
 
 ``incoming_allow_headers``
     A whitespace-delimited list of the headers allowed as

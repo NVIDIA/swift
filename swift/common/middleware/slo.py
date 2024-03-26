@@ -369,7 +369,7 @@ from swift.common.registry import register_swift_info
 from swift.common.request_helpers import SegmentedIterable, \
     get_sys_meta_prefix, update_etag_is_at_header, resolve_etag_is_at_header, \
     get_container_update_override_key, update_ignore_range_header, \
-    get_param
+    get_param, get_valid_part_num
 from swift.common.constraints import check_utf8, AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common.http import HTTP_NOT_FOUND, HTTP_UNAUTHORIZED
 from swift.common.wsgi import WSGIContext, make_subrequest, make_env, \
@@ -632,39 +632,6 @@ def calculate_byteranges(req, segments, resp_attrs, part_num):
         byteranges = [(0, resp_attrs.slo_size - 1)]
 
     return byteranges
-
-
-def get_valid_part_num(req):
-    """
-    Any non-range GET or HEAD request for a SLO object may include a
-    part-number parameter in query string.  If the passed in request
-    includes a part-number parameter it will be parsed into a valid integer
-    and returned.  If the passed in request does not include a part-number
-    param we will return None.  If the part-number parameter is invalid for
-    the given request we will raise the appropriate HTTP exception
-
-    :param req: the request object
-
-    :returns: validated part-number value or None
-    :raises HTTPBadRequest: if request or part-number param is not valid
-    """
-    part_number_param = get_param(req, 'part-number')
-    if part_number_param is None:
-        return None
-    try:
-        part_number = int(part_number_param)
-        if part_number <= 0:
-            raise ValueError
-    except ValueError:
-        raise HTTPBadRequest('Part number must be an integer greater '
-                             'than 0')
-
-    if req.range:
-        raise HTTPBadRequest(req=req,
-                             body='Range requests are not supported '
-                                  'with part number queries')
-
-    return part_number
 
 
 class RespAttrs(object):
@@ -954,8 +921,7 @@ class SloGetContext(WSGIContext):
         # we can avoid re-fetching the object.
         return first_byte == 0 and last_byte == length - 1
 
-    def _need_to_refetch_manifest(self, req, resp_attrs,
-                                  is_part_num_request):
+    def _need_to_refetch_manifest(self, req, resp_attrs, is_part_num_request):
         """
         Check if the segments will be needed to service the request and update
         the segment_listing_needed attribute.
@@ -1214,15 +1180,6 @@ class SloGetContext(WSGIContext):
         orig_path_info = req.path_info
         resp_iter = self._app_call(req.environ)
         resp_attrs = RespAttrs.from_headers(self._response_headers)
-        # the next two calls hide a couple side-effects, sorry:
-        #
-        # 1) regardless of the return value the "need_to_refetch" check *may*
-        #    also set self.segment_listing_needed = True (it's commented to
-        #    help you wrap your head around that one, good luck)
-        # 2) if we refetch, we overwrite the current resp_iter and resp_attrs
-        #    variables, partly because we *might* get back a NOT
-        #    resp_attrs.is_slo response (even if we had one to start), but
-        #    hopefully they're just the manifest resp we needed to refetch!
         if resp_attrs.is_slo and not is_manifest_get:
             try:
                 # only validate part-number if the request is to an SLO
@@ -1230,9 +1187,17 @@ class SloGetContext(WSGIContext):
             except HTTPException:
                 friendly_close(resp_iter)
                 raise
-
-            if self._need_to_refetch_manifest(
-                    req, resp_attrs, part_num):
+            # the next two calls hide a couple side effects, sorry:
+            #
+            # 1) regardless of the return value the "need_to_refetch" check
+            #    *may* also set self.segment_listing_needed = True (it's
+            #    commented to help you wrap your head around that one,
+            #    good luck)
+            # 2) if we refetch, we overwrite the current resp_iter and
+            #    resp_attrs variables, partly because we *might* get back a NOT
+            #    resp_attrs.is_slo response (even if we had one to start), but
+            #    hopefully they're just the manifest resp we needed to refetch!
+            if self._need_to_refetch_manifest(req, resp_attrs, part_num):
                 # reset path in case it was modified during original request
                 # (e.g. object versioning might re-write the path)
                 req.path_info = orig_path_info

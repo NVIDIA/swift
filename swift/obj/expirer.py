@@ -30,7 +30,7 @@ from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.middleware.s3api.utils import sysmeta_header
 from swift.common.utils import get_logger, dump_recon_cache, split_path, \
     Timestamp, config_true_value, normalize_delete_at_timestamp, \
-    RateLimitedIterator, md5
+    RateLimitedIterator, md5, non_negative_float
 from swift.common.http import HTTP_NOT_FOUND, HTTP_CONFLICT, \
     HTTP_PRECONDITION_FAILED
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
@@ -93,16 +93,14 @@ def read_conf_for_grace_periods(conf):
                 'should be in the form grace_period_<account> '
                 'or grace_period_<account>/<container> '
                 '(at most one "/" is allowed)' % conf_key)
-        gp = None
         try:
-            gp = float(conf.get(conf_key))
+            grace_periods[(account, container)] = non_negative_float(
+                conf.get(conf_key)
+            )
         except ValueError:
-            pass
-        if gp is None or gp < 0:
             raise ValueError(
                 '%s must be a float '
                 'greater than or equal to 0' % conf_key)
-        grace_periods[(account, container)] = gp
     return grace_periods
 
 
@@ -173,6 +171,8 @@ class ObjectExpirer(Daemon):
                     'grace_period_%s must be a float '
                     'greater than or equal to 0' % account)
             self.acct_grace_periods[account] = gp
+
+        self.grace_periods = read_conf_for_grace_periods(conf)
 
         self.grace_periods = read_conf_for_grace_periods(conf)
 
@@ -340,16 +340,14 @@ class ObjectExpirer(Daemon):
                     continue
                 grace_period = self.get_grace_period(target_account,
                                                      target_container)
-                cutoff = time() - grace_period
-                if delete_timestamp > Timestamp(cutoff):
-                    if grace_period:
-                        # we shouldn't yield the object if it's target_account
-                        # is under configured grace_period
-                        continue
-                    else:
-                        # we shouldn't yield ANY more objects that can't reach
-                        # the expiration date yet.
-                        break
+
+                if delete_timestamp > Timestamp.now():
+                    # we shouldn't yield ANY more objects that can't reach
+                    # the expiration date yet.
+                    break
+                if delete_timestamp > Timestamp(time() - grace_period):
+                    # we shouldn't yield the object during its grace period
+                    continue
 
                 # Only one expirer daemon assigned for one task
                 if self.hash_mod('%s/%s' % (task_container, task_object),

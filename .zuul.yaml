@@ -350,17 +350,17 @@
       - tools/playbooks/probetests/post.yaml
 
 - job:
-    name: swift-probetests-centos-8-stream
+    name: swift-probetests-centos-9-stream
     parent: unittests
-    nodeset: centos-8-stream
+    nodeset: centos-9-stream
     description: |
       Setup a SAIO dev environment and run Swift's probe tests
       under Python 3.
     timeout: 7200
     vars:
       s3_acl: no
+      bindep_profile: test py39
       s3_inventory_enabled: no
-      bindep_profile: test py36
     pre-run:
       - tools/playbooks/common/install_dependencies.yaml
       - tools/playbooks/saio_single_node_setup/setup_saio.yaml
@@ -370,12 +370,12 @@
     post-run: tools/playbooks/probetests/post.yaml
 
 - job:
-    name: swift-probetests-centos-8-stream-arm64
-    parent: swift-probetests-centos-8-stream
+    name: swift-probetests-centos-9-stream-arm64
+    parent: swift-probetests-centos-9-stream
     nodeset:
       nodes:
-        - name: swift-centos-8-stream-arm64
-          label: centos-8-stream-arm64
+        - name: swift-centos-9-stream-arm64
+          label: centos-9-stream-arm64
     description: |
       Setup a SAIO dev environment and run Swift's probe tests
       under Python 3 on top of arm64 architecture.
@@ -383,7 +383,7 @@
 
 - job:
     name: swift-func-cors
-    parent: swift-probetests-centos-8-stream
+    parent: swift-probetests-centos-9-stream
     description: |
       Setup a SAIO dev environment and run Swift's CORS functional tests
     timeout: 1200
@@ -457,19 +457,19 @@
     name: swift-multinode-rolling-upgrade-victoria
     parent: swift-multinode-rolling-upgrade
     vars:
-      previous_swift_version: origin/stable/victoria
+      previous_swift_version: origin/unmaintained/victoria
 
 - job:
     name: swift-multinode-rolling-upgrade-wallaby
     parent: swift-multinode-rolling-upgrade
     vars:
-      previous_swift_version: origin/stable/wallaby
+      previous_swift_version: origin/unmaintained/wallaby
 
 - job:
     name: swift-multinode-rolling-upgrade-xena
     parent: swift-multinode-rolling-upgrade
     vars:
-      previous_swift_version: origin/stable/xena
+      previous_swift_version: origin/unmaintained/xena
 
 - job:
     name: swift-multinode-rolling-upgrade-yoga
@@ -674,9 +674,7 @@
               - ^test/(cors|functional|probe|s3api)/.*$
         - swift-tox-py36:
             irrelevant-files: *unittest-irrelevant-files
-        - swift-tox-py39:
-            irrelevant-files: *unittest-irrelevant-files
-        - swift-tox-py310:
+        - swift-tox-py38:
             irrelevant-files: *unittest-irrelevant-files
         - swift-tox-py311:
             irrelevant-files: *unittest-irrelevant-files
@@ -720,7 +718,7 @@
               - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
               - ^test/(cors|unit|functional|probe)/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
-        - swift-probetests-centos-8-stream:
+        - swift-probetests-centos-9-stream:
             irrelevant-files: &probetest-irrelevant-files
               - ^(api-ref|releasenotes)/.*$
               # Keep doc/saio -- we use those sample configs in the saio playbooks
@@ -766,8 +764,7 @@
             irrelevant-files: *docker-irrelevant-files
         - swift-tox-py27
         - swift-tox-py36
-        - swift-tox-py39
-        - swift-tox-py310
+        - swift-tox-py38
         - swift-tox-py311
         - swift-tox-func-py27
         - swift-tox-func-encryption-py27
@@ -777,7 +774,7 @@
         - swift-tox-func-ec-py38
         - swift-func-cors
         - swift-tox-func-s3api-tests-tempauth
-        - swift-probetests-centos-8-stream:
+        - swift-probetests-centos-9-stream:
             irrelevant-files: *probetest-irrelevant-files
         - swift-dsvm-functional:
             irrelevant-files: *functest-irrelevant-files
@@ -800,7 +797,8 @@
     experimental:
       jobs:
         - swift-tox-py37
-        - swift-tox-py38
+        - swift-tox-py39
+        - swift-tox-py310
         - swift-tox-py36-centos-8-stream
         - swift-tox-func-py39-centos-9-stream
         - swift-tox-func-encryption-py39-centos-9-stream
