@@ -94,6 +94,19 @@
 # N.B. By default no delay_reaping value is configured for any accounts or
 # containers.
 #
+# When false each cycle the expirer will process all task containers oldest to
+# newest; N.B. this does not guarantee all tasks are processed oldest to
+# newest because of how tasks are randomly distributed into 100 containers for
+# each day's worth of expirations.  Randomized task container iteration may help
+# avoid longer start-up delays if using large values w/ delay_reaping or create
+# less hot spots listing task_containers from many processes.
+# randomized_task_container_iteration = false
+#
+# Number of tasks objects to cache before processing.  With many nodes it may
+# take some time to fill a larger cache_size but may also have a better chance
+# to distribute DELETEs to multiple target containers.
+# round_robin_task_cache_size = 100000
+#
 # recon_cache_path = /var/cache/swift
 #
 # You can set scheduling priority of processes. Niceness values range from -20
