@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 from time import time
 from unittest import main, TestCase
 from test.debug_logger import debug_logger
@@ -22,6 +23,7 @@ from tempfile import mkdtemp
 from shutil import rmtree
 from collections import defaultdict
 from copy import deepcopy
+import random
 
 import mock
 import six
@@ -65,6 +67,7 @@ class FakeInternalClient(object):
         """
         self.aco_dict = defaultdict(dict)
         self.aco_dict.update(aco_dict)
+        self._calls = []
 
     def get_account_info(self, account):
         acc_dict = self.aco_dict[account]
@@ -82,6 +85,7 @@ class FakeInternalClient(object):
         pass
 
     def iter_objects(self, account, container):
+        self._calls.append(('iter_objects', account, container))
         acc_dict = self.aco_dict[account]
         obj_iter = acc_dict.get(container, [])
         resp = []
@@ -91,8 +95,9 @@ class FakeInternalClient(object):
             resp.append(obj)
         return resp
 
-    def delete_object(*a, **kw):
-        pass
+    def delete_object(self, account, container, obj, *a, **kw):
+        self._calls.append(('delete_object', account, container, obj))
+        return swob.HTTPNoContent()
 
 
 class TestObjectExpirer(TestCase):
@@ -116,7 +121,7 @@ class TestObjectExpirer(TestCase):
         self.just_past_time = str(int(time() - 1))
         self.future_time = str(int(time() + 86400))
         # Dummy task queue for test
-        self.fake_swift = FakeInternalClient({
+        self._setup_fake_swift({
             '.expiring_objects': {
                 # this task container will be checked
                 self.empty_time: [],
@@ -141,8 +146,6 @@ class TestObjectExpirer(TestCase):
                 self.future_time: [
                     self.future_time + '-a11/c11/o11']}
         })
-        self.expirer = expirer.ObjectExpirer(self.conf, logger=self.logger,
-                                             swift=self.fake_swift)
 
         # map of times to target object paths which should be expirerd now
         self.expired_target_paths = {
@@ -158,6 +161,11 @@ class TestObjectExpirer(TestCase):
                 )
             ],
         }
+
+    def _setup_fake_swift(self, aco_dict):
+        self.fake_swift = FakeInternalClient(aco_dict)
+        self.expirer = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                             swift=self.fake_swift)
 
     def make_fake_ic(self, app):
         app._pipeline_final_app = mock.MagicMock()
@@ -827,7 +835,8 @@ class TestObjectExpirer(TestCase):
             return captured_iter
 
         with mock.patch('swift.obj.expirer.RateLimitedIterator',
-                        side_effect=fake_ratelimiter):
+                        side_effect=fake_ratelimiter), \
+                mock.patch('swift.obj.expirer.shuffle', lambda a: None):
             x.run_once()
         self.assertEqual(calls, [([
             self.make_task(self.past_time, target_path)
@@ -1086,6 +1095,177 @@ class TestObjectExpirer(TestCase):
             task_account_container_list, 0, 1))
         self.assertEqual(expected, observed)
 
+    def _setup_a_bunch_of_tasks(
+            self, now=None, num_days_past_due=7, num_days_after_due=3,
+            containers_per_day=100, num_task_per_container=2000, accounts=None,
+            max_objects_to_cache=expirer.MAX_OBJECTS_TO_CACHE):
+        """
+        Create a task queue with many containers going back many days with
+        different accounts; but before the day represented by "now" only
+        tasks for accounts[0] is in the queue.
+
+        :param now: the timestamp used consistently as now by the expirer
+        :param num_days_past_due: number of task_container days <= now
+        :param num_days_after_due: number of task_container days > now
+        :param containers_per_day: common.utils.get_expirer_container creates
+                                   at most 100 containers per day by default
+        :param num_tasks_per_container: the number of queue entries per
+                                        task_container
+        :param accounts: a list of account names, used round robin creating
+                         tasks; but for containers older than today only
+                         accounts[0] is used.
+        """
+        now = time() if now is None else now
+        accounts = [
+            'AUTH_nvetl',  # XXX bad example
+            'AUTH_a1',
+            'AUTH_a2',
+            'AUTH_a3',
+        ] if accounts is None else accounts
+        task_containers = [
+            str(int((now - (86400 * i)) - j))
+            for i in range(num_days_past_due)
+            for j in range(containers_per_day)
+        ] + [
+            str(int((now + (86400 * (i + 1))) - j))
+            for i in range(num_days_after_due)
+            for j in range(containers_per_day)
+        ]
+        # sanity
+        self.assertEqual(len(task_containers), (containers_per_day *
+                                                (num_days_past_due +
+                                                 num_days_after_due)))
+        obj_names = ('obj%s' % i for i in itertools.count())
+
+        def task_name(task_container, i):
+            account = accounts[i % 3]
+            # before *today* there's *only* grace account objects
+            if Timestamp(task_container) < now - containers_per_day:
+                account = accounts[0]
+            return task_container + '-%s/c%s/%s' % (
+                account, i, next(obj_names))
+
+        day_seconds = 60 * 60 * 24
+        self.conf['delay_reaping_%s' % accounts[0]] = day_seconds * 10
+        self._setup_fake_swift({
+            '.expiring_objects': {
+                task_container: [
+                    task_name(task_container, i)
+                    for i in range(num_task_per_container)]
+                for task_container in task_containers
+            }
+        })
+        num_expected_iter_calls = num_days_past_due * containers_per_day
+        non_grace_task_per_container = len([
+            t for t in self.fake_swift.aco_dict[
+                '.expiring_objects'][str(int(now))]
+            if accounts[0] not in t
+        ])
+        num_expected_delete_calls = (
+            non_grace_task_per_container * containers_per_day)
+        wrost_num_iter_before_delete = (
+            # how many iters before we get to useful work
+            (num_days_past_due - 1) * containers_per_day
+        ) + (
+            # how many iters of useful work needed to bust the cache
+            (max_objects_to_cache // non_grace_task_per_container) + 1
+        )
+        return (now,
+                num_expected_iter_calls,
+                num_expected_delete_calls,
+                wrost_num_iter_before_delete)
+
+    def _expirer_run_once_with_mocks(
+            self, now=None, stub_shuffle=None,
+            stub_max_objects_to_cache=None,
+            stub_max_task_container_to_cache=None):
+        """
+        call self.expirer.run_once() with some things (optionally) stubbed out
+        """
+        now = now or time.time()
+        stub_shuffle = stub_shuffle or random.shuffle
+        stub_max_objects_to_cache = (
+            stub_max_objects_to_cache
+            if stub_max_objects_to_cache is not None
+            else expirer.MAX_OBJECTS_TO_CACHE
+        )
+        stub_max_task_container_to_cache = (
+            stub_max_task_container_to_cache
+            if stub_max_task_container_to_cache is not None
+            else expirer.MAX_TASK_CONTAINER_TO_CACHE
+        )
+        # IME abuse of MagicMock's call tracking will pop OOM
+        memory_efficient_noop = lambda *args, **kwargs: None
+        memory_efficient_time = lambda: now
+        with mock.patch('swift.obj.expirer.MAX_TASK_CONTAINER_TO_CACHE',
+                        stub_max_task_container_to_cache), \
+                mock.patch('swift.obj.expirer.MAX_OBJECTS_TO_CACHE',
+                           stub_max_objects_to_cache), \
+                mock.patch.object(self.expirer, 'pop_queue',
+                                  memory_efficient_noop), \
+                mock.patch('eventlet.sleep', memory_efficient_noop), \
+                mock.patch('swift.common.utils.timestamp.time.time',
+                           memory_efficient_time), \
+                mock.patch('swift.obj.expirer.time', memory_efficient_time), \
+                mock.patch('swift.obj.expirer.shuffle', stub_shuffle):
+            self.expirer.run_once()
+
+    def _sort_out_fake_swift_calls(self):
+        iter_object_calls = []
+        delete_object_calls = []
+        found_delete_object = False
+        num_iter_before_delete = 0
+        for call in self.fake_swift._calls:
+            if call[0] == 'iter_objects':
+                iter_object_calls.append(call)
+                if not found_delete_object:
+                    num_iter_before_delete += 1
+            elif call[0] == 'delete_object':
+                delete_object_calls.append(call)
+                found_delete_object = True
+        return iter_object_calls, delete_object_calls, num_iter_before_delete
+
+    def test_in_order_task_container_iteration_delays_deletes(self):
+        # the default products get pretty big; this test takes >1m OOM
+        (now,
+         num_expected_iter_calls,
+         num_expected_delete_calls,
+         worst_num_iter_before_delete) = self._setup_a_bunch_of_tasks()
+
+        # "in order" is the least optimized "randomization"
+        stub_shuffle = lambda x: None
+        # if we don't create >100K tasks that are *actually* ready to expire
+        # round_robin_order will iter task_containers until *all* tasks are
+        # found before letting any work get done; so we should probably lower
+        # that cache size to speed up tests
+        self._expirer_run_once_with_mocks(now=now, stub_shuffle=stub_shuffle)
+        iter_object_calls, delete_object_calls, num_iter_before_delete = \
+            self._sort_out_fake_swift_calls()
+        self.assertEqual(num_expected_iter_calls, len(iter_object_calls))
+        self.assertEqual(num_expected_delete_calls, len(delete_object_calls))
+        self.assertEqual(num_iter_before_delete, worst_num_iter_before_delete)
+
+    def test_randomized_task_container_iteration_hastens_deletes(self):
+        # the default products get pretty big; this test takes >1m OOM
+        (now,
+         num_expected_iter_calls,
+         num_expected_delete_calls,
+         worst_num_iter_before_delete) = self._setup_a_bunch_of_tasks()
+
+        # no stub_shuffle - this is normal randomization
+        stub_shuffle = None
+        # if we don't create >100K tasks that are *actually* ready to expire
+        # round_robin_order will iter task_containers until *all* tasks are
+        # found before letting any work get done; so we should probably lower
+        # that cache size to speed up tests
+        self._expirer_run_once_with_mocks(now=now, stub_shuffle=stub_shuffle)
+        iter_object_calls, delete_object_calls, num_iter_before_delete = \
+            self._sort_out_fake_swift_calls()
+        self.assertEqual(num_expected_iter_calls, len(iter_object_calls))
+        self.assertEqual(num_expected_delete_calls, len(delete_object_calls))
+        # with a sufficiently few task_containers this might randomly fail
+        self.assertLess(num_iter_before_delete, worst_num_iter_before_delete)
+
     def test_run_once_unicode_problem(self):
         requests = []
 
@@ -1102,15 +1282,18 @@ class TestObjectExpirer(TestCase):
         with mock.patch.object(self.fake_swift, 'iter_objects') as mock_method:
             self.expirer.run_once()
 
+        # old mock doesn't suport c.args the same way as new mock
+        expected = {c[0] for c in mock_method.call_args_list}
         # iter_objects is called only for past_time, not future_time
-        self.assertEqual(mock_method.call_args_list, [
-            mock.call('.expiring_objects', self.empty_time),
-            mock.call('.expiring_objects', self.past_time),
-            mock.call('.expiring_objects', self.just_past_time)])
+        self.assertEqual(expected, {
+            ('.expiring_objects', self.empty_time),
+            ('.expiring_objects', self.past_time),
+            ('.expiring_objects', self.just_past_time)})
 
     def test_object_timestamp_break(self):
         with mock.patch.object(self.expirer, 'delete_actual_object') \
                 as mock_method, \
+                mock.patch('swift.obj.expirer.shuffle', lambda a: None), \
                 mock.patch.object(self.expirer, 'pop_queue'):
             self.expirer.run_once()
 
@@ -1139,6 +1322,7 @@ class TestObjectExpirer(TestCase):
         # all tasks are done
         with mock.patch.object(self.expirer, 'delete_actual_object',
                                lambda o, t, b: None), \
+                mock.patch('swift.obj.expirer.shuffle', lambda a: None), \
                 mock.patch.object(self.expirer, 'pop_queue') as mock_method:
             self.expirer.run_once()
 
@@ -1194,6 +1378,7 @@ class TestObjectExpirer(TestCase):
                                fail_delete_container), \
                 mock.patch.object(self.expirer, 'delete_actual_object',
                                   fail_delete_actual_object), \
+                mock.patch('swift.obj.expirer.shuffle', lambda a: None), \
                 mock.patch.object(self.expirer, 'pop_queue') as mock_pop:
             self.expirer.run_once()
 
