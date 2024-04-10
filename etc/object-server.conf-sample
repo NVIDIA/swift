@@ -749,21 +749,25 @@ use = egg:swift#xprofile
 # unwind the iterator of applications
 # unwind = false
 #
-# The expirer can be tuned to leave expired objects on disk (and in container
-# listings) for a per-account or per-container grace_period.
-# After the grace_period has passed objects will be deleted as normal.
-# You may configure this grace period in seconds with dynamic config
-# option names prefixed with grace_period_<ACCT> for per-account grace periods
-# and grace_period_<ACCT>/<CNTR> for per-container grace periods.
-# The grace period should be a float value greater than or equal to zero.
-# A per-container grace period does not require a per-account grace period
-# but overrides the per-account grace period for the same account if it exists.
+# The expirer can delay the reaping of expired objects on disk (and in
+# container listings) with an account level or container level delay_reaping
+# time.
+# After the delay_reaping time has passed objects will be reaped as normal.
+# You may configure this delay_reaping value in seconds with dynamic config
+# option names prefixed with delay_reaping_<ACCT> for account level delays
+# and delay_reaping_<ACCT>/<CNTR> for container level delays.
+# The delay_reaping value should be a float value greater than or equal to
+# zero.
+# A container level delay_reaping does not require an account level
+# delay_reaping but overrides the account level delay_reaping for the same
+# account if it exists.
 # For example:
-# grace_period_AUTH_test = 300.0
-# grace_period_AUTH_test2 = 86400.0
-# grace_period_AUTH_test/test = 400.0
-# grace_period_AUTH_test/test2 = 600.0
-# N.B. By default no grace_period is configured for any accounts or containers.
+# delay_reaping_AUTH_test = 300.0
+# delay_reaping_AUTH_test2 = 86400.0
+# delay_reaping_AUTH_test/test = 400.0
+# delay_reaping_AUTH_test/test2 = 600.0
+# N.B. By default no delay_reaping value is configured for any accounts or
+# containers.
 
 [object-relinker]
 # You can override the default log routing for this app here (don't use set!):

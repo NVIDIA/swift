@@ -100,7 +100,7 @@ class InternalClient(internal_client.InternalClient):
 class StubSwobResponse(object):
     def __init__(self, status_int, body=None, headers=None, app_iter=None):
         self.status_int = status_int
-        self.body = body or ''
+        self.body = body or b''
         self.headers = headers or {}
         self.app_iter = app_iter
 

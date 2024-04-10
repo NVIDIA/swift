@@ -861,25 +861,26 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                 self.assertEqual(r['headers']['X-Open-Expired'], 'false')
                 self.assertNotIn('X-Backend-Open-Expired', r['headers'])
 
-        # we don't support x-open-expired on PUT
-        req = swift.common.swob.Request.blank(
-            '/v1/a/c/o', method='PUT', headers={
-                'Content-Length': '0',
-                'X-Open-Expired': 'true'})
-        codes = [201] * self.obj_ring.replicas
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with mocked_http_conn(
-                *codes, expect_headers=expect_headers) as fake_conn:
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 201)
-        for r in fake_conn.requests:
-            self.assertEqual(r['headers']['X-Open-Expired'], 'true')
-            self.assertNotIn('X-Backend-Open-Expired', r['headers'])
-
     def test_x_open_expired_custom_config(self):
+        # helper to check that PUT is not supported in all cases
+        def test_put_unsupported():
+            req = swift.common.swob.Request.blank(
+                '/v1/a/c/o', method='PUT', headers={
+                    'Content-Length': '0',
+                    'X-Open-Expired': 'true'})
+            codes = [201] * self.obj_ring.replicas
+            expect_headers = {
+                'X-Obj-Metadata-Footer': 'yes',
+                'X-Obj-Multiphase-Commit': 'yes'
+            }
+            with mocked_http_conn(
+                    *codes, expect_headers=expect_headers) as fake_conn:
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 201)
+            for r in fake_conn.requests:
+                self.assertEqual(r['headers']['X-Open-Expired'], 'true')
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
         # Enable open expired
         # Override app configuration
         conf = {'enable_open_expired': 'true'}
@@ -906,6 +907,23 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                 self.assertEqual(r['headers']['X-Backend-Open-Expired'],
                                  'true')
 
+        for method, num_reqs in (
+                ('GET',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('HEAD',
+                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                ('POST', self.obj_ring.replicas)):
+            requests = self._test_x_open_expired(
+                method, num_reqs, headers={'X-Open-Expired': 'false'})
+            for r in requests:
+                # If the proxy server config is has enable_open_expired set
+                # to false, then we set x-backend-open-expired to false
+                self.assertEqual(r['headers']['X-Open-Expired'], 'false')
+                self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+        # we don't support x-open-expired on PUT when enable_open_expired
+        test_put_unsupported()
+
         # Disable open expired
         conf = {'enable_open_expired': 'false'}
         # Create a new proxy instance for test with config
@@ -929,6 +947,9 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             for r in requests:
                 self.assertEqual(r['headers']['X-Open-Expired'], 'true')
                 self.assertNotIn('X-Backend-Open-Expired', r['headers'])
+
+        # we don't support x-open-expired on PUT when not enable_open_expired
+        test_put_unsupported()
 
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD')

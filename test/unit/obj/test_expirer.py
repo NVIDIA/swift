@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 from time import time
 from unittest import main, TestCase
 from test.debug_logger import debug_logger
@@ -22,6 +23,7 @@ from tempfile import mkdtemp
 from shutil import rmtree
 from collections import defaultdict
 from copy import deepcopy
+import random
 from test import unit
 
 import mock
@@ -66,6 +68,7 @@ class FakeInternalClient(object):
         """
         self.aco_dict = defaultdict(dict)
         self.aco_dict.update(aco_dict)
+        self._calls = []
 
     def get_account_info(self, account):
         acc_dict = self.aco_dict[account]
@@ -83,6 +86,7 @@ class FakeInternalClient(object):
         pass
 
     def iter_objects(self, account, container):
+        self._calls.append(('iter_objects', account, container))
         acc_dict = self.aco_dict[account]
         obj_iter = acc_dict.get(container, [])
         resp = []
@@ -92,7 +96,8 @@ class FakeInternalClient(object):
             resp.append(obj)
         return resp
 
-    def delete_object(*a, **kw):
+    def delete_object(self, account, container, obj, *a, **kw):
+        self._calls.append(('delete_object', account, container, obj))
         return swob.HTTPNoContent()
 
 
@@ -117,7 +122,7 @@ class TestObjectExpirer(TestCase):
         self.just_past_time = str(int(time() - 1))
         self.future_time = str(int(time() + 86400))
         # Dummy task queue for test
-        self.fake_swift = FakeInternalClient({
+        self._setup_fake_swift({
             '.expiring_objects': {
                 # this task container will be checked
                 self.empty_time: [],
@@ -142,8 +147,6 @@ class TestObjectExpirer(TestCase):
                 self.future_time: [
                     self.future_time + '-a11/c11/o11']}
         })
-        self.expirer = expirer.ObjectExpirer(self.conf, logger=self.logger,
-                                             swift=self.fake_swift)
 
         # map of times to target object paths which should be expirerd now
         self.expired_target_paths = {
@@ -159,6 +162,11 @@ class TestObjectExpirer(TestCase):
                 )
             ],
         }
+
+    def _setup_fake_swift(self, aco_dict):
+        self.fake_swift = FakeInternalClient(aco_dict)
+        self.expirer = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                             swift=self.fake_swift)
 
     def make_fake_ic(self, app):
         app._pipeline_final_app = mock.MagicMock()
@@ -286,55 +294,55 @@ class TestObjectExpirer(TestCase):
             x.get_process_values(vals)
         self.assertEqual(str(ctx.exception), expected_msg)
 
-    def test_valid_grace_period(self):
+    def test_valid_delay_reaping(self):
         conf = {}
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {})
+        self.assertEqual(x.delay_reaping_times, {})
 
         conf = {
-            'grace_period_a': 1.0,
+            'delay_reaping_a': 1.0,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {('a', None): 1.0})
+        self.assertEqual(x.delay_reaping_times, {('a', None): 1.0})
 
-        # allow grace_period to be 0
+        # allow delay_reaping to be 0
         conf = {
-            'grace_period_a': 0.0,
+            'delay_reaping_a': 0.0,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {('a', None): 0.0})
+        self.assertEqual(x.delay_reaping_times, {('a', None): 0.0})
 
         conf = {
-            'grace_period_a/b': 0.0,
+            'delay_reaping_a/b': 0.0,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {('a', 'b'): 0.0})
+        self.assertEqual(x.delay_reaping_times, {('a', 'b'): 0.0})
 
-        # test configure multi-account grace_period
+        # test configure multi-account delay_reaping
         conf = {
-            'grace_period_a': 1.0,
-            'grace_period_b': '259200.0',
-            'grace_period_AUTH_aBC': 999,
-            u'grace_period_AUTH_aBáC': 555,
+            'delay_reaping_a': 1.0,
+            'delay_reaping_b': '259200.0',
+            'delay_reaping_AUTH_aBC': 999,
+            u'delay_reaping_AUTH_aBáC': 555,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {
+        self.assertEqual(x.delay_reaping_times, {
             ('a', None): 1.0,
             ('b', None): 259200.0,
             ('AUTH_aBC', None): 999,
             (u'AUTH_aBáC', None): 555,
         })
 
-        # test configure multi-account grace_period with containers
+        # test configure multi-account delay_reaping with containers
         conf = {
-            'grace_period_a': 10.0,
-            'grace_period_a/test': 1.0,
-            'grace_period_b': '259200.0',
-            'grace_period_AUTH_aBC/test2': 999,
-            u'grace_period_AUTH_aBáC/tést': 555,
+            'delay_reaping_a': 10.0,
+            'delay_reaping_a/test': 1.0,
+            'delay_reaping_b': '259200.0',
+            'delay_reaping_AUTH_aBC/test2': 999,
+            u'delay_reaping_AUTH_aBáC/tést': 555,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {
+        self.assertEqual(x.delay_reaping_times, {
             ('a', None): 10.0,
             ('a', 'test'): 1.0,
             ('b', None): 259200.0,
@@ -342,146 +350,146 @@ class TestObjectExpirer(TestCase):
             (u'AUTH_aBáC', u'tést'): 555,
         })
 
-    def test_invalid_grace_period_keys(self):
-        # there is no global grace_period
+    def test_invalid_delay_reaping_keys(self):
+        # there is no global delay_reaping
         conf = {
-            'grace_period': 0.0,
+            'delay_reaping': 0.0,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(x.grace_periods, {})
+        self.assertEqual(x.delay_reaping_times, {})
 
         # Multiple "/" or invalid parsing
         conf = {
-            'grace_period_A_U_TH_foo_bar/my-container_name/with/slash': 60400,
+            'delay_reaping_A_U_TH_foo_bar/my-container_name/with/slash': 60400,
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_A_U_TH_foo_bar/my-container_name/with/slash '
-            'should be in the form grace_period_<account> '
-            'or grace_period_<account>/<container> '
+            'delay_reaping_A_U_TH_foo_bar/my-container_name/with/slash '
+            'should be in the form delay_reaping_<account> '
+            'or delay_reaping_<account>/<container> '
             '(at most one "/" is allowed)',
             str(ctx.exception))
         conf = {
-            'grace_period_': 60400
+            'delay_reaping_': 60400
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_ '
-            'should be in the form grace_period_<account> '
-            'or grace_period_<account>/<container> '
+            'delay_reaping_ '
+            'should be in the form delay_reaping_<account> '
+            'or delay_reaping_<account>/<container> '
             '(at most one "/" is allowed)',
             str(ctx.exception))
 
         # Leading and trailing "/"
         conf = {
-            'grace_period_/a': 60400,
+            'delay_reaping_/a': 60400,
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_/a '
-            'should be in the form grace_period_<account> '
-            'or grace_period_<account>/<container> '
+            'delay_reaping_/a '
+            'should be in the form delay_reaping_<account> '
+            'or delay_reaping_<account>/<container> '
             '(leading or trailing "/" is not allowed)',
             str(ctx.exception))
 
         conf = {
-            'grace_period_a/': 60400,
+            'delay_reaping_a/': 60400,
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_a/ '
-            'should be in the form grace_period_<account> '
-            'or grace_period_<account>/<container> '
+            'delay_reaping_a/ '
+            'should be in the form delay_reaping_<account> '
+            'or delay_reaping_<account>/<container> '
             '(leading or trailing "/" is not allowed)',
             str(ctx.exception))
 
         conf = {
-            'grace_period_/a/c/': 60400,
+            'delay_reaping_/a/c/': 60400,
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_/a/c/ '
-            'should be in the form grace_period_<account> '
-            'or grace_period_<account>/<container> '
+            'delay_reaping_/a/c/ '
+            'should be in the form delay_reaping_<account> '
+            'or delay_reaping_<account>/<container> '
             '(leading or trailing "/" is not allowed)',
             str(ctx.exception))
 
-    def test_invalid_grace_period_values(self):
+    def test_invalid_delay_reaping_values(self):
         # negative tests
         conf = {
-            'grace_period_a': -1.0,
+            'delay_reaping_a': -1.0,
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_a must be a float greater than or equal to 0',
+            'delay_reaping_a must be a float greater than or equal to 0',
             str(ctx.exception))
         conf = {
-            'grace_period_a': '-259200.0'
+            'delay_reaping_a': '-259200.0'
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_a must be a float greater than or equal to 0',
+            'delay_reaping_a must be a float greater than or equal to 0',
             str(ctx.exception))
         conf = {
-            'grace_period_a': 'foo'
+            'delay_reaping_a': 'foo'
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_a must be a float greater than or equal to 0',
+            'delay_reaping_a must be a float greater than or equal to 0',
             str(ctx.exception))
 
         # negative tests with containers
         conf = {
-            'grace_period_a/b': -100.0
+            'delay_reaping_a/b': -100.0
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_a/b must be a float greater than or equal to 0',
+            'delay_reaping_a/b must be a float greater than or equal to 0',
             str(ctx.exception))
         conf = {
-            'grace_period_a/b': '-259200.0'
+            'delay_reaping_a/b': '-259200.0'
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_a/b must be a float greater than or equal to 0',
+            'delay_reaping_a/b must be a float greater than or equal to 0',
             str(ctx.exception))
         conf = {
-            'grace_period_a/b': 'foo'
+            'delay_reaping_a/b': 'foo'
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(
-            'grace_period_a/b must be a float greater than or equal to 0',
+            'delay_reaping_a/b must be a float greater than or equal to 0',
             str(ctx.exception))
 
-    def test_get_grace_period(self):
+    def test_get_delay_reaping(self):
         conf = {
-            'grace_period_a': 1.0,
-            'grace_period_a/test': 2.0,
-            'grace_period_b': '259200.0',
-            'grace_period_b/a': '0.0',
-            'grace_period_c/test': '3.0'
+            'delay_reaping_a': 1.0,
+            'delay_reaping_a/test': 2.0,
+            'delay_reaping_b': '259200.0',
+            'delay_reaping_b/a': '0.0',
+            'delay_reaping_c/test': '3.0'
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
-        self.assertEqual(1.0, x.get_grace_period('a', None))
-        self.assertEqual(1.0, x.get_grace_period('a', 'not-test'))
-        self.assertEqual(2.0, x.get_grace_period('a', 'test'))
-        self.assertEqual(259200.0, x.get_grace_period('b', None))
-        self.assertEqual(0.0, x.get_grace_period('b', 'a'))
-        self.assertEqual(259200.0, x.get_grace_period('b', 'test'))
-        self.assertEqual(3.0, x.get_grace_period('c', 'test'))
-        self.assertEqual(0.0, x.get_grace_period('c', 'not-test'))
-        self.assertEqual(0.0, x.get_grace_period('no-conf', 'test'))
+        self.assertEqual(1.0, x.get_delay_reaping('a', None))
+        self.assertEqual(1.0, x.get_delay_reaping('a', 'not-test'))
+        self.assertEqual(2.0, x.get_delay_reaping('a', 'test'))
+        self.assertEqual(259200.0, x.get_delay_reaping('b', None))
+        self.assertEqual(0.0, x.get_delay_reaping('b', 'a'))
+        self.assertEqual(259200.0, x.get_delay_reaping('b', 'test'))
+        self.assertEqual(3.0, x.get_delay_reaping('c', 'test'))
+        self.assertEqual(0.0, x.get_delay_reaping('c', 'not-test'))
+        self.assertEqual(0.0, x.get_delay_reaping('no-conf', 'test'))
 
     def test_init_concurrency_too_small(self):
         conf = {
@@ -582,6 +590,13 @@ class TestObjectExpirer(TestCase):
                     self.assertTrue(log_lines[0].startswith(
                         'Exception while deleting object '
                         'account container obj'))
+            if should_pop:
+                expected_stats = {'objects': 1}
+            else:
+                expected_stats = {'errors': 1}
+            self.assertEqual(
+                expected_stats,
+                x.logger.statsd_client.get_increment_counts())
 
         # verify pop_queue logic on exceptions
         for exc, ts, should_pop in [(None, timestamp, True),
@@ -828,7 +843,8 @@ class TestObjectExpirer(TestCase):
             return captured_iter
 
         with mock.patch('swift.obj.expirer.RateLimitedIterator',
-                        side_effect=fake_ratelimiter):
+                        side_effect=fake_ratelimiter), \
+                mock.patch('swift.obj.expirer.shuffle', lambda a: None):
             x.run_once()
         self.assertEqual(calls, [([
             self.make_task(self.past_time, target_path)
@@ -945,7 +961,7 @@ class TestObjectExpirer(TestCase):
                 task_account_container_list, my_index, divisor)),
             expected)
 
-    def test_iter_task_to_expire_with_grace(self):
+    def test_iter_task_to_expire_with_delay_reaping(self):
         aco_dict = {
             '.expiring_objects': {
                 self.past_time: [
@@ -969,7 +985,7 @@ class TestObjectExpirer(TestCase):
             }
         }
         fake_swift = FakeInternalClient(aco_dict)
-        # sanity, no accounts configured with grace period
+        # sanity, no accounts configured with delay_reaping
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=fake_swift)
         # ... we expect tasks past time to yield
@@ -1000,8 +1016,8 @@ class TestObjectExpirer(TestCase):
             task_account_container_list, 0, 1))
         self.assertEqual(expected, observed)
 
-        # configure grace for account a1
-        self.conf['grace_period_a1'] = 300.0
+        # configure delay for account a1
+        self.conf['delay_reaping_a1'] = 300.0
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=fake_swift)
         # ... and we don't expect *recent* a1 tasks or future tasks
@@ -1026,11 +1042,11 @@ class TestObjectExpirer(TestCase):
             task_account_container_list, 0, 1))
         self.assertEqual(expected, observed)
 
-        # configure grace for account a1 and for account a1 and container c2
+        # configure delay for account a1 and for account a1 and container c2
         # container a1/c2 expires expires almost immediately
         # but other containers in account a1 remain (a1/c1 and a1/c3)
-        self.conf['grace_period_a1'] = 300.0
-        self.conf['grace_period_a1/c2'] = 0.1
+        self.conf['delay_reaping_a1'] = 300.0
+        self.conf['delay_reaping_a1/c2'] = 0.1
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=fake_swift)
         # ... and we don't expect *recent* a1 tasks, excluding c2
@@ -1057,10 +1073,10 @@ class TestObjectExpirer(TestCase):
             task_account_container_list, 0, 1))
         self.assertEqual(expected, observed)
 
-        # configure grace for account a1 and for account a1 and container c2
+        # configure delay for account a1 and for account a1 and container c2
         # container a1/c2 does not expire but others in account a1 do
-        self.conf['grace_period_a1'] = 0.1
-        self.conf['grace_period_a1/c2'] = 300.0
+        self.conf['delay_reaping_a1'] = 0.1
+        self.conf['delay_reaping_a1/c2'] = 300.0
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=fake_swift)
         # ... and we don't expect *recent* a1 tasks, excluding c2
@@ -1086,6 +1102,177 @@ class TestObjectExpirer(TestCase):
         observed = list(x.iter_task_to_expire(
             task_account_container_list, 0, 1))
         self.assertEqual(expected, observed)
+
+    def _setup_a_bunch_of_tasks(
+            self, now=None, num_days_past_due=7, num_days_after_due=3,
+            containers_per_day=100, num_task_per_container=2000, accounts=None,
+            max_objects_to_cache=expirer.MAX_OBJECTS_TO_CACHE):
+        """
+        Create a task queue with many containers going back many days with
+        different accounts; but before the day represented by "now" only
+        tasks for accounts[0] is in the queue.
+
+        :param now: the timestamp used consistently as now by the expirer
+        :param num_days_past_due: number of task_container days <= now
+        :param num_days_after_due: number of task_container days > now
+        :param containers_per_day: common.utils.get_expirer_container creates
+                                   at most 100 containers per day by default
+        :param num_tasks_per_container: the number of queue entries per
+                                        task_container
+        :param accounts: a list of account names, used round robin creating
+                         tasks; but for containers older than today only
+                         accounts[0] is used.
+        """
+        now = time() if now is None else now
+        accounts = [
+            'AUTH_nvetl',  # XXX bad example
+            'AUTH_a1',
+            'AUTH_a2',
+            'AUTH_a3',
+        ] if accounts is None else accounts
+        task_containers = [
+            str(int((now - (86400 * i)) - j))
+            for i in range(num_days_past_due)
+            for j in range(containers_per_day)
+        ] + [
+            str(int((now + (86400 * (i + 1))) - j))
+            for i in range(num_days_after_due)
+            for j in range(containers_per_day)
+        ]
+        # sanity
+        self.assertEqual(len(task_containers), (containers_per_day *
+                                                (num_days_past_due +
+                                                 num_days_after_due)))
+        obj_names = ('obj%s' % i for i in itertools.count())
+
+        def task_name(task_container, i):
+            account = accounts[i % 3]
+            # before *today* there's *only* grace account objects
+            if Timestamp(task_container) < now - containers_per_day:
+                account = accounts[0]
+            return task_container + '-%s/c%s/%s' % (
+                account, i, next(obj_names))
+
+        day_seconds = 60 * 60 * 24
+        self.conf['delay_reaping_%s' % accounts[0]] = day_seconds * 10
+        self._setup_fake_swift({
+            '.expiring_objects': {
+                task_container: [
+                    task_name(task_container, i)
+                    for i in range(num_task_per_container)]
+                for task_container in task_containers
+            }
+        })
+        num_expected_iter_calls = num_days_past_due * containers_per_day
+        non_grace_task_per_container = len([
+            t for t in self.fake_swift.aco_dict[
+                '.expiring_objects'][str(int(now))]
+            if accounts[0] not in t
+        ])
+        num_expected_delete_calls = (
+            non_grace_task_per_container * containers_per_day)
+        wrost_num_iter_before_delete = (
+            # how many iters before we get to useful work
+            (num_days_past_due - 1) * containers_per_day
+        ) + (
+            # how many iters of useful work needed to bust the cache
+            (max_objects_to_cache // non_grace_task_per_container) + 1
+        )
+        return (now,
+                num_expected_iter_calls,
+                num_expected_delete_calls,
+                wrost_num_iter_before_delete)
+
+    def _expirer_run_once_with_mocks(
+            self, now=None, stub_shuffle=None,
+            stub_max_objects_to_cache=None,
+            stub_max_task_container_to_cache=None):
+        """
+        call self.expirer.run_once() with some things (optionally) stubbed out
+        """
+        now = now or time.time()
+        stub_shuffle = stub_shuffle or random.shuffle
+        stub_max_objects_to_cache = (
+            stub_max_objects_to_cache
+            if stub_max_objects_to_cache is not None
+            else expirer.MAX_OBJECTS_TO_CACHE
+        )
+        stub_max_task_container_to_cache = (
+            stub_max_task_container_to_cache
+            if stub_max_task_container_to_cache is not None
+            else expirer.MAX_TASK_CONTAINER_TO_CACHE
+        )
+        # IME abuse of MagicMock's call tracking will pop OOM
+        memory_efficient_noop = lambda *args, **kwargs: None
+        memory_efficient_time = lambda: now
+        with mock.patch('swift.obj.expirer.MAX_TASK_CONTAINER_TO_CACHE',
+                        stub_max_task_container_to_cache), \
+                mock.patch('swift.obj.expirer.MAX_OBJECTS_TO_CACHE',
+                           stub_max_objects_to_cache), \
+                mock.patch.object(self.expirer, 'pop_queue',
+                                  memory_efficient_noop), \
+                mock.patch('eventlet.sleep', memory_efficient_noop), \
+                mock.patch('swift.common.utils.timestamp.time.time',
+                           memory_efficient_time), \
+                mock.patch('swift.obj.expirer.time', memory_efficient_time), \
+                mock.patch('swift.obj.expirer.shuffle', stub_shuffle):
+            self.expirer.run_once()
+
+    def _sort_out_fake_swift_calls(self):
+        iter_object_calls = []
+        delete_object_calls = []
+        found_delete_object = False
+        num_iter_before_delete = 0
+        for call in self.fake_swift._calls:
+            if call[0] == 'iter_objects':
+                iter_object_calls.append(call)
+                if not found_delete_object:
+                    num_iter_before_delete += 1
+            elif call[0] == 'delete_object':
+                delete_object_calls.append(call)
+                found_delete_object = True
+        return iter_object_calls, delete_object_calls, num_iter_before_delete
+
+    def test_in_order_task_container_iteration_delays_deletes(self):
+        # the default products get pretty big; this test takes >1m OOM
+        (now,
+         num_expected_iter_calls,
+         num_expected_delete_calls,
+         worst_num_iter_before_delete) = self._setup_a_bunch_of_tasks()
+
+        # "in order" is the least optimized "randomization"
+        stub_shuffle = lambda x: None
+        # if we don't create >100K tasks that are *actually* ready to expire
+        # round_robin_order will iter task_containers until *all* tasks are
+        # found before letting any work get done; so we should probably lower
+        # that cache size to speed up tests
+        self._expirer_run_once_with_mocks(now=now, stub_shuffle=stub_shuffle)
+        iter_object_calls, delete_object_calls, num_iter_before_delete = \
+            self._sort_out_fake_swift_calls()
+        self.assertEqual(num_expected_iter_calls, len(iter_object_calls))
+        self.assertEqual(num_expected_delete_calls, len(delete_object_calls))
+        self.assertEqual(num_iter_before_delete, worst_num_iter_before_delete)
+
+    def test_randomized_task_container_iteration_hastens_deletes(self):
+        # the default products get pretty big; this test takes >1m OOM
+        (now,
+         num_expected_iter_calls,
+         num_expected_delete_calls,
+         worst_num_iter_before_delete) = self._setup_a_bunch_of_tasks()
+
+        # no stub_shuffle - this is normal randomization
+        stub_shuffle = None
+        # if we don't create >100K tasks that are *actually* ready to expire
+        # round_robin_order will iter task_containers until *all* tasks are
+        # found before letting any work get done; so we should probably lower
+        # that cache size to speed up tests
+        self._expirer_run_once_with_mocks(now=now, stub_shuffle=stub_shuffle)
+        iter_object_calls, delete_object_calls, num_iter_before_delete = \
+            self._sort_out_fake_swift_calls()
+        self.assertEqual(num_expected_iter_calls, len(iter_object_calls))
+        self.assertEqual(num_expected_delete_calls, len(delete_object_calls))
+        # with a sufficiently few task_containers this might randomly fail
+        self.assertLess(num_iter_before_delete, worst_num_iter_before_delete)
 
     def test_run_once_unicode_problem(self):
         requests = []
@@ -1103,15 +1290,18 @@ class TestObjectExpirer(TestCase):
         with mock.patch.object(self.fake_swift, 'iter_objects') as mock_method:
             self.expirer.run_once()
 
+        # old mock doesn't suport c.args the same way as new mock
+        expected = {c[0] for c in mock_method.call_args_list}
         # iter_objects is called only for past_time, not future_time
-        self.assertEqual(mock_method.call_args_list, [
-            mock.call('.expiring_objects', self.empty_time),
-            mock.call('.expiring_objects', self.past_time),
-            mock.call('.expiring_objects', self.just_past_time)])
+        self.assertEqual(expected, {
+            ('.expiring_objects', self.empty_time),
+            ('.expiring_objects', self.past_time),
+            ('.expiring_objects', self.just_past_time)})
 
     def test_object_timestamp_break(self):
         with mock.patch.object(self.expirer, 'delete_actual_object') \
                 as mock_method, \
+                mock.patch('swift.obj.expirer.shuffle', lambda a: None), \
                 mock.patch.object(self.expirer, 'pop_queue'):
             self.expirer.run_once()
 
@@ -1140,6 +1330,7 @@ class TestObjectExpirer(TestCase):
         # all tasks are done
         with mock.patch.object(self.expirer, 'delete_actual_object',
                                lambda o, t, b: None), \
+                mock.patch('swift.obj.expirer.shuffle', lambda a: None), \
                 mock.patch.object(self.expirer, 'pop_queue') as mock_method:
             self.expirer.run_once()
 
@@ -1195,6 +1386,7 @@ class TestObjectExpirer(TestCase):
                                fail_delete_container), \
                 mock.patch.object(self.expirer, 'delete_actual_object',
                                   fail_delete_actual_object), \
+                mock.patch('swift.obj.expirer.shuffle', lambda a: None), \
                 mock.patch.object(self.expirer, 'pop_queue') as mock_pop:
             self.expirer.run_once()
 
@@ -1220,6 +1412,10 @@ class TestObjectExpirer(TestCase):
                       self.past_time + '-' + target_path)
             for target_path in self.expired_target_paths[self.past_time]
         ])
+
+        self.assertEqual(
+            {'objects': 5, 'errors': 5},
+            self.expirer.logger.statsd_client.get_increment_counts())
 
     def test_run_forever_initial_sleep_random(self):
         global last_not_sleep
@@ -1266,21 +1462,19 @@ class TestObjectExpirer(TestCase):
                          'exception 1')
 
     def test_delete_actual_object(self):
-        got_env = [None]
-
-        def fake_app(env, start_response):
-            got_env[0] = env
-            start_response('204 No Content', [('Content-Length', '0')])
-            return []
-
-        x = expirer.ObjectExpirer({}, swift=self.make_fake_ic(fake_app))
+        x = expirer.ObjectExpirer(
+            {}, swift=unit.FakeInternalClient([swob.Response(status=204)]))
         ts = Timestamp('1234')
-        x.delete_actual_object('path/to/object', ts, False)
-        self.assertEqual(got_env[0]['HTTP_X_IF_DELETE_AT'], ts)
-        self.assertEqual(got_env[0]['HTTP_X_TIMESTAMP'],
-                         got_env[0]['HTTP_X_IF_DELETE_AT'])
+        with x.swift:
+            x.delete_actual_object('path/to/object', ts, False)
+        self.assertEqual(1, len(x.swift.calls))
+        request = x.swift.calls[0]
+        self.assertEqual(ts, request.headers['X-If-Delete-At'])
+        self.assertEqual(request.headers['X-Timestamp'],
+                         request.headers['X-If-Delete-At'])
         self.assertEqual(
-            got_env[0]['HTTP_X_BACKEND_CLEAN_EXPIRING_OBJECT_QUEUE'], 'no')
+            'no',
+            request.headers['X-Backend-Clean-Expiring-Object-Queue'])
 
     def test_delete_actual_object_bulk(self):
         got_env = [None]
@@ -1297,6 +1491,36 @@ class TestObjectExpirer(TestCase):
         self.assertNotIn('HTTP_X_BACKEND_CLEAN_EXPIRING_OBJECT_QUEUE',
                          got_env[0])
         self.assertEqual(got_env[0]['HTTP_X_TIMESTAMP'], ts.internal)
+
+    def test_delete_actual_object_bulk_s3api_mpu(self):
+        stub_responses = [
+            # delete manifest response
+            swob.Response(status=204, headers={
+                'X-Object-Sysmeta-S3Api-Upload-Id': 'upload-foo',
+                'X-Object-Sysmeta-S3Api-Etag': 'bar-1',
+            }),
+            # delete segment response
+            swob.Response(status=204),
+        ]
+        x = expirer.ObjectExpirer(
+            {}, swift=unit.FakeInternalClient(stub_responses))
+        ts = Timestamp('1234')
+        with x.swift:
+            x.delete_actual_object('account/bucket/mpu', ts, True)
+        self.assertEqual(2, len(x.swift.calls))
+        self.assertEqual({'DELETE'}, {c.method for c in x.swift.calls})
+        object_delete_request = x.swift.calls[0]
+        self.assertNotIn('X-Delete-At', object_delete_request.headers)
+        self.assertNotIn('X-Backend-Clean-Expiring-Object-Queue',
+                         object_delete_request.headers)
+        self.assertEqual(ts.internal,
+                         object_delete_request.headers['X-Timestamp'])
+        segment_delete_request = x.swift.calls[1]
+        self.assertNotIn('X-Delete-At', segment_delete_request.headers)
+        self.assertNotIn('X-Backend-Clean-Expiring-Object-Queue',
+                         segment_delete_request.headers)
+        self.assertEqual(ts.internal,
+                         segment_delete_request.headers['X-Timestamp'])
 
     def test_delete_actual_object_nourlquoting(self):
         # delete_actual_object should not do its own url quoting because
@@ -1448,19 +1672,20 @@ class TestObjectExpirer(TestCase):
             # delete manifest response
             swob.Response(status=204, headers={
                 'X-Object-Sysmeta-S3Api-Upload-Id': 'upload-foo',
-                'X-Object-Sysmeta-S3Api-Etag': 'bar-3',
+                'X-Object-Sysmeta-S3Api-Etag': 'bar-4',
             }),
             # delete segment response
             swob.Response(status=404),
             swob.Response(status=204),
-            swob.Response(status=404),
+            swob.Response(status=503),
+            swob.Response(status=204),
         ]
         x = expirer.ObjectExpirer(
             {}, swift=unit.FakeInternalClient(stub_responses))
         ts = Timestamp('1234')
         with x.swift:
             x.delete_actual_object('account/bucket/mpu', ts, False)
-        self.assertEqual(4, len(x.swift.calls))
+        self.assertEqual(5, len(x.swift.calls))
         self.assertEqual('/v1/account/bucket/mpu', x.swift.calls[0].path)
         self.assertEqual({
             'X-Backend-Clean-Expiring-Object-Queue': 'no',
@@ -1468,13 +1693,34 @@ class TestObjectExpirer(TestCase):
             'X-Timestamp': '0000001234.00000',
         }, x.swift.calls[0].headers)
         segment_path = '/v1/account/bucket%2Bsegments/mpu/upload-foo/'
-        for seg_num in range(1, 3):
+        for seg_num in range(1, 5):
             self.assertEqual(segment_path + str(seg_num),
                              x.swift.calls[seg_num].path)
             self.assertEqual({
                 'X-Backend-Clean-Expiring-Object-Queue': 'no',
                 'X-Timestamp': '0000001234.00000',
             }, x.swift.calls[seg_num].headers)
+
+    def test_delete_actual_object_s3api_mpu_missing_headers(self):
+        stub_responses = [
+            # delete manifest response
+            swob.Response(status=204, headers={
+                'X-Object-Sysmeta-S3Api-Upload-Id': '',
+                'X-Object-Sysmeta-S3Api-Etag': '',
+            }),
+        ]
+        x = expirer.ObjectExpirer(
+            {}, swift=unit.FakeInternalClient(stub_responses))
+        ts = Timestamp('1234')
+        with x.swift:
+            x.delete_actual_object('account/bucket/mpu', ts, False)
+        self.assertEqual(1, len(x.swift.calls))
+        self.assertEqual('/v1/account/bucket/mpu', x.swift.calls[0].path)
+        self.assertEqual({
+            'X-Backend-Clean-Expiring-Object-Queue': 'no',
+            'X-If-Delete-At': '0000001234.00000',
+            'X-Timestamp': '0000001234.00000',
+        }, x.swift.calls[0].headers)
 
     def test_pop_queue(self):
         x = expirer.ObjectExpirer({}, logger=self.logger,

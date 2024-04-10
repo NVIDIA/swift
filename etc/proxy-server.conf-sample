@@ -349,7 +349,7 @@ use = egg:swift#proxy
 # Setting 'enable_open_expired' to 'true' allows the 'x-open-expired' header
 # to be used with HEAD, GET, or POST requests to access expired objects that
 # have not yet been deleted from disk. This can be useful in conjunction with
-# the object-expirer 'grace period' feature.
+# the object-expirer 'delay_reaping' feature.
 # This flag is set to false by default, so it must be changed to access
 # expired objects.
 # enable_open_expired = true

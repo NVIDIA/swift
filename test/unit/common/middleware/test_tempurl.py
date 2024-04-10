@@ -1046,7 +1046,9 @@ class TestTempURL(unittest.TestCase):
         swift_info = registry.get_swift_info()
         self.assertIn('tempurl', swift_info)
         info = swift_info['tempurl']
-        incoming_remove_headers = info.get('incoming_remove_headers', set())
+        incoming_remove_headers = info.get('incoming_remove_headers', set(
+            ('x-timestamp', 'x-open-expired')
+        ))
 
         method = 'GET'
         expires = int(time() + 86400)

@@ -15,7 +15,7 @@
 
 import six
 
-from random import random
+from random import random, shuffle
 from time import time
 from os.path import join
 from collections import defaultdict, deque
@@ -27,7 +27,8 @@ from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common.daemon import Daemon
 from swift.common.http import is_success
 from swift.common.internal_client import InternalClient, UnexpectedResponse
-from swift.common.middleware.s3api.utils import sysmeta_header
+from swift.common.middleware.s3api.utils import sysmeta_header as \
+    s3_sysmeta_header
 from swift.common.utils import get_logger, dump_recon_cache, split_path, \
     Timestamp, config_true_value, normalize_delete_at_timestamp, \
     RateLimitedIterator, md5, non_negative_float
@@ -37,6 +38,7 @@ from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 
 from swift.container.reconciler import direct_delete_container_entry
 
+MAX_TASK_CONTAINER_TO_CACHE = 10000
 MAX_OBJECTS_TO_CACHE = 100000
 ASYNC_DELETE_TYPE = 'application/async-deleted'
 
@@ -68,45 +70,46 @@ def parse_task_obj(task_obj):
     return timestamp, target_account, target_container, target_obj
 
 
-def read_conf_for_grace_periods(conf):
-    grace_periods = {}
+def read_conf_for_delay_reaping_times(conf):
+    delay_reaping_times = {}
     for conf_key in conf:
-        grace_period_prefix = "grace_period_"
-        if not conf_key.startswith(grace_period_prefix):
+        delay_reaping_prefix = "delay_reaping_"
+        if not conf_key.startswith(delay_reaping_prefix):
             continue
-        grace_period_key = conf_key[len(grace_period_prefix):]
-        if grace_period_key.strip('/') != grace_period_key:
+        delay_reaping_key = conf_key[len(delay_reaping_prefix):]
+        if delay_reaping_key.strip('/') != delay_reaping_key:
             raise ValueError(
                 '%s '
-                'should be in the form grace_period_<account> '
-                'or grace_period_<account>/<container> '
+                'should be in the form delay_reaping_<account> '
+                'or delay_reaping_<account>/<container> '
                 '(leading or trailing "/" is not allowed)' % conf_key)
         try:
             # If split_path fails, have multiple '/' or
             # account name is invalid
             account, container = split_path(
-                '/' + grace_period_key, 1, 2
+                '/' + delay_reaping_key, 1, 2
             )
         except ValueError:
             raise ValueError(
                 '%s '
-                'should be in the form grace_period_<account> '
-                'or grace_period_<account>/<container> '
+                'should be in the form delay_reaping_<account> '
+                'or delay_reaping_<account>/<container> '
                 '(at most one "/" is allowed)' % conf_key)
         try:
-            grace_periods[(account, container)] = non_negative_float(
+            delay_reaping_times[(account, container)] = non_negative_float(
                 conf.get(conf_key)
             )
         except ValueError:
             raise ValueError(
                 '%s must be a float '
                 'greater than or equal to 0' % conf_key)
-    return grace_periods
+    return delay_reaping_times
 
 
-def get_grace_period(grace_periods, target_account, target_container):
-    return grace_periods.get((target_account, target_container),
-                             grace_periods.get((target_account, None), 0.0))
+def get_delay_reaping(delay_reaping_times, target_account, target_container):
+    return delay_reaping_times.get(
+        (target_account, target_container),
+        delay_reaping_times.get((target_account, None), 0.0))
 
 
 class ObjectExpirer(Daemon):
@@ -179,6 +182,8 @@ class ObjectExpirer(Daemon):
         self.grace_periods = read_conf_for_grace_periods(conf)
 
         self.grace_periods = read_conf_for_grace_periods(conf)
+
+        self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
 
     def read_conf_for_queue_access(self, swift):
         self.expiring_objects_account = AUTO_CREATE_ACCOUNT_PREFIX + \
@@ -300,30 +305,43 @@ class ObjectExpirer(Daemon):
         # task_container name is timestamp
         return Timestamp(task_container)
 
-    def iter_task_containers_to_expire(self, task_account):
+    def iter_task_account_containers_to_expire(self, task_account):
         """
-        Yields task_container names under the task_account if the delete at
-        timestamp of task_container is past.
+        Yields (task_account, task_container) tuples under the task_account if
+        the delete at timestamp of task_container is past.
+
+        N.B. This method "batches" the pages of the account listings so that it
+        can yield the task_containers in a randomized order.
         """
+        container_list = []
+
         for c in self.swift.iter_containers(task_account,
                                             prefix=self.task_container_prefix):
             task_container = str(c['name'])
             timestamp = self.delete_at_time_of_task_container(task_container)
             if timestamp > Timestamp.now():
                 break
-            yield task_container
+            container_list.append(task_container)
+            if len(container_list) > MAX_TASK_CONTAINER_TO_CACHE:
+                shuffle(container_list)
+                for task_container in container_list:
+                    yield task_account, task_container
+                container_list = []
+        shuffle(container_list)
+        for task_container in container_list:
+            yield task_account, task_container
 
-    def get_grace_period(self, target_account, target_container):
-        return get_grace_period(self.grace_periods, target_account,
-                                target_container)
+    def get_delay_reaping(self, target_account, target_container):
+        return get_delay_reaping(self.delay_reaping_times, target_account,
+                                 target_container)
 
-    def iter_task_to_expire(self, task_account_container_list,
+    def iter_task_to_expire(self, task_account_container_iter,
                             my_index, divisor):
         """
         Yields task expire info dict which consists of task_account,
         task_container, task_object, timestamp_to_delete, and target_path
         """
-        for task_account, task_container in task_account_container_list:
+        for task_account, task_container in task_account_container_iter:
             container_empty = True
             for o in self.swift.iter_objects(task_account, task_container):
                 container_empty = False
@@ -338,15 +356,15 @@ class ObjectExpirer(Daemon):
                     self.logger.exception('Unexcepted error handling task %r' %
                                           task_object)
                     continue
-                grace_period = self.get_grace_period(target_account,
-                                                     target_container)
+                delay_reaping = self.get_delay_reaping(target_account,
+                                                       target_container)
 
                 if delete_timestamp > Timestamp.now():
                     # we shouldn't yield ANY more objects that can't reach
                     # the expiration date yet.
                     break
-                if delete_timestamp > Timestamp(time() - grace_period):
-                    # we shouldn't yield the object during its grace period
+                if delete_timestamp > Timestamp(time() - delay_reaping):
+                    # we shouldn't yield the object during the delay
                     continue
 
                 # Only one expirer daemon assigned for one task
@@ -418,9 +436,12 @@ class ObjectExpirer(Daemon):
                         'container_count': container_count,
                         'obj_count': obj_count})
 
-                task_account_container_list = \
-                    [(task_account, task_container) for task_container in
-                     self.iter_task_containers_to_expire(task_account)]
+                # For backwards compatibility with tests, the
+                # task_account_container_iter is passed into
+                # iter_task_to_expire rather than constructed within
+                # iter_task_to_expire.
+                task_account_container_iter = \
+                    self.iter_task_account_containers_to_expire(task_account)
 
                 # delete_task_iter is a generator to yield a dict of
                 # task_account, task_container, task_object, delete_timestamp,
@@ -428,7 +449,7 @@ class ObjectExpirer(Daemon):
                 # from the queue.
                 delete_task_iter = \
                     self.round_robin_order(self.iter_task_to_expire(
-                        task_account_container_list, my_index, divisor))
+                        task_account_container_iter, my_index, divisor))
                 rate_limited_iter = RateLimitedIterator(
                     delete_task_iter,
                     elements_per_second=self.tasks_per_second)
@@ -554,8 +575,11 @@ class ObjectExpirer(Daemon):
     def delete_actual_object(self, actual_obj, timestamp, is_async_delete):
         """
         Deletes the end-user object indicated by the actual object name given
-        '<account>/<container>/<object>' if and only if the X-Delete-At value
-        of the object is exactly the timestamp given.
+        '<account>/<container>/<object>'.
+
+        For "normal" expiration the DELETE request may be rejected if the
+        X-Delete-At value of the object is exactly the timestamp given; this
+        behavior does not effect is_async_delete=True.
 
         :param actual_obj: The name of the end-user object to delete:
                            '<account>/<container>/<object>'
@@ -580,12 +604,14 @@ class ObjectExpirer(Daemon):
         resp = self.swift.delete_object(
             a, c, o,
             headers=headers, acceptable_statuses=acceptable_statuses)
-        upload_id_key = sysmeta_header('object', 'upload-id')
-        if not (is_success(resp.status_int) and
-                resp.headers.get(upload_id_key)):
-            # Note that upload_id_key may be the empty string!
+        upload_id_key = s3_sysmeta_header('object', 'upload-id')
+        segments_key = s3_sysmeta_header('object', 'etag')
+        if not (is_success(resp.status_int) and all(
+                resp.headers.get(key) for key in (
+                    upload_id_key, segments_key))):
+            # upload_id/segments headers may have been set to the empty string
+            # during a COPY that creates a non-mpu object
             return
-        segments_key = sysmeta_header('object', 'etag')
         # cleanup s3api mpu segments
         headers.pop('X-If-Delete-At', None)
         num_segments = int(resp.headers[segments_key].rsplit('-', 1)[1])
