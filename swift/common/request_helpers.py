@@ -1009,6 +1009,13 @@ def is_open_expired(app, req):
 
 
 def is_backend_open_expired(request):
+    """
+    Helper function to check if a request has either the headers
+    'x-backend-open-expired' or 'x-backend-replication' for the backend
+    to access expired objects.
+
+    :param request: request object
+    """
     x_backend_open_expired = config_true_value(request.headers.get(
         'x-backend-open-expired', 'false'))
     x_backend_replication = config_true_value(request.headers.get(

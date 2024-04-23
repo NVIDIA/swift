@@ -510,6 +510,9 @@ class TestRequestHelpers(unittest.TestCase):
         })
         self.assertFalse(rh.is_backend_open_expired(req))
 
+        req = Request.blank('/v1/a/c/o', headers={})
+        self.assertFalse(rh.is_backend_open_expired(req))
+
 
 class TestHTTPResponseToDocumentIters(unittest.TestCase):
     def test_200(self):

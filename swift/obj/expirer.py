@@ -31,7 +31,7 @@ from swift.common.middleware.s3api.utils import sysmeta_header as \
     s3_sysmeta_header
 from swift.common.utils import get_logger, dump_recon_cache, split_path, \
     Timestamp, config_true_value, normalize_delete_at_timestamp, \
-    RateLimitedIterator, md5, non_negative_float
+    RateLimitedIterator, md5, non_negative_float, parse_content_type
 from swift.common.http import HTTP_NOT_FOUND, HTTP_CONFLICT, \
     HTTP_PRECONDITION_FAILED
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
@@ -68,6 +68,32 @@ def parse_task_obj(task_obj):
     target_account, target_container, target_obj = \
         split_path('/' + target_path, 3, 3, True)
     return timestamp, target_account, target_container, target_obj
+
+
+def extract_expirer_bytes_from_ctype(content_type):
+    """
+    Parse a content-type and return the number of bytes.
+
+    :param content_type: a content-type string
+    :return: int or None
+    """
+    content_type, params = parse_content_type(content_type)
+    bytes_size = None
+    for k, v in params:
+        if k == 'swift_expirer_bytes':
+            bytes_size = int(v)
+    return bytes_size
+
+
+def embed_expirer_bytes_in_ctype(content_type, bytes_size):
+    """
+    Embed number of bytes into content-type.
+
+    :param content_type: a content-type string
+    :param bytes: an int representing number of bytes
+    :return: str
+    """
+    return "%s;swift_expirer_bytes=%s" % (content_type, bytes_size)
 
 
 def read_conf_for_delay_reaping_times(conf):
@@ -185,6 +211,17 @@ class ObjectExpirer(Daemon):
 
         self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
 
+        self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
+        # randomized task container iteration can be useful if there's lots of
+        # tasks in the queue under a configured delay_reaping
+        self.randomized_task_container_iteration = config_true_value(
+            conf.get('randomized_task_container_iteration', 'false'))
+        # with lots of nodes and lots of tasks a large cache size can
+        # significantly delay processing; which may be less necessary with only
+        # a few target containers or randomized task container iteration
+        self.round_robin_task_cache_size = int(
+            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
+
     def read_conf_for_queue_access(self, swift):
         self.expiring_objects_account = AUTO_CREATE_ACCOUNT_PREFIX + \
             (self.conf.get('expiring_objects_account_name') or
@@ -262,7 +299,7 @@ class ObjectExpirer(Daemon):
             obj_cache[cache_key].append(delete_task)
             cnt += 1
 
-            if cnt > MAX_OBJECTS_TO_CACHE:
+            if cnt > self.round_robin_task_cache_size:
                 for task in dump_obj_cache_in_round_robin():
                     yield task
                 cnt = 0
@@ -310,8 +347,9 @@ class ObjectExpirer(Daemon):
         Yields (task_account, task_container) tuples under the task_account if
         the delete at timestamp of task_container is past.
 
-        N.B. This method "batches" the pages of the account listings so that it
-        can yield the task_containers in a randomized order.
+        N.B. When randomized_task_container_iteration is enabled, this method
+        "batches" the pages of the account listings so that it can yield the
+        task_containers in a randomized order.
         """
         container_list = []
 
@@ -321,6 +359,10 @@ class ObjectExpirer(Daemon):
             timestamp = self.delete_at_time_of_task_container(task_container)
             if timestamp > Timestamp.now():
                 break
+            if not self.randomized_task_container_iteration:
+                yield task_account, task_container
+                # we never append to container_list
+                continue
             container_list.append(task_container)
             if len(container_list) > MAX_TASK_CONTAINER_TO_CACHE:
                 shuffle(container_list)

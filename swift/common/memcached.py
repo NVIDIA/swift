@@ -59,6 +59,8 @@ from eventlet import Timeout
 from six.moves import range
 from six.moves.configparser import ConfigParser, NoSectionError, NoOptionError
 from swift.common import utils
+from swift.common.exceptions import MemcacheConnectionError, \
+    MemcacheIncrNotFoundError, MemcachePoolTimeout
 from swift.common.utils import md5, human_readable, config_true_value, \
     memcached_timing_stats
 
@@ -120,25 +122,6 @@ def set_msg(key, flags, timeout, value):
         str(timeout).encode('ascii'),
         str(len(value)).encode('ascii'),
     ]) + (b'\r\n' + value + b'\r\n')
-
-
-# get the prefix of a user provided memcache key by removing the content after
-# the last '/', all current usages within swift are using prefix, such as
-# "shard-updating-v2", "nvratelimit" and etc.
-def get_key_prefix(key):
-    return key.rsplit('/', 1)[0]
-
-
-class MemcacheConnectionError(Exception):
-    pass
-
-
-class MemcacheIncrNotFoundError(MemcacheConnectionError):
-    pass
-
-
-class MemcachePoolTimeout(Timeout):
-    pass
 
 
 class MemcacheConnPool(Pool):

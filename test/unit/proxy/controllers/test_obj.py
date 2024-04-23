@@ -916,7 +916,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             requests = self._test_x_open_expired(
                 method, num_reqs, headers={'X-Open-Expired': 'false'})
             for r in requests:
-                # If the proxy server config is has enable_open_expired set
+                # If the proxy server config has enable_open_expired set
                 # to false, then we set x-backend-open-expired to false
                 self.assertEqual(r['headers']['X-Open-Expired'], 'false')
                 self.assertNotIn('X-Backend-Open-Expired', r['headers'])

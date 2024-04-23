@@ -703,6 +703,19 @@ use = egg:swift#backend_ratelimit
 # queue.
 # reclaim_age = 604800
 #
+# When false each cycle the expirer will process all task containers oldest to
+# newest; N.B. this does not guarantee all tasks are processed oldest to
+# newest because of how tasks are randomly distributed into 100 containers for
+# each day's worth of expirations.  Randomized task container iteration may help
+# avoid longer start-up delays if using large values w/ delay_reaping or create
+# less hot spots listing task_containers from many processes.
+# randomized_task_container_iteration = false
+#
+# Number of tasks objects to cache before processing.  With many nodes it may
+# take some time to fill a larger cache_size but may also have a better chance
+# to distribute DELETEs to multiple target containers.
+# round_robin_task_cache_size = 100000
+#
 # recon_cache_path = /var/cache/swift
 #
 # You can set scheduling priority of processes. Niceness values range from -20
@@ -716,10 +729,30 @@ use = egg:swift#backend_ratelimit
 # ionice_class =
 # ionice_priority =
 #
-# Note: Put it at the beginning of the pipleline to profile all middleware. But
-# it is safer to put this after healthcheck.
+# The expirer can delay the reaping of expired objects on disk (and in
+# container listings) with an account level or container level delay_reaping
+# time.
+# After the delay_reaping time has passed objects will be reaped as normal.
+# You may configure this delay_reaping value in seconds with dynamic config
+# option names prefixed with delay_reaping_<ACCT> for account level delays
+# and delay_reaping_<ACCT>/<CNTR> for container level delays.
+# The delay_reaping value should be a float value greater than or equal to
+# zero.
+# A container level delay_reaping does not require an account level
+# delay_reaping but overrides the account level delay_reaping for the same
+# account if it exists.
+# For example:
+# delay_reaping_AUTH_test = 300.0
+# delay_reaping_AUTH_test2 = 86400.0
+# delay_reaping_AUTH_test/test = 400.0
+# delay_reaping_AUTH_test/test2 = 600.0
+# N.B. By default no delay_reaping value is configured for any accounts or
+# containers.
+
 [filter:xprofile]
 use = egg:swift#xprofile
+# Note: Put it at the beginning of the pipleline to profile all middleware. But
+# it is safer to put this after healthcheck.
 # This option enable you to switch profilers which should inherit from python
 # standard profiler. Currently the supported value can be 'cProfile',
 # 'eventlet.green.profile' etc.

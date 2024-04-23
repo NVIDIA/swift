@@ -807,6 +807,23 @@ def record_cache_op_metrics(
                 server_type, op_type, cache_state))
 
 
+def record_cooperative_token_metrics(logger, cache_populator, op_type):
+    """
+    Record related metrics after a cooperative token request has finished.
+
+    :param  logger: the metrics logger.
+    :param  cache_populator: the instance of ``CooperativeCachePopulator``.
+    :param  op_type: the name of the operation type, includes 'shard_listing',
+              'shard_updating', and etc.
+    """
+    if cache_populator.done_reqs_with_token:
+        logger.increment('token.%s.done_token_reqs' % op_type)
+    if cache_populator.req_served_from_cache:
+        logger.increment('token.%s.cache_served_reqs' % op_type)
+    else:
+        logger.increment('token.%s.backend_reqs' % op_type)
+
+
 def _get_info_from_memcache(app, env, account, container=None):
     """
     Get cached account or container information from memcache
@@ -889,6 +906,50 @@ def _get_info_from_caches(app, env, account, container=None):
     return info, cache_state
 
 
+def encode_namespace_bounds(bounds):
+    """
+    This function formats the namespaces bounds for py2, after namespaces
+    bounds are read out of memcached.
+
+    :param  bounds: a list of namespaces bounds(tuple of lower and name).
+    :returns: the formatted bounds
+    """
+    if bounds and six.PY2:
+        # json.loads() in memcache.get will convert json 'string' to
+        # 'unicode' with python2, here we cast 'unicode' back to 'str'
+        return [[lower.encode('utf-8'), name.encode('utf-8')]
+                for lower, name in bounds]
+    return bounds
+
+
+def namespace_bounds_to_list(bounds):
+    """
+    This function converts the namespaces bounds to ``NamespaceBoundList``.
+
+    :param  bounds: a list of namespaces bounds(tuple of lower and name).
+    :returns: the object instance of ``NamespaceBoundList``; None if ``bounds``
+        is None or empty.
+    """
+    ns_bound_list = None
+    if bounds:
+        ns_bound_list = NamespaceBoundList(encode_namespace_bounds(bounds))
+    return ns_bound_list
+
+
+def namespace_list_to_bounds(ns_bound_list):
+    """
+    This function converts ``NamespaceBoundList`` to the namespaces bounds.
+
+    :param  ns_bound_list: an object instance of ``NamespaceBoundList``.
+    :returns: a list of namespaces bounds(tuple of lower and name); None if
+        ``ns_bound_list`` is None or empty.
+    """
+    bounds = None
+    if ns_bound_list:
+        bounds = ns_bound_list.bounds
+    return bounds
+
+
 def get_namespaces_from_cache(req, cache_key, skip_chance):
     """
     Get cached namespaces from infocache or memcache.
@@ -920,17 +981,9 @@ def get_namespaces_from_cache(req, cache_key, skip_chance):
         bounds = None
         cache_state = 'error'
 
-    if bounds:
-        if six.PY2:
-            # json.loads() in memcache.get will convert json 'string' to
-            # 'unicode' with python2, here we cast 'unicode' back to 'str'
-            bounds = [
-                [lower.encode('utf-8'), name.encode('utf-8')]
-                for lower, name in bounds]
-        ns_bound_list = NamespaceBoundList(bounds)
+    ns_bound_list = namespace_bounds_to_list(bounds)
+    if ns_bound_list:
         infocache[cache_key] = ns_bound_list
-    else:
-        ns_bound_list = None
     return ns_bound_list, cache_state
 
 
@@ -948,9 +1001,9 @@ def set_namespaces_in_cache(req, cache_key, ns_bound_list, time):
     infocache[cache_key] = ns_bound_list
     memcache = cache_from_env(req.environ, True)
     if memcache and ns_bound_list:
+        bounds = namespace_list_to_bounds(ns_bound_list)
         try:
-            memcache.set(cache_key, ns_bound_list.bounds, time=time,
-                         raise_on_error=True)
+            memcache.set(cache_key, bounds, time=time, raise_on_error=True)
         except MemcacheConnectionError:
             cache_state = 'set_error'
         else:
