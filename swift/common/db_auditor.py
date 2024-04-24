@@ -21,9 +21,11 @@ from eventlet import Timeout
 
 import swift.common.db
 from swift.common.utils import get_logger, audit_location_generator, \
-    config_true_value, dump_recon_cache, EventletRateLimiter
+    config_true_value, dump_recon_cache, EventletRateLimiter, \
+    non_negative_int, config_float_value
 from swift.common.daemon import Daemon
-from swift.common.exceptions import DatabaseAuditorException
+from swift.common.exceptions import DatabaseAuditorException, \
+    DatabaseException
 from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
     server_type_to_recon_file
 
@@ -62,6 +64,10 @@ class DatabaseAuditor(Daemon):
             config_true_value(conf.get('db_preallocation', 'f'))
         self.recon_cache_path = conf.get('recon_cache_path',
                                          DEFAULT_RECON_CACHE_PATH)
+        self.max_freelist_size = non_negative_int(
+            conf.get('vacuum_threshold_size', 0))
+        self.max_freelist_percent = config_float_value(
+            conf.get('vacuum_threshold_percent', 0), 0, 100)
         self.datadir = '{}s'.format(self.server_type)
 
     def _one_audit_pass(self, reported):
@@ -127,6 +133,39 @@ class DatabaseAuditor(Daemon):
             {'{}_auditor_pass_completed'.format(self.server_type): elapsed},
             self.rcache, self.logger)
 
+    def generate_freepage_stats(self, broker):
+        """Generate and send freepage stats.
+
+        This calls into the broker to get free page information. So return
+        that information as a dict, so we don't have to bother the broker
+        again.
+        """
+        def get_size_bucket(number, increment):
+            in_mb = int(number / 1024 / 1024)
+            return int(in_mb / increment) * increment
+
+        def get_percent_bucket(number, increment):
+            return int(number / increment) * increment
+
+        freelist_size = broker.get_freelist_size()
+        size_increment = 5
+        size_bucket = get_size_bucket(freelist_size, size_increment)
+        size_stat = "%s.freelist.size.%d-%dMB" % (
+            self.server_type, size_bucket, size_bucket + (size_increment - 1))
+        self.logger.increment(size_stat)
+
+        freelist_percent = broker.get_freelist_percent()
+        percent_increment = 10
+        percent_bucket = get_percent_bucket(
+            freelist_percent, percent_increment)
+        percent_stat = "%s.freelist.percent.%d-%d" % (
+            self.server_type, percent_bucket,
+            percent_bucket + (percent_increment - 1))
+        self.logger.increment(percent_stat)
+
+        return dict(freelist_percent=freelist_percent,
+                    freelist_size=freelist_size)
+
     def audit(self, path):
         """
         Audits the given database path
@@ -141,6 +180,30 @@ class DatabaseAuditor(Daemon):
                 err = self._audit(info, broker)
                 if err:
                     raise err
+                fl_stats = self.generate_freepage_stats(broker)
+                vacuum_db = False
+                if self.max_freelist_size:
+                    # vacuuming is done when freelist_size gets bigger
+                    # then the configured value
+                    if fl_stats['freelist_size'] > self.max_freelist_size:
+                        self.logger.increment('freelist_size')
+                        vacuum_db = True
+                if self.max_freelist_percent:
+                    # vacuuming is done when freelist_percent gets bigger
+                    # then the configured value
+                    if fl_stats['freelist_percent'] \
+                            > self.max_freelist_percent:
+                        self.logger.increment('freelist_percent')
+                        vacuum_db = True
+                if vacuum_db:
+                    try:
+                        broker.vacuum()
+                        self.logger.increment('vacuum.success')
+                    except DatabaseException as de:
+                        self.logger.warning(
+                            'Vacuum failed on %(path)s: %(err)s',
+                            {'path': path, 'err': str(de)})
+                        self.logger.increment('vacuum.failure')
                 self.logger.increment('passes')
                 self.passes += 1
                 self.logger.debug('Audit passed for %s', broker)
