@@ -45,7 +45,7 @@ from swift.common.db import chexor, dict_factory, get_db_connection, \
     DatabaseBroker, DatabaseConnectionError, DatabaseAlreadyExists, \
     GreenDBConnection, PICKLE_PROTOCOL, zero_like, TombstoneReclaimer
 from swift.common.utils import normalize_timestamp, mkdirs, Timestamp
-from swift.common.exceptions import LockTimeout
+from swift.common.exceptions import LockTimeout, DatabasePragmaException
 from swift.common.swob import HTTPException
 
 from test.unit import make_timestamp_iter, generate_db_path
@@ -244,6 +244,16 @@ class ExampleBroker(DatabaseBroker):
     db_type = 'test'
     db_contains_type = 'test'
     db_reclaim_timestamp = 'created_at'
+
+    def initialize(self, put_timestamp=None, storage_policy_index=None):
+        super(ExampleBroker, self).initialize(
+            put_timestamp, storage_policy_index)
+
+        with self.get() as conn:
+            # let's hardcode the page_size to something smaller and repeatable
+            conn.execute("PRAGMA page_size = 1024")
+            # We need to vacuum to make it take effect
+            conn.execute("VACUUM")
 
     def _initialize(self, conn, put_timestamp, **kwargs):
         if not self.account:
@@ -1658,6 +1668,72 @@ class TestDatabaseBroker(TestDbBase):
         with open(broker.pending_file, 'rb') as fd:
             pending = fd.read()
         self.assertFalse(pending)
+
+    def _freelist_setup(self):
+        db_file = os.path.join(self.testdir, '1.db')
+        broker = ExampleBroker(db_file, account='a', container='c')
+        broker.initialize(Timestamp.now().internal)
+
+        # This is a new file so our freelist page count should be 0
+        self.assertFalse(broker.get_freelist_count())
+        # put a few items and then remove them to build up some freelist pages
+        for t in range(1000):
+            broker.put_test('a%d' % t, Timestamp.now().internal)
+        broker._commit_puts()
+
+        def remove_rows():
+            with broker.get() as conn:
+                conn.execute('DELETE FROM test')
+                conn.commit()
+
+        remove_rows()
+        return broker
+
+    def test_get_freelist_stats_and_vacuum(self):
+        broker = self._freelist_setup()
+
+        # removing all those rows have given us some free pages now
+        self.assertEqual(broker.get_freelist_count(), 30)
+        self.assertGreater(broker.get_freelist_percent(), 71.0)
+        self.assertEqual(broker.get_freelist_size(), 30720)
+
+        # if we vacuum the DB it's freelist page count will reduce back down
+        # to 0 (no freelist pages)
+        broker.vacuum()
+        self.assertFalse(broker.get_freelist_count())
+        self.assertFalse(broker.get_freelist_percent())
+        self.assertFalse(broker.get_freelist_size())
+
+    def test_failure_getting_pragma(self):
+        def fake_get_pragma_value(key):
+            raise DatabasePragmaException("Boom!")
+
+        broker = self._freelist_setup()
+
+        # First if we attempt to get a pragma that doesn't exist:
+        with self.assertRaises(DatabasePragmaException) as ex:
+            broker._get_pragma_value('foobar')
+            self.assertEqual("Failed to use Pragma foobar", str(ex))
+
+        # first the freelist count should be 30
+        self.assertEqual(broker.get_freelist_count(), 30)
+
+        # now let's force a failure on pragmas we use
+        with mock.patch.object(
+                broker, '_get_pragma_value', fake_get_pragma_value):
+            # on an error it should return 0
+            self.assertEqual(broker.get_freelist_count(), 0)
+
+            # Others will throw exceptions
+            with self.assertRaises(ValueError) as ex:
+                broker.get_freelist_percent()
+                self.assertEqual(
+                    "Failed to calculate freelist percent: Boom!", str(ex))
+
+            with self.assertRaises(ValueError) as ex:
+                broker.get_freelist_size()
+                self.assertEqual(
+                    "Failed to calculate freelist size: Boom!", str(ex))
 
 
 class TestTombstoneReclaimer(TestDbBase):
