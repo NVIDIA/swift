@@ -36,7 +36,8 @@ from swift.common.constraints import MAX_META_COUNT, MAX_META_OVERALL_SIZE, \
 from swift.common import utils
 from swift.common.utils import Timestamp, renamer, \
     mkdirs, lock_parent_directory, fallocate_with_reserve, md5
-from swift.common.exceptions import LockTimeout
+from swift.common.exceptions import LockTimeout, DatabaseException, \
+    DatabasePragmaException
 from swift.common.swob import HTTPBadRequest
 
 
@@ -245,6 +246,7 @@ def get_db_connection(path, timeout=30, logger=None, okay_to_create=False):
 
 class TombstoneReclaimer(object):
     """Encapsulates reclamation of deleted rows in a database."""
+
     def __init__(self, broker, age_timestamp):
         """
         Encapsulates reclamation of deleted rows in a database.
@@ -1194,3 +1196,48 @@ class DatabaseBroker(object):
             'UPDATE %s_stat SET status_changed_at = ?'
             ' WHERE status_changed_at < ?' % self.db_type,
             (timestamp, timestamp))
+
+    def _get_pragma_value(self, key):
+        with self.get() as conn:
+            row = conn.execute('PRAGMA {}'.format(key))
+            if row:
+                return row.fetchone()[0]
+            else:
+                raise DatabasePragmaException(
+                    'Failed to use Pragma {}'.format(key))
+
+    def get_freelist_count(self):
+        try:
+            return self._get_pragma_value('freelist_count')
+        except DatabasePragmaException:
+            return 0
+
+    def get_freelist_size(self):
+        try:
+            page_size = self._get_pragma_value('page_size')
+            freelist_count = self._get_pragma_value('freelist_count')
+            return freelist_count * page_size
+        except DatabasePragmaException:
+            raise ValueError('Failed to calculate freelist size')
+
+    def get_freelist_percent(self):
+        try:
+            page_count = self._get_pragma_value('page_count')
+            if not page_count:
+                return 0
+            freelist_count = self._get_pragma_value('freelist_count')
+            return float(freelist_count) / float(page_count) * 100
+        except DatabasePragmaException:
+            raise ValueError('Failed to calulate freelist percent')
+
+    def vacuum(self):
+        """Vacuum the DB this broker is pointing to.
+
+        Returns:
+            bool: True on vacuum success, false on failure
+        """
+        try:
+            with self.get() as conn:
+                conn.execute('VACUUM')
+        except sqlite3.OperationalError as err:
+            raise DatabaseException(str(err))
