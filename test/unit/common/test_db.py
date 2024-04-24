@@ -245,6 +245,16 @@ class ExampleBroker(DatabaseBroker):
     db_contains_type = 'test'
     db_reclaim_timestamp = 'created_at'
 
+    def initialize(self, put_timestamp=None, storage_policy_index=None):
+        super(ExampleBroker, self).initialize(
+            put_timestamp, storage_policy_index)
+
+        with self.get() as conn:
+            # let's hardcode the page_size to something smaller and repeatable
+            conn.execute("PRAGMA page_size = 1024")
+            # We need to vacuum to make it take effect
+            conn.execute("VACUUM")
+
     def _initialize(self, conn, put_timestamp, **kwargs):
         if not self.account:
             raise ValueError(
@@ -1658,6 +1668,37 @@ class TestDatabaseBroker(TestDbBase):
         with open(broker.pending_file, 'rb') as fd:
             pending = fd.read()
         self.assertFalse(pending)
+
+    def test_get_freelist_stats_and_vacuum(self):
+        db_file = os.path.join(self.testdir, '1.db')
+        broker = ExampleBroker(db_file, account='a', container='c')
+        broker.initialize(Timestamp.now().internal)
+
+        # This is a new file so our freelist page count should be 0
+        self.assertFalse(broker.get_freelist_count())
+        # put a few items and then remove them to build up some freelist pages
+        for t in range(1000):
+            broker.put_test('a%d' % t, Timestamp.now().internal)
+        broker._commit_puts()
+
+        def remove_rows():
+            with broker.get() as conn:
+                conn.execute('DELETE FROM test')
+                conn.commit()
+
+        remove_rows()
+
+        # removing all those rows have given us some free pages now
+        self.assertEqual(broker.get_freelist_count(), 30)
+        self.assertGreater(broker.get_freelist_percent(), 71.0)
+        self.assertEqual(broker.get_freelist_size(), 30720)
+
+        # if we vacuum the DB it's freelist page count will reduce back down
+        # to 0 (no freelist pages)
+        broker.vacuum()
+        self.assertFalse(broker.get_freelist_count())
+        self.assertFalse(broker.get_freelist_percent())
+        self.assertFalse(broker.get_freelist_size())
 
 
 class TestTombstoneReclaimer(TestDbBase):
