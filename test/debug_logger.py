@@ -55,6 +55,7 @@ class BaseFakeStatsdClient(object):
         self.timing = self._capture("timing")
         self.timing_since = self._capture("timing_since")
         self.transfer_rate = self._capture("transfer_rate")
+        self.gauge = self._capture("gauge")
 
     def _capture(self, func_name):
         # this works in subclasses because super() searches the next inherited
@@ -102,6 +103,15 @@ class BaseFakeStatsdClient(object):
             counts[metric] += step
         # convert to normal dict for better failure messages
         return dict(counts)
+
+    def get_gauges(self):
+        return [call[0][:2] for call in self.calls['gauge']]
+
+    def get_latest_gauges(self):
+        guages = defaultdict(int)
+        for metric, value in self.get_gauges():
+            guages.update({metric: value})
+        return dict(guages)
 
 
 class FakeStatsdClient(BaseFakeStatsdClient, statsd_client.StatsdClient):

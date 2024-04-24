@@ -422,6 +422,7 @@ class LogAdapter(logging.LoggerAdapter, object):
     timing = statsd_delegate('timing')
     timing_since = statsd_delegate('timing_since')
     transfer_rate = statsd_delegate('transfer_rate')
+    gauge = statsd_delegate('gauge')
 
 
 class SwiftLogFormatter(logging.Formatter):
@@ -587,6 +588,9 @@ class SwiftLoggerAdapter(logging.LoggerAdapter):
 
     def transfer_rate(self, *a, **kw):
         return self.logger.transfer_rate(*a, **kw)
+
+    def gauge(self, *a, **kw):
+        return self.logger.gauge(*a, **kw)
 
     @property
     def thread_locals(self):

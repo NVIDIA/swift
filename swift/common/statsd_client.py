@@ -342,6 +342,9 @@ class StatsdClient(AbstractStatsdClient):
     def decrement(self, metric, sample_rate=None):
         return self.update_stats(metric, -1, sample_rate)
 
+    def gauge(self, m_name, m_value, sample_rate=None):
+        return self._send(m_name, m_value, 'g', sample_rate)
+
     def _timing(self, metric, timing_ms, sample_rate):
         # This method was added to disagregate timing metrics when testing
         return self._send(metric, round(timing_ms, 4), 'ms', sample_rate)
