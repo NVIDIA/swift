@@ -13,7 +13,7 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import collections
 import os
 import itertools
 from time import time
@@ -365,6 +365,104 @@ class TestExpirerConfig(TestCase):
         self.assertIn('ExpirerConfig', str(ctx.exception))
         self.assertIn('container_ring kwarg', str(ctx.exception))
 
+    def test_get_all_task_containers_per_day_only_expected(self):
+        # taks containers per day is 3
+        expirer_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 3,
+        })
+        containers = [86398]
+        self.assertEqual(
+            # within each day, task containers are in descending order.
+            [[86400, 86399, 86398]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86398, 86399, 86400]
+        self.assertEqual(
+            [[86400, 86399, 86398]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86400, 86399, 86398]
+        self.assertEqual(
+            [[86400, 86399, 86398]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86398, 172799]
+        self.assertEqual(
+            [[86400, 86399, 86398], [172800, 172799, 172798]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [172799, 86398, 86399, 86400]
+        self.assertEqual(
+            # days are sorted in ascending order
+            [[86400, 86399, 86398], [172800, 172799, 172798]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [172800, 172798, 172799, 86398, 86399, 86400]
+        self.assertEqual(
+            [[86400, 86399, 86398], [172800, 172799, 172798]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [172799, 259198, 86398]
+        self.assertEqual(
+            [[86400, 86399, 86398], [172800, 172799, 172798],
+                [259200, 259199, 259198]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        # taks containers per day is 100
+        expirer_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 100,
+        })
+        containers = [86398]
+        self.assertEqual(
+            [[86400 - i for i in range(100)]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86396, 86398, 86318]
+        self.assertEqual(
+            [[86400 - i for i in range(100)]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+
+    def test_get_all_task_containers_per_day_only_unexpected(self):
+        expirer_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 3,
+        })
+        containers = [86397]
+        self.assertEqual(
+            # no new containers filled for unexpected task container
+            [[86397]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86393, 86397, 86394]
+        self.assertEqual(
+            # expect no sorting for unexpected task containers
+            [[86393, 86397, 86394]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86393, 86397, 86394, 172797, 9999]
+        self.assertEqual(
+            [[86393, 86397, 86394], [172797, 9999]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+
+    def test_get_all_task_containers_per_day_mixed(self):
+        expirer_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 3,
+        })
+        # only one unexpected task container
+        containers = [86398, 172799, 9999]
+        self.assertEqual(
+            [[86400, 86399, 86398], [172800, 172799, 172798], [9999]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        # two days of unexpected task containers
+        containers = [86393, 86394, 86397, 86398, 8000, 172797, 172799]
+        self.assertEqual(
+            [[86400, 86399, 86398], [172800, 172799, 172798],
+                [86393, 86394, 86397], [8000, 172797]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+
 
 class TestExpirerHelpers(TestCase):
 
@@ -708,6 +806,24 @@ class TestObjectExpirer(TestCase):
         x = expirer.ObjectExpirer(conf, logger=self.logger,
                                   swift=self.fake_swift)
         self.assertEqual("randomized", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_parallel(self):
+        conf = {
+            'task_container_iteration_strategy': 'parallel',
+            'processes': '1700',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("parallel", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_parallel_invalid(self):
+        conf = {
+            'task_container_iteration_strategy': 'parallel',
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertIn('multiple processes', str(ctx.exception))
 
     def test_init_task_container_iteration_strategy_invalid(self):
         conf = {
@@ -1345,6 +1461,131 @@ class TestObjectExpirer(TestCase):
         self.assertGreater(mod_count[1], 300)
         self.assertGreater(mod_count[2], 300)
 
+    def _do_test_parallel_strategy(self, containers, processes,
+                                   task_container_per_day):
+        conf = dict(
+            self.conf,
+            processes=processes,
+            expiring_objects_task_container_per_day=task_container_per_day)
+        result_per_proc = {}
+        for process in range(processes):
+            conf['process'] = process
+            x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                      swift=self.fake_swift)
+            index, divisor, selected = x._parallel_strategy(containers)
+            result_per_proc[process] = index, divisor, selected
+        return result_per_proc
+
+    def test_parallel_strategy_expected_containers(self):
+        # 2 days worth at 3 per day
+        containers = [86398, 86399, 86400, 172798, 172799, 172800]
+        actual = self._do_test_parallel_strategy(
+            containers, processes=2, task_container_per_day=3)
+        # expected container sort in descending order across processes
+        self.assertEqual({0: (0, 1, [86398, 86400, 172798, 172800]),
+                          1: (0, 1, [86399, 172799])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=3, task_container_per_day=3)
+        self.assertEqual({0: (0, 1, [86400, 172800]),
+                          1: (0, 1, [86399, 172799]),
+                          2: (0, 1, [86398, 172798])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=4, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86400, 172800]),
+                          1: (0, 1, [86399, 172799]),
+                          2: (0, 1, [86398, 172798]),
+                          3: (1, 2, [86400, 172800])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=5, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86400, 172800]),
+                          1: (0, 2, [86399, 172799]),
+                          2: (0, 1, [86398, 172798]),
+                          3: (1, 2, [86400, 172800]),
+                          4: (1, 2, [86399, 172799])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=6, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86400, 172800]),
+                          1: (0, 2, [86399, 172799]),
+                          2: (0, 2, [86398, 172798]),
+                          3: (1, 2, [86400, 172800]),
+                          4: (1, 2, [86399, 172799]),
+                          5: (1, 2, [86398, 172798])},
+                         actual)
+
+    def test_parallel_strategy_missing_only_unexpected_containers(self):
+        containers = [86396, 86397, 99999]
+        actual = self._do_test_parallel_strategy(
+            containers, processes=2, task_container_per_day=3)
+        # missing containers sort in ascending order across processes
+        self.assertEqual({0: (0, 1, [86396, 99999]),
+                          1: (0, 1, [86397])},
+                         actual)
+
+    def test_parallel_strategy_missing_expected_container(self):
+        # the missing expected container is synthesized
+        containers = [86398, 86400]
+        actual = self._do_test_parallel_strategy(
+            containers, processes=2, task_container_per_day=3)
+        self.assertEqual({0: (0, 1, [86398, 86400]),
+                          1: (0, 1, [86399])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=3, task_container_per_day=3)
+        self.assertEqual({0: (0, 1, [86400]),
+                          1: (0, 1, [86399]),
+                          2: (0, 1, [86398])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=4, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86400]),
+                          1: (0, 1, [86399]),
+                          2: (0, 1, [86398]),
+                          3: (1, 2, [86400])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=5, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86400]),
+                          1: (0, 2, [86399]),
+                          2: (0, 1, [86398]),
+                          3: (1, 2, [86400]),
+                          4: (1, 2, [86399])},
+                         actual)
+
+    def test_parallel_strategy_missing_expected_and_unexpected_container(self):
+        # the missing expected container is synthesized
+        containers = [86396, 86397, 86398, 86400]
+        actual = self._do_test_parallel_strategy(
+            containers, processes=2, task_container_per_day=3)
+        self.assertEqual({0: (0, 1, [86396, 86398, 86400]),
+                          1: (0, 1, [86397, 86399])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=3, task_container_per_day=3)
+        self.assertEqual({0: (0, 1, [86396, 86400]),
+                          1: (0, 1, [86397, 86399]),
+                          2: (0, 1, [86398])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=4, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86396, 86400]),
+                          1: (0, 1, [86397, 86399]),
+                          2: (0, 1, [86398]),
+                          3: (1, 2, [86396, 86400])},
+                         actual)
+
     def test_select_task_containers_to_expire_single_process(self):
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=self.fake_swift)
@@ -1372,6 +1613,207 @@ class TestObjectExpirer(TestCase):
             self.past_time_container,
             self.just_past_time_container,
         ], [str(c) for c in containers])
+
+    def test_select_task_containers_parallel_multi_node_small_cluster(self):
+        # parallel distributed task iteration
+        self.conf['task_container_iteration_strategy'] = 'parallel'
+        num_processes = 2
+        self.conf['processes'] = str(num_processes)
+        container_per_proc = {}
+        for p in range(num_processes):
+            self.conf['process'] = str(p)
+            x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                      swift=self.fake_swift)
+            index, divisor, containers = x.select_task_containers_to_expire(
+                '.expiring_objects')
+            # there's more containers per day than processes, each process does
+            # all tasks in many containers per day
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            container_per_proc[p] = containers
+        # assertions make the most sense against the process set
+        all_selected_containers = set(itertools.chain.from_iterable(
+            container_per_proc.values()))
+        # 3 days worth of containers * 100 containers per day
+        self.assertEqual(300, len(all_selected_containers))
+        # distributed evenly
+        for containers in container_per_proc.values():
+            self.assertEqual(len(all_selected_containers) / num_processes,
+                             len(containers))
+        # including all expected containers
+        expected = [
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ]
+        for container_str in expected:
+            self.assertIn(container_str, all_selected_containers)
+        # and none that aren't ready
+        self.assertNotIn(self.future_time_container,
+                         all_selected_containers)
+
+    def test_select_task_containers_parallel_medium_unexpected_container(self):
+        # add an unexpected container in the account listing
+        unexpected_container = str(int(self.past_time_container) - 200)
+        self.fake_swift.aco_dict['.expiring_objects'][unexpected_container] = [
+            unexpected_container + '-a0/c0/o0',
+        ]
+        # parallel distributed task iteration
+        self.conf['task_container_iteration_strategy'] = 'parallel'
+        num_processes = 100
+        self.conf['processes'] = str(num_processes)
+        container_per_proc = {}
+        for p in range(num_processes):
+            self.conf['process'] = str(p)
+            x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                      swift=self.fake_swift)
+            index, divisor, containers = x.select_task_containers_to_expire(
+                '.expiring_objects')
+            # there's same expected containers per day as processes, each
+            # process does all tasks in one container per day except on the day
+            # when one process also does all the task in the unexpected
+            # containers
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            container_per_proc[p] = containers
+        # assertions make the most sense against the process set
+        all_selected_containers = set(itertools.chain.from_iterable(
+            container_per_proc.values()))
+        # 3 days worth of containers * 100 containers per day (+1 unexpected!)
+        self.assertEqual(301, len(all_selected_containers))
+        # distributed "evenly" (300 / 100 = 3, but one node gets +1 unexpected)
+        found_per_proc_container_len = []
+        for containers in container_per_proc.values():
+            found_per_proc_container_len.append(len(containers))
+        self.assertEqual(found_per_proc_container_len, [4] + [3] * 99)
+        # including all expected containers
+        expected = [
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ]
+        for container_str in expected:
+            self.assertIn(container_str, all_selected_containers)
+        # and the unexpected container
+        self.assertIn(unexpected_container, all_selected_containers)
+        # and none that aren't ready
+        self.assertNotIn(self.future_time_container,
+                         all_selected_containers)
+
+    def test_select_task_containers_parallel_multi_node_large_cluster(self):
+        # parallel distributed task iteration
+        self.conf.update({
+            'task_container_iteration_strategy': 'parallel',
+            'expiring_objects_task_container_per_day': '1000',
+        })
+        num_processes = 500
+        self.conf['processes'] = str(num_processes)
+        container_per_proc = {}
+        for p in range(num_processes):
+            self.conf['process'] = str(p)
+            x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                      swift=self.fake_swift)
+            index, divisor, containers = x.select_task_containers_to_expire(
+                '.expiring_objects')
+            # there's more containers per day (1000) than processes (500), each
+            # process does all tasks in two containers per day
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            container_per_proc[(p, index, divisor)] = containers
+        # assertions make the most sense against the process set
+        all_selected_containers = set(itertools.chain.from_iterable(
+            container_per_proc.values()))
+        # 3 days worth of containers * 1000 containers per day
+        self.assertEqual(3000, len(all_selected_containers))
+        # distributed evenly per day
+        for containers in container_per_proc.values():
+            self.assertEqual(6, len(containers))
+        # including all expected containers
+        expected = [
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ]
+        for container_str in expected:
+            self.assertIn(container_str, all_selected_containers)
+        # and none that aren't ready
+        self.assertNotIn(self.future_time_container,
+                         all_selected_containers)
+
+    def test_select_task_containers_parallel_huge_unexpected_container(self):
+        # add an unexpected container account listing
+        unexpected_containers = [
+            str(int(self.past_time_container) - 200 + i)
+            for i in range(167)]
+        self.fake_swift.aco_dict['.expiring_objects'].update({
+            unexpected_container: [unexpected_container + '-a0/c0/o0']
+            for unexpected_container in unexpected_containers
+        })
+        # parallel distributed task iteration
+        self.conf['task_container_iteration_strategy'] = 'parallel'
+        # way more processes than containers per day, they will share
+        num_processes = 900
+        self.conf['processes'] = str(num_processes)
+        container_per_proc = {}
+        for p in range(num_processes):
+            self.conf['process'] = str(p)
+            x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                      swift=self.fake_swift)
+            index, divisor, containers = x.select_task_containers_to_expire(
+                '.expiring_objects')
+            # there's more processes than containers per day, each process will
+            # share the container with a "few" other nodes - still better than
+            # all nodes listing all containers and sharing with all processes!
+            minimum_share = (
+                num_processes // x.expirer_config.task_container_per_day)
+            self.assertIn(divisor, {minimum_share, minimum_share + 1})
+            self.assertIn(index, set(range(divisor)))
+            container_per_proc[(p, index, divisor)] = containers
+        # assertions make the most sense against the process set
+        all_selected_containers = set(itertools.chain.from_iterable(
+            container_per_proc.values()))
+        # 3 days worth of containers * 100 containers per day (+ unexpected!)
+        self.assertEqual(300 + len(unexpected_containers),
+                         len(all_selected_containers))
+
+        found_per_proc_container_len_count = defaultdict(int)
+        per_container_indexes = collections.defaultdict(list)
+        per_container_divisors = collections.defaultdict(list)
+        for (p, index, divisor), containers in container_per_proc.items():
+            found_per_proc_container_len_count[len(containers)] += 1
+            for container in containers:
+                per_container_indexes[container].append(index)
+                per_container_divisors[container].append(divisor)
+        # there's 3 normal days worth of containers, plus another
+        # day-equivalent of unexpected, plus another 67 unexpected. So all
+        # procs get at least 4 containers, then the remaining 67 unexpected
+        # containers are striped across 900 procs with a stride of 100, so 9 *
+        # 67 = 603 procs get a 5th container
+        self.assertEqual(found_per_proc_container_len_count, {
+            5: 603,
+            4: 297,
+        })
+        # verify that, for each container, allocated procs use the same divisor
+        # and collectively cover all indexes
+        for container, indexes in per_container_indexes.items():
+            self.assertEqual(sorted(indexes), [0, 1, 2, 3, 4, 5, 6, 7, 8])
+            divisors = per_container_divisors[container]
+            self.assertEqual(divisors, [9, 9, 9, 9, 9, 9, 9, 9, 9])
+
+        # including all expected containers
+        expected = [
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ]
+        for container_str in expected:
+            self.assertIn(container_str, all_selected_containers)
+        # and the unexpected containers
+        for unexpected_container in unexpected_containers:
+            self.assertIn(unexpected_container, all_selected_containers)
+        # and none that aren't ready
+        self.assertNotIn(self.future_time_container,
+                         all_selected_containers)
 
     def test_run_once_nothing_to_do(self):
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
@@ -2311,6 +2753,68 @@ class TestObjectExpirer(TestCase):
              'objects': 1260},
             self.expirer.logger.statsd_client.get_increment_counts()
         )
+
+    def test_parallel_task_container_iteration_hastens_deletes(self):
+        now = time()
+        num_days_before_now = 2
+        num_days_after_now = 1
+        self.conf['round_robin_task_cache_size'] = 200
+        containers_per_day = 100  # just like for realz!
+        num_tasks_per_container = 10
+        self.conf['delay_reaping_a0'] = 86400 * 8
+        self.conf['delay_reaping_a1/c1a'] = 86400 * 3
+        self.conf['delay_reaping_a2'] = 86400
+        target_account_containers = [
+            # the backlog will have ONLY tasks under grace
+            ('a0', 'c0'),
+            ('a1', 'c1a'),
+            ('a2', 'c2'),
+            # these are always reapable, and only show up on todays backlog
+            ('a1', 'c1b'),
+            ('a1', 'c1c'),
+            ('a3', 'c3'),
+            ('a4', 'c4'),
+        ]
+        self._setup_a_bunch_of_tasks(now, num_days_before_now,
+                                     num_days_after_now, containers_per_day,
+                                     num_tasks_per_container,
+                                     target_account_containers)
+        # calculate expectations based on serial process configuration
+        task_containers = self.fake_swift.aco_dict['.expiring_objects'].keys()
+        expected_calls = self._count_expected_calls(
+            now, sorted(task_containers))
+
+        # ... but take observation of distributed process configuration
+        self.conf['task_container_iteration_strategy'] = 'parallel'
+        num_processes = 3
+        self.conf['processes'] = str(num_processes)
+        observation_per_proc = {}
+        for p in range(num_processes):
+            self.conf['process'] = str(p)
+            self._setup_fake_swift(self.fake_swift.aco_dict)
+            self._expirer_run_once_with_mocks(now=now)
+            observation_per_proc[p] = self._sort_out_fake_swift_calls()
+
+        self.assertEqual(
+            {'tasks.assigned': 1000,
+             'tasks.delayed': 2000,
+             'objects': 1000},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
+
+        all_iter_object_count = 0
+        all_delete_object_count = 0
+        for o_iter_object, o_delete_object, o_num_iter_before_delete in \
+                observation_per_proc.values():
+            all_iter_object_count += len(o_iter_object)
+            all_delete_object_count += len(o_delete_object)
+            # each process gets into today/ready after listing fewer containers
+            self.assertLess(o_num_iter_before_delete,
+                            expected_calls['listing_before_delete'])
+
+        # but in aggregate all containers are listed and ready tasks reaped
+        self.assertEqual(all_iter_object_count, expected_calls['listing'])
+        self.assertEqual(all_delete_object_count, expected_calls['delete'])
 
     def test_run_once_unicode_problem(self):
         requests = []
