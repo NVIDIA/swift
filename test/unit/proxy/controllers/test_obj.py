@@ -881,15 +881,15 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                 self.assertEqual(r['headers']['X-Open-Expired'], 'true')
                 self.assertNotIn('X-Backend-Open-Expired', r['headers'])
 
-        # Enable open expired
+        # Allow open expired
         # Override app configuration
-        conf = {'enable_open_expired': 'true'}
+        conf = {'allow_open_expired': 'true'}
         # Create a new proxy instance for test with config
         self.app = PatchedObjControllerApp(
             conf, account_ring=FakeRing(),
             container_ring=FakeRing(), logger=None)
         # Use the same container info as the app used in other tests
-        self.app.container_info = dict(self.container_info)
+        self.app.container_info = dict(self.fake_container_info())
         self.obj_ring = self.app.get_object_ring(int(self.policy))
 
         for method, num_reqs in (
@@ -901,7 +901,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             requests = self._test_x_open_expired(
                 method, num_reqs, headers={'X-Open-Expired': 'true'})
             for r in requests:
-                # If the proxy server config is has enable_open_expired set
+                # If the proxy server config is has allow_open_expired set
                 # to true, then we set x-backend-open-expired to true
                 self.assertEqual(r['headers']['X-Open-Expired'], 'true')
                 self.assertEqual(r['headers']['X-Backend-Open-Expired'],
@@ -916,22 +916,22 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             requests = self._test_x_open_expired(
                 method, num_reqs, headers={'X-Open-Expired': 'false'})
             for r in requests:
-                # If the proxy server config has enable_open_expired set
+                # If the proxy server config has allow_open_expired set
                 # to false, then we set x-backend-open-expired to false
                 self.assertEqual(r['headers']['X-Open-Expired'], 'false')
                 self.assertNotIn('X-Backend-Open-Expired', r['headers'])
 
-        # we don't support x-open-expired on PUT when enable_open_expired
+        # we don't support x-open-expired on PUT when allow_open_expired
         test_put_unsupported()
 
-        # Disable open expired
-        conf = {'enable_open_expired': 'false'}
+        # Disallow open expired
+        conf = {'allow_open_expired': 'false'}
         # Create a new proxy instance for test with config
         self.app = PatchedObjControllerApp(
             conf, account_ring=FakeRing(),
             container_ring=FakeRing(), logger=None)
         # Use the same container info as the app used in other tests
-        self.app.container_info = dict(self.container_info)
+        self.app.container_info = dict(self.fake_container_info())
         self.obj_ring = self.app.get_object_ring(int(self.policy))
 
         for method, num_reqs in (
@@ -948,7 +948,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                 self.assertEqual(r['headers']['X-Open-Expired'], 'true')
                 self.assertNotIn('X-Backend-Open-Expired', r['headers'])
 
-        # we don't support x-open-expired on PUT when not enable_open_expired
+        # we don't support x-open-expired on PUT when not allow_open_expired
         test_put_unsupported()
 
     def test_HEAD_simple(self):
@@ -2449,12 +2449,12 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                 self.assertIn('X-Delete-At-Partition', given_headers)
                 self.assertIn('X-Delete-At-Container', given_headers)
 
-        # Check when enable_open_expired config is set to true
-        conf = {'enable_open_expired': 'true'}
+        # Check when allow_open_expired config is set to true
+        conf = {'allow_open_expired': 'true'}
         self.app = PatchedObjControllerApp(
             conf, account_ring=FakeRing(),
             container_ring=FakeRing(), logger=None)
-        self.app.container_info = dict(self.container_info)
+        self.app.container_info = dict(self.fake_container_info())
         self.obj_ring = self.app.get_object_ring(int(self.policy))
 
         post_headers = []
@@ -2473,12 +2473,12 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
             self.assertEqual(given_headers.get('X-Backend-Open-Expired'),
                              'true')
 
-        # Check when enable_open_expired config is set to false
-        conf = {'enable_open_expired': 'false'}
+        # Check when allow_open_expired config is set to false
+        conf = {'allow_open_expired': 'false'}
         self.app = PatchedObjControllerApp(
             conf, account_ring=FakeRing(),
             container_ring=FakeRing(), logger=None)
-        self.app.container_info = dict(self.container_info)
+        self.app.container_info = dict(self.fake_container_info())
         self.obj_ring = self.app.get_object_ring(int(self.policy))
 
         post_headers = []
@@ -7902,7 +7902,7 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
         resp_headers = {'X-Backend-Record-Type': 'shard'}
         with mocked_http_conn(200, 200, body_iter=iter([b'', body]),
                               headers=resp_headers):
-            actual, resp = self.ctrl._get_updating_namespaces(
+            actual, resp = self.ctrl._do_get_updating_namespaces(
                 req, 'a', 'c', '1_test')
         self.assertEqual(200, resp.status_int)
         self.assertIsNone(actual)
@@ -7947,7 +7947,7 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
         body = json.dumps([dict(sr)]).encode('ascii')
         with mocked_http_conn(
                 200, 200, body_iter=iter([b'', body])):
-            actual, resp = self.ctrl._get_updating_namespaces(
+            actual, resp = self.ctrl._do_get_updating_namespaces(
                 req, 'a', 'c', '1_test')
         self.assertEqual(200, resp.status_int)
         self.assertIsNone(actual)
@@ -7965,7 +7965,7 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
         with mocked_http_conn(
                 200, 200, body_iter=iter([b'', body]),
                 headers=headers):
-            actual, resp = self.ctrl._get_updating_namespaces(
+            actual, resp = self.ctrl._do_get_updating_namespaces(
                 req, 'a', 'c', '1_test')
         self.assertEqual(200, resp.status_int)
         self.assertIsNone(actual)
@@ -7978,7 +7978,7 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
     def test_get_namespaces_request_failed(self):
         req = Request.blank('/v1/a/c/o', method='PUT')
         with mocked_http_conn(200, 404, 404, 404):
-            actual, resp = self.ctrl._get_updating_namespaces(
+            actual, resp = self.ctrl._do_get_updating_namespaces(
                 req, 'a', 'c', '1_test')
         self.assertEqual(404, resp.status_int)
         self.assertIsNone(actual)

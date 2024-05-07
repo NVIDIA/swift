@@ -101,6 +101,62 @@ class FakeInternalClient(object):
         return swob.HTTPNoContent()
 
 
+class TestExpirerHelpers(TestCase):
+
+    def test_add_expirer_bytes_to_ctype(self):
+        self.assertEqual(
+            'text/plain;swift_expirer_bytes=10',
+            expirer.embed_expirer_bytes_in_ctype('text/plain', 10))
+        self.assertEqual(
+            'text/plain;some_foo=bar;swift_expirer_bytes=10',
+            expirer.embed_expirer_bytes_in_ctype(
+                'text/plain;some_foo=bar', 10))
+
+    def test_extract_expirer_bytes_from_ctype(self):
+        self.assertEqual(10, expirer.extract_expirer_bytes_from_ctype(
+            'text/plain;swift_expirer_bytes=10'))
+        self.assertEqual(10, expirer.extract_expirer_bytes_from_ctype(
+            'text/plain;swift_expirer_bytes=10;some_foo=bar'))
+
+    def test_inverse_add_extract_bytes_from_ctype(self):
+        ctype_bytes = [
+            ('null', 0),
+            ('text/plain', 10),
+            ('application/octet-stream', 42),
+            ('application/json', 512),
+            ('gzip', 1000044),
+        ]
+        for ctype, expirer_bytes in ctype_bytes:
+            embedded_ctype = expirer.embed_expirer_bytes_in_ctype(
+                ctype, expirer_bytes)
+            found_bytes = expirer.extract_expirer_bytes_from_ctype(
+                embedded_ctype)
+            self.assertEqual(expirer_bytes, found_bytes)
+
+    def test_add_invalid_expirer_bytes_to_ctype(self):
+        self.assertRaises(TypeError,
+                          expirer.embed_expirer_bytes_in_ctype, 'nill', None)
+        self.assertRaises(ValueError,
+                          expirer.embed_expirer_bytes_in_ctype, 'bar', 'foo')
+        # perhaps could be an error
+        self.assertEqual(
+            'weird/float;swift_expirer_bytes=15',
+            expirer.embed_expirer_bytes_in_ctype('weird/float', 15.9))
+
+    def test_extract_missing_bytes_from_ctype(self):
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype('text/plain'))
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype(
+                'text/plain;swift_bytes=10'))
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype(
+                'text/plain;bytes=21'))
+        self.assertEqual(
+            None, expirer.extract_expirer_bytes_from_ctype(
+                'text/plain;some_foo=bar;other-baz=buz'))
+
+
 class TestObjectExpirer(TestCase):
     maxDiff = None
     internal_client = None
@@ -378,6 +434,8 @@ class TestObjectExpirer(TestCase):
             'delay_reaping_b': '259200.0',
             'delay_reaping_AUTH_aBC/test2': 999,
             u'delay_reaping_AUTH_aBáC/tést': 555,
+            'delay_reaping_AUTH_test/special%0Achars%3Dare%20quoted': 777,
+            'delay_reaping_AUTH_test/plus+signs+are+preserved': 888,
         }
         x = expirer.ObjectExpirer(conf, swift=self.fake_swift)
         self.assertEqual(x.delay_reaping_times, {
@@ -386,6 +444,8 @@ class TestObjectExpirer(TestCase):
             ('b', None): 259200.0,
             ('AUTH_aBC', 'test2'): 999,
             (u'AUTH_aBáC', u'tést'): 555,
+            ('AUTH_test', 'special\nchars=are quoted'): 777,
+            ('AUTH_test', 'plus+signs+are+preserved'): 888,
         })
 
     def test_invalid_delay_reaping_keys(self):
@@ -408,6 +468,20 @@ class TestObjectExpirer(TestCase):
             'or delay_reaping_<account>/<container> '
             '(at most one "/" is allowed)',
             str(ctx.exception))
+
+        # Can't sneak around it by escaping
+        conf = {
+            'delay_reaping_AUTH_test/sneaky%2fsneaky': 60400,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, swift=self.fake_swift)
+        self.assertEqual(
+            'delay_reaping_AUTH_test/sneaky%2fsneaky '
+            'should be in the form delay_reaping_<account> '
+            'or delay_reaping_<account>/<container> '
+            '(at most one "/" is allowed)',
+            str(ctx.exception))
+
         conf = {
             'delay_reaping_': 60400
         }
@@ -1136,6 +1210,99 @@ class TestObjectExpirer(TestCase):
                     'a1/c1/o1',
                 )
             )
+        ]
+        observed = list(x.iter_task_to_expire(
+            task_account_container_list, 0, 1))
+        self.assertEqual(expected, observed)
+
+    def test_iter_task_to_expire_with_delay_reaping_is_async(self):
+        aco_dict = {
+            '.expiring_objects': {
+                self.past_time: [
+                    # tasks 86400s past ready for execution
+                    {'name': self.past_time + '-a0/c0/o00',
+                     'content_type': 'application/async-deleted'},
+                    {'name': self.past_time + '-a0/c0/o01',
+                     'content_type': 'text/plain'},
+                    {'name': self.past_time + '-a1/c0/o02',
+                     'content_type': 'application/async-deleted'},
+                    {'name': self.past_time + '-a1/c0/o03',
+                     'content_type': 'text/plain'},
+                    {'name': self.past_time + '-a1/c1/o04',
+                     'content_type': 'application/async-deleted'},
+                    {'name': self.past_time + '-a1/c1/o05',
+                     'content_type': 'text/plain'},
+                ],
+                self.just_past_time: [
+                    # tasks only just 1s ready for execution
+                    {'name': self.just_past_time + '-a0/c0/o06',
+                     'content_type': 'application/async-deleted'},
+                    {'name': self.just_past_time + '-a0/c0/o07',
+                     'content_type': 'text/plain'},
+                    {'name': self.just_past_time + '-a1/c0/o08',
+                     'content_type': 'application/async-deleted'},
+                    {'name': self.just_past_time + '-a1/c0/o09',
+                     'content_type': 'text/plain'},
+                    {'name': self.just_past_time + '-a1/c1/o10',
+                     'content_type': 'application/async-deleted'},
+                    {'name': self.just_past_time + '-a1/c1/o11',
+                     'content_type': 'text/plain'},
+                ],
+                self.future_time: [
+                    # tasks not yet ready for execution
+                    {'name': self.future_time + '-a0/c0/o12',
+                     'content_type': 'application/async-deleted'},
+                    {'name': self.future_time + '-a0/c0/o13',
+                     'content_type': 'text/plain'},
+                    {'name': self.future_time + '-a1/c0/o14',
+                     'content_type': 'application/async-deleted'},
+                    {'name': self.future_time + '-a1/c0/o15',
+                     'content_type': 'text/plain'},
+                    {'name': self.future_time + '-a1/c1/o16',
+                     'content_type': 'application/async-deleted'},
+                    {'name': self.future_time + '-a1/c1/o17',
+                     'content_type': 'text/plain'},
+                ],
+            }
+        }
+        fake_swift = FakeInternalClient(aco_dict)
+        # no accounts configured with delay_reaping
+        x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                  swift=fake_swift)
+        # ... we expect all past async tasks to yield
+        expected = [
+            self.make_task(self.past_time, swob.wsgi_to_str(tgt),
+                           is_async_delete=is_async)
+            for (tgt, is_async) in (
+                ('a0/c0/o00', True),
+                ('a0/c0/o01', False),  # a0 no delay
+                ('a1/c0/o02', True),
+                # a1/c0/o03 a1 long delay
+                ('a1/c1/o04', True),
+                ('a1/c1/o05', False),  # c1 short delay
+            )
+        ] + [
+            self.make_task(self.just_past_time, swob.wsgi_to_str(tgt),
+                           is_async_delete=is_async)
+            for (tgt, is_async) in (
+                ('a0/c0/o06', True),
+                ('a0/c0/o07', False),  # a0 no delay
+                ('a1/c0/o08', True),
+                # a1/c0/o09 a1 delay
+                ('a1/c1/o10', True),  # async
+                # a1/c1/o11 c1 delay
+            )
+        ]
+        # configure delays
+        self.conf['delay_reaping_a1'] = 86500.0
+        self.conf['delay_reaping_a1/c1'] = 300.0
+        x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                  swift=fake_swift)
+        # ... and we still expect all past async tasks to yield
+        task_account_container_list = [
+            ('.expiring_objects', self.past_time),
+            ('.expiring_objects', self.just_past_time),
+            ('.expiring_objects', self.future_time),
         ]
         observed = list(x.iter_task_to_expire(
             task_account_container_list, 0, 1))

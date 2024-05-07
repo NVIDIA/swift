@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import Counter
 import json
 import random
 import time
 import uuid
 import unittest
-import io
-from collections import Counter
+from io import BytesIO
 
 from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.manager import Manager
@@ -290,9 +290,9 @@ class TestObjectExpirer(ReplProbeTest):
             self.client.make_request('PUT', path, {
                 'X-Delete-At': str(delete_at),
                 'X-Timestamp': Timestamp(now).normal,
-                'Content-Length': '0',
-                'X-Object-Meta-Test': 'foo'
-            }, (2,))
+                'Content-Length': '3',
+                'X-Object-Meta-Test': 'foo',
+            }, (2,), BytesIO(b'foo'))
         except UnexpectedResponse as e:
             self.fail(
                 'Expected 201 for PUT object but got %s' % e.resp.status)
@@ -321,22 +321,22 @@ class TestObjectExpirer(ReplProbeTest):
 
     def test_open_expired_enabled(self):
 
-        # When the global configuration option enable_open_expired is set to
+        # When the global configuration option allow_open_expired is set to
         # true, the client should be able to access expired objects that have
         # not yet been reaped using the x-open-expired flag. However, after
         # they have been reaped, it should return 404.
 
-        enable_open_expired = config_true_value(
-            self.cluster_info['swift'].get('enable_open_expired')
+        allow_open_expired = config_true_value(
+            self.cluster_info['swift'].get('allow_open_expired')
         )
 
-        if not enable_open_expired:
+        if not allow_open_expired:
             raise unittest.SkipTest(
-                "enable_open_expired is disabled in this swift cluster")
+                "allow_open_expired is disabled in this swift cluster")
 
         self._setup_test_open_expired()
 
-        # since enable_open_expired is enabled, ensure object can be accessed
+        # since allow_open_expired is enabled, ensure object can be accessed
         # with x-open-expired header
         # HEAD request should succeed
         try:
@@ -353,14 +353,14 @@ class TestObjectExpirer(ReplProbeTest):
             _, body = client.get_object(self.url, self.token,
                                         self.container_name, self.object_name,
                                         headers={'X-Open-Expired': True})
-            self.assertEqual(body, b'')
+            self.assertEqual(body, b'foo')
         except ClientException as e:
             self.fail(
                 'Expected 200 for GET object but got %s' % e.http_status)
 
         # POST request should succeed, update x-delete-at
         now = time.time()
-        new_delete_at = int(now + 2)
+        new_delete_at = int(now + 5)
         try:
             client.post_object(self.url, self.token,
                                self.container_name, self.object_name,
@@ -372,6 +372,15 @@ class TestObjectExpirer(ReplProbeTest):
         except ClientException as e:
             self.fail(
                 'Expected 200 for POST object but got %s' % e.http_status)
+
+        # GET requests succeed again, even without the magic header
+        try:
+            _, body = client.get_object(self.url, self.token,
+                                        self.container_name, self.object_name)
+            self.assertEqual(body, b'foo')
+        except ClientException as e:
+            self.fail(
+                'Expected 200 for GET object but got %s' % e.http_status)
 
         # make sure auto-created containers get in the account listing
         Manager(['container-updater']).once()
@@ -403,22 +412,22 @@ class TestObjectExpirer(ReplProbeTest):
 
     def test_open_expired_disabled(self):
 
-        # When the global configuration option enable_open_expired is set to
+        # When the global configuration option allow_open_expired is set to
         # false or not configured, the client should not be able to access
         # expired objects that have not yet been reaped using the
         # x-open-expired flag.
 
-        enable_open_expired = config_true_value(
-            self.cluster_info['swift'].get('enable_open_expired')
+        allow_open_expired = config_true_value(
+            self.cluster_info['swift'].get('allow_open_expired')
         )
 
-        if enable_open_expired:
+        if allow_open_expired:
             raise unittest.SkipTest(
-                "enable_open_expired is enabled in this swift cluster")
+                "allow_open_expired is enabled in this swift cluster")
 
         self._setup_test_open_expired()
 
-        # since enable_open_expired is disabled, should get 404 even
+        # since allow_open_expired is disabled, should get 404 even
         # with x-open-expired header
         # HEAD request should fail
         with self.assertRaises(ClientException) as e:
@@ -441,30 +450,44 @@ class TestObjectExpirer(ReplProbeTest):
                               headers={'X-Open-Expired': True})
         self.assertEqual(e.exception.http_status, 404)
 
+        # But with internal client, can GET with X-Backend-Open-Expired
+        # Since object still exists on disk
+        try:
+            object_metadata = self.client.get_object_metadata(
+                self.account, self.container_name, self.object_name,
+                acceptable_statuses=(2,),
+                headers={'X-Backend-Open-Expired': True})
+        except UnexpectedResponse as e:
+            self.fail(
+                'Expected 200 for GET object but got %s' % e.resp.status)
+        self.assertEqual('foo', object_metadata.get('x-object-meta-test'))
+
         # expirer runs to reap the object
         self.expirer.once()
 
-        # should get a 404 with x-open-expired since object is reaped
-        with self.assertRaises(ClientException) as e:
-            client.head_object(self.url, self.token,
-                               self.container_name, self.object_name,
-                               headers={'X-Open-Expired': True})
-        self.assertEqual(e.exception.http_status, 404)
+        # should get a 404 even with X-Backend-Open-Expired
+        # since object is reaped
+        with self.assertRaises(UnexpectedResponse) as e:
+            object_metadata = self.client.get_object_metadata(
+                self.account, self.container_name, self.object_name,
+                acceptable_statuses=(2,),
+                headers={'X-Backend-Open-Expired': True})
+        self.assertEqual(e.exception.resp.status_int, 404)
 
     def test_expirer_object_bytes_eventual_consistency(self):
+        obj_brain = BrainSplitter(self.url, self.token, self.container_name,
+                                  self.object_name, 'object', self.policy)
+
+        obj_brain.put_container()
+
         def put_object(content_length=0):
             try:
-                self.client.upload_object(io.BytesIO(bytes(content_length)),
+                self.client.upload_object(BytesIO(bytes(content_length)),
                                           self.account, self.container_name,
                                           self.object_name)
             except UnexpectedResponse as e:
                 self.fail(
                     'Expected 201 for PUT object but got %s' % e.resp.status)
-
-        obj_brain = BrainSplitter(self.url, self.token, self.container_name,
-                                  self.object_name, 'object', self.policy)
-
-        obj_brain.put_container()
 
         t0_content_length = 24
         put_object(content_length=t0_content_length)

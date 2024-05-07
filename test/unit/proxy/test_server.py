@@ -60,6 +60,7 @@ from test.unit import (
     DEFAULT_TEST_EC_TYPE, make_timestamp_iter, skip_if_no_xattrs,
     FakeHTTPResponse, node_error_count, node_last_error, set_node_errors)
 from test.unit.helpers import setup_servers, teardown_servers
+from swift.common.statsd_client import StatsdClient
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers.obj import ReplicatedObjectController
 from swift.obj import server as object_server
@@ -71,7 +72,7 @@ from swift.common.exceptions import ChunkReadTimeout, DiskFileNotExist, \
     APIVersionError, ChunkReadError
 from swift.common import utils, constraints, registry
 from swift.common.utils import hash_path, storage_directory, \
-    parse_content_type, parse_mime_headers, StatsdClient, \
+    ShardRange, parse_content_type, parse_mime_headers, \
     iter_multipart_mime_documents, public, mkdirs, NullLogger, md5, \
     node_to_string, NamespaceBoundList, ShardRange
 from swift.common.wsgi import loadapp, ConfigString
@@ -2293,7 +2294,8 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         """ % self.tempdir
         conf_path = self._write_conf(dedent(conf_sections))
 
-        with mock.patch('swift.common.utils.StatsdClient') as mock_statsd:
+        with mock.patch('swift.common.statsd_client.StatsdClient')\
+                as mock_statsd:
             app = loadapp(conf_path, allow_modify_pipeline=False)
         # logger name is hard-wired 'proxy-server'
         self.assertEqual('proxy-server', app.logger.name)
@@ -2316,7 +2318,8 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         """ % self.tempdir
         conf_path = self._write_conf(dedent(conf_sections))
 
-        with mock.patch('swift.common.utils.StatsdClient') as mock_statsd:
+        with mock.patch('swift.common.statsd_client.StatsdClient') \
+                as mock_statsd:
             app = loadapp(conf_path, allow_modify_pipeline=False)
         # logger name is hard-wired 'proxy-server'
         self.assertEqual('proxy-server', app.logger.name)
@@ -2539,6 +2542,7 @@ class BaseTestObjectController(object):
             self.assertEqual(gotten_obj, obj)
 
             sleep(0.3)  # client_timeout should kick us off
+            sock.close()  # explicitly close the socket
 
             fd.write(('GET /v1/a/%s/go-get-it HTTP/1.1\r\n'
                       'Host: localhost\r\n'
@@ -5053,7 +5057,7 @@ class TestReplicatedObjectController(
         # verify that the request to get updating shard from the container
         # backend works with cooperative token acquired.
         # reset the router post patch_policies
-        conf = {'namespace_cache_use_token': True}
+        conf = {'namespace_cache_use_token': 'True'}
         self.app = proxy_server.Application(
             conf,
             logger=self.logger,
@@ -5071,10 +5075,10 @@ class TestReplicatedObjectController(
 
             cache_key = 'shard-updating-v2/a/c'
             token_key = "_cache_token/%s" % cache_key
-            if random.choice([True, False]):
-                # Preset 'token_key' to be value of 1, then make this request
-                # getting updating shard to be the second to acquire a token.
-                # Otherwise, it would be the first.
+            if not random.choice([True, False]):
+                # Add some randomization to this test case. If True, this
+                # request which gets updating shard will be the first to
+                # acquire a token; otherwise, it would be the second one.
                 req.environ['swift.cache'].incr(token_key)
 
             # we want the container_info response to say policy index of 1 and
@@ -5101,19 +5105,24 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.statsd_client.get_increment_counts()
-            self.assertEqual({'account.info.cache.miss.200': 1,
-                              'account.info.infocache.hit': 2,
-                              'container.info.cache.miss.200': 1,
-                              'container.info.infocache.hit': 1,
-                              'object.shard_updating.cache.miss.200': 1,
-                              'object.shard_updating.cache.set': 1,
-                              'token.shard_updating.backend_reqs': 1,
-                              'token.shard_updating.done_token_reqs': 1},
-                             stats)
+            self.assertEqual(
+                {
+                    "account.info.cache.miss.200": 1,
+                    "account.info.infocache.hit": 2,
+                    "container.info.cache.miss.200": 1,
+                    "container.info.infocache.hit": 1,
+                    "object.shard_updating.cache.miss.200": 1,
+                    "object.shard_updating.cache.set": 1,
+                    "token.shard_updating.backend_reqs.with_token.200": 1,
+                    "token.shard_updating.done_token_reqs": 1,
+                },
+                stats,
+            )
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
             info_lines = self.logger.get_lines_for_level('info')
             self.assertIn(
-                'Cached updating shards for shard-updating-v2/a/c (3 shards)',
+                'Caching updating shards for shard-updating-v2/a/c (3 shards)'
+                ' with a finished token',
                 info_lines)
 
             backend_requests = fake_conn.requests
@@ -5155,7 +5164,8 @@ class TestReplicatedObjectController(
         # backend will be served out of memcached when other requests have
         # grabbed all available cooperative tokens.
         # reset the router post patch_policies
-        conf = {'namespace_cache_use_token': True}
+        conf = {'namespace_cache_use_token': 'True',
+                'namespace_cache_token_retry_interval': 0.005}
         self.app = proxy_server.Application(
             conf,
             logger=self.logger,
@@ -5253,6 +5263,114 @@ class TestReplicatedObjectController(
         do_test('DELETE', 'sharded')
         do_test('PUT', 'sharding')
         do_test('PUT', 'sharded')
+
+    @patch_policies([
+        StoragePolicy(0, 'zero', is_default=True, object_ring=FakeRing()),
+        StoragePolicy(1, 'one', object_ring=FakeRing()),
+    ])
+    def test_get_backend_updating_shard_with_cooperative_token_timeout(self):
+        # verify that the request to get updating shard from the container
+        # backend works with cooperative token timeout.
+        conf = {
+            'namespace_cache_use_token': True,
+            'namespace_cache_token_retry_interval': 0.001,
+        }
+        self.app = proxy_server.Application(
+            conf,
+            logger=self.logger,
+            account_ring=FakeRing(),
+            container_ring=FakeRing())
+        self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
+        self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
+        self.app.recheck_updating_shard_ranges = 3600
+        cache_key = 'shard-updating-v2/a/c'
+        token_key = "_cache_token/%s" % cache_key
+
+        def do_test(method, sharding_state):
+
+            class CustomizedFakeCache(FakeMemcache):
+                def get(self, key, raise_on_error=False):
+                    if key != cache_key:
+                        return super(CustomizedFakeCache, self).get(key)
+                    # all fail forever - just like real memcache!
+                    return super(CustomizedFakeCache, self).get(
+                        "NOT_EXISTED_YET")
+
+            self.app.logger.clear()  # clean capture state
+            req = Request.blank(
+                '/v1/a/c/o', {'swift.cache': CustomizedFakeCache()},
+                method=method, body='', headers={'Content-Type': 'text/plain'})
+
+            # Preset 'token_key' to be value of 3+, then make this request of
+            # getting updating shard to not able to acquire a token.
+            req.environ['swift.cache'].incr(token_key, 30)
+
+            # we want the container_info response to say policy index of 1 and
+            # sharding state
+            # acc HEAD, cont HEAD, cont shard GET, obj POSTs
+            status_codes = (200, 200, 200, 202, 202, 202)
+            resp_headers = {'X-Backend-Storage-Policy-Index': 1,
+                            'x-backend-sharding-state': sharding_state,
+                            'X-Backend-Record-Type': 'shard'}
+            shard_ranges = [
+                utils.ShardRange(
+                    '.shards_a/c_not_used', utils.Timestamp.now(), '', 'l'),
+                utils.ShardRange(
+                    '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u'),
+                utils.ShardRange(
+                    '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
+            ]
+            body = json.dumps([
+                dict(shard_range)
+                for shard_range in shard_ranges]).encode('ascii')
+            with mocked_http_conn(*status_codes, headers=resp_headers,
+                                  body=body) as fake_conn:
+                resp = req.get_response(self.app)
+
+            self.assertEqual(resp.status_int, 202)
+            stats = self.app.logger.statsd_client.get_increment_counts()
+            self.assertEqual(
+                {
+                    'account.info.cache.miss.200': 1,
+                    'account.info.infocache.hit': 2,
+                    'container.info.cache.miss.200': 1,
+                    'container.info.infocache.hit': 1,
+                    'object.shard_updating.cache.miss.200': 1,
+                    'object.shard_updating.cache.set': 1,
+                    'token.shard_updating.backend_reqs.no_token.200': 1
+                },
+                stats
+            )
+            self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
+            info_lines = self.logger.get_lines_for_level('info')
+            self.assertIn(
+                'Caching updating shards for shard-updating-v2/a/c (3 shards)',
+                info_lines)
+
+            backend_requests = fake_conn.requests
+            account_request = backend_requests[0]
+            self._check_request(
+                account_request, method='HEAD', path='/sda/0/a')
+            container_request = backend_requests[1]
+            self._check_request(
+                container_request, method='HEAD', path='/sda/0/a/c')
+            container_request_shard = backend_requests[2]
+            self._check_request(
+                container_request_shard, method='GET', path='/sda/0/a/c',
+                params={'states': 'updating'},
+                headers={'X-Backend-Record-Type': 'shard'})
+
+            self.assertIn(cache_key, req.environ['swift.cache'].store)
+            cached_namespaces = NamespaceBoundList.parse(shard_ranges)
+            self.assertEqual(
+                req.environ['swift.cache'].store[cache_key],
+                cached_namespaces.bounds)
+            self.assertIn(cache_key, req.environ.get('swift.infocache'))
+            self.assertEqual(
+                req.environ['swift.infocache'][cache_key].bounds,
+                cached_namespaces.bounds)
+
+        do_test('POST', 'sharding')
 
     def test_DELETE(self):
         with save_globals():
@@ -12340,7 +12458,7 @@ class TestSwiftInfo(unittest.TestCase):
                          constraints.MAX_OBJECT_NAME_LENGTH)
         self.assertIn('strict_cors_mode', si)
         self.assertFalse(si['allow_account_management'])
-        self.assertFalse(si['enable_open_expired'])
+        self.assertFalse(si['allow_open_expired'])
         self.assertFalse(si['account_autocreate'])
         # this next test is deliberately brittle in order to alert if
         # other items are added to swift info

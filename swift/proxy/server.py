@@ -250,8 +250,8 @@ class Application(object):
         self.account_existence_skip_cache = config_percent_value(
             conf.get('account_existence_skip_cache_pct', 0))
         self.namespace_cache_use_token = \
-            float(conf.get('namespace_cache_use_token',
-                  DEFAULT_NAMESPACE_CACHE_USE_TOKEN))
+            config_true_value(conf.get('namespace_cache_use_token',
+                                       DEFAULT_NAMESPACE_CACHE_USE_TOKEN))
         self.namespace_cache_token_retry_interval = \
             float(conf.get('namespace_cache_token_retry_interval',
                   DEFAULT_NAMESPACE_CACHE_TOKEN_RETRY_INTERVAL))
@@ -295,8 +295,8 @@ class Application(object):
             if a.strip()]
         self.strict_cors_mode = config_true_value(
             conf.get('strict_cors_mode', 't'))
-        self.enable_open_expired = config_true_value(
-            conf.get('enable_open_expired', 'f'))
+        self.allow_open_expired = config_true_value(
+            conf.get('allow_open_expired', 'f'))
         self.node_timings = {}
         self.timing_expiry = int(conf.get('timing_expiry', 300))
         value = conf.get('request_node_count', '2 * replicas')
@@ -360,7 +360,7 @@ class Application(object):
             policies=POLICIES.get_policy_info(),
             allow_account_management=self.allow_account_management,
             account_autocreate=self.account_autocreate,
-            enable_open_expired=self.enable_open_expired,
+            allow_open_expired=self.allow_open_expired,
             **constraints.EFFECTIVE_CONSTRAINTS)
         self.watchdog = Watchdog()
         self.watchdog.spawn()

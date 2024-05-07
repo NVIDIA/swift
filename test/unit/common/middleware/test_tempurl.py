@@ -1045,10 +1045,8 @@ class TestTempURL(unittest.TestCase):
 
         swift_info = registry.get_swift_info()
         self.assertIn('tempurl', swift_info)
-        info = swift_info['tempurl']
-        incoming_remove_headers = info.get('incoming_remove_headers', set(
-            ('x-timestamp', 'x-open-expired')
-        ))
+        incoming_remove_headers = \
+            swift_info['tempurl']['incoming_remove_headers']
 
         method = 'GET'
         expires = int(time() + 86400)
@@ -1068,7 +1066,7 @@ class TestTempURL(unittest.TestCase):
 
     def test_removed_incoming_header(self):
         self.tempurl = tempurl.filter_factory({
-            'incoming_remove_headers': 'x-remove-this x-open-expired'
+            'incoming_remove_headers': 'x-remove-this'
         })(self.auth)
         method = 'GET'
         expires = int(time() + 86400)
@@ -1084,7 +1082,7 @@ class TestTempURL(unittest.TestCase):
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 404)
         self.assertNotIn('x-remove-this', self.app.request.headers)
-        self.assertNotIn('x-open-expired', self.app.request.headers)
+        self.assertIn('x-open-expired', self.app.request.headers)
 
     def test_removed_incoming_headers_match(self):
         self.tempurl = tempurl.filter_factory({

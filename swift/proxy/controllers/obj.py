@@ -287,7 +287,7 @@ class BaseObjectController(Controller):
         """Handler for HTTP HEAD requests."""
         return self.GETorHEAD(req)
 
-    def _get_updating_namespaces(
+    def _do_get_updating_namespaces(
             self, req, account, container, includes=None):
         """
         Fetch namespaces in 'updating' states from given `account/container`.
@@ -327,7 +327,7 @@ class BaseObjectController(Controller):
             or None if the update should go back to the root
         """
         # legacy behavior requests container server for includes=obj
-        namespaces, response = self._get_updating_namespaces(
+        namespaces, response = self._do_get_updating_namespaces(
             req, account, container, includes=obj)
         record_cache_op_metrics(
             self.logger, self.server_type.lower(), 'shard_updating',
@@ -335,7 +335,7 @@ class BaseObjectController(Controller):
         # there will be only one Namespace in the list if any
         return namespaces[0] if namespaces else None
 
-    def _cache_token_fetch_backend(self, req, account, container):
+    def _get_backend_updating_namespaces(self, req, account, container):
         """
         Retrieve the updating namespaces from the backend.
 
@@ -345,7 +345,7 @@ class BaseObjectController(Controller):
         :return: a tuple of (NamespaceBoundList, response).
         """
         # pull full set of updating namespaces from backend
-        namespaces, backend_response = self._get_updating_namespaces(
+        namespaces, backend_response = self._do_get_updating_namespaces(
             req, account, container)
         ns_bound_list = NamespaceBoundList.parse(
             namespaces) if namespaces else None
@@ -364,13 +364,11 @@ class BaseObjectController(Controller):
             instance of :class:`swift.common.utils.NamespaceBoundList`,
             response is the backend response.
         """
-        ns_bound_list = None
-        namespaces, response = self._get_updating_namespaces(
+        ns_bound_list, response = self._get_backend_updating_namespaces(
             req, account, container)
-        if namespaces:
+        if ns_bound_list:
             # only store the list of namespace lower bounds and names into
             # infocache and memcache.
-            ns_bound_list = NamespaceBoundList.parse(namespaces)
             set_cache_state = set_namespaces_in_cache(
                 req, cache_key, ns_bound_list,
                 self.app.recheck_updating_shard_ranges)
@@ -380,7 +378,7 @@ class BaseObjectController(Controller):
             if set_cache_state == 'set':
                 self.logger.info(
                     'Caching updating shards for %s (%d shards)',
-                    cache_key, len(namespaces))
+                    cache_key, len(ns_bound_list))
         return ns_bound_list, response
 
     def _populate_updating_namespaces_cooperatively(self, req, account,
@@ -400,7 +398,7 @@ class BaseObjectController(Controller):
         infocache = req.environ.setdefault('swift.infocache', {})
         memcache = cache_from_env(req.environ, True)
         do_fetch_backend = partial(
-            self._cache_token_fetch_backend, req, account, container)
+            self._get_backend_updating_namespaces, req, account, container)
         cache_populator = CooperativeCachePopulator(
             infocache, memcache, cache_key,
             self.app.recheck_updating_shard_ranges, do_fetch_backend,
@@ -412,9 +410,11 @@ class BaseObjectController(Controller):
                 self.logger, self.server_type.lower(), 'shard_updating',
                 cache_populator.set_cache_state, None)
             if cache_populator.set_cache_state == 'set':
-                self.logger.info(
-                    'Cached updating shards for %s (%d shards)',
+                message = "Caching updating shards for %s (%d shards)" % (
                     cache_key, len(ns_bound_list))
+                if cache_populator.token_acquired:
+                    message += " with a finished token"
+                self.logger.info(message)
         record_cooperative_token_metrics(
             self.logger, cache_populator, 'shard_updating')
         if cache_populator.req_served_from_cache:
@@ -422,8 +422,7 @@ class BaseObjectController(Controller):
                 'Retrieved updating shards (%d shards) from cache instead '
                 'of backend due to request coalescing by cooperative '
                 'token for %s', len(ns_bound_list), cache_key)
-        response = cache_populator.backend_response
-        return ns_bound_list, response
+        return ns_bound_list, cache_populator.backend_response
 
     def _get_update_shard(self, req, account, container, obj):
         """

@@ -79,6 +79,7 @@
 # You may configure this delay_reaping value in seconds with dynamic config
 # option names prefixed with delay_reaping_<ACCT> for account level delays
 # and delay_reaping_<ACCT>/<CNTR> for container level delays.
+# Special characters in <ACCT> or <CNTR> should be quoted.
 # The delay_reaping value should be a float value greater than or equal to
 # zero.
 # A container level delay_reaping does not require an account level
@@ -89,6 +90,7 @@
 # delay_reaping_AUTH_test2 = 86400.0
 # delay_reaping_AUTH_test/test = 400.0
 # delay_reaping_AUTH_test/test2 = 600.0
+# delay_reaping_AUTH_test/special%0Achars%3Dshould%20be%20quoted
 # N.B. By default no delay_reaping value is configured for any accounts or
 # containers.
 #

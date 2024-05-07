@@ -474,7 +474,7 @@ class TestRequestHelpers(unittest.TestCase):
                          'Invalid reserved name')
 
     def test_is_open_expired(self):
-        app = argparse.Namespace(enable_open_expired=False)
+        app = argparse.Namespace(allow_open_expired=False)
         req = Request.blank('/v1/a/c/o', headers={'X-Open-Expired': 'yes'})
         self.assertFalse(rh.is_open_expired(app, req))
         req = Request.blank('/v1/a/c/o', headers={'X-Open-Expired': 'no'})
@@ -482,7 +482,7 @@ class TestRequestHelpers(unittest.TestCase):
         req = Request.blank('/v1/a/c/o', headers={})
         self.assertFalse(rh.is_open_expired(app, req))
 
-        app = argparse.Namespace(enable_open_expired=True)
+        app = argparse.Namespace(allow_open_expired=True)
         req = Request.blank('/v1/a/c/o', headers={'X-Open-Expired': 'no'})
         self.assertFalse(rh.is_open_expired(app, req))
         req = Request.blank('/v1/a/c/o', headers={})

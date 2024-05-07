@@ -469,11 +469,11 @@ class TestObject(unittest.TestCase):
         self.assertEqual(resp.status, 201)
 
     def test_open_expired_enabled(self):
-        enable_open_expired = config_true_value(tf.cluster_info['swift'].get(
-            'enable_open_expired', 'false'))
+        allow_open_expired = config_true_value(tf.cluster_info['swift'].get(
+            'allow_open_expired', 'false'))
 
-        if not enable_open_expired:
-            raise SkipTest
+        if not allow_open_expired:
+            raise SkipTest('allow_open_expired is disabled')
 
         def put(url, token, parsed, conn):
             dt = datetime.datetime.now()
@@ -543,13 +543,13 @@ class TestObject(unittest.TestCase):
         self.assertEqual(resp.status, 404)
 
         dt = datetime.datetime.now()
-        delete_time = str(int(time.mktime(dt.timetuple())) + 2)
+        now = str(int(time.mktime(dt.timetuple())))
         resp = retry(get, extra_headers={'X-Open-Expired': True})
         resp.read()
         headers = HeaderKeyDict(resp.getheaders())
         # read the expired object with magic x-open-expired header
         self.assertEqual(resp.status, 200)
-        self.assertTrue(delete_time > headers['X-Delete-At'])
+        self.assertTrue(now > headers['X-Delete-At'])
 
         resp = retry(head, extra_headers={'X-Open-Expired': True})
         resp.read()
@@ -570,7 +570,7 @@ class TestObject(unittest.TestCase):
         resp.read()
         self.assertEqual(resp.status, 200)
         headers = HeaderKeyDict(resp.getheaders())
-        self.assertTrue(delete_time > headers['X-Delete-At'])
+        self.assertTrue(now > headers['X-Delete-At'])
 
         resp = retry(head, extra_headers={'X-Open-Expired': False})
         resp.read()
@@ -580,7 +580,7 @@ class TestObject(unittest.TestCase):
         resp.read()
         self.assertEqual(resp.status, 200)
         headers = HeaderKeyDict(resp.getheaders())
-        self.assertTrue(delete_time > headers['X-Delete-At'])
+        self.assertTrue(now > headers['X-Delete-At'])
 
         resp = retry(post, extra_headers={'X-Open-Expired': False})
         resp.read()
@@ -613,12 +613,12 @@ class TestObject(unittest.TestCase):
         resp.read()
         self.assertEqual(resp.status, 201)
 
-    def test_enable_open_expired_disabled(self):
-        enable_open_expired = config_true_value(tf.cluster_info['swift'].get(
-            'enable_open_expired', 'false'))
+    def test_allow_open_expired_disabled(self):
+        allow_open_expired = config_true_value(tf.cluster_info['swift'].get(
+            'allow_open_expired', 'false'))
 
-        if enable_open_expired:
-            raise SkipTest
+        if allow_open_expired:
+            raise SkipTest('allow_open_expired is enabled')
 
         def put(url, token, parsed, conn):
             dt = datetime.datetime.now()

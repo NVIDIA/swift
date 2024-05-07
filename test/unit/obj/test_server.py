@@ -8033,12 +8033,10 @@ class TestObjectController(BaseTestCase):
             }))
 
         with fake_spawn(), mocked_http_conn(
-                200, give_connect=capture_updates):
+                200, 200, give_connect=capture_updates):
             resp1 = req1.get_response(self.object_controller)
+            resp2 = req2.get_response(self.object_controller)
         self.assertEqual(resp1.status_int, 202)
-
-        # this request does not trigger a expirer queue update
-        resp2 = req2.get_response(self.object_controller)
         self.assertEqual(resp2.status_int, 202)
 
         self.assertEqual([(
@@ -8047,9 +8045,26 @@ class TestObjectController(BaseTestCase):
                 delete_at_container, delete_at
             ), {
                 'X-Backend-Storage-Policy-Index': '0',
-                # only the first POST generates an update?
+                # this the PUT from the POST-1
                 'X-Timestamp': post1_ts.normal,
                 'X-Trans-Id': 'txn2',
+                'Referer': 'POST http://localhost/sda1/p/a/c/o',
+                'X-Size': '0',
+                'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e',
+                'X-Content-Type':
+                'text/plain;swift_expirer_bytes=%s' % put_size,
+                'X-Content-Type-Timestamp': put_ts.normal,
+                'User-Agent': 'object-server %s' % os.getpid(),
+            }
+        ), (
+            '10.2.2.2', '6202', 'PUT',
+            '/sdm/592/.expiring_objects/%s/%s-a/c/o' % (
+                delete_at_container, delete_at
+            ), {
+                'X-Backend-Storage-Policy-Index': '0',
+                # this the PUT from POST-2
+                'X-Timestamp': post2_ts.normal,
+                'X-Trans-Id': 'txn3',
                 'Referer': 'POST http://localhost/sda1/p/a/c/o',
                 'X-Size': '0',
                 'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e',
@@ -8067,7 +8082,7 @@ class TestObjectController(BaseTestCase):
             for filename in filenames:
                 async_pendings.append(os.path.join(dirpath, filename))
 
-        self.assertEqual(len(async_pendings), 2)
+        self.assertEqual(len(async_pendings), 1)
 
         async_updates = []
         for pending_file in async_pendings:
@@ -8081,28 +8096,10 @@ class TestObjectController(BaseTestCase):
             'obj': '%s-a/c/o' % put_delete_at,
             'headers': {
                 'X-Backend-Storage-Policy-Index': '0',
-                # this seems fine, the first POST clears the PUT delete-at
+                # only POST-1 has to clear the orig PUT delete-at
                 'X-Timestamp': post1_ts.normal,
                 'X-Trans-Id': 'txn2',
                 'Referer': 'POST http://localhost/sda1/p/a/c/o',
-                'User-Agent': 'object-server %s' % os.getpid(),
-            },
-        }, {
-            'op': 'PUT',
-            'account': '.expiring_objects',
-            'container': delete_at_container,
-            'obj': '%s-a/c/o' % delete_at,
-            'headers': {
-                'X-Backend-Storage-Policy-Index': '0',
-                # the second POST triggers a PUT, but no DELETE
-                'X-Timestamp': post2_ts.normal,
-                'X-Trans-Id': 'txn3',
-                'Referer': 'POST http://localhost/sda1/p/a/c/o',
-                'X-Size': '0',
-                'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e',
-                'X-Content-Type':
-                'text/plain;swift_expirer_bytes=%s' % put_size,
-                'X-Content-Type-Timestamp': put_ts.normal,
                 'User-Agent': 'object-server %s' % os.getpid(),
             },
         }], async_updates)

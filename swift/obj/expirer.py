@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import six
+from six.moves import urllib
 
 from random import random, shuffle
 from time import time
@@ -90,10 +91,10 @@ def embed_expirer_bytes_in_ctype(content_type, bytes_size):
     Embed number of bytes into content-type.
 
     :param content_type: a content-type string
-    :param bytes: an int representing number of bytes
+    :param bytes: a number representing the amout of bytes
     :return: str
     """
-    return "%s;swift_expirer_bytes=%s" % (content_type, bytes_size)
+    return "%s;swift_expirer_bytes=%d" % (content_type, int(bytes_size))
 
 
 def read_conf_for_delay_reaping_times(conf):
@@ -102,7 +103,8 @@ def read_conf_for_delay_reaping_times(conf):
         delay_reaping_prefix = "delay_reaping_"
         if not conf_key.startswith(delay_reaping_prefix):
             continue
-        delay_reaping_key = conf_key[len(delay_reaping_prefix):]
+        delay_reaping_key = urllib.parse.unquote(
+            conf_key[len(delay_reaping_prefix):])
         if delay_reaping_key.strip('/') != delay_reaping_key:
             raise ValueError(
                 '%s '
@@ -210,6 +212,17 @@ class ObjectExpirer(Daemon):
         self.grace_periods = read_conf_for_grace_periods(conf)
 
         self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
+
+        self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
+        # randomized task container iteration can be useful if there's lots of
+        # tasks in the queue under a configured delay_reaping
+        self.randomized_task_container_iteration = config_true_value(
+            conf.get('randomized_task_container_iteration', 'false'))
+        # with lots of nodes and lots of tasks a large cache size can
+        # significantly delay processing; which may be less necessary with only
+        # a few target containers or randomized task container iteration
+        self.round_robin_task_cache_size = int(
+            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
 
         self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
         # randomized task container iteration can be useful if there's lots of
@@ -398,6 +411,7 @@ class ObjectExpirer(Daemon):
                     self.logger.exception('Unexcepted error handling task %r' %
                                           task_object)
                     continue
+                is_async = o.get('content_type') == ASYNC_DELETE_TYPE
                 delay_reaping = self.get_delay_reaping(target_account,
                                                        target_container)
 
@@ -405,7 +419,8 @@ class ObjectExpirer(Daemon):
                     # we shouldn't yield ANY more objects that can't reach
                     # the expiration date yet.
                     break
-                if delete_timestamp > Timestamp(time() - delay_reaping):
+                if delete_timestamp > Timestamp(time() - delay_reaping) \
+                        and not is_async:
                     # we shouldn't yield the object during the delay
                     continue
 
@@ -414,7 +429,6 @@ class ObjectExpirer(Daemon):
                                  divisor) != my_index:
                     continue
 
-                is_async = o.get('content_type') == ASYNC_DELETE_TYPE
                 yield {'task_account': task_account,
                        'task_container': task_container,
                        'task_object': task_object,

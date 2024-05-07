@@ -816,12 +816,21 @@ def record_cooperative_token_metrics(logger, cache_populator, op_type):
     :param  op_type: the name of the operation type, includes 'shard_listing',
               'shard_updating', and etc.
     """
-    if cache_populator.done_reqs_with_token:
-        logger.increment('token.%s.done_token_reqs' % op_type)
+    resp = cache_populator.backend_response
+    if cache_populator.token_acquired:
+        if resp:
+            logger.increment('token.%s.backend_reqs.with_token.%d' %
+                             (op_type, resp.status_int))
+        if cache_populator.is_token_request_done():
+            logger.increment('token.%s.done_token_reqs' % op_type)
+        return
+
     if cache_populator.req_served_from_cache:
         logger.increment('token.%s.cache_served_reqs' % op_type)
     else:
-        logger.increment('token.%s.backend_reqs' % op_type)
+        if resp:
+            logger.increment('token.%s.backend_reqs.no_token.%d' %
+                             (op_type, resp.status_int))
 
 
 def _get_info_from_memcache(app, env, account, container=None):

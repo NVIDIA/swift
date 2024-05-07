@@ -41,7 +41,6 @@ import mock
 import posix
 import pwd
 import random
-import re
 import socket
 import string
 import sys
@@ -52,7 +51,6 @@ import warnings
 
 import six
 from six import StringIO
-from six.moves.queue import Queue, Empty
 from six.moves import http_client
 from six.moves import range
 from textwrap import dedent
@@ -783,31 +781,28 @@ class TestUtils(unittest.TestCase):
         with TemporaryFile('r') as f:
             self.assertEqual([], list(utils.backward(f)))
 
-    def test_mkdirs(self):
-        testdir_base = mkdtemp()
+    @with_tempdir
+    def test_mkdirs(self, testdir_base):
         testroot = os.path.join(testdir_base, 'mkdirs')
-        try:
-            self.assertTrue(not os.path.exists(testroot))
-            utils.mkdirs(testroot)
-            self.assertTrue(os.path.exists(testroot))
-            utils.mkdirs(testroot)
-            self.assertTrue(os.path.exists(testroot))
-            rmtree(testroot, ignore_errors=1)
+        self.assertTrue(not os.path.exists(testroot))
+        utils.mkdirs(testroot)
+        self.assertTrue(os.path.exists(testroot))
+        utils.mkdirs(testroot)
+        self.assertTrue(os.path.exists(testroot))
+        rmtree(testroot, ignore_errors=1)
 
-            testdir = os.path.join(testroot, 'one/two/three')
-            self.assertTrue(not os.path.exists(testdir))
-            utils.mkdirs(testdir)
-            self.assertTrue(os.path.exists(testdir))
-            utils.mkdirs(testdir)
-            self.assertTrue(os.path.exists(testdir))
-            rmtree(testroot, ignore_errors=1)
+        testdir = os.path.join(testroot, 'one/two/three')
+        self.assertTrue(not os.path.exists(testdir))
+        utils.mkdirs(testdir)
+        self.assertTrue(os.path.exists(testdir))
+        utils.mkdirs(testdir)
+        self.assertTrue(os.path.exists(testdir))
+        rmtree(testroot, ignore_errors=1)
 
-            open(testroot, 'wb').close()
-            self.assertTrue(not os.path.exists(testdir))
-            self.assertRaises(OSError, utils.mkdirs, testdir)
-            os.unlink(testroot)
-        finally:
-            rmtree(testdir_base)
+        open(testroot, 'wb').close()
+        self.assertTrue(not os.path.exists(testdir))
+        self.assertRaises(OSError, utils.mkdirs, testdir)
+        os.unlink(testroot)
 
     def test_split_path(self):
         # Test swift.common.utils.split_account_path
@@ -1012,115 +1007,101 @@ class TestUtils(unittest.TestCase):
             self.assertEqual(options['extra_args'], ['plugin_name'])
 
     def test_parse_options_errors(self):
-        orig_stdout = sys.stdout
-        orig_stderr = sys.stderr
-        stdo = StringIO()
-        stde = StringIO()
-        utils.sys.stdout = stdo
-        utils.sys.stderr = stde
-        self.assertRaises(SystemExit, utils.parse_options, once=True,
-                          test_args=[])
-        self.assertTrue('missing config' in stdo.getvalue())
+        with mock.patch.object(utils.sys, 'stdout', StringIO()) as stdo:
+            self.assertRaises(SystemExit, utils.parse_options, once=True,
+                              test_args=[])
+            self.assertTrue('missing config' in stdo.getvalue())
 
-        # verify conf file must exist, context manager will delete temp file
-        with NamedTemporaryFile() as f:
-            conf_file = f.name
-        self.assertRaises(SystemExit, utils.parse_options, once=True,
-                          test_args=[conf_file])
-        self.assertTrue('unable to locate' in stdo.getvalue())
+            # verify conf file must exist -- context manager will delete
+            # temp file
+            with NamedTemporaryFile() as f:
+                conf_file = f.name
+            self.assertRaises(SystemExit, utils.parse_options, once=True,
+                              test_args=[conf_file])
+            self.assertTrue('unable to locate' in stdo.getvalue())
 
-        # reset stdio
-        utils.sys.stdout = orig_stdout
-        utils.sys.stderr = orig_stderr
-
-    def test_dump_recon_cache(self):
-        testdir_base = mkdtemp()
+    @with_tempdir
+    def test_dump_recon_cache(self, testdir_base):
         testcache_file = os.path.join(testdir_base, 'cache.recon')
         logger = utils.get_logger(None, 'server', log_route='server')
-        try:
-            submit_dict = {'key0': 99,
-                           'key1': {'value1': 1, 'value2': 2}}
-            utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            with open(testcache_file) as fd:
-                file_dict = json.loads(fd.readline())
-            self.assertEqual(submit_dict, file_dict)
-            # Use a nested entry
-            submit_dict = {'key0': 101,
-                           'key1': {'key2': {'value1': 1, 'value2': 2}}}
-            expect_dict = {'key0': 101,
-                           'key1': {'key2': {'value1': 1, 'value2': 2},
-                                    'value1': 1, 'value2': 2}}
-            utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            with open(testcache_file) as fd:
-                file_dict = json.loads(fd.readline())
-            self.assertEqual(expect_dict, file_dict)
-            # nested dict items are not sticky
-            submit_dict = {'key1': {'key2': {'value3': 3}}}
-            expect_dict = {'key0': 101,
-                           'key1': {'key2': {'value3': 3},
-                                    'value1': 1, 'value2': 2}}
-            utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            with open(testcache_file) as fd:
-                file_dict = json.loads(fd.readline())
-            self.assertEqual(expect_dict, file_dict)
-            # cached entries are sticky
-            submit_dict = {}
-            utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            with open(testcache_file) as fd:
-                file_dict = json.loads(fd.readline())
-            self.assertEqual(expect_dict, file_dict)
-            # nested dicts can be erased...
-            submit_dict = {'key1': {'key2': {}}}
-            expect_dict = {'key0': 101,
-                           'key1': {'value1': 1, 'value2': 2}}
-            utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            with open(testcache_file) as fd:
-                file_dict = json.loads(fd.readline())
-            self.assertEqual(expect_dict, file_dict)
-            # ... and erasure is idempotent
-            utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            with open(testcache_file) as fd:
-                file_dict = json.loads(fd.readline())
-            self.assertEqual(expect_dict, file_dict)
-            # top level dicts can be erased...
-            submit_dict = {'key1': {}}
-            expect_dict = {'key0': 101}
-            utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            with open(testcache_file) as fd:
-                file_dict = json.loads(fd.readline())
-            self.assertEqual(expect_dict, file_dict)
-            # ... and erasure is idempotent
-            utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            with open(testcache_file) as fd:
-                file_dict = json.loads(fd.readline())
-            self.assertEqual(expect_dict, file_dict)
-        finally:
-            rmtree(testdir_base)
+        submit_dict = {'key0': 99,
+                       'key1': {'value1': 1, 'value2': 2}}
+        utils.dump_recon_cache(submit_dict, testcache_file, logger)
+        with open(testcache_file) as fd:
+            file_dict = json.loads(fd.readline())
+        self.assertEqual(submit_dict, file_dict)
+        # Use a nested entry
+        submit_dict = {'key0': 101,
+                       'key1': {'key2': {'value1': 1, 'value2': 2}}}
+        expect_dict = {'key0': 101,
+                       'key1': {'key2': {'value1': 1, 'value2': 2},
+                                'value1': 1, 'value2': 2}}
+        utils.dump_recon_cache(submit_dict, testcache_file, logger)
+        with open(testcache_file) as fd:
+            file_dict = json.loads(fd.readline())
+        self.assertEqual(expect_dict, file_dict)
+        # nested dict items are not sticky
+        submit_dict = {'key1': {'key2': {'value3': 3}}}
+        expect_dict = {'key0': 101,
+                       'key1': {'key2': {'value3': 3},
+                                'value1': 1, 'value2': 2}}
+        utils.dump_recon_cache(submit_dict, testcache_file, logger)
+        with open(testcache_file) as fd:
+            file_dict = json.loads(fd.readline())
+        self.assertEqual(expect_dict, file_dict)
+        # cached entries are sticky
+        submit_dict = {}
+        utils.dump_recon_cache(submit_dict, testcache_file, logger)
+        with open(testcache_file) as fd:
+            file_dict = json.loads(fd.readline())
+        self.assertEqual(expect_dict, file_dict)
+        # nested dicts can be erased...
+        submit_dict = {'key1': {'key2': {}}}
+        expect_dict = {'key0': 101,
+                       'key1': {'value1': 1, 'value2': 2}}
+        utils.dump_recon_cache(submit_dict, testcache_file, logger)
+        with open(testcache_file) as fd:
+            file_dict = json.loads(fd.readline())
+        self.assertEqual(expect_dict, file_dict)
+        # ... and erasure is idempotent
+        utils.dump_recon_cache(submit_dict, testcache_file, logger)
+        with open(testcache_file) as fd:
+            file_dict = json.loads(fd.readline())
+        self.assertEqual(expect_dict, file_dict)
+        # top level dicts can be erased...
+        submit_dict = {'key1': {}}
+        expect_dict = {'key0': 101}
+        utils.dump_recon_cache(submit_dict, testcache_file, logger)
+        with open(testcache_file) as fd:
+            file_dict = json.loads(fd.readline())
+        self.assertEqual(expect_dict, file_dict)
+        # ... and erasure is idempotent
+        utils.dump_recon_cache(submit_dict, testcache_file, logger)
+        with open(testcache_file) as fd:
+            file_dict = json.loads(fd.readline())
+        self.assertEqual(expect_dict, file_dict)
 
-    def test_dump_recon_cache_set_owner(self):
-        testdir_base = mkdtemp()
+    @with_tempdir
+    def test_dump_recon_cache_set_owner(self, testdir_base):
         testcache_file = os.path.join(testdir_base, 'cache.recon')
         logger = utils.get_logger(None, 'server', log_route='server')
-        try:
-            submit_dict = {'key1': {'value1': 1, 'value2': 2}}
+        submit_dict = {'key1': {'value1': 1, 'value2': 2}}
 
-            _ret = lambda: None
-            _ret.pw_uid = 100
-            _mock_getpwnam = MagicMock(return_value=_ret)
-            _mock_chown = mock.Mock()
+        _ret = lambda: None
+        _ret.pw_uid = 100
+        _mock_getpwnam = MagicMock(return_value=_ret)
+        _mock_chown = mock.Mock()
 
-            with patch('os.chown', _mock_chown), \
-                    patch('pwd.getpwnam', _mock_getpwnam):
-                utils.dump_recon_cache(submit_dict, testcache_file,
-                                       logger, set_owner="swift")
+        with patch('os.chown', _mock_chown), \
+                patch('pwd.getpwnam', _mock_getpwnam):
+            utils.dump_recon_cache(submit_dict, testcache_file,
+                                   logger, set_owner="swift")
 
-            _mock_getpwnam.assert_called_once_with("swift")
-            self.assertEqual(_mock_chown.call_args[0][1], 100)
-        finally:
-            rmtree(testdir_base)
+        _mock_getpwnam.assert_called_once_with("swift")
+        self.assertEqual(_mock_chown.call_args[0][1], 100)
 
-    def test_dump_recon_cache_permission_denied(self):
-        testdir_base = mkdtemp()
+    @with_tempdir
+    def test_dump_recon_cache_permission_denied(self, testdir_base):
         testcache_file = os.path.join(testdir_base, 'cache.recon')
 
         class MockLogger(object):
@@ -1132,15 +1113,12 @@ class TestUtils(unittest.TestCase):
                 self._excs.append(exc)
 
         logger = MockLogger()
-        try:
-            submit_dict = {'key1': {'value1': 1, 'value2': 2}}
-            with mock.patch(
-                    'swift.common.utils.NamedTemporaryFile',
-                    side_effect=IOError(13, 'Permission Denied')):
-                utils.dump_recon_cache(submit_dict, testcache_file, logger)
-            self.assertIsInstance(logger._excs[0], IOError)
-        finally:
-            rmtree(testdir_base)
+        submit_dict = {'key1': {'value1': 1, 'value2': 2}}
+        with mock.patch(
+                'swift.common.utils.NamedTemporaryFile',
+                side_effect=IOError(13, 'Permission Denied')):
+            utils.dump_recon_cache(submit_dict, testcache_file, logger)
+        self.assertIsInstance(logger._excs[0], IOError)
 
     def test_load_recon_cache(self):
         stub_data = {'test': 'foo'}
@@ -1296,7 +1274,7 @@ class TestUtils(unittest.TestCase):
 
     @with_tempdir
     def test_get_logger_sysloghandler_plumbing(self, tempdir):
-        orig_sysloghandler = utils.ThreadSafeSysLogHandler
+        orig_sysloghandler = utils.logs.ThreadSafeSysLogHandler
         syslog_handler_args = []
 
         def syslog_handler_catcher(*args, **kwargs):
@@ -1313,7 +1291,7 @@ class TestUtils(unittest.TestCase):
         def fake_getaddrinfo(host, *args):
             return orig_getaddrinfo('localhost', *args)
 
-        with mock.patch.object(utils, 'ThreadSafeSysLogHandler',
+        with mock.patch.object(utils.logs, 'ThreadSafeSysLogHandler',
                                syslog_handler_catcher), \
                 mock.patch.object(socket, 'getaddrinfo', fake_getaddrinfo):
             # default log_address
@@ -1395,7 +1373,7 @@ class TestUtils(unittest.TestCase):
                       'facility': orig_sysloghandler.LOG_LOCAL0})],
                 syslog_handler_args)
 
-        with mock.patch.object(utils, 'ThreadSafeSysLogHandler',
+        with mock.patch.object(utils.logs, 'ThreadSafeSysLogHandler',
                                side_effect=OSError(errno.EPERM, 'oops')):
             with self.assertRaises(OSError) as cm:
                 utils.get_logger({
@@ -2117,54 +2095,57 @@ log_name = %(yarr)s'''
     @reset_logger_state
     def test_capture_stdio(self):
         # stubs
-        logger = utils.get_logger(None, 'dummy')
+        logger = utils.logs.get_logger(None, 'dummy')
 
         # mock utils system modules
-        _orig_sys = utils.sys
-        _orig_os = utils.os
-        try:
-            utils.sys = MockSys()
-            utils.os = MockOs()
-
+        mock_os = MockOs()
+        mock_sys = MockSys()
+        with mock.patch.object(utils.logs, 'os', mock_os), \
+                mock.patch.object(utils.logs, 'sys', mock_sys):
             # basic test
-            utils.capture_stdio(logger)
-            self.assertTrue(utils.sys.excepthook is not None)
-            self.assertEqual(utils.os.closed_fds, utils.sys.stdio_fds)
-            self.assertIsInstance(utils.sys.stdout, utils.LoggerFileObject)
-            self.assertIsInstance(utils.sys.stderr, utils.LoggerFileObject)
+            utils.logs.capture_stdio(logger)
+            self.assertTrue(mock_sys.excepthook is not None)
+            self.assertEqual(mock_os.closed_fds, mock_sys.stdio_fds)
+            self.assertIsInstance(mock_sys.stdout,
+                                  utils.logs.LoggerFileObject)
+            self.assertIsInstance(mock_sys.stderr,
+                                  utils.logs.LoggerFileObject)
 
-            # reset; test same args, but exc when trying to close stdio
-            utils.os = MockOs(raise_funcs=('dup2',))
-            utils.sys = MockSys()
-
+        # reset; test same args, but exc when trying to close stdio
+        mock_os = MockOs(raise_funcs=('dup2',))
+        mock_sys = MockSys()
+        with mock.patch.object(utils.logs, 'os', mock_os), \
+                mock.patch.object(utils.logs, 'sys', mock_sys):
             # test unable to close stdio
-            utils.capture_stdio(logger)
-            self.assertTrue(utils.sys.excepthook is not None)
-            self.assertEqual(utils.os.closed_fds, [])
-            self.assertIsInstance(utils.sys.stdout, utils.LoggerFileObject)
-            self.assertIsInstance(utils.sys.stderr, utils.LoggerFileObject)
+            utils.logs.capture_stdio(logger)
+            self.assertTrue(utils.logs.sys.excepthook is not None)
+            self.assertEqual(utils.logs.os.closed_fds, [])
+            self.assertIsInstance(mock_sys.stdout,
+                                  utils.logs.LoggerFileObject)
+            self.assertIsInstance(mock_sys.stderr,
+                                  utils.logs.LoggerFileObject)
 
-            # reset; test some other args
-            utils.os = MockOs()
-            utils.sys = MockSys()
+        # reset; test some other args
+        mock_os = MockOs()
+        mock_sys = MockSys()
+        with mock.patch.object(utils.logs, 'os', mock_os), \
+                mock.patch.object(utils.logs, 'sys', mock_sys):
             logger = utils.get_logger(None, log_to_console=True)
 
             # test console log
-            utils.capture_stdio(logger, capture_stdout=False,
-                                capture_stderr=False)
-            self.assertTrue(utils.sys.excepthook is not None)
+            utils.logs.capture_stdio(logger, capture_stdout=False,
+                                     capture_stderr=False)
+            self.assertTrue(utils.logs.sys.excepthook is not None)
             # when logging to console, stderr remains open
-            self.assertEqual(utils.os.closed_fds, utils.sys.stdio_fds[:2])
+            self.assertEqual(mock_os.closed_fds,
+                             mock_sys.stdio_fds[:2])
             reset_loggers()
 
             # stdio not captured
-            self.assertFalse(isinstance(utils.sys.stdout,
-                                        utils.LoggerFileObject))
-            self.assertFalse(isinstance(utils.sys.stderr,
-                                        utils.LoggerFileObject))
-        finally:
-            utils.sys = _orig_sys
-            utils.os = _orig_os
+            self.assertFalse(isinstance(mock_sys.stdout,
+                                        utils.logs.LoggerFileObject))
+            self.assertFalse(isinstance(mock_sys.stderr,
+                                        utils.logs.LoggerFileObject))
 
     @reset_logger_state
     def test_get_logger_console(self):
@@ -2570,40 +2551,14 @@ cluster_dfw1 = http://dfw1.host/v1/
         for v in utils.TRUE_VALUES:
             self.assertEqual(v, v.lower())
 
-    def test_transform_to_set(self):
-        self.assertEqual(set(), utils.transform_to_set(None))
-        self.assertEqual(set(), utils.transform_to_set([]))
-
-        self.assertEqual({1}, utils.transform_to_set(1))
-        self.assertEqual({1}, utils.transform_to_set([1]))
-        self.assertEqual({1}, utils.transform_to_set([1, 1]))
-        self.assertEqual({1, 2}, utils.transform_to_set([2, 1]))
-        self.assertEqual({1, 2}, utils.transform_to_set((2, 1)))
-        self.assertEqual({1, 2}, utils.transform_to_set({2, 1}))
-        self.assertEqual({1, 2}, utils.transform_to_set([1, 2, 1, 2]))
-
-        self.assertEqual({'x'}, utils.transform_to_set('x'))
-        self.assertEqual({'x'}, utils.transform_to_set(['x']))
-        self.assertEqual({'x', 1},
-                         utils.transform_to_set(['x', 'x', 1]))
-        self.assertEqual({'x', 'y'},
-                         utils.transform_to_set(('x', 'y')))
-        self.assertEqual({'xyz'}, utils.transform_to_set('xyz'))
-        self.assertEqual({''}, utils.transform_to_set(''))
-        self.assertEqual({0}, utils.transform_to_set(0))
-
+    @mock.patch.object(utils.config, 'TRUE_VALUES', 'hello world'.split())
     def test_config_true_value(self):
-        orig_trues = utils.TRUE_VALUES
-        try:
-            utils.TRUE_VALUES = 'hello world'.split()
-            for val in 'hello world HELLO WORLD'.split():
-                self.assertTrue(utils.config_true_value(val) is True)
-            self.assertTrue(utils.config_true_value(True) is True)
-            self.assertTrue(utils.config_true_value('foo') is False)
-            self.assertTrue(utils.config_true_value(False) is False)
-            self.assertTrue(utils.config_true_value(None) is False)
-        finally:
-            utils.TRUE_VALUES = orig_trues
+        for val in 'hello world HELLO WORLD'.split():
+            self.assertTrue(utils.config_true_value(val) is True)
+        self.assertTrue(utils.config_true_value(True) is True)
+        self.assertTrue(utils.config_true_value('foo') is False)
+        self.assertTrue(utils.config_true_value(False) is False)
+        self.assertTrue(utils.config_true_value(None) is False)
 
     def test_non_negative_float(self):
         self.assertEqual(0, utils.non_negative_float('0.0'))
@@ -3085,65 +3040,51 @@ cluster_dfw1 = http://dfw1.host/v1/
             self.assertTrue(timedout)
             self.assertTrue(os.path.exists(nt.name))
 
-    def test_ismount_path_does_not_exist(self):
-        tmpdir = mkdtemp()
-        try:
-            self.assertFalse(utils.ismount(os.path.join(tmpdir, 'bar')))
-        finally:
-            shutil.rmtree(tmpdir)
+    @with_tempdir
+    def test_ismount_path_does_not_exist(self, tmpdir):
+        self.assertFalse(utils.ismount(os.path.join(tmpdir, 'bar')))
 
-    def test_ismount_path_not_mount(self):
-        tmpdir = mkdtemp()
-        try:
-            self.assertFalse(utils.ismount(tmpdir))
-        finally:
-            shutil.rmtree(tmpdir)
+    @with_tempdir
+    def test_ismount_path_not_mount(self, tmpdir):
+        self.assertFalse(utils.ismount(tmpdir))
 
-    def test_ismount_path_error(self):
+    @with_tempdir
+    def test_ismount_path_error(self, tmpdir):
 
         def _mock_os_lstat(path):
             raise OSError(13, "foo")
 
-        tmpdir = mkdtemp()
-        try:
-            with patch("os.lstat", _mock_os_lstat):
-                # Raises exception with _raw -- see next test.
-                utils.ismount(tmpdir)
-        finally:
-            shutil.rmtree(tmpdir)
+        with patch("os.lstat", _mock_os_lstat):
+            # Raises exception with _raw -- see next test.
+            utils.ismount(tmpdir)
 
-    def test_ismount_raw_path_error(self):
+    @with_tempdir
+    def test_ismount_raw_path_error(self, tmpdir):
 
         def _mock_os_lstat(path):
             raise OSError(13, "foo")
 
-        tmpdir = mkdtemp()
-        try:
-            with patch("os.lstat", _mock_os_lstat):
-                self.assertRaises(OSError, utils.ismount_raw, tmpdir)
-        finally:
-            shutil.rmtree(tmpdir)
+        with patch("os.lstat", _mock_os_lstat):
+            self.assertRaises(OSError, utils.ismount_raw, tmpdir)
 
-    def test_ismount_path_is_symlink(self):
-        tmpdir = mkdtemp()
-        try:
-            link = os.path.join(tmpdir, "tmp")
-            rdir = os.path.join(tmpdir, "realtmp")
-            os.mkdir(rdir)
-            os.symlink(rdir, link)
-            self.assertFalse(utils.ismount(link))
+    @with_tempdir
+    def test_ismount_path_is_symlink(self, tmpdir):
+        link = os.path.join(tmpdir, "tmp")
+        rdir = os.path.join(tmpdir, "realtmp")
+        os.mkdir(rdir)
+        os.symlink(rdir, link)
+        self.assertFalse(utils.ismount(link))
 
-            # Can add a stubfile to make it pass
-            with open(os.path.join(link, ".ismount"), "w"):
-                pass
-            self.assertTrue(utils.ismount(link))
-        finally:
-            shutil.rmtree(tmpdir)
+        # Can add a stubfile to make it pass
+        with open(os.path.join(link, ".ismount"), "w"):
+            pass
+        self.assertTrue(utils.ismount(link))
 
     def test_ismount_path_is_root(self):
         self.assertTrue(utils.ismount('/'))
 
-    def test_ismount_parent_path_error(self):
+    @with_tempdir
+    def test_ismount_parent_path_error(self, tmpdir):
 
         _os_lstat = os.lstat
 
@@ -3153,15 +3094,12 @@ cluster_dfw1 = http://dfw1.host/v1/
             else:
                 return _os_lstat(path)
 
-        tmpdir = mkdtemp()
-        try:
-            with patch("os.lstat", _mock_os_lstat):
-                # Raises exception with _raw -- see next test.
-                utils.ismount(tmpdir)
-        finally:
-            shutil.rmtree(tmpdir)
+        with patch("os.lstat", _mock_os_lstat):
+            # Raises exception with _raw -- see next test.
+            utils.ismount(tmpdir)
 
-    def test_ismount_raw_parent_path_error(self):
+    @with_tempdir
+    def test_ismount_raw_parent_path_error(self, tmpdir):
 
         _os_lstat = os.lstat
 
@@ -3171,14 +3109,11 @@ cluster_dfw1 = http://dfw1.host/v1/
             else:
                 return _os_lstat(path)
 
-        tmpdir = mkdtemp()
-        try:
-            with patch("os.lstat", _mock_os_lstat):
-                self.assertRaises(OSError, utils.ismount_raw, tmpdir)
-        finally:
-            shutil.rmtree(tmpdir)
+        with patch("os.lstat", _mock_os_lstat):
+            self.assertRaises(OSError, utils.ismount_raw, tmpdir)
 
-    def test_ismount_successes_dev(self):
+    @with_tempdir
+    def test_ismount_successes_dev(self, tmpdir):
 
         _os_lstat = os.lstat
 
@@ -3196,14 +3131,11 @@ cluster_dfw1 = http://dfw1.host/v1/
             else:
                 return _os_lstat(path)
 
-        tmpdir = mkdtemp()
-        try:
-            with patch("os.lstat", _mock_os_lstat):
-                self.assertTrue(utils.ismount(tmpdir))
-        finally:
-            shutil.rmtree(tmpdir)
+        with patch("os.lstat", _mock_os_lstat):
+            self.assertTrue(utils.ismount(tmpdir))
 
-    def test_ismount_successes_ino(self):
+    @with_tempdir
+    def test_ismount_successes_ino(self, tmpdir):
 
         _os_lstat = os.lstat
 
@@ -3223,22 +3155,15 @@ cluster_dfw1 = http://dfw1.host/v1/
                 return MockStat(child.st_mode, parent.st_ino,
                                 child.st_dev)
 
-        tmpdir = mkdtemp()
-        try:
-            with patch("os.lstat", _mock_os_lstat):
-                self.assertTrue(utils.ismount(tmpdir))
-        finally:
-            shutil.rmtree(tmpdir)
-
-    def test_ismount_successes_stubfile(self):
-        tmpdir = mkdtemp()
-        fname = os.path.join(tmpdir, ".ismount")
-        try:
-            with open(fname, "w") as stubfile:
-                stubfile.write("")
+        with patch("os.lstat", _mock_os_lstat):
             self.assertTrue(utils.ismount(tmpdir))
-        finally:
-            shutil.rmtree(tmpdir)
+
+    @with_tempdir
+    def test_ismount_successes_stubfile(self, tmpdir):
+        fname = os.path.join(tmpdir, ".ismount")
+        with open(fname, "w") as stubfile:
+            stubfile.write("")
+        self.assertTrue(utils.ismount(tmpdir))
 
     def test_parse_content_type(self):
         self.assertEqual(utils.parse_content_type('text/plain'),
@@ -3489,7 +3414,7 @@ cluster_dfw1 = http://dfw1.host/v1/
                           'Swift is great!', 'sha257', '')
 
     def test_str_anonymizer_python_maddness(self):
-        with mock.patch('swift.common.utils.hashlib') as mocklib:
+        with mock.patch('swift.common.utils.base.hashlib') as mocklib:
             if six.PY2:
                 # python <2.7.9 doesn't have this algorithms_guaranteed, but
                 # our if block short-circuts before we explode
@@ -3588,12 +3513,11 @@ cluster_dfw1 = http://dfw1.host/v1/
             self.assertIsNone(utils.cache_from_env(env, True))
             self.assertEqual(0, len(logger.get_lines_for_level('error')))
 
-    def test_fsync_dir(self):
+    @with_tempdir
+    def test_fsync_dir(self, tempdir):
 
-        tempdir = None
         fd = None
         try:
-            tempdir = mkdtemp()
             fd, temppath = tempfile.mkstemp(dir=tempdir)
 
             _mock_fsync = mock.Mock()
@@ -3625,41 +3549,34 @@ cluster_dfw1 = http://dfw1.host/v1/
             if fd is not None:
                 os.close(fd)
                 os.unlink(temppath)
-            if tempdir:
-                os.rmdir(tempdir)
 
-    def test_renamer_with_fsync_dir(self):
-        tempdir = None
-        try:
-            tempdir = mkdtemp()
-            # Simulate part of object path already existing
-            part_dir = os.path.join(tempdir, 'objects/1234/')
-            os.makedirs(part_dir)
-            obj_dir = os.path.join(part_dir, 'aaa', 'a' * 32)
-            obj_path = os.path.join(obj_dir, '1425276031.12345.data')
+    @with_tempdir
+    def test_renamer_with_fsync_dir(self, tempdir):
+        # Simulate part of object path already existing
+        part_dir = os.path.join(tempdir, 'objects/1234/')
+        os.makedirs(part_dir)
+        obj_dir = os.path.join(part_dir, 'aaa', 'a' * 32)
+        obj_path = os.path.join(obj_dir, '1425276031.12345.data')
 
-            # Object dir had to be created
-            _m_os_rename = mock.Mock()
-            _m_fsync_dir = mock.Mock()
-            with patch('os.rename', _m_os_rename):
-                with patch('swift.common.utils.fsync_dir', _m_fsync_dir):
-                    utils.renamer("fake_path", obj_path)
-            _m_os_rename.assert_called_once_with('fake_path', obj_path)
-            # fsync_dir on parents of all newly create dirs
-            self.assertEqual(_m_fsync_dir.call_count, 3)
+        # Object dir had to be created
+        _m_os_rename = mock.Mock()
+        _m_fsync_dir = mock.Mock()
+        with patch('os.rename', _m_os_rename):
+            with patch('swift.common.utils.fsync_dir', _m_fsync_dir):
+                utils.renamer("fake_path", obj_path)
+        _m_os_rename.assert_called_once_with('fake_path', obj_path)
+        # fsync_dir on parents of all newly create dirs
+        self.assertEqual(_m_fsync_dir.call_count, 3)
 
-            # Object dir existed
-            _m_os_rename.reset_mock()
-            _m_fsync_dir.reset_mock()
-            with patch('os.rename', _m_os_rename):
-                with patch('swift.common.utils.fsync_dir', _m_fsync_dir):
-                    utils.renamer("fake_path", obj_path)
-            _m_os_rename.assert_called_once_with('fake_path', obj_path)
-            # fsync_dir only on the leaf dir
-            self.assertEqual(_m_fsync_dir.call_count, 1)
-        finally:
-            if tempdir:
-                shutil.rmtree(tempdir)
+        # Object dir existed
+        _m_os_rename.reset_mock()
+        _m_fsync_dir.reset_mock()
+        with patch('os.rename', _m_os_rename):
+            with patch('swift.common.utils.fsync_dir', _m_fsync_dir):
+                utils.renamer("fake_path", obj_path)
+        _m_os_rename.assert_called_once_with('fake_path', obj_path)
+        # fsync_dir only on the leaf dir
+        self.assertEqual(_m_fsync_dir.call_count, 1)
 
     def test_renamer_when_fsync_is_false(self):
         _m_os_rename = mock.Mock()
@@ -3674,26 +3591,20 @@ cluster_dfw1 = http://dfw1.host/v1/
         _m_os_rename.assert_called_once_with('fake_path', "/a/b/c.data")
         self.assertFalse(_m_fsync_dir.called)
 
-    def test_makedirs_count(self):
-        tempdir = None
-        fd = None
-        try:
-            tempdir = mkdtemp()
-            os.makedirs(os.path.join(tempdir, 'a/b'))
-            # 4 new dirs created
-            dirpath = os.path.join(tempdir, 'a/b/1/2/3/4')
-            ret = utils.makedirs_count(dirpath)
-            self.assertEqual(ret, 4)
-            # no new dirs created - dir already exists
-            ret = utils.makedirs_count(dirpath)
-            self.assertEqual(ret, 0)
-            # path exists and is a file
-            fd, temppath = tempfile.mkstemp(dir=dirpath)
-            os.close(fd)
-            self.assertRaises(OSError, utils.makedirs_count, temppath)
-        finally:
-            if tempdir:
-                shutil.rmtree(tempdir)
+    @with_tempdir
+    def test_makedirs_count(self, tempdir):
+        os.makedirs(os.path.join(tempdir, 'a/b'))
+        # 4 new dirs created
+        dirpath = os.path.join(tempdir, 'a/b/1/2/3/4')
+        ret = utils.makedirs_count(dirpath)
+        self.assertEqual(ret, 4)
+        # no new dirs created - dir already exists
+        ret = utils.makedirs_count(dirpath)
+        self.assertEqual(ret, 0)
+        # path exists and is a file
+        fd, temppath = tempfile.mkstemp(dir=dirpath)
+        os.close(fd)
+        self.assertRaises(OSError, utils.makedirs_count, temppath)
 
     def test_find_namespace(self):
         ts = utils.Timestamp.now().internal
@@ -3797,8 +3708,8 @@ cluster_dfw1 = http://dfw1.host/v1/
                           '/path/to/hash.db', 'bad epoch')
 
     @requires_o_tmpfile_support_in_tmp
-    def test_link_fd_to_path_linkat_success(self):
-        tempdir = mkdtemp()
+    @with_tempdir
+    def test_link_fd_to_path_linkat_success(self, tempdir):
         fd = os.open(tempdir, utils.O_TMPFILE | os.O_WRONLY)
         data = b"I'm whatever Gotham needs me to be"
         _m_fsync_dir = mock.Mock()
@@ -3814,11 +3725,10 @@ cluster_dfw1 = http://dfw1.host/v1/
             self.assertEqual(_m_fsync_dir.call_count, 2)
         finally:
             os.close(fd)
-            shutil.rmtree(tempdir)
 
     @requires_o_tmpfile_support_in_tmp
-    def test_link_fd_to_path_target_exists(self):
-        tempdir = mkdtemp()
+    @with_tempdir
+    def test_link_fd_to_path_target_exists(self, tempdir):
         # Create and write to a file
         fd, path = tempfile.mkstemp(dir=tempdir)
         os.write(fd, b"hello world")
@@ -3836,7 +3746,6 @@ cluster_dfw1 = http://dfw1.host/v1/
                 self.assertEqual(f.read(), b"bye world")
         finally:
             os.close(fd)
-            shutil.rmtree(tempdir)
 
     def test_link_fd_to_path_errno_not_EEXIST_or_ENOENT(self):
         _m_linkat = mock.Mock(
@@ -3851,22 +3760,21 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertTrue(_m_linkat.called)
 
     @requires_o_tmpfile_support_in_tmp
-    def test_linkat_race_dir_not_exists(self):
-        tempdir = mkdtemp()
+    @with_tempdir
+    def test_linkat_race_dir_not_exists(self, tempdir):
         target_dir = os.path.join(tempdir, uuid4().hex)
         target_path = os.path.join(target_dir, uuid4().hex)
         os.mkdir(target_dir)
         fd = os.open(target_dir, utils.O_TMPFILE | os.O_WRONLY)
-        # Simulating directory deletion by other backend process
-        os.rmdir(target_dir)
-        self.assertFalse(os.path.exists(target_dir))
         try:
+            # Simulating directory deletion by other backend process
+            os.rmdir(target_dir)
+            self.assertFalse(os.path.exists(target_dir))
             utils.link_fd_to_path(fd, target_path, 1)
             self.assertTrue(os.path.exists(target_dir))
             self.assertTrue(os.path.exists(target_path))
         finally:
             os.close(fd)
-            shutil.rmtree(tempdir)
 
     def test_safe_json_loads(self):
         expectations = {
@@ -4498,7 +4406,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertIsNone(obj._cache_encoder)
         self.assertIsNone(obj._cache_decoder)
         self.assertIsNone(obj.set_cache_state)
-        self.assertFalse(obj.done_reqs_with_token)
+        self.assertFalse(obj.is_token_request_done())
         self.assertFalse(obj.req_served_from_cache)
         self.assertIsNone(obj.backend_response)
 
@@ -4518,7 +4426,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
-        self.assertTrue(populator.done_reqs_with_token)
+        self.assertTrue(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4550,7 +4458,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
-        self.assertTrue(populator.done_reqs_with_token)
+        self.assertTrue(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4578,7 +4486,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertIsNone(populator.set_cache_state)
-        self.assertFalse(populator.done_reqs_with_token)
+        self.assertFalse(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache, {})
         self.assertEqual(self.memcache.incr_calls, [])
@@ -4608,7 +4516,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
-        self.assertTrue(populator.done_reqs_with_token)
+        self.assertTrue(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4676,7 +4584,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                 [('NOT_EXISTED_YET')] * (retries[0] - 1) + [(self.cache_key)]
             )
         self.do_fetch_backend.assert_not_called()
-        self.assertFalse(populator.done_reqs_with_token)
+        self.assertFalse(populator.is_token_request_done())
         self.assertTrue(populator.req_served_from_cache)
 
     def test_fetch_data_cache_miss_without_token(self):
@@ -4714,7 +4622,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
-        self.assertFalse(populator.done_reqs_with_token)
+        self.assertFalse(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4751,7 +4659,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.assertEqual(populator.set_cache_state, "set")
         self.do_fetch_backend.assert_called_once()
-        self.assertFalse(populator.done_reqs_with_token)
+        self.assertFalse(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4786,7 +4694,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.assertEqual(populator.set_cache_state, "set_error")
         self.do_fetch_backend.assert_called_once()
-        self.assertFalse(populator.done_reqs_with_token)
+        self.assertFalse(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4822,7 +4730,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.assertEqual(populator.set_cache_state, "set_error")
         self.do_fetch_backend.assert_called_once()
-        self.assertFalse(populator.done_reqs_with_token)
+        self.assertFalse(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4864,7 +4772,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.backend_response, "response")
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
-        self.assertFalse(populator.done_reqs_with_token)
+        self.assertFalse(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
@@ -4910,7 +4818,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             self.assertEqual(data, "backend data")
             if populator.set_cache_state == 'set':
                 counts['num_requests_with_token'] += 1
-                self.assertTrue(populator.done_reqs_with_token)
+                self.assertTrue(populator.is_token_request_done())
                 self.assertFalse(populator.req_served_from_cache)
                 self.assertEqual(
                     populator._infocache[self.cache_key], "backend data")
@@ -5544,441 +5452,6 @@ class TestFileLikeIter(unittest.TestCase):
             self.assertEqual(utils.get_hub(), 'selects')
 
 
-class TestStatsdLogging(unittest.TestCase):
-    def setUp(self):
-
-        def fake_getaddrinfo(host, port, *args):
-            # this is what a real getaddrinfo('localhost', port,
-            # socket.AF_INET) returned once
-            return [(socket.AF_INET,      # address family
-                     socket.SOCK_STREAM,  # socket type
-                     socket.IPPROTO_TCP,  # socket protocol
-                     '',                  # canonical name,
-                     ('127.0.0.1', port)),  # socket address
-                    (socket.AF_INET,
-                     socket.SOCK_DGRAM,
-                     socket.IPPROTO_UDP,
-                     '',
-                     ('127.0.0.1', port))]
-
-        self.real_getaddrinfo = utils.socket.getaddrinfo
-        self.getaddrinfo_patcher = mock.patch.object(
-            utils.socket, 'getaddrinfo', fake_getaddrinfo)
-        self.mock_getaddrinfo = self.getaddrinfo_patcher.start()
-        self.addCleanup(self.getaddrinfo_patcher.stop)
-
-    def test_get_logger_statsd_client_not_specified(self):
-        logger = utils.get_logger({}, 'some-name', log_route='some-route')
-        # white-box construction validation
-        self.assertIsNone(logger.logger.statsd_client)
-
-    def test_get_logger_statsd_client_defaults(self):
-        logger = utils.get_logger({'log_statsd_host': 'some.host.com'},
-                                  'some-name', log_route='some-route')
-        # white-box construction validation
-        self.assertIsInstance(logger.logger.statsd_client, utils.StatsdClient)
-        self.assertEqual(logger.logger.statsd_client._host, 'some.host.com')
-        self.assertEqual(logger.logger.statsd_client._port, 8125)
-        self.assertEqual(logger.logger.statsd_client._prefix, 'some-name.')
-        self.assertEqual(logger.logger.statsd_client._default_sample_rate, 1)
-
-        logger2 = utils.get_logger(
-            {'log_statsd_host': 'some.host.com'},
-            'other-name', log_route='some-route',
-            statsd_tail_prefix='some-name.more-specific')
-        self.assertEqual(logger.logger.statsd_client._prefix,
-                         'some-name.more-specific.')
-        self.assertEqual(logger2.logger.statsd_client._prefix,
-                         'some-name.more-specific.')
-
-        # note: set_statsd_prefix is deprecated
-        logger2 = utils.get_logger({'log_statsd_host': 'some.host.com'},
-                                   'other-name', log_route='some-route')
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                'ignore', r'set_statsd_prefix\(\) is deprecated')
-            logger.set_statsd_prefix('some-name.more-specific')
-        self.assertEqual(logger.logger.statsd_client._prefix,
-                         'some-name.more-specific.')
-        self.assertEqual(logger2.logger.statsd_client._prefix,
-                         'some-name.more-specific.')
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                'ignore', r'set_statsd_prefix\(\) is deprecated')
-            logger.set_statsd_prefix('')
-        self.assertEqual(logger.logger.statsd_client._prefix, '')
-        self.assertEqual(logger2.logger.statsd_client._prefix, '')
-
-    def test_get_logger_statsd_client_non_defaults(self):
-        conf = {
-            'log_statsd_host': 'another.host.com',
-            'log_statsd_port': '9876',
-            'log_statsd_default_sample_rate': '0.75',
-            'log_statsd_sample_rate_factor': '0.81',
-            'log_statsd_metric_prefix': 'tomato.sauce',
-        }
-        logger = utils.get_logger(conf, 'some-name', log_route='some-route')
-        self.assertEqual(logger.logger.statsd_client._prefix,
-                         'tomato.sauce.some-name.')
-
-        logger = utils.get_logger(conf, 'other-name', log_route='some-route',
-                                  statsd_tail_prefix='some-name.more-specific')
-        self.assertEqual(logger.logger.statsd_client._prefix,
-                         'tomato.sauce.some-name.more-specific.')
-
-        # note: set_statsd_prefix is deprecated
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                'ignore', r'set_statsd_prefix\(\) is deprecated')
-            logger.set_statsd_prefix('some-name.more-specific')
-        self.assertEqual(logger.logger.statsd_client._prefix,
-                         'tomato.sauce.some-name.more-specific.')
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                'ignore', r'set_statsd_prefix\(\) is deprecated')
-            logger.set_statsd_prefix('')
-        self.assertEqual(logger.logger.statsd_client._prefix, 'tomato.sauce.')
-        self.assertEqual(logger.logger.statsd_client._host, 'another.host.com')
-        self.assertEqual(logger.logger.statsd_client._port, 9876)
-        self.assertEqual(logger.logger.statsd_client._default_sample_rate,
-                         0.75)
-        self.assertEqual(logger.logger.statsd_client._sample_rate_factor,
-                         0.81)
-
-    def test_statsd_set_prefix_deprecation(self):
-        conf = {'log_statsd_host': 'another.host.com'}
-
-        with warnings.catch_warnings(record=True) as cm:
-            if six.PY2:
-                getattr(utils, '__warningregistry__', {}).clear()
-            warnings.resetwarnings()
-            warnings.simplefilter('always', DeprecationWarning)
-            logger = utils.get_logger(
-                conf, 'some-name', log_route='some-route')
-            logger.logger.statsd_client.set_prefix('some-name.more-specific')
-        msgs = [str(warning.message)
-                for warning in cm
-                if str(warning.message).startswith('set_prefix')]
-        self.assertEqual(
-            ['set_prefix() is deprecated; use the ``tail_prefix`` argument of '
-             'the constructor when instantiating the class instead.'],
-            msgs)
-
-        with warnings.catch_warnings(record=True) as cm:
-            warnings.resetwarnings()
-            warnings.simplefilter('always', DeprecationWarning)
-            logger = utils.get_logger(
-                conf, 'some-name', log_route='some-route')
-            logger.set_statsd_prefix('some-name.more-specific')
-        msgs = [str(warning.message)
-                for warning in cm
-                if str(warning.message).startswith('set_statsd_prefix')]
-        self.assertEqual(
-            ['set_statsd_prefix() is deprecated; use the '
-             '``statsd_tail_prefix`` argument to ``get_logger`` instead.'],
-            msgs)
-
-    def test_ipv4_or_ipv6_hostname_defaults_to_ipv4(self):
-        def stub_getaddrinfo_both_ipv4_and_ipv6(host, port, family, *rest):
-            if family == socket.AF_INET:
-                return [(socket.AF_INET, 'blah', 'blah', 'blah',
-                        ('127.0.0.1', int(port)))]
-            elif family == socket.AF_INET6:
-                # Implemented so an incorrectly ordered implementation (IPv6
-                # then IPv4) would realistically fail.
-                return [(socket.AF_INET6, 'blah', 'blah', 'blah',
-                        ('::1', int(port), 0, 0))]
-
-        with mock.patch.object(utils.socket, 'getaddrinfo',
-                               new=stub_getaddrinfo_both_ipv4_and_ipv6):
-            logger = utils.get_logger({
-                'log_statsd_host': 'localhost',
-                'log_statsd_port': '9876',
-            }, 'some-name', log_route='some-route')
-        statsd_client = logger.logger.statsd_client
-
-        self.assertEqual(statsd_client._sock_family, socket.AF_INET)
-        self.assertEqual(statsd_client._target, ('localhost', 9876))
-
-        got_sock = statsd_client._open_socket()
-        self.assertEqual(got_sock.family, socket.AF_INET)
-
-    def test_ipv4_instantiation_and_socket_creation(self):
-        logger = utils.get_logger({
-            'log_statsd_host': '127.0.0.1',
-            'log_statsd_port': '9876',
-        }, 'some-name', log_route='some-route')
-        statsd_client = logger.logger.statsd_client
-
-        self.assertEqual(statsd_client._sock_family, socket.AF_INET)
-        self.assertEqual(statsd_client._target, ('127.0.0.1', 9876))
-
-        got_sock = statsd_client._open_socket()
-        self.assertEqual(got_sock.family, socket.AF_INET)
-
-    def test_ipv6_instantiation_and_socket_creation(self):
-        # We have to check the given hostname or IP for IPv4/IPv6 on logger
-        # instantiation so we don't call getaddrinfo() too often and don't have
-        # to call bind() on our socket to detect IPv4/IPv6 on every send.
-        #
-        # This test patches over the existing mock. If we just stop the
-        # existing mock, then unittest.exit() blows up, but stacking
-        # real-fake-fake works okay.
-        calls = []
-
-        def fake_getaddrinfo(host, port, family, *args):
-            calls.append(family)
-            if len(calls) == 1:
-                raise socket.gaierror
-            # this is what a real getaddrinfo('::1', port,
-            # socket.AF_INET6) returned once
-            return [(socket.AF_INET6,
-                     socket.SOCK_STREAM,
-                     socket.IPPROTO_TCP,
-                     '', ('::1', port, 0, 0)),
-                    (socket.AF_INET6,
-                     socket.SOCK_DGRAM,
-                     socket.IPPROTO_UDP,
-                     '',
-                     ('::1', port, 0, 0))]
-
-        with mock.patch.object(utils.socket, 'getaddrinfo', fake_getaddrinfo):
-            logger = utils.get_logger({
-                'log_statsd_host': '::1',
-                'log_statsd_port': '9876',
-            }, 'some-name', log_route='some-route')
-        statsd_client = logger.logger.statsd_client
-        self.assertEqual([socket.AF_INET, socket.AF_INET6], calls)
-        self.assertEqual(statsd_client._sock_family, socket.AF_INET6)
-        self.assertEqual(statsd_client._target, ('::1', 9876, 0, 0))
-
-        got_sock = statsd_client._open_socket()
-        self.assertEqual(got_sock.family, socket.AF_INET6)
-
-    def test_bad_hostname_instantiation(self):
-        with mock.patch.object(utils.socket, 'getaddrinfo',
-                               side_effect=utils.socket.gaierror("whoops")):
-            logger = utils.get_logger({
-                'log_statsd_host': 'i-am-not-a-hostname-or-ip',
-                'log_statsd_port': '9876',
-            }, 'some-name', log_route='some-route')
-        statsd_client = logger.logger.statsd_client
-
-        self.assertEqual(statsd_client._sock_family, socket.AF_INET)
-        self.assertEqual(statsd_client._target,
-                         ('i-am-not-a-hostname-or-ip', 9876))
-
-        got_sock = statsd_client._open_socket()
-        self.assertEqual(got_sock.family, socket.AF_INET)
-        # Maybe the DNS server gets fixed in a bit and it starts working... or
-        # maybe the DNS record hadn't propagated yet.  In any case, failed
-        # statsd sends will warn in the logs until the DNS failure or invalid
-        # IP address in the configuration is fixed.
-
-    def test_sending_ipv6(self):
-        def fake_getaddrinfo(host, port, *args):
-            # this is what a real getaddrinfo('::1', port,
-            # socket.AF_INET6) returned once
-            return [(socket.AF_INET6,
-                     socket.SOCK_STREAM,
-                     socket.IPPROTO_TCP,
-                     '', ('::1', port, 0, 0)),
-                    (socket.AF_INET6,
-                     socket.SOCK_DGRAM,
-                     socket.IPPROTO_UDP,
-                     '',
-                     ('::1', port, 0, 0))]
-
-        with mock.patch.object(utils.socket, 'getaddrinfo', fake_getaddrinfo):
-            logger = utils.get_logger({
-                'log_statsd_host': '::1',
-                'log_statsd_port': '9876',
-            }, 'some-name', log_route='some-route')
-        statsd_client = logger.logger.statsd_client
-
-        fl = debug_logger()
-        statsd_client.logger = fl
-        mock_socket = MockUdpSocket()
-
-        statsd_client._open_socket = lambda *_: mock_socket
-        logger.increment('tunafish')
-        self.assertEqual(fl.get_lines_for_level('warning'), [])
-        self.assertEqual(mock_socket.sent,
-                         [(b'some-name.tunafish:1|c', ('::1', 9876, 0, 0))])
-
-    def test_no_exception_when_cant_send_udp_packet(self):
-        logger = utils.get_logger({'log_statsd_host': 'some.host.com'})
-        statsd_client = logger.logger.statsd_client
-        fl = debug_logger()
-        statsd_client.logger = fl
-        mock_socket = MockUdpSocket(sendto_errno=errno.EPERM)
-        statsd_client._open_socket = lambda *_: mock_socket
-        logger.increment('tunafish')
-        expected = ["Error sending UDP message to ('some.host.com', 8125): "
-                    "[Errno 1] test errno 1"]
-        self.assertEqual(fl.get_lines_for_level('warning'), expected)
-
-    def test_sample_rates(self):
-        logger = utils.get_logger({'log_statsd_host': 'some.host.com'})
-
-        mock_socket = MockUdpSocket()
-        # encapsulation? what's that?
-        statsd_client = logger.logger.statsd_client
-        self.assertTrue(statsd_client.random is random.random)
-
-        statsd_client._open_socket = lambda *_: mock_socket
-        statsd_client.random = lambda: 0.50001
-
-        logger.increment('tribbles', sample_rate=0.5)
-        self.assertEqual(len(mock_socket.sent), 0)
-
-        statsd_client.random = lambda: 0.49999
-        logger.increment('tribbles', sample_rate=0.5)
-        self.assertEqual(len(mock_socket.sent), 1)
-
-        payload = mock_socket.sent[0][0]
-        self.assertTrue(payload.endswith(b"|@0.5"))
-
-    def test_sample_rates_with_sample_rate_factor(self):
-        logger = utils.get_logger({
-            'log_statsd_host': 'some.host.com',
-            'log_statsd_default_sample_rate': '0.82',
-            'log_statsd_sample_rate_factor': '0.91',
-        })
-        effective_sample_rate = 0.82 * 0.91
-
-        mock_socket = MockUdpSocket()
-        # encapsulation? what's that?
-        statsd_client = logger.logger.statsd_client
-        self.assertTrue(statsd_client.random is random.random)
-
-        statsd_client._open_socket = lambda *_: mock_socket
-        statsd_client.random = lambda: effective_sample_rate + 0.001
-
-        logger.increment('tribbles')
-        self.assertEqual(len(mock_socket.sent), 0)
-
-        statsd_client.random = lambda: effective_sample_rate - 0.001
-        logger.increment('tribbles')
-        self.assertEqual(len(mock_socket.sent), 1)
-
-        payload = mock_socket.sent[0][0]
-        suffix = "|@%s" % effective_sample_rate
-        if six.PY3:
-            suffix = suffix.encode('utf-8')
-        self.assertTrue(payload.endswith(suffix), payload)
-
-        effective_sample_rate = 0.587 * 0.91
-        statsd_client.random = lambda: effective_sample_rate - 0.001
-        logger.increment('tribbles', sample_rate=0.587)
-        self.assertEqual(len(mock_socket.sent), 2)
-
-        payload = mock_socket.sent[1][0]
-        suffix = "|@%s" % effective_sample_rate
-        if six.PY3:
-            suffix = suffix.encode('utf-8')
-        self.assertTrue(payload.endswith(suffix), payload)
-
-    def test_timing_stats(self):
-        class MockController(object):
-            def __init__(self, status):
-                self.status = status
-                self.logger = self
-                self.args = ()
-                self.called = 'UNKNOWN'
-
-            def timing_since(self, *args):
-                self.called = 'timing'
-                self.args = args
-
-        @utils.timing_stats()
-        def METHOD(controller):
-            return Response(status=controller.status)
-
-        mock_controller = MockController(200)
-        METHOD(mock_controller)
-        self.assertEqual(mock_controller.called, 'timing')
-        self.assertEqual(len(mock_controller.args), 2)
-        self.assertEqual(mock_controller.args[0], 'METHOD.timing')
-        self.assertTrue(mock_controller.args[1] > 0)
-
-        mock_controller = MockController(400)
-        METHOD(mock_controller)
-        self.assertEqual(len(mock_controller.args), 2)
-        self.assertEqual(mock_controller.called, 'timing')
-        self.assertEqual(mock_controller.args[0], 'METHOD.timing')
-        self.assertTrue(mock_controller.args[1] > 0)
-
-        mock_controller = MockController(404)
-        METHOD(mock_controller)
-        self.assertEqual(len(mock_controller.args), 2)
-        self.assertEqual(mock_controller.called, 'timing')
-        self.assertEqual(mock_controller.args[0], 'METHOD.timing')
-        self.assertTrue(mock_controller.args[1] > 0)
-
-        mock_controller = MockController(412)
-        METHOD(mock_controller)
-        self.assertEqual(len(mock_controller.args), 2)
-        self.assertEqual(mock_controller.called, 'timing')
-        self.assertEqual(mock_controller.args[0], 'METHOD.timing')
-        self.assertTrue(mock_controller.args[1] > 0)
-
-        mock_controller = MockController(416)
-        METHOD(mock_controller)
-        self.assertEqual(len(mock_controller.args), 2)
-        self.assertEqual(mock_controller.called, 'timing')
-        self.assertEqual(mock_controller.args[0], 'METHOD.timing')
-        self.assertTrue(mock_controller.args[1] > 0)
-
-        mock_controller = MockController(500)
-        METHOD(mock_controller)
-        self.assertEqual(len(mock_controller.args), 2)
-        self.assertEqual(mock_controller.called, 'timing')
-        self.assertEqual(mock_controller.args[0], 'METHOD.errors.timing')
-        self.assertTrue(mock_controller.args[1] > 0)
-
-        mock_controller = MockController(507)
-        METHOD(mock_controller)
-        self.assertEqual(len(mock_controller.args), 2)
-        self.assertEqual(mock_controller.called, 'timing')
-        self.assertEqual(mock_controller.args[0], 'METHOD.errors.timing')
-        self.assertTrue(mock_controller.args[1] > 0)
-
-    def test_memcached_timing_stats(self):
-        class MockMemcached(object):
-            def __init__(self):
-                self.logger = self
-                self.args = ()
-                self.called = 'UNKNOWN'
-
-            def timing_since(self, *args):
-                self.called = 'timing'
-                self.args = args
-
-        @utils.memcached_timing_stats()
-        def set(cache):
-            pass
-
-        @utils.memcached_timing_stats()
-        def get(cache):
-            pass
-
-        mock_cache = MockMemcached()
-        with patch('time.time',) as mock_time:
-            mock_time.return_value = 1000.99
-            set(mock_cache)
-            self.assertEqual(mock_cache.called, 'timing')
-            self.assertEqual(len(mock_cache.args), 2)
-            self.assertEqual(mock_cache.args[0], 'memcached.set.timing')
-            self.assertEqual(mock_cache.args[1], 1000.99)
-            mock_time.return_value = 2000.99
-            get(mock_cache)
-            self.assertEqual(mock_cache.called, 'timing')
-            self.assertEqual(len(mock_cache.args), 2)
-            self.assertEqual(mock_cache.args[0], 'memcached.get.timing')
-            self.assertEqual(mock_cache.args[1], 2000.99)
-
-
 class UnsafeXrange(object):
     """
     Like range(limit), but with extra context switching to screw things up.
@@ -6393,343 +5866,6 @@ class TestGreenthreadSafeIterator(unittest.TestCase):
         self.assertEqual(list(range(1, 11)), response)
         self.assertTrue(
             not unsafe_iterable.concurrent_call, 'concurrent call occurred')
-
-
-class TestStatsdLoggingDelegation(unittest.TestCase):
-
-    def setUp(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(('localhost', 0))
-        self.port = self.sock.getsockname()[1]
-        self.queue = Queue()
-        self.reader_thread = threading.Thread(target=self.statsd_reader)
-        self.reader_thread.daemon = True
-        self.reader_thread.start()
-
-    def tearDown(self):
-        # The "no-op when disabled" test doesn't set up a real logger, so
-        # create one here so we can tell the reader thread to stop.
-        if not getattr(self, 'logger', None):
-            self.logger = utils.get_logger({
-                'log_statsd_host': 'localhost',
-                'log_statsd_port': str(self.port),
-            }, 'some-name')
-        self.logger.increment('STOP')
-        self.reader_thread.join(timeout=4)
-        self.sock.close()
-        del self.logger
-
-    def statsd_reader(self):
-        while True:
-            try:
-                payload = self.sock.recv(4096)
-                if payload and b'STOP' in payload:
-                    return 42
-                self.queue.put(payload)
-            except Exception as e:
-                sys.stderr.write('statsd_reader thread: %r' % (e,))
-                break
-
-    def _send_and_get(self, sender_fn, *args, **kwargs):
-        """
-        Because the client library may not actually send a packet with
-        sample_rate < 1, we keep trying until we get one through.
-        """
-        got = None
-        while not got:
-            sender_fn(*args, **kwargs)
-            try:
-                got = self.queue.get(timeout=0.5)
-            except Empty:
-                pass
-        return got
-
-    def assertStat(self, expected, sender_fn, *args, **kwargs):
-        got = self._send_and_get(sender_fn, *args, **kwargs)
-        if six.PY3:
-            got = got.decode('utf-8')
-        return self.assertEqual(expected, got)
-
-    def assertStatMatches(self, expected_regexp, sender_fn, *args, **kwargs):
-        got = self._send_and_get(sender_fn, *args, **kwargs)
-        if six.PY3:
-            got = got.decode('utf-8')
-        return self.assertTrue(re.search(expected_regexp, got),
-                               [got, expected_regexp])
-
-    def test_methods_are_no_ops_when_not_enabled(self):
-        logger = utils.get_logger({
-            # No "log_statsd_host" means "disabled"
-            'log_statsd_port': str(self.port),
-        }, 'some-name')
-        # Delegate methods are no-ops
-        self.assertIsNone(logger.update_stats('foo', 88))
-        self.assertIsNone(logger.update_stats('foo', 88, 0.57))
-        self.assertIsNone(logger.update_stats('foo', 88,
-                                              sample_rate=0.61))
-        self.assertIsNone(logger.increment('foo'))
-        self.assertIsNone(logger.increment('foo', 0.57))
-        self.assertIsNone(logger.increment('foo', sample_rate=0.61))
-        self.assertIsNone(logger.decrement('foo'))
-        self.assertIsNone(logger.decrement('foo', 0.57))
-        self.assertIsNone(logger.decrement('foo', sample_rate=0.61))
-        self.assertIsNone(logger.timing('foo', 88.048))
-        self.assertIsNone(logger.timing('foo', 88.57, 0.34))
-        self.assertIsNone(logger.timing('foo', 88.998, sample_rate=0.82))
-        self.assertIsNone(logger.timing_since('foo', 8938))
-        self.assertIsNone(logger.timing_since('foo', 8948, 0.57))
-        self.assertIsNone(logger.timing_since('foo', 849398,
-                                              sample_rate=0.61))
-        # Now, the queue should be empty (no UDP packets sent)
-        self.assertRaises(Empty, self.queue.get_nowait)
-
-    def test_delegate_methods_with_no_default_sample_rate(self):
-        self.logger = utils.get_logger({
-            'log_statsd_host': 'localhost',
-            'log_statsd_port': str(self.port),
-        }, 'some-name')
-        self.assertStat('some-name.some.counter:1|c', self.logger.increment,
-                        'some.counter')
-        self.assertStat('some-name.some.counter:-1|c', self.logger.decrement,
-                        'some.counter')
-        self.assertStat('some-name.some.operation:4900.0|ms',
-                        self.logger.timing, 'some.operation', 4.9 * 1000)
-        self.assertStatMatches(r'some-name\.another\.operation:\d+\.\d+\|ms',
-                               self.logger.timing_since, 'another.operation',
-                               time.time())
-        self.assertStat('some-name.another.counter:42|c',
-                        self.logger.update_stats, 'another.counter', 42)
-
-        # Each call can override the sample_rate (also, bonus prefix test)
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                'ignore', r'set_statsd_prefix\(\) is deprecated')
-            self.logger.set_statsd_prefix('pfx')
-        self.assertStat('pfx.some.counter:1|c|@0.972', self.logger.increment,
-                        'some.counter', sample_rate=0.972)
-        self.assertStat('pfx.some.counter:-1|c|@0.972', self.logger.decrement,
-                        'some.counter', sample_rate=0.972)
-        self.assertStat('pfx.some.operation:4900.0|ms|@0.972',
-                        self.logger.timing, 'some.operation', 4.9 * 1000,
-                        sample_rate=0.972)
-        self.assertStat(
-            'pfx.some.hi-res.operation:3141.5927|ms|@0.367879441171',
-            self.logger.timing, 'some.hi-res.operation',
-            3.141592653589793 * 1000, sample_rate=0.367879441171)
-        self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.972',
-                               self.logger.timing_since, 'another.op',
-                               time.time(), sample_rate=0.972)
-        # Timestamp objects work too
-        self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.972',
-                               self.logger.timing_since, 'another.op',
-                               utils.Timestamp.now(), sample_rate=0.972)
-        self.assertStat('pfx.another.counter:3|c|@0.972',
-                        self.logger.update_stats, 'another.counter', 3,
-                        sample_rate=0.972)
-
-        # Can override sample_rate with non-keyword arg
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                'ignore', r'set_statsd_prefix\(\) is deprecated')
-            self.logger.set_statsd_prefix('')
-        self.assertStat('some.counter:1|c|@0.939', self.logger.increment,
-                        'some.counter', 0.939)
-        self.assertStat('some.counter:-1|c|@0.939', self.logger.decrement,
-                        'some.counter', 0.939)
-        self.assertStat('some.operation:4900.0|ms|@0.939',
-                        self.logger.timing, 'some.operation',
-                        4.9 * 1000, 0.939)
-        self.assertStatMatches(r'another\.op:\d+\.\d+\|ms|@0.939',
-                               self.logger.timing_since, 'another.op',
-                               time.time(), 0.939)
-        self.assertStat('another.counter:3|c|@0.939',
-                        self.logger.update_stats, 'another.counter', 3, 0.939)
-
-    def test_delegate_methods_with_default_sample_rate(self):
-        self.logger = utils.get_logger({
-            'log_statsd_host': 'localhost',
-            'log_statsd_port': str(self.port),
-            'log_statsd_default_sample_rate': '0.93',
-        }, 'pfx')
-        self.assertStat('pfx.some.counter:1|c|@0.93', self.logger.increment,
-                        'some.counter')
-        self.assertStat('pfx.some.counter:-1|c|@0.93', self.logger.decrement,
-                        'some.counter')
-        self.assertStat('pfx.some.operation:4760.0|ms|@0.93',
-                        self.logger.timing, 'some.operation', 4.76 * 1000)
-        self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.93',
-                               self.logger.timing_since, 'another.op',
-                               time.time())
-        self.assertStat('pfx.another.counter:3|c|@0.93',
-                        self.logger.update_stats, 'another.counter', 3)
-
-        # Each call can override the sample_rate
-        self.assertStat('pfx.some.counter:1|c|@0.9912', self.logger.increment,
-                        'some.counter', sample_rate=0.9912)
-        self.assertStat('pfx.some.counter:-1|c|@0.9912', self.logger.decrement,
-                        'some.counter', sample_rate=0.9912)
-        self.assertStat('pfx.some.operation:4900.0|ms|@0.9912',
-                        self.logger.timing, 'some.operation', 4.9 * 1000,
-                        sample_rate=0.9912)
-        self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.9912',
-                               self.logger.timing_since, 'another.op',
-                               time.time(), sample_rate=0.9912)
-        # Timestamp objects work too
-        self.assertStatMatches(r'pfx\.another\.op:\d+\.\d+\|ms|@0.9912',
-                               self.logger.timing_since, 'another.op',
-                               utils.Timestamp.now(), sample_rate=0.9912)
-        self.assertStat('pfx.another.counter:3|c|@0.9912',
-                        self.logger.update_stats, 'another.counter', 3,
-                        sample_rate=0.9912)
-
-        # Can override sample_rate with non-keyword arg
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                'ignore', r'set_statsd_prefix\(\) is deprecated')
-            self.logger.set_statsd_prefix('')
-        self.assertStat('some.counter:1|c|@0.987654', self.logger.increment,
-                        'some.counter', 0.987654)
-        self.assertStat('some.counter:-1|c|@0.987654', self.logger.decrement,
-                        'some.counter', 0.987654)
-        self.assertStat('some.operation:4900.0|ms|@0.987654',
-                        self.logger.timing, 'some.operation',
-                        4.9 * 1000, 0.987654)
-        self.assertStatMatches(r'another\.op:\d+\.\d+\|ms|@0.987654',
-                               self.logger.timing_since, 'another.op',
-                               time.time(), 0.987654)
-        self.assertStat('another.counter:3|c|@0.987654',
-                        self.logger.update_stats, 'another.counter',
-                        3, 0.987654)
-
-    def test_delegate_methods_with_metric_prefix(self):
-        self.logger = utils.get_logger({
-            'log_statsd_host': 'localhost',
-            'log_statsd_port': str(self.port),
-            'log_statsd_metric_prefix': 'alpha.beta',
-        }, 'pfx')
-        self.assertStat('alpha.beta.pfx.some.counter:1|c',
-                        self.logger.increment, 'some.counter')
-        self.assertStat('alpha.beta.pfx.some.counter:-1|c',
-                        self.logger.decrement, 'some.counter')
-        self.assertStat('alpha.beta.pfx.some.operation:4760.0|ms',
-                        self.logger.timing, 'some.operation', 4.76 * 1000)
-        self.assertStatMatches(
-            r'alpha\.beta\.pfx\.another\.op:\d+\.\d+\|ms',
-            self.logger.timing_since, 'another.op', time.time())
-        # Timestamp objects work too
-        self.assertStatMatches(
-            r'alpha\.beta\.pfx\.another\.op:\d+\.\d+\|ms',
-            self.logger.timing_since, 'another.op', utils.Timestamp.now())
-        self.assertStat('alpha.beta.pfx.another.counter:3|c',
-                        self.logger.update_stats, 'another.counter', 3)
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                'ignore', r'set_statsd_prefix\(\) is deprecated')
-            self.logger.set_statsd_prefix('')
-        self.assertStat('alpha.beta.some.counter:1|c|@0.9912',
-                        self.logger.increment, 'some.counter',
-                        sample_rate=0.9912)
-        self.assertStat('alpha.beta.some.counter:-1|c|@0.9912',
-                        self.logger.decrement, 'some.counter', 0.9912)
-        self.assertStat('alpha.beta.some.operation:4900.0|ms|@0.9912',
-                        self.logger.timing, 'some.operation', 4.9 * 1000,
-                        sample_rate=0.9912)
-        self.assertStatMatches(
-            r'alpha\.beta\.another\.op:\d+\.\d+\|ms|@0.9912',
-            self.logger.timing_since, 'another.op',
-            time.time(), sample_rate=0.9912)
-        # Timestamp objects work too
-        self.assertStatMatches(
-            r'alpha\.beta\.another\.op:\d+\.\d+\|ms|@0.9912',
-            self.logger.timing_since, 'another.op',
-            utils.Timestamp.now(), sample_rate=0.9912)
-        self.assertStat('alpha.beta.another.counter:3|c|@0.9912',
-                        self.logger.update_stats, 'another.counter', 3,
-                        sample_rate=0.9912)
-
-    @reset_logger_state
-    def test_thread_locals(self):
-        logger = utils.get_logger(None)
-        # test the setter
-        logger.thread_locals = ('id', 'ip')
-        self.assertEqual(logger.thread_locals, ('id', 'ip'))
-        # reset
-        logger.thread_locals = (None, None)
-        self.assertEqual(logger.thread_locals, (None, None))
-        logger.txn_id = '1234'
-        logger.client_ip = '1.2.3.4'
-        self.assertEqual(logger.thread_locals, ('1234', '1.2.3.4'))
-        logger.txn_id = '5678'
-        logger.client_ip = '5.6.7.8'
-        self.assertEqual(logger.thread_locals, ('5678', '5.6.7.8'))
-
-    def test_no_fdatasync(self):
-        called = []
-
-        class NoFdatasync(object):
-            pass
-
-        def fsync(fd):
-            called.append(fd)
-
-        with patch('swift.common.utils.os', NoFdatasync()):
-            with patch('swift.common.utils.fsync', fsync):
-                utils.fdatasync(12345)
-                self.assertEqual(called, [12345])
-
-    def test_yes_fdatasync(self):
-        called = []
-
-        class YesFdatasync(object):
-
-            def fdatasync(self, fd):
-                called.append(fd)
-
-        with patch('swift.common.utils.os', YesFdatasync()):
-            utils.fdatasync(12345)
-            self.assertEqual(called, [12345])
-
-    def test_fsync_bad_fullsync(self):
-
-        class FCNTL(object):
-
-            F_FULLSYNC = 123
-
-            def fcntl(self, fd, op):
-                raise IOError(18)
-
-        with patch('swift.common.utils.fcntl', FCNTL()):
-            self.assertRaises(OSError, lambda: utils.fsync(12345))
-
-    def test_fsync_f_fullsync(self):
-        called = []
-
-        class FCNTL(object):
-
-            F_FULLSYNC = 123
-
-            def fcntl(self, fd, op):
-                called[:] = [fd, op]
-                return 0
-
-        with patch('swift.common.utils.fcntl', FCNTL()):
-            utils.fsync(12345)
-            self.assertEqual(called, [12345, 123])
-
-    def test_fsync_no_fullsync(self):
-        called = []
-
-        class FCNTL(object):
-            pass
-
-        def fsync(fd):
-            called.append(fd)
-
-        with patch('swift.common.utils.fcntl', FCNTL()):
-            with patch('os.fsync', fsync):
-                utils.fsync(12345)
-                self.assertEqual(called, [12345])
 
 
 class TestSwiftLoggerAdapter(unittest.TestCase):
