@@ -212,6 +212,15 @@ class ObjectExpirer(Daemon):
         self.grace_periods = read_conf_for_grace_periods(conf)
 
         self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
+        # randomized task container iteration can be useful if there's lots of
+        # tasks in the queue under a configured delay_reaping
+        self.randomized_task_container_iteration = config_true_value(
+            conf.get('randomized_task_container_iteration', 'false'))
+        # with lots of nodes and lots of tasks a large cache size can
+        # significantly delay processing; which may be less necessary with only
+        # a few target containers or randomized task container iteration
+        self.round_robin_task_cache_size = int(
+            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
 
         self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
         # randomized task container iteration can be useful if there's lots of
