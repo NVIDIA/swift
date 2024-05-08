@@ -74,7 +74,7 @@ from swift.common import utils, constraints, registry
 from swift.common.utils import hash_path, storage_directory, \
     ShardRange, parse_content_type, parse_mime_headers, \
     iter_multipart_mime_documents, public, mkdirs, NullLogger, md5, \
-    node_to_string, NamespaceBoundList, ShardRange
+    node_to_string, NamespaceBoundList
 from swift.common.wsgi import loadapp, ConfigString
 from swift.common.http_protocol import SwiftHttpProtocol
 from swift.container.backend import NOTFOUND, UNSHARDED, SHARDING, SHARDED, \

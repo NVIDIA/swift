@@ -547,7 +547,6 @@ def fallocate_with_reserve(fd, fallocate_reserve, fallocate_is_percent,
 
     return libc.fallocate(fd, size, offset)
 
-    return libc.fallocate(fd, size, offset)
 
 def fallocate(fd, size, offset=0):
     warnings.warn(
