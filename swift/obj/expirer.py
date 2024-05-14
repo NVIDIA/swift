@@ -442,27 +442,25 @@ class ObjectExpirer(Daemon):
         return int(md5(
             name, usedforsecurity=False).hexdigest(), 16) % divisor
 
-    def iter_task_accounts_to_expire(self):
+    def select_task_containers_to_expire(self, task_account):
         """
-        Yields (task_account, my_index, divisor).
-        my_index and divisor is used to assign task obj to only one
-        expirer. In expirer method, expirer calculates assigned index for each
-        expiration task. The assigned index is in [0, 1, ..., divisor - 1].
-        Expirers have their own "my_index" for each task_account. Expirer whose
-        "my_index" is equal to the assigned index executes the task. Because
-        each expirer have different "my_index", task objects are executed by
-        only one expirer.
-        """
-        if self.processes > 0:
-            yield (self.expirer_config.account_name,
-                   self.process, self.processes)
-        else:
-            yield self.expirer_config.account_name, 0, 1
+        Look in the task_account for task_containers that may have expiration
+        tasks that are ready to reap and return contextual information and the
+        task containers to process.
 
-    def get_task_containers_to_expire(self, task_account):
-        """
-        Collects task_container names under the task_account if the delete at
-        timestamp of task_container is past.
+        Specifically, the my_index and divisor values are used to assign task
+        objects to only one expirer. In the iter_tasks_to_expire method, the
+        expirer calculates the assigned index for each expiration task. The
+        assigned index is in [0, 1, ..., divisor - 1].  When running multiple
+        expirer processes each have their own "my_index". The expirer whose
+        "my_index" is equal to the assigned index will reap objects targeted by
+        the task. Because each expirer is configured to have a unique
+        "my_index", task objects are executed by only one expirer.
+
+        When running with a single expirer process the assigned index and
+        "my_index" are always 0, task objects are executed by the only expirer.
+
+        :returns: (my_index, divisor, container_list)
         """
         container_list = []
         unexpected_task_containers = {
@@ -495,7 +493,15 @@ class ObjectExpirer(Daemon):
                 ' '.join(unexpected_task_containers['examples']))
         if self.task_container_iteration_strategy == 'randomized':
             shuffle(container_list)
-        return container_list
+
+        if self.processes <= 0:
+            # this single process will handle *all* tasks in *all*
+            # task_containers
+            return 0, 1, container_list
+        else:
+            # each process will *list* all tasks in *all* task_containers
+            # (and "handle" only a subset)
+            return self.process, self.processes, container_list
 
     def get_delay_reaping(self, target_account, target_container):
         return get_delay_reaping(self.delay_reaping_times, target_account,
@@ -623,39 +629,37 @@ class ObjectExpirer(Daemon):
         self.report_objects = 0
         try:
             self.logger.debug('Run begin')
-            for task_account, my_index, divisor in \
-                    self.iter_task_accounts_to_expire():
-                container_count, obj_count = \
-                    self.swift.get_account_info(task_account)
+            container_count, obj_count = \
+                self.swift.get_account_info(self.expirer_config.account_name)
 
-                # the task account is skipped if there are no task container
-                if not container_count:
-                    continue
+            self.logger.info(
+                'Pass beginning for task account %(account)s; '
+                '%(container_count)s possible containers; '
+                '%(obj_count)s possible objects', {
+                    'account': self.expirer_config.account_name,
+                    'container_count': container_count,
+                    'obj_count': obj_count})
 
-                self.logger.info(
-                    'Pass beginning for task account %(account)s; '
-                    '%(container_count)s possible containers; '
-                    '%(obj_count)s possible objects', {
-                        'account': task_account,
-                        'container_count': container_count,
-                        'obj_count': obj_count})
+            my_index, divisor, my_containers = \
+                self.select_task_containers_to_expire(
+                    self.expirer_config.account_name)
 
-                task_account_container_list = \
-                    [(task_account, task_container) for task_container in
-                     self.get_task_containers_to_expire(task_account)]
+            task_account_container_list = [
+                (self.expirer_config.account_name, task_container)
+                for task_container in my_containers]
 
-                # delete_task_iter is a generator to yield a dict of
-                # task_account, task_container, task_object, delete_timestamp,
-                # target_path to handle delete actual object and pop the task
-                # from the queue.
-                delete_task_iter = \
-                    self.round_robin_order(self.iter_task_to_expire(
-                        task_account_container_list, my_index, divisor))
-                rate_limited_iter = RateLimitedIterator(
-                    delete_task_iter,
-                    elements_per_second=self.tasks_per_second)
-                for delete_task in rate_limited_iter:
-                    pool.spawn_n(self.delete_object, **delete_task)
+            # delete_task_iter is a generator to yield a dict of
+            # task_account, task_container, task_object, delete_timestamp,
+            # target_path to handle delete actual object and pop the task
+            # from the queue.
+            delete_task_iter = \
+                self.round_robin_order(self.iter_task_to_expire(
+                    task_account_container_list, my_index, divisor))
+            rate_limited_iter = RateLimitedIterator(
+                delete_task_iter,
+                elements_per_second=self.tasks_per_second)
+            for delete_task in rate_limited_iter:
+                pool.spawn_n(self.delete_object, **delete_task)
 
             pool.waitall()
             self.logger.debug('Run end')
