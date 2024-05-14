@@ -1414,18 +1414,33 @@ class TestObjectExpirer(TestCase):
         self.assertGreater(mod_count[1], 300)
         self.assertGreater(mod_count[2], 300)
 
-    def test_iter_task_accounts_to_expire(self):
+    def test_select_task_containers_to_expire_single_process(self):
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=self.fake_swift)
-        results = [_ for _ in x.iter_task_accounts_to_expire()]
-        self.assertEqual(results, [('.expiring_objects', 0, 1)])
+        index, divisor, containers = x.select_task_containers_to_expire(
+            '.expiring_objects')
+        self.assertEqual(0, index)
+        self.assertEqual(1, divisor)
+        self.assertEqual([
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ], [str(c) for c in containers])
 
+    def test_select_task_containers_to_expire_multi_node(self):
         self.conf['processes'] = '2'
         self.conf['process'] = '1'
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=self.fake_swift)
-        results = [_ for _ in x.iter_task_accounts_to_expire()]
-        self.assertEqual(results, [('.expiring_objects', 1, 2)])
+        index, divisor, containers = x.select_task_containers_to_expire(
+            '.expiring_objects')
+        self.assertEqual(1, index)
+        self.assertEqual(2, divisor)
+        self.assertEqual([
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ], [str(c) for c in containers])
 
     def test_run_once_nothing_to_do(self):
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
@@ -1476,7 +1491,7 @@ class TestObjectExpirer(TestCase):
             for target_path in self.expired_target_paths[self.just_past_time]
         ], 2)])
 
-    def test_skip_task_account_without_task_container(self):
+    def test_run_once_task_account_without_task_container(self):
         fake_swift = FakeInternalClient({
             # task account has no containers
             '.expiring_objects': dict()
@@ -1486,10 +1501,12 @@ class TestObjectExpirer(TestCase):
         x.run_once()
         self.assertEqual(
             x.logger.get_lines_for_level('info'), [
+                'Pass beginning for task account .expiring_objects; '
+                '0 possible containers; 0 possible objects',
                 'Pass completed in 0s; 0 objects expired',
             ])
 
-    def test_get_task_containers_unexpected_container(self):
+    def test_select_task_containers_unexpected_container(self):
         expected = self.get_expirer_container(time())
         unexpected = str(int(expected) - 200)
         for name in (expected, unexpected):
@@ -1498,9 +1515,13 @@ class TestObjectExpirer(TestCase):
         container_list = [{'name': unexpected}, {'name': expected}]
         with mock.patch.object(self.expirer.swift, 'iter_containers',
                                return_value=container_list):
-            self.assertEqual(
-                self.expirer.get_task_containers_to_expire('task_account'),
-                [unexpected, expected])
+            index, divisor, selected_containers = \
+                self.expirer.select_task_containers_to_expire(
+                    self.expirer_config.account_name)
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            self.assertEqual([unexpected, expected],
+                             selected_containers)
         self.assertEqual(self.expirer.logger.all_log_lines(), {'info': [
             'processing 1 unexpected task containers (e.g. %s) '
             'if you have recently changed your expirer config '
@@ -1514,12 +1535,15 @@ class TestObjectExpirer(TestCase):
         with mock.patch.object(self.expirer.swift, 'iter_containers',
                                return_value=container_list):
             self.expirer.expirer_config = new_config
-            self.assertEqual(
-                self.expirer.get_task_containers_to_expire('task_account'),
-                [unexpected, expected])
-        self.assertFalse(self.expirer.logger.all_log_lines())
+            index, divisor, selected_containers = \
+                self.expirer.select_task_containers_to_expire(
+                    self.expirer_config.account_name)
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            self.assertEqual([unexpected, expected],
+                             selected_containers)
 
-    def test_get_task_containers_invalid_container(self):
+    def test_select_task_containers_invalid_container(self):
         ok_names = ['86301', '86400']
         bad_names = ['-1', 'rogue']
         unexpected = ['86300', '86401']
@@ -1529,9 +1553,12 @@ class TestObjectExpirer(TestCase):
                          [{'name': name} for name in unexpected]
         with mock.patch.object(self.expirer.swift, 'iter_containers',
                                return_value=container_list):
-            self.assertEqual(
-                self.expirer.get_task_containers_to_expire('task_account'),
-                ok_names + unexpected)
+            index, divisor, selected_containers = \
+                self.expirer.select_task_containers_to_expire('task_account')
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            self.assertEqual(ok_names + unexpected,
+                             selected_containers)
         lines = self.expirer.logger.get_lines_for_level('error')
         self.assertEqual(lines, [
             'skipping invalid task container: task_account/-1',
