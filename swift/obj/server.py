@@ -60,6 +60,7 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPServerError, bytes_to_wsgi, wsgi_to_bytes, wsgi_to_str, \
     normalize_etag, HTTPServiceUnavailable
 from swift.common.wsgi import run_wsgi
+from swift.container.backend import SHARDED
 from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter
 from swift.obj.expirer import build_task_obj, embed_expirer_bytes_in_ctype, \
     X_DELETE_TYPE
@@ -124,6 +125,7 @@ class EventletPlungerString(bytes):
     eventlet.wsgi to force the headers out, so we use an
     EventletPlungerString to empty out all of Eventlet's buffers.
     """
+
     def __len__(self):
         return wsgi.MINIMUM_CHUNK_SIZE + 1
 
@@ -272,7 +274,7 @@ class ObjectController(BaseStorageServer):
     def async_update(self, op, account, container, obj, host, partition,
                      contdevice, headers_out, objdevice, policy,
                      logger_thread_locals=None, container_path=None,
-                     db_state=None):
+                     db_state=None, attempt_sync_update=True):
         """
         Sends or saves an async update.
 
@@ -296,6 +298,8 @@ class ObjectController(BaseStorageServer):
             ``container`` params.
         :param db_state: The current database state of the container as
             supplied to us by the proxy.
+        :param attempt_sync_update: boolean, when false all spawned threads
+                                    write the update data directly to async
         """
         if logger_thread_locals:
             self.logger.thread_locals = logger_thread_locals
@@ -306,9 +310,13 @@ class ObjectController(BaseStorageServer):
         else:
             full_path = '/%s/%s/%s' % (account, container, obj)
 
-        redirect_data = None
-        if all([host, partition, contdevice]):
-            try:
+        redirect_data = status_or_error = None
+        success = False
+        skip = not attempt_sync_update or \
+            not all([host, partition, contdevice])
+        try:
+            if not skip:
+                # Do an sync update
                 with ConnectionTimeout(self.conn_timeout):
                     ip, port = host.rsplit(':', 1)
                     conn = http_connect(ip, port, contdevice, partition, op,
@@ -316,7 +324,9 @@ class ObjectController(BaseStorageServer):
                 with Timeout(self.node_timeout):
                     response = conn.getresponse()
                     response.read()
+                status_or_error = response.status
                 if is_success(response.status):
+                    success = True
                     return
 
                 if response.status == HTTP_MOVED_PERMANENTLY:
@@ -326,6 +336,8 @@ class ObjectController(BaseStorageServer):
                         self.logger.error(
                             'Container update failed for %r; problem with '
                             'redirect location: %s' % (obj, err))
+                    else:
+                        success = True
                 else:
                     self.logger.error(
                         'ERROR Container update failed '
@@ -333,11 +345,26 @@ class ObjectController(BaseStorageServer):
                         'response from %(ip)s:%(port)s/%(dev)s',
                         {'status': response.status, 'ip': ip, 'port': port,
                          'dev': contdevice})
-            except (Exception, Timeout):
-                self.logger.exception(
-                    'ERROR container update failed with '
-                    '%(ip)s:%(port)s/%(dev)s (saving for async update later)',
-                    {'ip': ip, 'port': port, 'dev': contdevice})
+
+        except (Exception, Timeout) as e:
+            if isinstance(e, Timeout):
+                status_or_error = 'timeout'
+            else:
+                status_or_error = 'exception'
+            self.logger.exception(
+                'ERROR container update failed (%(error_type)s) with '
+                '%(ip)s:%(port)s/%(dev)s (saving for async update later)',
+                {'ip': ip, 'port': port, 'dev': contdevice,
+                 'error_type': status_or_error})
+        finally:
+            # self.stats.increment('sync_update', **sync_update_ctx)
+            if skip:
+                legacy_ctx = 'skip'
+            else:
+                legacy_ctx = 'success' if success else 'error'
+                legacy_ctx += '.%s' % (status_or_error)
+            legacy_metric_name = 'sync_update.%s' % legacy_ctx
+            self.logger.increment(legacy_metric_name)
         data = {'op': op, 'account': account, 'container': container,
                 'obj': obj, 'headers': headers_out, 'db_state': db_state}
         if redirect_data:
@@ -392,6 +419,12 @@ class ObjectController(BaseStorageServer):
         else:
             contpath = headers_in.get('X-Backend-Container-Path')
 
+        # If db_state is sharded but we didn't get the shard to pass it to
+        # must mean we failed to get this info from the proxy.  This is
+        # usually caused by the container servers being overloaded.  We
+        # don't want to add to the problem so skip trying to query the
+        # root synchronously and write directly to async_pending
+        skip_sync_update = (contdbstate == SHARDED and not contpath)
         if contpath:
             try:
                 # TODO: this is very late in request handling to be validating
@@ -424,7 +457,8 @@ class ObjectController(BaseStorageServer):
                        conthost, contpartition, contdevice, headers_out,
                        objdevice, policy,
                        logger_thread_locals=self.logger.thread_locals,
-                       container_path=contpath, db_state=contdbstate)
+                       container_path=contpath, db_state=contdbstate,
+                       attempt_sync_update=not skip_sync_update)
             update_greenthreads.append(gt)
         # Wait a little bit to see if the container updates are successful.
         # If we immediately return after firing off the greenthread above, then
