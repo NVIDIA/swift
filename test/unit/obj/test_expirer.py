@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import itertools
+import os
 from time import time
 from unittest import main, TestCase
 from test.debug_logger import debug_logger
@@ -32,7 +33,7 @@ from six.moves import urllib
 
 from swift.common import internal_client, utils, swob
 from swift.common.utils import Timestamp
-from swift.obj import expirer
+from swift.obj import expirer, diskfile
 
 
 def not_random():
@@ -106,11 +107,12 @@ class TestExpirerHelpers(TestCase):
     def test_add_expirer_bytes_to_ctype(self):
         self.assertEqual(
             'text/plain;swift_expirer_bytes=10',
-            expirer.embed_expirer_bytes_in_ctype('text/plain', 10))
+            expirer.embed_expirer_bytes_in_ctype(
+                'text/plain', {'Content-Length': 10}))
         self.assertEqual(
             'text/plain;some_foo=bar;swift_expirer_bytes=10',
             expirer.embed_expirer_bytes_in_ctype(
-                'text/plain;some_foo=bar', 10))
+                'text/plain;some_foo=bar', {'Content-Length': '10'}))
 
     def test_extract_expirer_bytes_from_ctype(self):
         self.assertEqual(10, expirer.extract_expirer_bytes_from_ctype(
@@ -128,20 +130,86 @@ class TestExpirerHelpers(TestCase):
         ]
         for ctype, expirer_bytes in ctype_bytes:
             embedded_ctype = expirer.embed_expirer_bytes_in_ctype(
-                ctype, expirer_bytes)
+                ctype, {'Content-Length': expirer_bytes})
             found_bytes = expirer.extract_expirer_bytes_from_ctype(
                 embedded_ctype)
             self.assertEqual(expirer_bytes, found_bytes)
 
     def test_add_invalid_expirer_bytes_to_ctype(self):
-        self.assertRaises(TypeError,
+        self.assertRaises(AttributeError,
                           expirer.embed_expirer_bytes_in_ctype, 'nill', None)
-        self.assertRaises(ValueError,
+        self.assertRaises(AttributeError,
                           expirer.embed_expirer_bytes_in_ctype, 'bar', 'foo')
+        self.assertRaises(KeyError,
+                          expirer.embed_expirer_bytes_in_ctype, 'nill', {})
+        self.assertRaises(TypeError,
+                          expirer.embed_expirer_bytes_in_ctype, 'nill',
+                          {'Content-Length': None})
+        self.assertRaises(ValueError,
+                          expirer.embed_expirer_bytes_in_ctype, 'nill',
+                          {'Content-Length': 'foo'})
         # perhaps could be an error
         self.assertEqual(
             'weird/float;swift_expirer_bytes=15',
-            expirer.embed_expirer_bytes_in_ctype('weird/float', 15.9))
+            expirer.embed_expirer_bytes_in_ctype('weird/float',
+                                                 {'Content-Length': 15.9}))
+
+    def test_embed_expirer_bytes_from_diskfile_metadata(self):
+        self.logger = debug_logger('test-expirer')
+        self.ts = make_timestamp_iter()
+        self.devices = mkdtemp()
+        self.conf = {
+            'mount_check': 'false',
+            'devices': self.devices,
+        }
+        self.df_mgr = diskfile.DiskFileManager(self.conf, logger=self.logger)
+        utils.mkdirs(os.path.join(self.devices, 'sda1'))
+        df = self.df_mgr.get_diskfile('sda1', '0', 'a', 'c', 'o', policy=0)
+
+        ts = next(self.ts)
+        with df.create() as writer:
+            writer.write(b'test')
+            writer.put({
+                # wrong key/case here would KeyError
+                'X-Timestamp': ts.internal,
+                # wrong key/case here would cause quarantine on read
+                'Content-Length': '4',
+            })
+
+        metadata = df.read_metadata()
+        # the Content-Type in the metadata is irrelevant; this method is used
+        # to create the content_type of an expirer queue task object
+        embeded_ctype_entry = expirer.embed_expirer_bytes_in_ctype(
+            'text/plain', metadata)
+        self.assertEqual('text/plain;swift_expirer_bytes=4',
+                         embeded_ctype_entry)
+
+    def test_embed_expirer_bytes_from_mpu_metadata(self):
+        metadata = {
+            'X-Timestamp': '1715981937.86913',
+            'Content-Type': 'application/octet-stream;swift_bytes=15728640',
+            'Content-Length': '936',
+            'ETag': '61f6468389e276b0a36fb11e0669189a',
+            'X-Object-Sysmeta-S3Api-Acl': '{"Owner":"test:tester","Grant":['
+            '{"Permission":"FULL_CONTROL","Grantee":"test:tester"}]}',
+            'X-Object-Sysmeta-S3Api-Upload-Id':
+            'MDZhYjljYTgtMjdkYy00ZjVmLThjZDYtNTY4ZTZjNzA0ODg0',
+            'X-Object-Sysmeta-S3Api-Etag':
+            'fd453aaf14ea07844745550b30b084d7-3',
+            'X-Object-Sysmeta-Container-Update-Override-Etag':
+            '61f6468389e276b0a36fb11e0669189a; '
+            's3_etag=fd453aaf14ea07844745550b30b084d7-3; '
+            'slo_etag=2cdb89ae568d0aa7f4fcea57cc2c3ae4',
+            'X-Object-Sysmeta-Slo-Etag': '2cdb89ae568d0aa7f4fcea57cc2c3ae4',
+            'X-Object-Sysmeta-Slo-Size': '15728640',
+            'X-Static-Large-Object': 'True',
+            'name': '/AUTH_test/'
+            'bucket-6fc0fac3-e5aa-42ad-9df7-653c6884e540/'
+            'mpu-6c541365-4cf2-4842-8ad9-af30784556d2'
+        }
+        self.assertEqual('text/plain;swift_expirer_bytes=15728640',
+                         expirer.embed_expirer_bytes_in_ctype(
+                             'text/plain', metadata))
 
     def test_extract_missing_bytes_from_ctype(self):
         self.assertEqual(
@@ -244,43 +312,98 @@ class TestObjectExpirer(TestCase):
         self.assertEqual(x.expiring_objects_account, '.expiring_objects')
         self.assertIs(x.swift, self.fake_swift)
 
-    def test_init_randomized_round_robin_cache_default(self):
+    def test_init_default_round_robin_cache_default(self):
         conf = {}
         x = expirer.ObjectExpirer(conf, logger=self.logger,
                                   swift=self.fake_swift)
-        self.assertFalse(x.randomized_task_container_iteration)
         self.assertEqual(x.round_robin_task_cache_size,
                          expirer.MAX_OBJECTS_TO_CACHE)
 
-    def test_init_randomized_round_robin_cache_disabled(self):
+    def test_init_large_round_robin_cache(self):
         conf = {
-            'randomized_task_container_iteration': 'no',
             'round_robin_task_cache_size': '1000000',
         }
         x = expirer.ObjectExpirer(conf, logger=self.logger,
                                   swift=self.fake_swift)
-        self.assertFalse(x.randomized_task_container_iteration)
         self.assertEqual(x.round_robin_task_cache_size, 1000000)
 
-    def test_init_randomized_round_robin_cache_enabled(self):
+    def test_xxx_randomized_task_container_iteration_shim(self):
         conf = {
             'randomized_task_container_iteration': 'yes',
             'round_robin_task_cache_size': '3000',
         }
         x = expirer.ObjectExpirer(conf, logger=self.logger,
                                   swift=self.fake_swift)
-        self.assertTrue(x.randomized_task_container_iteration)
+        self.assertEqual("randomized", x.task_container_iteration_strategy)
         self.assertEqual(x.round_robin_task_cache_size, 3000)
 
-    def test_init_randomized_round_robin_cache_invalid(self):
+    def test_xxx_randomized_task_container_iteration_old_vs_new(self):
         conf = {
-            'randomized_task_container_iteration': 'maybe',
+            'randomized_task_container_iteration': 'false',
+            'task_container_iteration_strategy': 'randomized',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("randomized", x.task_container_iteration_strategy)
+
+        conf = {
+            'randomized_task_container_iteration': 'yes',
+            'task_container_iteration_strategy': 'legacy',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("randomized", x.task_container_iteration_strategy)
+
+    def test_init_medium_round_robin_cache(self):
+        conf = {
+            'round_robin_task_cache_size': '3000',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual(x.round_robin_task_cache_size, 3000)
+
+    def test_init_round_robin_task_cache_size_invalid(self):
+        conf = {
             'round_robin_task_cache_size': '-2.x',
         }
         with self.assertRaises(ValueError) as ctx:
             expirer.ObjectExpirer(conf, logger=self.logger,
                                   swift=self.fake_swift)
         self.assertIn('invalid literal for int', str(ctx.exception))
+
+    def test_init_task_container_iteration_strategy_default(self):
+        conf = {}
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("legacy", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_legacy(self):
+        conf = {
+            'task_container_iteration_strategy': 'legacy',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("legacy", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_randomized(self):
+        conf = {
+            'task_container_iteration_strategy': 'randomized',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("randomized", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_invalid(self):
+        conf = {
+            'task_container_iteration_strategy': 'next-great-thing',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("legacy", x.task_container_iteration_strategy)
+        self.assertEqual([
+            "Unrecognized config value: 'task_container_iteration_strategy "
+            "= next-great-thing' (using legacy)"
+        ], self.logger.get_lines_for_level('warning'))
 
     def test_init_internal_client_log_name(self):
         def _do_test_init_ic_log_name(conf, exp_internal_client_log_name):
@@ -1384,26 +1507,18 @@ class TestObjectExpirer(TestCase):
 
     def _expirer_run_once_with_mocks(
             self, now=None, stub_shuffle=None,
-            stub_pop_queue=None,
-            stub_max_task_container_to_cache=None):
+            stub_pop_queue=None):
         """
         call self.expirer.run_once() with some things (optionally) stubbed out
         """
         now = now or time()
         stub_shuffle = stub_shuffle or random.shuffle
-        stub_max_task_container_to_cache = (
-            stub_max_task_container_to_cache
-            if stub_max_task_container_to_cache is not None
-            else expirer.MAX_TASK_CONTAINER_TO_CACHE
-        )
         # IME abuse of MagicMock's call tracking will pop OOM
         memory_efficient_noop = lambda *args, **kwargs: None
         stub_pop_queue = stub_pop_queue or memory_efficient_noop
         memory_efficient_time = lambda: now
-        with mock.patch('swift.obj.expirer.MAX_TASK_CONTAINER_TO_CACHE',
-                        stub_max_task_container_to_cache), \
-                mock.patch.object(self.expirer, 'pop_queue',
-                                  stub_pop_queue), \
+        with mock.patch.object(self.expirer, 'pop_queue',
+                               stub_pop_queue), \
                 mock.patch('eventlet.sleep', memory_efficient_noop), \
                 mock.patch('swift.common.utils.timestamp.time.time',
                            memory_efficient_time), \
@@ -1475,17 +1590,18 @@ class TestObjectExpirer(TestCase):
         iteration; if you want to exercise a different scenario it's
         recommended you use those lower level helpers directly.
 
-        :param stub_shuffle: when provided this enables
-                             randomized_task_container_iteration and replaces
-                             the stdlib shuffle method; N.B. mocking stdlib
-                             shuffle would have no effect when
-                             randomized_task_container_iteration is disabled.
+        :param stub_shuffle: when provided this configures
+                             task_container_iteration_strategy to "randomized"
+                             and replaces the expirer's shuffle method; N.B.
+                             mocking shuffle would have no effect when
+                             task_container_iteration_strategy is "legacy".
         """
         now = time()
         num_days_before_now = 7
         num_days_after_now = 3
         if stub_shuffle:
-            self.conf.setdefault('randomized_task_container_iteration', 'true')
+            self.conf.setdefault('task_container_iteration_strategy',
+                                 'randomized')
         self.conf['round_robin_task_cache_size'] = 200
         containers_per_day = 10
         num_tasks_per_container = 100

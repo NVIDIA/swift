@@ -35,7 +35,14 @@ import datetime
 from swift.common.utils.base import md5, quote, split_path
 from swift.common.utils.timestamp import UTC
 from swift.common.utils.config import config_true_value
-from swift.common import statsd_client, exceptions
+from swift.common import statsd_client
+# common.utils imports a fully qualified common.exceptions so that
+# common.exceptions can import common.utils with out a circular import error
+# (if we only make reference to attributes of a module w/i our function/method
+# bodies fully qualifed module names can have their attributes lazily
+# evaluated); as the only other module with-in utils that imports exceptions:
+# we do the same here
+import swift.common.exceptions
 
 if six.PY2:
     from eventlet.green import httplib as green_http_client
@@ -351,7 +358,7 @@ class LogAdapter(logging.LoggerAdapter, object):
             if hasattr(exc, 'created_at'):
                 detail += ' after %0.2fs' % (time.time() - exc.created_at)
             emsg += ' (%s)' % detail
-            if isinstance(exc, exceptions.MessageTimeout):
+            if isinstance(exc, swift.common.exceptions.MessageTimeout):
                 if exc.msg:
                     emsg += ' %s' % exc.msg
         else:
@@ -728,20 +735,17 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
 
     # Setup logger with a StatsD client if so configured
     statsd_host = conf.get('log_statsd_host')
-    if statsd_host:
-        statsd_port = int(conf.get('log_statsd_port', 8125))
-        base_prefix = conf.get('log_statsd_metric_prefix', '')
-        default_sample_rate = float(conf.get(
-            'log_statsd_default_sample_rate', 1))
-        sample_rate_factor = float(conf.get(
-            'log_statsd_sample_rate_factor', 1))
-        if statsd_tail_prefix is None:
-            statsd_tail_prefix = name
-        logger.statsd_client = statsd_client.StatsdClient(
-            statsd_host, statsd_port, base_prefix, statsd_tail_prefix,
-            default_sample_rate, sample_rate_factor, logger=logger)
-    else:
-        logger.statsd_client = None
+    statsd_port = int(conf.get('log_statsd_port', 8125))
+    base_prefix = conf.get('log_statsd_metric_prefix', '')
+    default_sample_rate = float(conf.get(
+        'log_statsd_default_sample_rate', 1))
+    sample_rate_factor = float(conf.get(
+        'log_statsd_sample_rate_factor', 1))
+    if statsd_tail_prefix is None:
+        statsd_tail_prefix = name
+    logger.statsd_client = statsd_client.StatsdClient(
+        statsd_host, statsd_port, base_prefix, statsd_tail_prefix,
+        default_sample_rate, sample_rate_factor, logger=logger)
 
     adapted_logger = LogAdapter(logger, name)
     other_handlers = conf.get('log_custom_handlers', None)

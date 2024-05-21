@@ -86,15 +86,24 @@ def extract_expirer_bytes_from_ctype(content_type):
     return bytes_size
 
 
-def embed_expirer_bytes_in_ctype(content_type, bytes_size):
+def embed_expirer_bytes_in_ctype(content_type, metadata):
     """
-    Embed number of bytes into content-type.
+    Embed number of bytes into content-type.  The bytes can come from
+    content-length on regular objects of the swift_bytes in the objects
+    content-length when the object is an MPU/SLO.
 
     :param content_type: a content-type string
-    :param bytes: a number representing the amout of bytes
+    :param metadata: a dict, from Diskfile metadata
     :return: str
     """
-    return "%s;swift_expirer_bytes=%d" % (content_type, int(bytes_size))
+    # all new SLO will have this key
+    slo_size = metadata.get('X-Object-Sysmeta-Slo-Size')
+    if slo_size is not None:
+        report_bytes = slo_size
+    else:
+        # as best I can tell this key is required by df.open
+        report_bytes = metadata['Content-Length']
+    return "%s;swift_expirer_bytes=%d" % (content_type, int(report_bytes))
 
 
 def read_conf_for_delay_reaping_times(conf):
@@ -222,6 +231,31 @@ class ObjectExpirer(Daemon):
         self.round_robin_task_cache_size = int(
             conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
 
+        valid_task_container_iteration_strategies = {'legacy', 'randomized'}
+        self.task_container_iteration_strategy = conf.get(
+            'task_container_iteration_strategy', 'legacy')
+        # XXX temporary shim to support the un-released configuration option
+        if config_true_value(conf.get(
+                'randomized_task_container_iteration', 'false')):
+            self.task_container_iteration_strategy = "randomized"
+        # randomized task container iteration can be useful if there's lots of
+        # tasks in the queue under a configured delay_reaping
+        if self.task_container_iteration_strategy not in \
+                valid_task_container_iteration_strategies:
+            self.logger.warning(
+                "Unrecognized config value: "
+                "'task_container_iteration_strategy = %s' "
+                "(using legacy)",
+                self.task_container_iteration_strategy)
+            self.task_container_iteration_strategy = "legacy"
+
+        # with lots of nodes and lots of tasks a large cache size can
+        # significantly delay processing; and caching tasks to round_robin
+        # target container order may be less necessary if there's only a few
+        # target containers or with randomized task container iteration
+        self.round_robin_task_cache_size = int(
+            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
+
     def read_conf_for_queue_access(self, swift):
         self.expiring_objects_account = AUTO_CREATE_ACCOUNT_PREFIX + \
             (self.conf.get('expiring_objects_account_name') or
@@ -346,30 +380,17 @@ class ObjectExpirer(Daemon):
         """
         Yields (task_account, task_container) tuples under the task_account if
         the delete at timestamp of task_container is past.
-
-        N.B. When randomized_task_container_iteration is enabled, this method
-        "batches" the pages of the account listings so that it can yield the
-        task_containers in a randomized order.
         """
         container_list = []
-
         for c in self.swift.iter_containers(task_account,
                                             prefix=self.task_container_prefix):
             task_container = str(c['name'])
             timestamp = self.delete_at_time_of_task_container(task_container)
             if timestamp > Timestamp.now():
                 break
-            if not self.randomized_task_container_iteration:
-                yield task_account, task_container
-                # we never append to container_list
-                continue
             container_list.append(task_container)
-            if len(container_list) > MAX_TASK_CONTAINER_TO_CACHE:
-                shuffle(container_list)
-                for task_container in container_list:
-                    yield task_account, task_container
-                container_list = []
-        shuffle(container_list)
+        if self.task_container_iteration_strategy == 'randomized':
+            shuffle(container_list)
         for task_container in container_list:
             yield task_account, task_container
 

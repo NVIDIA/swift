@@ -14,7 +14,9 @@
 
 from collections import Counter
 import json
+import os
 import random
+from tempfile import mkdtemp
 import time
 import uuid
 import unittest
@@ -31,6 +33,9 @@ from test.probe.brain import BrainSplitter
 
 from swiftclient import client
 from swiftclient.exceptions import ClientException
+
+from test.s3api import get_s3_client
+from boto3.s3.transfer import TransferConfig
 
 
 class TestObjectExpirer(ReplProbeTest):
@@ -609,6 +614,67 @@ class TestObjectExpirer(ReplProbeTest):
         expected_byte_size_counts = {t1_content_length: 3}
 
         self.assertEqual(expected_byte_size_counts, byte_size_counts)
+
+    def test_expirer_object_bytes_s3api_mpu(self):
+        # a mpu is a form an swift SLO, this same test applies but we create
+        # the SLO using boto3 for extra coverage
+        s3api_info = self.cluster_info.get('s3api', {})
+        if not s3api_info:
+            raise unittest.SkipTest('s3api not enabled')
+
+        self.s3 = get_s3_client(1)
+
+        self.bucket_name = 'bucket-%s' % uuid.uuid4()
+        self.mpu_name = 'mpu-%s' % uuid.uuid4()
+
+        self.s3.create_bucket(Bucket=self.bucket_name)
+
+        chunksize = 5 * 2 ** 20
+        num_chunks = 3
+
+        self.tempdir = mkdtemp()
+        filename = os.path.join(self.tempdir, 'big.file')
+        with open(filename, 'wb') as f:
+            c = 'a'
+            for i in range(num_chunks):
+                c = chr(ord(c) + i)
+                chunk = c.encode() * chunksize
+                f.write(chunk)
+        expected_size = chunksize * num_chunks
+
+        config = TransferConfig(multipart_threshold=chunksize,
+                                multipart_chunksize=chunksize)
+        self.s3.upload_file(filename, self.bucket_name, self.mpu_name,
+                            Config=config)
+
+        # set expiration using swift API
+        client.post_object(self.url, self.token,
+                           self.bucket_name, self.mpu_name,
+                           headers={
+                               'X-Delete-After': '1',
+                           })
+
+        # Run the container updater once to register new container containing
+        # expirey queue entry
+        Manager(['container-updater']).once()
+
+        # Find the name of the container containing the expiring object
+        expiring_containers = list(
+            self.client.iter_containers('.expiring_objects')
+        )
+        self.assertEqual(1, len(expiring_containers))
+        expiring_container = expiring_containers[0]
+        expiring_container_name = expiring_container['name']
+
+        # Verify that there is one expiring object
+        expiring_objects = list(
+            self.client.iter_objects('.expiring_objects',
+                                     expiring_container_name)
+        )
+        self.assertEqual(1, len(expiring_objects))
+        found_bytes = extract_expirer_bytes_from_ctype(
+            expiring_objects[0]['content_type'])
+        self.assertEqual(found_bytes, expected_size)
 
     def _test_expirer_delete_outdated_object_version(self, object_exists):
         # This test simulates a case where the expirer tries to delete

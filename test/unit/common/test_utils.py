@@ -139,21 +139,6 @@ class MockOs(object):
             return getattr(os, name)
 
 
-class MockUdpSocket(object):
-    def __init__(self, sendto_errno=None):
-        self.sent = []
-        self.sendto_errno = sendto_errno
-
-    def sendto(self, data, target):
-        if self.sendto_errno:
-            raise socket.error(self.sendto_errno,
-                               'test errno %s' % self.sendto_errno)
-        self.sent.append((data, target))
-
-    def close(self):
-        pass
-
-
 class MockSys(object):
 
     def __init__(self):
@@ -5887,6 +5872,22 @@ class TestSwiftLoggerAdapter(unittest.TestCase):
         self.assertEqual(logger.thread_locals, locals2)
         logger.thread_locals = (None, None)
 
+    @reset_logger_state
+    def test_thread_locals_more(self):
+        logger = utils.get_logger(None)
+        # test the setter
+        logger.thread_locals = ('id', 'ip')
+        self.assertEqual(logger.thread_locals, ('id', 'ip'))
+        # reset
+        logger.thread_locals = (None, None)
+        self.assertEqual(logger.thread_locals, (None, None))
+        logger.txn_id = '1234'
+        logger.client_ip = '1.2.3.4'
+        self.assertEqual(logger.thread_locals, ('1234', '1.2.3.4'))
+        logger.txn_id = '5678'
+        logger.client_ip = '5.6.7.8'
+        self.assertEqual(logger.thread_locals, ('5678', '5.6.7.8'))
+
     def test_exception(self):
         # verify that the adapter routes exception calls to utils.LogAdapter
         # for special case handling
@@ -9129,6 +9130,76 @@ class TestShardRangeList(unittest.TestCase):
                          do_test([utils.ShardRange.ACTIVE]))
 
 
+class TestFsync(unittest.TestCase):
+
+    def test_no_fdatasync(self):
+        called = []
+
+        class NoFdatasync(object):
+            pass
+
+        def fsync(fd):
+            called.append(fd)
+
+        with patch('swift.common.utils.os', NoFdatasync()):
+            with patch('swift.common.utils.fsync', fsync):
+                utils.fdatasync(12345)
+                self.assertEqual(called, [12345])
+
+    def test_yes_fdatasync(self):
+        called = []
+
+        class YesFdatasync(object):
+
+            def fdatasync(self, fd):
+                called.append(fd)
+
+        with patch('swift.common.utils.os', YesFdatasync()):
+            utils.fdatasync(12345)
+            self.assertEqual(called, [12345])
+
+    def test_fsync_bad_fullsync(self):
+
+        class FCNTL(object):
+
+            F_FULLSYNC = 123
+
+            def fcntl(self, fd, op):
+                raise IOError(18)
+
+        with patch('swift.common.utils.fcntl', FCNTL()):
+            self.assertRaises(OSError, lambda: utils.fsync(12345))
+
+    def test_fsync_f_fullsync(self):
+        called = []
+
+        class FCNTL(object):
+
+            F_FULLSYNC = 123
+
+            def fcntl(self, fd, op):
+                called[:] = [fd, op]
+                return 0
+
+        with patch('swift.common.utils.fcntl', FCNTL()):
+            utils.fsync(12345)
+            self.assertEqual(called, [12345, 123])
+
+    def test_fsync_no_fullsync(self):
+        called = []
+
+        class FCNTL(object):
+            pass
+
+        def fsync(fd):
+            called.append(fd)
+
+        with patch('swift.common.utils.fcntl', FCNTL()):
+            with patch('os.fsync', fsync):
+                utils.fsync(12345)
+                self.assertEqual(called, [12345])
+
+
 @patch('ctypes.get_errno')
 @patch.object(utils.libc, '_sys_posix_fallocate')
 @patch.object(utils.libc, '_sys_fallocate')
@@ -9676,6 +9747,51 @@ class TestClosingIterator(unittest.TestCase):
         self.assertEqual([1, 1], [i.close_call_count for i in others])
 
 
+class TestClosingMapper(unittest.TestCase):
+    def test_close(self):
+        calls = []
+
+        def func(args):
+            calls.append(args)
+            return sum(args)
+
+        wrapped = FakeIterable([(2, 3), (4, 5)])
+        other = FakeIterable([])
+        it = utils.ClosingMapper(func, wrapped, [other])
+        actual = [x for x in it]
+        self.assertEqual([(2, 3), (4, 5)], calls)
+        self.assertEqual([5, 9], actual)
+        self.assertEqual(1, wrapped.close_call_count)
+        self.assertEqual(1, other.close_call_count)
+        # check against result of map()
+        wrapped = FakeIterable([(2, 3), (4, 5)])
+        mapped = [x for x in map(func, wrapped)]
+        self.assertEqual(mapped, actual)
+
+    def test_function_raises_exception(self):
+        calls = []
+
+        class TestExc(Exception):
+            pass
+
+        def func(args):
+            calls.append(args)
+            if len(calls) > 1:
+                raise TestExc('boom')
+            else:
+                return sum(args)
+
+        wrapped = FakeIterable([(2, 3), (4, 5), (6, 7)])
+        it = utils.ClosingMapper(func, wrapped)
+        self.assertEqual(5, next(it))
+        with self.assertRaises(TestExc) as cm:
+            next(it)
+        self.assertIn('boom', str(cm.exception))
+        self.assertEqual(1, wrapped.close_call_count)
+        with self.assertRaises(StopIteration) as cm:
+            next(it)
+
+
 class TestCloseableChain(unittest.TestCase):
     def test_closeable_chain_iterates(self):
         test_iter1 = FakeIterable([1])
@@ -9700,7 +9816,8 @@ class TestCloseableChain(unittest.TestCase):
         # close
         chain = utils.CloseableChain([1, 2], [3])
         chain.close()
-        self.assertEqual([1, 2, 3], [x for x in chain])
+        # read after close raises StopIteration
+        self.assertEqual([], [x for x in chain])
 
         # check with generator in the chain
         generator_closed = [False]

@@ -59,8 +59,7 @@ from swift.common.exceptions import DiskFileNotExist, DiskFileQuarantined, \
     DiskFileDeviceUnavailable, DiskFileDeleted, DiskFileNotOpen, \
     DiskFileError, ReplicationLockTimeout, DiskFileCollision, \
     DiskFileExpired, SwiftException, DiskFileNoSpace, \
-    DiskFileXattrNotSupported, PartitionLockTimeout, \
-    DiskFileMetadataUnavailable
+    DiskFileXattrNotSupported, PartitionLockTimeout, DiskFileStateChanged
 from swift.common.storage_policy import (
     POLICIES, get_policy_string, StoragePolicy, ECStoragePolicy, REPL_POLICY,
     EC_POLICY, PolicyError)
@@ -867,16 +866,16 @@ class TestDiskFileModuleMethods(unittest.TestCase):
         with open(path, 'wb') as fd:
             diskfile.write_metadata(fd, metadata)
 
-        actual = diskfile.read_file_metadata(path)
+        actual = diskfile._read_file_metadata(path)
         self.assertEqual(metadata, actual)
         with open(path, 'rb') as fd:
             os.unlink(path)
-            actual = diskfile.read_file_metadata(fd)
+            actual = diskfile._read_file_metadata(fd)
         self.assertEqual(metadata, actual)
 
     def test_read_file_metadata_nonexistent_file(self):
-        with self.assertRaises(DiskFileMetadataUnavailable):
-            diskfile.read_file_metadata('nonexistent')
+        with self.assertRaises(DiskFileStateChanged):
+            diskfile._read_file_metadata('nonexistent')
 
     def test_read_metadata_nonexistent_file(self):
         with self.assertRaises(DiskFileNotExist):
@@ -3152,7 +3151,7 @@ class TestECDiskFileManager(DiskFileManagerMixin, BaseTestCase):
         with create_files(class_under_test, good_files), \
                 mock.patch('swift.obj.diskfile.os.listdir',
                            side_effect=deleting_listdir), \
-                self.assertRaises(DiskFileNotExist):
+                self.assertRaises(DiskFileStateChanged):
             class_under_test.open()
 
     def test_verify_ondisk_files(self):
@@ -5447,7 +5446,7 @@ class DiskFileMixin(BaseDiskFileTestMixin):
 
     def test_open_data_file_concurrently_unlinked(self):
         # if a .data file is cleaned up while diskfile is being opened then
-        # DiskFileNotExist can be raised
+        # DiskFileStateChanged can be raised
         ts_data = self.ts()
         ts_meta1 = self.ts()
         self._create_test_file(b'1234567890', timestamp=ts_data)
@@ -5468,12 +5467,12 @@ class DiskFileMixin(BaseDiskFileTestMixin):
             return file_info
 
         with mock.patch.object(df, '_get_ondisk_files', fake_get_ondisk_files):
-            with self.assertRaises(DiskFileNotExist):
+            with self.assertRaises(DiskFileStateChanged):
                 df.open()
 
     def test_open_meta_file_concurrently_unlinked(self):
         # if a .meta file is cleaned up while diskfile is being opened then
-        # DiskFileMetadataUnavailable can be raised
+        # DiskFileStateChanged can be raised
         ts_data = self.ts()
         ts_meta1 = self.ts()
         ts_meta2 = self.ts()
@@ -5497,7 +5496,7 @@ class DiskFileMixin(BaseDiskFileTestMixin):
             return file_info
 
         with mock.patch.object(df, '_get_ondisk_files', fake_get_ondisk_files):
-            with self.assertRaises(DiskFileMetadataUnavailable):
+            with self.assertRaises(DiskFileStateChanged):
                 df.open()
 
         df = self._simple_get_diskfile()

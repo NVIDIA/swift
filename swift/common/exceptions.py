@@ -81,9 +81,12 @@ class DiskFileNotExist(DiskFileError):
     pass
 
 
-class DiskFileMetadataUnavailable(DiskFileError):
-    # the DiskFile exists but could not be opened for some transient reason
-    pass
+class DiskFileStateChanged(DiskFileError):
+    """
+    Raised when state of a DiskFile changes while it is being opened (e.g. the
+    list of on-disk files changes). Retrying the DiskFile interface may
+    succeed.
+    """
 
 
 class DiskFileDeleted(DiskFileNotExist):

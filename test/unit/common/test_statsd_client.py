@@ -29,17 +29,35 @@ from mock import patch
 
 
 from swift.common import utils
+from swift.common import statsd_client
 from swift.common.statsd_client import StatsdClient
 
 from test.debug_logger import debug_logger
-from test.unit.common.test_utils import MockUdpSocket, reset_logger_state
 from swift.common.swob import Response
 
 
-class TestStatsdLogging(unittest.TestCase):
+class MockUdpSocket(object):
+    def __init__(self, sendto_errno=None):
+        self.sent = []
+        self.sendto_errno = sendto_errno
+
+    def sendto(self, data, target):
+        if self.sendto_errno:
+            raise socket.error(self.sendto_errno,
+                               'test errno %s' % self.sendto_errno)
+        self.sent.append((data, target))
+        return len(data)
+
+    def close(self):
+        pass
+
+
+class BaseTestStasdClient(unittest.TestCase):
     def setUp(self):
+        self.getaddrinfo_calls = []
 
         def fake_getaddrinfo(host, port, *args):
+            self.getaddrinfo_calls.append((host, port))
             # this is what a real getaddrinfo('localhost', port,
             # socket.AF_INET) returned once
             return [(socket.AF_INET,      # address family
@@ -53,22 +71,56 @@ class TestStatsdLogging(unittest.TestCase):
                      '',
                      ('127.0.0.1', port))]
 
-        self.real_getaddrinfo = utils.socket.getaddrinfo
+        self.real_getaddrinfo = statsd_client.socket.getaddrinfo
         self.getaddrinfo_patcher = mock.patch.object(
-            utils.socket, 'getaddrinfo', fake_getaddrinfo)
+            statsd_client.socket, 'getaddrinfo', fake_getaddrinfo)
         self.mock_getaddrinfo = self.getaddrinfo_patcher.start()
         self.addCleanup(self.getaddrinfo_patcher.stop)
 
+
+class TestStatsdClient(BaseTestStasdClient):
+    def test_init_host(self):
+        client = StatsdClient('myhost', 1234)
+        self.assertEqual([('myhost', 1234)], self.getaddrinfo_calls)
+        with mock.patch.object(client, '_open_socket') as mock_open:
+            self.assertIs(client.increment('tunafish'),
+                          mock_open.return_value.sendto.return_value)
+        self.assertEqual(mock_open.mock_calls, [
+            mock.call(),
+            mock.call().sendto(b'tunafish:1|c', ('myhost', 1234)),
+            mock.call().close(),
+        ])
+
+    def test_init_host_is_none(self):
+        client = StatsdClient(None, None)
+        self.assertIsNone(client._host)
+        self.assertFalse(self.getaddrinfo_calls)
+        with mock.patch.object(client, '_open_socket') as mock_open:
+            self.assertIsNone(client.increment('tunafish'))
+        self.assertFalse(mock_open.mock_calls)
+        self.assertFalse(self.getaddrinfo_calls)
+
+
+class TestStatsdLogging(BaseTestStasdClient):
     def test_get_logger_statsd_client_not_specified(self):
         logger = utils.get_logger({}, 'some-name', log_route='some-route')
-        # white-box construction validation
-        self.assertIsNone(logger.logger.statsd_client)
+        # white-box construction validation:
+        # there may be a client instance, but it won't send anything;
+        # won't even open a socket
+        self.assertIsInstance(logger.logger.statsd_client,
+                              statsd_client.StatsdClient)
+        self.assertIsNone(logger.logger.statsd_client._host)
+        with mock.patch.object(logger.logger.statsd_client,
+                               '_open_socket') as mock_open:
+            logger.increment('tunafish')
+        self.assertFalse(mock_open.mock_calls)
 
     def test_get_logger_statsd_client_defaults(self):
         logger = utils.get_logger({'log_statsd_host': 'some.host.com'},
                                   'some-name', log_route='some-route')
         # white-box construction validation
-        self.assertIsInstance(logger.logger.statsd_client, StatsdClient)
+        self.assertIsInstance(logger.logger.statsd_client,
+                              statsd_client.StatsdClient)
         self.assertEqual(logger.logger.statsd_client._host, 'some.host.com')
         self.assertEqual(logger.logger.statsd_client._port, 8125)
         self.assertEqual(logger.logger.statsd_client._prefix, 'some-name.')
@@ -181,18 +233,18 @@ class TestStatsdLogging(unittest.TestCase):
                 return [(socket.AF_INET6, 'blah', 'blah', 'blah',
                         ('::1', int(port), 0, 0))]
 
-        with mock.patch.object(utils.socket, 'getaddrinfo',
+        with mock.patch.object(statsd_client.socket, 'getaddrinfo',
                                new=stub_getaddrinfo_both_ipv4_and_ipv6):
             logger = utils.get_logger({
                 'log_statsd_host': 'localhost',
                 'log_statsd_port': '9876',
             }, 'some-name', log_route='some-route')
-        statsd_client = logger.logger.statsd_client
+        client = logger.logger.statsd_client
 
-        self.assertEqual(statsd_client._sock_family, socket.AF_INET)
-        self.assertEqual(statsd_client._target, ('localhost', 9876))
+        self.assertEqual(client._sock_family, socket.AF_INET)
+        self.assertEqual(client._target, ('localhost', 9876))
 
-        got_sock = statsd_client._open_socket()
+        got_sock = client._open_socket()
         self.assertEqual(got_sock.family, socket.AF_INET)
 
     def test_ipv4_instantiation_and_socket_creation(self):
@@ -234,34 +286,35 @@ class TestStatsdLogging(unittest.TestCase):
                      '',
                      ('::1', port, 0, 0))]
 
-        with mock.patch.object(utils.logs.socket,
+        with mock.patch.object(statsd_client.socket,
                                'getaddrinfo', fake_getaddrinfo):
             logger = utils.get_logger({
                 'log_statsd_host': '::1',
                 'log_statsd_port': '9876',
             }, 'some-name', log_route='some-route')
-        statsd_client = logger.logger.statsd_client
+        client = logger.logger.statsd_client
         self.assertEqual([socket.AF_INET, socket.AF_INET6], calls)
-        self.assertEqual(statsd_client._sock_family, socket.AF_INET6)
-        self.assertEqual(statsd_client._target, ('::1', 9876, 0, 0))
+        self.assertEqual(client._sock_family, socket.AF_INET6)
+        self.assertEqual(client._target, ('::1', 9876, 0, 0))
 
-        got_sock = statsd_client._open_socket()
+        got_sock = client._open_socket()
         self.assertEqual(got_sock.family, socket.AF_INET6)
 
     def test_bad_hostname_instantiation(self):
-        with mock.patch.object(utils.socket, 'getaddrinfo',
-                               side_effect=utils.socket.gaierror("whoops")):
+        stub_err = statsd_client.socket.gaierror('whoops')
+        with mock.patch.object(statsd_client.socket, 'getaddrinfo',
+                               side_effect=stub_err):
             logger = utils.get_logger({
                 'log_statsd_host': 'i-am-not-a-hostname-or-ip',
                 'log_statsd_port': '9876',
             }, 'some-name', log_route='some-route')
-        statsd_client = logger.logger.statsd_client
+        client = logger.logger.statsd_client
 
-        self.assertEqual(statsd_client._sock_family, socket.AF_INET)
-        self.assertEqual(statsd_client._target,
+        self.assertEqual(client._sock_family, socket.AF_INET)
+        self.assertEqual(client._target,
                          ('i-am-not-a-hostname-or-ip', 9876))
 
-        got_sock = statsd_client._open_socket()
+        got_sock = client._open_socket()
         self.assertEqual(got_sock.family, socket.AF_INET)
         # Maybe the DNS server gets fixed in a bit and it starts working... or
         # maybe the DNS record hadn't propagated yet.  In any case, failed
@@ -282,18 +335,19 @@ class TestStatsdLogging(unittest.TestCase):
                      '',
                      ('::1', port, 0, 0))]
 
-        with mock.patch.object(utils.socket, 'getaddrinfo', fake_getaddrinfo):
+        with mock.patch.object(statsd_client.socket, 'getaddrinfo',
+                               fake_getaddrinfo):
             logger = utils.get_logger({
                 'log_statsd_host': '::1',
                 'log_statsd_port': '9876',
             }, 'some-name', log_route='some-route')
-        statsd_client = logger.logger.statsd_client
+        client = logger.logger.statsd_client
 
         fl = debug_logger()
-        statsd_client.logger = fl
+        client.logger = fl
         mock_socket = MockUdpSocket()
 
-        statsd_client._open_socket = lambda *_: mock_socket
+        client._open_socket = lambda *_: mock_socket
         logger.increment('tunafish')
         self.assertEqual(fl.get_lines_for_level('warning'), [])
         self.assertEqual(mock_socket.sent,
@@ -301,11 +355,11 @@ class TestStatsdLogging(unittest.TestCase):
 
     def test_no_exception_when_cant_send_udp_packet(self):
         logger = utils.get_logger({'log_statsd_host': 'some.host.com'})
-        statsd_client = logger.logger.statsd_client
+        client = logger.logger.statsd_client
         fl = debug_logger()
-        statsd_client.logger = fl
+        client.logger = fl
         mock_socket = MockUdpSocket(sendto_errno=errno.EPERM)
-        statsd_client._open_socket = lambda *_: mock_socket
+        client._open_socket = lambda *_: mock_socket
         logger.increment('tunafish')
         expected = ["Error sending UDP message to ('some.host.com', 8125): "
                     "[Errno 1] test errno 1"]
@@ -316,17 +370,18 @@ class TestStatsdLogging(unittest.TestCase):
 
         mock_socket = MockUdpSocket()
         # encapsulation? what's that?
-        statsd_client = logger.logger.statsd_client
-        self.assertTrue(statsd_client.random is random.random)
+        client = logger.logger.statsd_client
+        self.assertTrue(client.random is random.random)
 
-        statsd_client._open_socket = lambda *_: mock_socket
-        statsd_client.random = lambda: 0.50001
+        client._open_socket = lambda *_: mock_socket
+        client.random = lambda: 0.50001
 
-        logger.increment('tribbles', sample_rate=0.5)
+        self.assertIsNone(logger.increment('tribbles', sample_rate=0.5))
         self.assertEqual(len(mock_socket.sent), 0)
 
-        statsd_client.random = lambda: 0.49999
-        logger.increment('tribbles', sample_rate=0.5)
+        client.random = lambda: 0.49999
+        rv = logger.increment('tribbles', sample_rate=0.5)
+        self.assertIsInstance(rv, int)
         self.assertEqual(len(mock_socket.sent), 1)
 
         payload = mock_socket.sent[0][0]
@@ -342,16 +397,16 @@ class TestStatsdLogging(unittest.TestCase):
 
         mock_socket = MockUdpSocket()
         # encapsulation? what's that?
-        statsd_client = logger.logger.statsd_client
-        self.assertTrue(statsd_client.random is random.random)
+        client = logger.logger.statsd_client
+        self.assertTrue(client.random is random.random)
 
-        statsd_client._open_socket = lambda *_: mock_socket
-        statsd_client.random = lambda: effective_sample_rate + 0.001
+        client._open_socket = lambda *_: mock_socket
+        client.random = lambda: effective_sample_rate + 0.001
 
         logger.increment('tribbles')
         self.assertEqual(len(mock_socket.sent), 0)
 
-        statsd_client.random = lambda: effective_sample_rate - 0.001
+        client.random = lambda: effective_sample_rate - 0.001
         logger.increment('tribbles')
         self.assertEqual(len(mock_socket.sent), 1)
 
@@ -362,7 +417,7 @@ class TestStatsdLogging(unittest.TestCase):
         self.assertTrue(payload.endswith(suffix), payload)
 
         effective_sample_rate = 0.587 * 0.91
-        statsd_client.random = lambda: effective_sample_rate - 0.001
+        client.random = lambda: effective_sample_rate - 0.001
         logger.increment('tribbles', sample_rate=0.587)
         self.assertEqual(len(mock_socket.sent), 2)
 
@@ -707,86 +762,3 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
         self.assertStat('alpha.beta.another.counter:3|c|@0.9912',
                         self.logger.update_stats, 'another.counter', 3,
                         sample_rate=0.9912)
-
-    @reset_logger_state
-    def test_thread_locals(self):
-        logger = utils.get_logger(None)
-        # test the setter
-        logger.thread_locals = ('id', 'ip')
-        self.assertEqual(logger.thread_locals, ('id', 'ip'))
-        # reset
-        logger.thread_locals = (None, None)
-        self.assertEqual(logger.thread_locals, (None, None))
-        logger.txn_id = '1234'
-        logger.client_ip = '1.2.3.4'
-        self.assertEqual(logger.thread_locals, ('1234', '1.2.3.4'))
-        logger.txn_id = '5678'
-        logger.client_ip = '5.6.7.8'
-        self.assertEqual(logger.thread_locals, ('5678', '5.6.7.8'))
-
-    def test_no_fdatasync(self):
-        called = []
-
-        class NoFdatasync(object):
-            pass
-
-        def fsync(fd):
-            called.append(fd)
-
-        with patch('swift.common.utils.os', NoFdatasync()):
-            with patch('swift.common.utils.fsync', fsync):
-                utils.fdatasync(12345)
-                self.assertEqual(called, [12345])
-
-    def test_yes_fdatasync(self):
-        called = []
-
-        class YesFdatasync(object):
-
-            def fdatasync(self, fd):
-                called.append(fd)
-
-        with patch('swift.common.utils.os', YesFdatasync()):
-            utils.fdatasync(12345)
-            self.assertEqual(called, [12345])
-
-    def test_fsync_bad_fullsync(self):
-
-        class FCNTL(object):
-
-            F_FULLSYNC = 123
-
-            def fcntl(self, fd, op):
-                raise IOError(18)
-
-        with patch('swift.common.utils.fcntl', FCNTL()):
-            self.assertRaises(OSError, lambda: utils.fsync(12345))
-
-    def test_fsync_f_fullsync(self):
-        called = []
-
-        class FCNTL(object):
-
-            F_FULLSYNC = 123
-
-            def fcntl(self, fd, op):
-                called[:] = [fd, op]
-                return 0
-
-        with patch('swift.common.utils.fcntl', FCNTL()):
-            utils.fsync(12345)
-            self.assertEqual(called, [12345, 123])
-
-    def test_fsync_no_fullsync(self):
-        called = []
-
-        class FCNTL(object):
-            pass
-
-        def fsync(fd):
-            called.append(fd)
-
-        with patch('swift.common.utils.fcntl', FCNTL()):
-            with patch('os.fsync', fsync):
-                utils.fsync(12345)
-                self.assertEqual(called, [12345])

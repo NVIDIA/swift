@@ -93,20 +93,23 @@
 # delay_reaping_AUTH_test/special%0Achars%3Dshould%20be%20quoted
 # N.B. By default no delay_reaping value is configured for any accounts or
 # containers.
-#
-# When false each cycle the expirer will process all task containers oldest to
-# newest; N.B. this does not guarantee all tasks are processed oldest to
-# newest because of how tasks are randomly distributed into 100 containers for
-# each day's worth of expirations.  Randomized task container iteration may help
-# avoid longer start-up delays if using large values w/ delay_reaping or create
-# less hot spots listing task_containers from many processes.
-# randomized_task_container_iteration = false
-#
+
+# The order in which expired objects are reaped is always random to a degree,
+# because of how tasks are randomly distributed into 100 containers for each
+# day's worth of expirations.  However the default object-expirer task
+# container iteration strategy "legacy" will tend to reap your "most expired
+# days" tasks *first* if you've had a node offline for awhile.  Alternatively,
+# the expirer supports a task container iteration strategy "randomized" which
+# will result in MORE randomness to the order in which expired objects are
+# reaped and may be useful to create less hot spots listing task_containers
+# from many processes.
+# task_container_iteration_strategy = legacy
+
 # Number of tasks objects to cache before processing.  With many nodes it may
 # take some time to fill a larger cache_size but may also have a better chance
 # to distribute DELETEs to multiple target containers.
 # round_robin_task_cache_size = 100000
-#
+
 # recon_cache_path = /var/cache/swift
 #
 # You can set scheduling priority of processes. Niceness values range from -20

@@ -566,7 +566,7 @@ class TestObjectController(BaseTestCase):
         test_req.headers['X-Timestamp'] = next(self.ts).internal
 
         # test requests concurrent with an on-disk file being unlinked...
-        orig_read_metadata = diskfile.read_file_metadata
+        orig_read_metadata = diskfile._read_file_metadata
         concurrent_resp = []
 
         def fake_read_metadata(fd, *args, **kwargs):
@@ -582,9 +582,9 @@ class TestObjectController(BaseTestCase):
                         concurrent_resp.append(resp.status_int)
             return orig_read_metadata(fd, *args, **kwargs)
 
-        # meta file listed but not found in read_file_metadata
+        # meta file listed but not found in _read_file_metadata
         timestamps = []
-        with mock.patch('swift.obj.diskfile.read_file_metadata',
+        with mock.patch('swift.obj.diskfile._read_file_metadata',
                         fake_read_metadata):
             resp = test_req.get_response(self.object_controller)
         self.assertEqual([t_put, t_post], timestamps)
@@ -9151,6 +9151,56 @@ class TestObjectController(BaseTestCase):
                 headers={'X-Timestamp': delete_timestamp})
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 404)
+
+        qdir = os.path.join(self.testdir, 'sda1', 'quarantined')
+        self.assertFalse(os.path.exists(qdir))
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'HEAD'},
+                            headers={'X-Timestamp': head_timestamp})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers['X-Timestamp'], put_timestamp)
+
+    def test_race_with_PUT_POST_PUT(self):
+        existing_timestamp = normalize_timestamp(time())
+        post_timestamp = normalize_timestamp(time() + 1)
+        put_timestamp = normalize_timestamp(time() + 2)
+        head_timestamp = normalize_timestamp(time() + 3)
+
+        # make a .data
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': existing_timestamp,
+                     'Content-Type': 'application/octet-stream'},
+            body=b'orig data')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # force a PUT between the listdir and read_metadata of a PUT
+        put_once = [False]
+        orig_listdir = os.listdir
+
+        def mock_listdir(path):
+            listing = orig_listdir(path)
+            if not put_once[0]:
+                put_once[0] = True
+                req = Request.blank(
+                    '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                    headers={'X-Timestamp': put_timestamp,
+                             'Content-Type': 'application/octet-stream'},
+                    body=b'some data')
+                resp = req.get_response(self.object_controller)
+                self.assertEqual(resp.status_int, 201)
+            return listing
+
+        with mock.patch('os.listdir', mock_listdir):
+            req = Request.blank(
+                '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'POST'},
+                headers={'X-Timestamp': post_timestamp})
+            resp = req.get_response(self.object_controller)
+            self.assertNotIn('X-Backend-Timestamp', resp.headers)
+            self.assertEqual(resp.status_int, 503)
 
         qdir = os.path.join(self.testdir, 'sda1', 'quarantined')
         self.assertFalse(os.path.exists(qdir))

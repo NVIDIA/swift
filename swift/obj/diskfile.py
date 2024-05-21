@@ -72,8 +72,7 @@ from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
     DiskFileDeleted, DiskFileError, DiskFileNotOpen, PathNotDir, \
     ReplicationLockTimeout, DiskFileExpired, DiskFileXattrNotSupported, \
-    DiskFileBadMetadataChecksum, PartitionLockTimeout, \
-    DiskFileMetadataUnavailable
+    DiskFileBadMetadataChecksum, PartitionLockTimeout, DiskFileStateChanged
 from swift.common.swob import multi_range_iterator
 from swift.common.storage_policy import (
     get_policy_string, split_policy_string, PolicyError, POLICIES,
@@ -201,7 +200,7 @@ def _decode_metadata(metadata, metadata_written_by_py3):
     return {to_str(k): to_str(v, k == b'name') for k, v in metadata.items()}
 
 
-def read_file_metadata(fd, add_missing_checksum=False):
+def _read_file_metadata(fd, add_missing_checksum=False):
     """
     Helper function to read the pickled metadata from an object file.
 
@@ -210,7 +209,10 @@ def read_file_metadata(fd, add_missing_checksum=False):
 
     :returns: dictionary of metadata
     :raises DiskFileXattrNotSupported: if the filesystem does not support xattr
-    :raises DiskFileMetadataUnavailable: if the file metadata could not be read
+    :raises DiskFileStateChanged: if the file metadata could not be read. It is
+        assumed that the caller perceived the file to exist, so the fact that
+        the file metadata cannot now be read suggests that the file state has
+        subsequently changed.
     :raises DiskFileBadMetadataChecksum: if the checksum of the read metadata
         does not match the stored checksum
     """
@@ -227,7 +229,7 @@ def read_file_metadata(fd, add_missing_checksum=False):
             logging.exception(msg, _get_filename(fd))
             raise DiskFileXattrNotSupported(e)
         if e.errno == errno.ENOENT:
-            raise DiskFileMetadataUnavailable()
+            raise DiskFileStateChanged()
         # TODO: we might want to re-raise errors that don't denote a missing
         # xattr here.  Seems to be ENODATA on linux and ENOATTR on BSD/OSX.
 
@@ -271,10 +273,8 @@ def read_metadata(fd, add_missing_checksum=False):
     """
     Helper function to read the pickled metadata from an object data file.
 
-    The only difference from ``read_file_metadata`` is that this function
-    raises ``DiskFileNotExist`` when the file cannot be read. That is only
-    appropriate if the file is a data file. For meta files callers should use
-    ``read_file_metadata`` which raises ``DiskFileMetadataUnavailable``.
+    The only difference from ``_read_file_metadata`` is that this function
+    raises ``DiskFileNotExist`` when the file cannot be read.
 
     :param fd: file descriptor or filename to load the metadata from
     :param add_missing_checksum: if set and checksum is missing, add it
@@ -285,8 +285,8 @@ def read_metadata(fd, add_missing_checksum=False):
         does not match the stored checksum
     """
     try:
-        return read_file_metadata(fd, add_missing_checksum)
-    except DiskFileMetadataUnavailable:
+        return _read_file_metadata(fd, add_missing_checksum)
+    except DiskFileStateChanged:
         raise DiskFileNotExist()
 
 
@@ -2754,7 +2754,7 @@ class BaseDiskFile(object):
         else:
             try:
                 metadata = self._read_and_validate_metadata(ts_file, ts_file)
-            except (DiskFileQuarantined, DiskFileMetadataUnavailable):
+            except (DiskFileQuarantined, DiskFileStateChanged):
                 # If the tombstone's corrupted, quarantine it and pretend it
                 # wasn't there
                 exc = DiskFileNotExist()
@@ -2868,14 +2868,14 @@ class BaseDiskFile(object):
         :returns: dictionary of metadata
         :raises DiskFileXattrNotSupported: if the filesystem does not support
             xattr
-        :raises DiskFileMetadataUnavailable: if the file metadata could not be
+        :raises DiskFileStateChanged: if the file metadata could not be
             read
         :raises DiskFileQuarantined: if an error occurred that caused the file
             to be quarantined
         """
         try:
-            return read_file_metadata(source, add_missing_checksum)
-        except (DiskFileXattrNotSupported, DiskFileMetadataUnavailable):
+            return _read_file_metadata(source, add_missing_checksum)
+        except (DiskFileXattrNotSupported, DiskFileStateChanged):
             raise
         except DiskFileBadMetadataChecksum as err:
             raise self._quarantine(quarantine_filename, str(err))
@@ -2919,6 +2919,7 @@ class BaseDiskFile(object):
         :param modernize: whether to update the on-disk files to the newest
                           format
         :returns: an opened data file pointer
+        :raises DiskFileStateChanged: if the on-disk files could not be read.
         :raises DiskFileError: various exceptions from
                     :func:`swift.obj.diskfile.DiskFile._verify_data_file`
         """
@@ -2926,17 +2927,11 @@ class BaseDiskFile(object):
             fp = open(data_file, 'rb')
         except IOError as e:
             if e.errno == errno.ENOENT:
-                raise DiskFileNotExist()
+                raise DiskFileStateChanged()
             raise
-        try:
-            self._datafile_metadata = self._read_and_validate_metadata(
-                fp, data_file,
-                add_missing_checksum=modernize)
-        except DiskFileMetadataUnavailable:
-            # not expected because an open file descriptor was passed, but
-            # handle it just in case
-            raise DiskFileNotExist()
-
+        self._datafile_metadata = self._read_and_validate_metadata(
+            fp, data_file,
+            add_missing_checksum=modernize)
         self._metadata = {}
         if meta_file:
             self._metafile_metadata = self._read_and_validate_metadata(

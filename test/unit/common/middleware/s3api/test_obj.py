@@ -722,6 +722,35 @@ class BaseS3ApiObj(object):
         # Check that s3api converts a Content-MD5 header into an etag.
         self.assertEqual(headers['etag'], etag)
 
+    def test_object_PUT_bad_hash(self):
+        # FakeSwift doesn't care if the etag matches, so we explicitly register
+        # the 422 that the proxy would have passed on from the object servers
+        self.swift.register('PUT', '/v1/AUTH_test/bucket/object',
+                            swob.HTTPUnprocessableEntity, {},
+                            'Unprocessable Entity')
+
+        bad_etag = md5(b'not-same-content').hexdigest()
+        content_md5 = binascii.b2a_base64(binascii.a2b_hex(bad_etag)).strip()
+        if not six.PY2:
+            content_md5 = content_md5.decode('ascii')
+
+        req = Request.blank(
+            '/bucket/object',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'x-amz-storage-class': 'STANDARD',
+                     'Content-MD5': content_md5,
+                     'Date': self.get_date_header()},
+            body=self.object_body)
+        req.date = datetime.now()
+        req.content_type = 'text/plain'
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '400')
+        self.assertEqual(self._get_error_code(body), 'BadDigest')
+        self.assertIn(b'Content-MD5', body)
+        self.assertEqual('/v1/AUTH_test/bucket/object',
+                         req.environ.get('swift.backend_path'))
+
     def test_object_PUT_quota_exceeded(self):
         etag = self.response_headers['etag']
         content_md5 = binascii.b2a_base64(binascii.a2b_hex(etag)).strip()
@@ -778,6 +807,18 @@ class BaseS3ApiObj(object):
                          req.environ.get('swift.backend_path'))
 
     def test_object_PUT_v4_bad_hash(self):
+        orig_app = self.s3api.app
+
+        def error_catching_app(env, start_response):
+            try:
+                return orig_app(env, start_response)
+            except Exception:
+                self.logger.exception('uh oh')
+                start_response('599 Uh Oh', [])
+                return [b'']
+
+        self.s3api.app = error_catching_app
+
         req = Request.blank(
             '/bucket/object',
             environ={'REQUEST_METHOD': 'PUT'},
@@ -798,6 +839,7 @@ class BaseS3ApiObj(object):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '400')
         self.assertEqual(self._get_error_code(body), 'BadDigest')
+        self.assertIn(b'X-Amz-Content-SHA56', body)
         self.assertEqual('/v1/AUTH_test/bucket/object',
                          req.environ.get('swift.backend_path'))
 
