@@ -35,6 +35,7 @@ from six.moves import urllib
 from swift.common import internal_client, utils, swob
 from swift.common.utils import Timestamp
 from swift.obj import expirer, diskfile
+from swift.obj.expirer import ExpirerConfig
 
 
 def not_random():
@@ -101,6 +102,268 @@ class FakeInternalClient(object):
     def delete_object(self, account, container, obj, *a, **kw):
         self._calls.append(('delete_object', account, container, obj))
         return swob.HTTPNoContent()
+
+
+class TestExpirerConfig(TestCase):
+    def setUp(self):
+        self.logger = debug_logger()
+
+    @mock.patch('swift.obj.expirer.utils.hash_path', return_value=hex(101)[2:])
+    def test_get_expirer_container(self, mock_hash_path):
+        expirer_config = ExpirerConfig(
+            {'expiring_objects_container_divisor': 200})
+        container = expirer_config.get_expirer_container(
+            12340, 'a', 'c', 'o')
+        self.assertEqual(container, '0000012199')
+        expirer_config = ExpirerConfig(
+            {'expiring_objects_container_divisor': 2000})
+        container = expirer_config.get_expirer_container(
+            12340, 'a', 'c', 'o')
+        self.assertEqual(container, '0000011999')
+
+    def test_get_expirer_container_legacy_config(self):
+        per_divisor = 10
+        expirer_config = ExpirerConfig({
+            'expiring_objects_container_divisor': 86400 * 2,
+            # this option is really "per divisor", but we name it "per day"
+            # because the configuration of expirer_divisor to any value other
+            # than 86400 is unnecessarily confusing and has been deprecated
+            'expiring_objects_task_container_per_day': per_divisor,
+        })
+        delete_at = time()
+        found = set()
+        for i in range(per_divisor * 10):
+            c = expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'obj%s' % i)
+            found.add(c)
+        self.assertEqual(per_divisor, len(found))
+
+    def test_get_expirer_config_default(self):
+        conf = {}
+        config = ExpirerConfig(conf, logger=self.logger)
+        self.assertEqual('.expiring_objects', config.account_name)
+        self.assertEqual(86400, config.expirer_divisor)
+        self.assertEqual(100, config.task_container_per_day)
+        self.assertFalse(self.logger.all_log_lines())
+
+    def test_get_expirer_config_legacy(self):
+        conf = {
+            'expiring_objects_account_name': 'exp',
+            'expiring_objects_container_divisor': '1000',
+        }
+        config = ExpirerConfig(conf, logger=self.logger)
+        self.assertEqual('.exp', config.account_name)
+        self.assertEqual(1000, config.expirer_divisor)
+        self.assertEqual(100, config.task_container_per_day)
+        self.assertEqual([
+            'expiring_objects_container_divisor is deprecated; use '
+            'expiring_objects_task_container_per_day instead',
+            'expiring_objects_account_name is deprecated; you need to '
+            'migrate to the standard .expiring_objects account',
+        ], self.logger.get_lines_for_level('warning'))
+
+    def test_get_expirer_config_legacy_no_logger_no_warnings(self):
+        conf = {
+            'expiring_objects_account_name': 'exp',
+            'expiring_objects_container_divisor': '1000',
+        }
+        config = ExpirerConfig(conf, logger=None)
+        self.assertEqual('.exp', config.account_name)
+        self.assertEqual(1000, config.expirer_divisor)
+        self.assertEqual(100, config.task_container_per_day)
+        self.assertFalse(self.logger.all_log_lines())
+
+    def test_get_expirer_config(self):
+        conf = {
+            'expiring_objects_task_container_per_day': 1000,
+        }
+        config = ExpirerConfig(conf, logger=self.logger)
+        self.assertEqual('.expiring_objects', config.account_name)
+        self.assertEqual(86400, config.expirer_divisor)
+        self.assertEqual(1000, config.task_container_per_day)
+        self.assertFalse(self.logger.all_log_lines())
+
+    def test_invalid_task_container_per_day_value(self):
+        invalid_values = ['-1', '54.2', '0']
+        for v in invalid_values:
+            self.assertRaises(ValueError, ExpirerConfig, {
+                'expiring_objects_task_container_per_day': v,
+            })
+
+    def test_invalid_task_container_per_day_divisor_combination(self):
+        # verify task_container_per_day must be < objects_container_divisor
+        with self.assertRaises(ValueError) as cm:
+            ExpirerConfig({
+                'expiring_objects_task_container_per_day': 86400,
+            }, logger=self.logger)
+        self.assertEqual(
+            'expiring_objects_task_container_per_day (86400) MUST be less '
+            'than 86400',
+            str(cm.exception))
+        self.assertFalse(self.logger.all_log_lines())
+
+        with self.assertRaises(ValueError) as cm:
+            ExpirerConfig({
+                'expiring_objects_task_container_per_day': 100000,
+            }, logger=self.logger)
+        self.assertEqual(
+            'expiring_objects_task_container_per_day (100000) MUST be less '
+            'than 86400',
+            str(cm.exception))
+        self.assertFalse(self.logger.all_log_lines())
+
+        with self.assertRaises(ValueError) as cm:
+            ExpirerConfig({
+                'expiring_objects_task_container_per_day': 3600,
+                'expiring_objects_container_divisor': 3600,
+            }, logger=self.logger)
+        self.assertEqual(
+            'expiring_objects_task_container_per_day (3600) MUST be less than '
+            '86400; expiring_objects_container_divisor (3600) SHOULD be '
+            'default value of 86400',
+            str(cm.exception))
+        self.assertEqual([
+            'expiring_objects_container_divisor is deprecated; use '
+            'expiring_objects_task_container_per_day instead',
+        ], self.logger.get_lines_for_level('warning'))
+
+        self.logger.clear()
+        with self.assertRaises(ValueError) as cm:
+            ExpirerConfig({
+                'expiring_objects_task_container_per_day': 3601,
+                'expiring_objects_container_divisor': 3600,
+            }, logger=self.logger)
+        self.assertEqual(
+            'expiring_objects_task_container_per_day (3601) MUST be less than '
+            '86400; expiring_objects_container_divisor (3600) SHOULD be '
+            'default value of 86400',
+            str(cm.exception))
+        self.assertEqual([
+            'expiring_objects_container_divisor is deprecated; use '
+            'expiring_objects_task_container_per_day instead',
+        ], self.logger.get_lines_for_level('warning'))
+
+        # ok...
+        self.logger.clear()
+        config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 86399,
+        }, logger=self.logger)
+        self.assertEqual(86399, config.task_container_per_day)
+        self.assertEqual(86400, config.expirer_divisor)
+        self.assertFalse(self.logger.all_log_lines())
+
+        # ok...but with deprecation warning
+        self.logger.clear()
+        config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 3599,
+            'expiring_objects_container_divisor': 3600,
+        }, logger=self.logger)
+        self.assertEqual(3599, config.task_container_per_day)
+        self.assertEqual(3600, config.expirer_divisor)
+        self.assertEqual([
+            'expiring_objects_container_divisor is deprecated; use '
+            'expiring_objects_task_container_per_day instead',
+        ], self.logger.get_lines_for_level('warning'))
+
+    def test_task_container_per_day_config(self):
+        per_day = 42
+        expirer_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': per_day,
+        })
+        delete_at = time()
+        found = set()
+        for i in range(per_day * 10):
+            c = expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'obj%s' % i)
+            found.add(c)
+            self.assertTrue(expirer_config.is_expected_task_container(int(c)))
+        self.assertEqual(per_day, len(found))
+
+    def test_increase_task_per_day_all_expected(self):
+        per_day = 10
+        expirer_config = ExpirerConfig(
+            {'expiring_objects_task_container_per_day': per_day})
+        delete_at = time()
+        found = set()
+        for i in range(per_day * 10):
+            c = expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'obj%s' % i)
+            found.add(c)
+            self.assertTrue(expirer_config.is_expected_task_container(int(c)))
+        expirer_config = ExpirerConfig(
+            {'expiring_objects_task_container_per_day': 11})
+        for c in found:
+            self.assertTrue(expirer_config.is_expected_task_container(int(c)))
+
+    def test_decrease_task_per_day_unexpected(self):
+        per_day = 12
+        conf = {
+            'expiring_objects_task_container_per_day': per_day
+        }
+        expirer_config = ExpirerConfig(conf)
+        delete_at = time()
+        found = set()
+        for i in range(per_day * 10):
+            c = expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'obj%s' % i)
+            found.add(c)
+            self.assertTrue(expirer_config.is_expected_task_container(int(c)))
+        num_unexpected = 3
+        conf['expiring_objects_task_container_per_day'] -= num_unexpected
+        new_expirer_config = ExpirerConfig(conf)
+        unexpected = set()
+        for c in found:
+            if not new_expirer_config.is_expected_task_container(int(c)):
+                unexpected.add(c)
+        self.assertEqual(num_unexpected, len(unexpected))
+
+    def test_get_expirer_account_and_container_default(self):
+        expirer_config = ExpirerConfig({})
+        delete_at = time()
+        account, container = \
+            expirer_config.get_expirer_account_and_container(
+                delete_at, 'a', 'c', 'o')
+        self.assertEqual('.expiring_objects', account)
+        self.assertTrue(expirer_config.is_expected_task_container(
+            int(container)))
+
+    def test_get_expirer_account_and_container_legacy(self):
+        expirer_config = ExpirerConfig({
+            'expiring_objects_account_name': 'exp',
+            'expiring_objects_expirer_divisor': 1000,
+        })
+        delete_at = time()
+        account, container = expirer_config.get_expirer_account_and_container(
+            delete_at, 'a', 'c', 'o')
+        self.assertEqual('.exp', account)
+        self.assertTrue(expirer_config.is_expected_task_container(
+            int(container)))
+
+    def test_get_delete_at_nodes(self):
+        container_ring = FakeRing()
+        # it seems default FakeRing is very predictable
+        self.assertEqual(32, container_ring._part_shift)
+        self.assertEqual(3, container_ring.replicas)
+        self.assertEqual(3, len(container_ring.devs))
+        expirer_config = ExpirerConfig({}, container_ring=container_ring)
+        delete_at = time()
+        part, nodes, task_container = expirer_config.get_delete_at_nodes(
+            delete_at, 'a', 'c', 'o2')
+        self.assertEqual(0, part)  # only one part
+        self.assertEqual([
+            dict(n, index=i) for i, n in enumerate(container_ring.devs)
+        ], nodes)  # assigned to all ring devices
+        self.assertTrue(expirer_config.is_expected_task_container(
+            int(task_container)))
+
+    def test_get_delete_at_nodes_no_ring(self):
+        expirer_config = ExpirerConfig({})
+        delete_at = time()
+        with self.assertRaises(RuntimeError) as ctx:
+            expirer_config.get_delete_at_nodes(
+                delete_at, 'a', 'c', 'o2')
+        self.assertIn('ExpirerConfig', str(ctx.exception))
+        self.assertIn('container_ring kwarg', str(ctx.exception))
 
 
 class TestExpirerHelpers(TestCase):
@@ -262,14 +525,12 @@ class TestObjectExpirer(TestCase):
     internal_client = None
 
     def get_expirer_container(self, delete_at, target_account='a',
-                              target_container='c', target_object='o',
-                              expirer_divisor=86400):
+                              target_container='c', target_object='o'):
         # the actual target a/c/o used only matters for consistent
         # distribution, tests typically only create one task container per-day,
         # but we want the task container names to be realistic
-        return utils.get_expirer_container(
-            delete_at, expirer_divisor,
-            target_account, target_container, target_object)
+        return self.expirer_config.get_expirer_container(
+            delete_at, target_account, target_container, target_object)
 
     def setUp(self):
         global not_sleep
@@ -287,9 +548,12 @@ class TestObjectExpirer(TestCase):
         now = int(time())
 
         self.empty_time = str(now - 864000)
-        self.empty_time_container = self.get_expirer_container(self.empty_time)
+        self.expirer_config = ExpirerConfig(self.conf)
+        self.empty_time_container = self.get_expirer_container(
+            self.empty_time)
         self.past_time = str(now - 86400)
-        self.past_time_container = self.get_expirer_container(self.past_time)
+        self.past_time_container = self.get_expirer_container(
+            self.past_time)
         self.just_past_time = str(now - 1)
         self.just_past_time_container = self.get_expirer_container(
             self.just_past_time)
@@ -342,6 +606,7 @@ class TestObjectExpirer(TestCase):
         self.fake_swift = FakeInternalClient(aco_dict)
         self.expirer = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                              swift=self.fake_swift)
+        self.expirer_config = self.expirer.expirer_config
 
     def make_fake_ic(self, app):
         app._pipeline_final_app = mock.MagicMock()
@@ -360,7 +625,7 @@ class TestObjectExpirer(TestCase):
             use_replication_network=True,
             global_conf={'log_name': 'object-expirer-ic'})])
         self.assertEqual(self.logger.get_lines_for_level('warning'), [])
-        self.assertEqual(x.expiring_objects_account, '.expiring_objects')
+        self.assertEqual(x.expirer_config.account_name, '.expiring_objects')
         self.assertIs(x.swift, self.fake_swift)
 
     def test_init_default_round_robin_cache_default(self):
@@ -1223,6 +1488,61 @@ class TestObjectExpirer(TestCase):
             x.logger.get_lines_for_level('info'), [
                 'Pass completed in 0s; 0 objects expired',
             ])
+
+    def test_get_task_containers_unexpected_container(self):
+        expected = self.get_expirer_container(time())
+        unexpected = str(int(expected) - 200)
+        for name in (expected, unexpected):
+            self.assertTrue(name.isdigit())  # sanity
+
+        container_list = [{'name': unexpected}, {'name': expected}]
+        with mock.patch.object(self.expirer.swift, 'iter_containers',
+                               return_value=container_list):
+            self.assertEqual(
+                self.expirer.get_task_containers_to_expire('task_account'),
+                [unexpected, expected])
+        self.assertEqual(self.expirer.logger.all_log_lines(), {'info': [
+            'processing 1 unexpected task containers (e.g. %s) '
+            'if you have recently changed your expirer config '
+            'this message should go away in a few days.' % unexpected,
+        ]})
+
+        self.expirer.logger.clear()
+        new_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 1000,
+        })
+        with mock.patch.object(self.expirer.swift, 'iter_containers',
+                               return_value=container_list):
+            self.expirer.expirer_config = new_config
+            self.assertEqual(
+                self.expirer.get_task_containers_to_expire('task_account'),
+                [unexpected, expected])
+        self.assertFalse(self.expirer.logger.all_log_lines())
+
+    def test_get_task_containers_invalid_container(self):
+        ok_names = ['86301', '86400']
+        bad_names = ['-1', 'rogue']
+        unexpected = ['86300', '86401']
+
+        container_list = [{'name': name} for name in bad_names] + \
+                         [{'name': name} for name in ok_names] + \
+                         [{'name': name} for name in unexpected]
+        with mock.patch.object(self.expirer.swift, 'iter_containers',
+                               return_value=container_list):
+            self.assertEqual(
+                self.expirer.get_task_containers_to_expire('task_account'),
+                ok_names + unexpected)
+        lines = self.expirer.logger.get_lines_for_level('error')
+        self.assertEqual(lines, [
+            'skipping invalid task container: task_account/-1',
+            'skipping invalid task container: task_account/rogue',
+        ])
+        lines = self.expirer.logger.get_lines_for_level('info')
+        self.assertEqual(lines, [
+            'processing 2 unexpected task containers (e.g. 86300 86401) '
+            'if you have recently changed your expirer config '
+            'this message should go away in a few days.'
+        ])
 
     def test_run_once_with_invalid_container(self):
         now = time()
