@@ -8169,9 +8169,8 @@ class TestReplicatedObjectController(
         self.app.container_ring.set_replicas(2)
 
         delete_at_timestamp = int(time.time()) + 100000
-        delete_at_container = utils.get_expirer_container(
-            delete_at_timestamp, self.app.expiring_objects_container_divisor,
-            'a', 'c', 'o')
+        delete_at_container = self.app.expirer_config.get_expirer_container(
+            delete_at_timestamp, 'a', 'c', 'o')
         req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'Content-Type': 'application/stuff',
                                      'Content-Length': '0',
@@ -8206,9 +8205,8 @@ class TestReplicatedObjectController(
         self.app.expiring_objects_container_divisor = 60
 
         delete_at_timestamp = int(time.time()) + 100000
-        delete_at_container = utils.get_expirer_container(
-            delete_at_timestamp, self.app.expiring_objects_container_divisor,
-            'a', 'c', 'o')
+        delete_at_container = self.app.expirer_config.get_expirer_container(
+            delete_at_timestamp, 'a', 'c', 'o')
         req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'Content-Type': 'application/stuff',
                                      'Content-Length': 0,
