@@ -25,6 +25,7 @@ from shutil import rmtree
 from collections import defaultdict
 from copy import deepcopy
 import random
+from test import unit
 
 import mock
 import six
@@ -192,6 +193,33 @@ class TestExpirerHelpers(TestCase):
             'text/plain', metadata)
         self.assertEqual('text/plain;swift_expirer_bytes=4',
                          embeded_ctype_entry)
+
+    def test_embed_expirer_bytes_from_mpu_metadata(self):
+        metadata = {
+            'X-Timestamp': '1715981937.86913',
+            'Content-Type': 'application/octet-stream;swift_bytes=15728640',
+            'Content-Length': '936',
+            'ETag': '61f6468389e276b0a36fb11e0669189a',
+            'X-Object-Sysmeta-S3Api-Acl': '{"Owner":"test:tester","Grant":['
+            '{"Permission":"FULL_CONTROL","Grantee":"test:tester"}]}',
+            'X-Object-Sysmeta-S3Api-Upload-Id':
+            'MDZhYjljYTgtMjdkYy00ZjVmLThjZDYtNTY4ZTZjNzA0ODg0',
+            'X-Object-Sysmeta-S3Api-Etag':
+            'fd453aaf14ea07844745550b30b084d7-3',
+            'X-Object-Sysmeta-Container-Update-Override-Etag':
+            '61f6468389e276b0a36fb11e0669189a; '
+            's3_etag=fd453aaf14ea07844745550b30b084d7-3; '
+            'slo_etag=2cdb89ae568d0aa7f4fcea57cc2c3ae4',
+            'X-Object-Sysmeta-Slo-Etag': '2cdb89ae568d0aa7f4fcea57cc2c3ae4',
+            'X-Object-Sysmeta-Slo-Size': '15728640',
+            'X-Static-Large-Object': 'True',
+            'name': '/AUTH_test/'
+            'bucket-6fc0fac3-e5aa-42ad-9df7-653c6884e540/'
+            'mpu-6c541365-4cf2-4842-8ad9-af30784556d2'
+        }
+        self.assertEqual('text/plain;swift_expirer_bytes=15728640',
+                         expirer.embed_expirer_bytes_in_ctype(
+                             'text/plain', metadata))
 
     def test_extract_missing_bytes_from_ctype(self):
         self.assertEqual(
@@ -819,6 +847,13 @@ class TestObjectExpirer(TestCase):
                     self.assertTrue(log_lines[0].startswith(
                         'Exception while deleting object '
                         'account container obj'))
+            if should_pop:
+                expected_stats = {'objects': 1}
+            else:
+                expected_stats = {'errors': 1}
+            self.assertEqual(
+                expected_stats,
+                x.logger.statsd_client.get_increment_counts())
 
         # verify pop_queue logic on exceptions
         for exc, ts, should_pop in [(None, timestamp, True),
@@ -1848,6 +1883,10 @@ class TestObjectExpirer(TestCase):
             for target_path in self.expired_target_paths[self.past_time]
         ])
 
+        self.assertEqual(
+            {'objects': 5, 'errors': 5},
+            self.expirer.logger.statsd_client.get_increment_counts())
+
     def test_run_forever_initial_sleep_random(self):
         global last_not_sleep
 
@@ -1948,21 +1987,19 @@ class TestObjectExpirer(TestCase):
         self.assertIn('must be a non-negative integer', str(ctx.exception))
 
     def test_delete_actual_object(self):
-        got_env = [None]
-
-        def fake_app(env, start_response):
-            got_env[0] = env
-            start_response('204 No Content', [('Content-Length', '0')])
-            return []
-
-        x = expirer.ObjectExpirer({}, swift=self.make_fake_ic(fake_app))
+        x = expirer.ObjectExpirer(
+            {}, swift=unit.FakeInternalClient([swob.Response(status=204)]))
         ts = Timestamp('1234')
-        x.delete_actual_object('path/to/object', ts, False)
-        self.assertEqual(got_env[0]['HTTP_X_IF_DELETE_AT'], ts)
-        self.assertEqual(got_env[0]['HTTP_X_TIMESTAMP'],
-                         got_env[0]['HTTP_X_IF_DELETE_AT'])
+        with x.swift:
+            x.delete_actual_object('path/to/object', ts, False)
+        self.assertEqual(1, len(x.swift.calls))
+        request = x.swift.calls[0]
+        self.assertEqual(ts, request.headers['X-If-Delete-At'])
+        self.assertEqual(request.headers['X-Timestamp'],
+                         request.headers['X-If-Delete-At'])
         self.assertEqual(
-            got_env[0]['HTTP_X_BACKEND_CLEAN_EXPIRING_OBJECT_QUEUE'], 'no')
+            'no',
+            request.headers['X-Backend-Clean-Expiring-Object-Queue'])
 
     def test_delete_actual_object_bulk(self):
         got_env = [None]
@@ -1979,6 +2016,36 @@ class TestObjectExpirer(TestCase):
         self.assertNotIn('HTTP_X_BACKEND_CLEAN_EXPIRING_OBJECT_QUEUE',
                          got_env[0])
         self.assertEqual(got_env[0]['HTTP_X_TIMESTAMP'], ts.internal)
+
+    def test_delete_actual_object_bulk_s3api_mpu(self):
+        stub_responses = [
+            # delete manifest response
+            swob.Response(status=204, headers={
+                'X-Object-Sysmeta-S3Api-Upload-Id': 'upload-foo',
+                'X-Object-Sysmeta-S3Api-Etag': 'bar-1',
+            }),
+            # delete segment response
+            swob.Response(status=204),
+        ]
+        x = expirer.ObjectExpirer(
+            {}, swift=unit.FakeInternalClient(stub_responses))
+        ts = Timestamp('1234')
+        with x.swift:
+            x.delete_actual_object('account/bucket/mpu', ts, True)
+        self.assertEqual(2, len(x.swift.calls))
+        self.assertEqual({'DELETE'}, {c.method for c in x.swift.calls})
+        object_delete_request = x.swift.calls[0]
+        self.assertNotIn('X-Delete-At', object_delete_request.headers)
+        self.assertNotIn('X-Backend-Clean-Expiring-Object-Queue',
+                         object_delete_request.headers)
+        self.assertEqual(ts.internal,
+                         object_delete_request.headers['X-Timestamp'])
+        segment_delete_request = x.swift.calls[1]
+        self.assertNotIn('X-Delete-At', segment_delete_request.headers)
+        self.assertNotIn('X-Backend-Clean-Expiring-Object-Queue',
+                         segment_delete_request.headers)
+        self.assertEqual(ts.internal,
+                         segment_delete_request.headers['X-Timestamp'])
 
     def test_delete_actual_object_nourlquoting(self):
         # delete_actual_object should not do its own url quoting because
@@ -2077,6 +2144,7 @@ class TestObjectExpirer(TestCase):
         x.swift.make_request = mock.Mock()
         x.swift.make_request.return_value.status_int = 204
         x.swift.make_request.return_value.app_iter = []
+        x.swift.make_request.return_value.headers = {}
         x.delete_actual_object(name, timestamp, False)
         self.assertEqual(x.swift.make_request.call_count, 1)
         self.assertEqual(x.swift.make_request.call_args[0][1],
@@ -2094,6 +2162,90 @@ class TestObjectExpirer(TestCase):
         self.assertEqual(
             x.swift.make_request.call_args[0][2].get(header),
             'no')
+
+    def test_delete_actual_object_s3api_mpu(self):
+        stub_responses = [
+            # delete manifest response
+            swob.Response(status=204, headers={
+                'X-Object-Sysmeta-S3Api-Upload-Id': 'upload-foo',
+                'X-Object-Sysmeta-S3Api-Etag': 'bar-1',
+            }),
+            # delete segment response
+            swob.Response(status=204),
+        ]
+        x = expirer.ObjectExpirer(
+            {}, swift=unit.FakeInternalClient(stub_responses))
+        ts = Timestamp('1234')
+        with x.swift:
+            x.delete_actual_object('account/bucket/mpu', ts, False)
+        self.assertEqual(2, len(x.swift.calls))
+        self.assertEqual('/v1/account/bucket/mpu', x.swift.calls[0].path)
+        self.assertEqual({
+            'X-Backend-Clean-Expiring-Object-Queue': 'no',
+            'X-If-Delete-At': '0000001234.00000',
+            'X-Timestamp': '0000001234.00000',
+        }, x.swift.calls[0].headers)
+        self.assertEqual('/v1/account/bucket%2Bsegments/mpu/upload-foo/1',
+                         x.swift.calls[1].path)
+        self.assertEqual({
+            'X-Backend-Clean-Expiring-Object-Queue': 'no',
+            'X-Timestamp': '0000001234.00000',
+        }, x.swift.calls[1].headers)
+
+    def test_delete_actual_object_s3api_mpu_missing_segment(self):
+        stub_responses = [
+            # delete manifest response
+            swob.Response(status=204, headers={
+                'X-Object-Sysmeta-S3Api-Upload-Id': 'upload-foo',
+                'X-Object-Sysmeta-S3Api-Etag': 'bar-4',
+            }),
+            # delete segment response
+            swob.Response(status=404),
+            swob.Response(status=204),
+            swob.Response(status=503),
+            swob.Response(status=204),
+        ]
+        x = expirer.ObjectExpirer(
+            {}, swift=unit.FakeInternalClient(stub_responses))
+        ts = Timestamp('1234')
+        with x.swift:
+            x.delete_actual_object('account/bucket/mpu', ts, False)
+        self.assertEqual(5, len(x.swift.calls))
+        self.assertEqual('/v1/account/bucket/mpu', x.swift.calls[0].path)
+        self.assertEqual({
+            'X-Backend-Clean-Expiring-Object-Queue': 'no',
+            'X-If-Delete-At': '0000001234.00000',
+            'X-Timestamp': '0000001234.00000',
+        }, x.swift.calls[0].headers)
+        segment_path = '/v1/account/bucket%2Bsegments/mpu/upload-foo/'
+        for seg_num in range(1, 5):
+            self.assertEqual(segment_path + str(seg_num),
+                             x.swift.calls[seg_num].path)
+            self.assertEqual({
+                'X-Backend-Clean-Expiring-Object-Queue': 'no',
+                'X-Timestamp': '0000001234.00000',
+            }, x.swift.calls[seg_num].headers)
+
+    def test_delete_actual_object_s3api_mpu_missing_headers(self):
+        stub_responses = [
+            # delete manifest response
+            swob.Response(status=204, headers={
+                'X-Object-Sysmeta-S3Api-Upload-Id': '',
+                'X-Object-Sysmeta-S3Api-Etag': '',
+            }),
+        ]
+        x = expirer.ObjectExpirer(
+            {}, swift=unit.FakeInternalClient(stub_responses))
+        ts = Timestamp('1234')
+        with x.swift:
+            x.delete_actual_object('account/bucket/mpu', ts, False)
+        self.assertEqual(1, len(x.swift.calls))
+        self.assertEqual('/v1/account/bucket/mpu', x.swift.calls[0].path)
+        self.assertEqual({
+            'X-Backend-Clean-Expiring-Object-Queue': 'no',
+            'X-If-Delete-At': '0000001234.00000',
+            'X-Timestamp': '0000001234.00000',
+        }, x.swift.calls[0].headers)
 
     def test_pop_queue(self):
         x = expirer.ObjectExpirer({}, logger=self.logger,
