@@ -60,7 +60,8 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPServerError, bytes_to_wsgi, wsgi_to_bytes, wsgi_to_str, \
     normalize_etag, HTTPServiceUnavailable
 from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter
-from swift.obj.expirer import build_task_obj, embed_expirer_bytes_in_ctype
+from swift.obj.expirer import build_task_obj, embed_expirer_bytes_in_ctype, \
+    X_DELETE_TYPE
 
 
 def iter_mime_headers_and_bodies(wsgi_input, mime_boundary, read_chunk_size):
@@ -511,7 +512,7 @@ class ObjectController(BaseStorageServer):
             if not updates:
                 updates = [(None, None)]
             headers_out['x-size'] = '0'
-            headers_out['x-content-type'] = 'text/plain'
+            headers_out['x-content-type'] = X_DELETE_TYPE
             headers_out['x-etag'] = 'd41d8cd98f00b204e9800998ecf8427e'
             if extra_headers:
                 headers_out.update(extra_headers)
@@ -645,7 +646,7 @@ class ObjectController(BaseStorageServer):
         if new_delete_at:
             extra_headers = {
                 'x-content-type': embed_expirer_bytes_in_ctype(
-                    'text/plain', metadata),
+                    X_DELETE_TYPE, metadata),
                 'x-content-type-timestamp':
                 metadata.get('X-Timestamp'),
             }

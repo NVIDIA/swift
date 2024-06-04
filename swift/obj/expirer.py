@@ -32,7 +32,8 @@ from swift.common.middleware.s3api.utils import sysmeta_header as \
     s3_sysmeta_header
 from swift.common.utils import get_logger, dump_recon_cache, split_path, \
     Timestamp, config_true_value, normalize_delete_at_timestamp, \
-    RateLimitedIterator, md5, non_negative_float, parse_content_type
+    RateLimitedIterator, md5, non_negative_float, non_negative_int, \
+    parse_content_type
 from swift.common.http import HTTP_NOT_FOUND, HTTP_CONFLICT, \
     HTTP_PRECONDITION_FAILED
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
@@ -41,6 +42,7 @@ from swift.container.reconciler import direct_delete_container_entry
 
 MAX_TASK_CONTAINER_TO_CACHE = 10000
 MAX_OBJECTS_TO_CACHE = 100000
+X_DELETE_TYPE = 'text/plain'
 ASYNC_DELETE_TYPE = 'application/async-deleted'
 
 
@@ -89,20 +91,20 @@ def extract_expirer_bytes_from_ctype(content_type):
 def embed_expirer_bytes_in_ctype(content_type, metadata):
     """
     Embed number of bytes into content-type.  The bytes can come from
-    content-length on regular objects of the swift_bytes in the objects
-    content-length when the object is an MPU/SLO.
+    content-length on regular objects or the X-Object-Sysmeta-Slo-Size
+    when the object is an MPU/SLO.
 
     :param content_type: a content-type string
     :param metadata: a dict, from Diskfile metadata
     :return: str
     """
+    # as best I can tell this key is required by df.open
+    report_bytes = metadata['Content-Length']
     # all new SLO will have this key
     slo_size = metadata.get('X-Object-Sysmeta-Slo-Size')
-    if slo_size is not None:
+    # sometimes is an empty string
+    if slo_size:
         report_bytes = slo_size
-    else:
-        # as best I can tell this key is required by df.open
-        report_bytes = metadata['Content-Length']
     return "%s;swift_expirer_bytes=%d" % (content_type, int(report_bytes))
 
 
@@ -256,6 +258,31 @@ class ObjectExpirer(Daemon):
         self.round_robin_task_cache_size = int(
             conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
 
+        valid_task_container_iteration_strategies = {'legacy', 'randomized'}
+        self.task_container_iteration_strategy = conf.get(
+            'task_container_iteration_strategy', 'legacy')
+        # XXX temporary shim to support the un-released configuration option
+        if config_true_value(conf.get(
+                'randomized_task_container_iteration', 'false')):
+            self.task_container_iteration_strategy = "randomized"
+        # randomized task container iteration can be useful if there's lots of
+        # tasks in the queue under a configured delay_reaping
+        if self.task_container_iteration_strategy not in \
+                valid_task_container_iteration_strategies:
+            self.logger.warning(
+                "Unrecognized config value: "
+                "'task_container_iteration_strategy = %s' "
+                "(using legacy)",
+                self.task_container_iteration_strategy)
+            self.task_container_iteration_strategy = "legacy"
+
+        # with lots of nodes and lots of tasks a large cache size can
+        # significantly delay processing; and caching tasks to round_robin
+        # target container order may be less necessary if there's only a few
+        # target containers or with randomized task container iteration
+        self.round_robin_task_cache_size = int(
+            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
+
     def read_conf_for_queue_access(self, swift):
         self.expiring_objects_account = AUTO_CREATE_ACCOUNT_PREFIX + \
             (self.conf.get('expiring_objects_account_name') or
@@ -271,8 +298,9 @@ class ObjectExpirer(Daemon):
             global_conf={'log_name': '%s-ic' % self.conf.get(
                 'log_name', self.log_route)})
 
-        self.processes = int(self.conf.get('processes', 0))
-        self.process = int(self.conf.get('process', 0))
+        self.processes = non_negative_int(self.conf.get('processes', 0))
+        self.process = non_negative_int(self.conf.get('process', 0))
+        self._validate_processes_config()
 
     def report(self, final=False):
         """
@@ -432,7 +460,7 @@ class ObjectExpirer(Daemon):
                     # we shouldn't yield the object during the delay
                     continue
 
-                # Only one expirer daemon assigned for one task
+                # Only one expirer daemon assigned for each task
                 if self.hash_mod('%s/%s' % (task_container, task_object),
                                  divisor) != my_index:
                     continue
@@ -467,6 +495,9 @@ class ObjectExpirer(Daemon):
                        These will override the values from the config file if
                        provided.
         """
+        # these config values are available to override at the command line,
+        # blow-up now if they're wrong
+        self.override_proceses_config_from_command_line(**kwargs)
         # This if-clause will be removed when general task queue feature is
         # implemented.
         if not self.dequeue_from_legacy:
@@ -477,7 +508,6 @@ class ObjectExpirer(Daemon):
                              'with dequeue_from_legacy == true.')
             return
 
-        self.get_process_values(kwargs)
         pool = GreenPool(self.concurrency)
         self.report_first_time = self.report_last_time = time()
         self.report_objects = 0
@@ -535,6 +565,9 @@ class ObjectExpirer(Daemon):
         :param kwargs: Extra keyword args to fulfill the Daemon interface; this
                        daemon has no additional keyword args.
         """
+        # these config values are available to override at the command line
+        # blow-up now if they're wrong
+        self.override_proceses_config_from_command_line(**kwargs)
         sleep(random() * self.interval)
         while True:
             begin = time()
@@ -546,7 +579,7 @@ class ObjectExpirer(Daemon):
             if elapsed < self.interval:
                 sleep(random() * (self.interval - elapsed))
 
-    def get_process_values(self, kwargs):
+    def override_proceses_config_from_command_line(self, **kwargs):
         """
         Sets self.processes and self.process from the kwargs if those
         values exist, otherwise, leaves those values as they were set in
@@ -557,19 +590,20 @@ class ObjectExpirer(Daemon):
                        line when the daemon is run.
         """
         if kwargs.get('processes') is not None:
-            self.processes = int(kwargs['processes'])
+            self.processes = non_negative_int(kwargs['processes'])
 
         if kwargs.get('process') is not None:
-            self.process = int(kwargs['process'])
+            self.process = non_negative_int(kwargs['process'])
 
-        if self.process < 0:
-            raise ValueError(
-                'process must be an integer greater than or equal to 0')
+        self._validate_processes_config()
 
-        if self.processes < 0:
-            raise ValueError(
-                'processes must be an integer greater than or equal to 0')
+    def _validate_processes_config(self):
+        """
+        Used in constructor and in override_proceses_config_from_command_line
+        to validate the processes configuration requirements.
 
+        :raiess: ValueError if processes config is invalid
+        """
         if self.processes and self.process >= self.processes:
             raise ValueError(
                 'process must be less than processes')
@@ -643,7 +677,7 @@ class ObjectExpirer(Daemon):
 
         For "normal" expiration the DELETE request may be rejected if the
         X-Delete-At value of the object is exactly the timestamp given; this
-        behavior does not effect is_async_delete=True.
+        behavior does not affect is_async_delete=True.
 
         :param actual_obj: The name of the end-user object to delete:
                            '<account>/<container>/<object>'
@@ -673,8 +707,11 @@ class ObjectExpirer(Daemon):
         if not (is_success(resp.status_int) and all(
                 resp.headers.get(key) for key in (
                     upload_id_key, segments_key))):
-            # upload_id/segments headers may have been set to the empty string
-            # during a COPY that creates a non-mpu object
+            # if there's no upload_id_key, we're definitely not dealing an MPU;
+            # but on segments that have been copied, there may be upload-id
+            # embedded in sysmeta for tracking, but their s3-sysmeta etag
+            # header would have been been explicitly set to the empty string
+            # during the COPY that created the duplicate segment.
             return
         # cleanup s3api mpu segments
         headers.pop('X-If-Delete-At', None)
