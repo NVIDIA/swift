@@ -16,7 +16,7 @@
 import six
 from six.moves import urllib
 
-from random import random
+from random import random, shuffle
 from time import time
 from optparse import OptionParser
 from os.path import join
@@ -192,6 +192,31 @@ class ObjectExpirer(Daemon):
 
         self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
 
+        valid_task_container_iteration_strategies = {'legacy', 'randomized'}
+        self.task_container_iteration_strategy = conf.get(
+            'task_container_iteration_strategy', 'legacy')
+        # XXX temporary shim to support the un-released configuration option
+        if config_true_value(conf.get(
+                'randomized_task_container_iteration', 'false')):
+            self.task_container_iteration_strategy = "randomized"
+        # randomized task container iteration can be useful if there's lots of
+        # tasks in the queue under a configured delay_reaping
+        if self.task_container_iteration_strategy not in \
+                valid_task_container_iteration_strategies:
+            self.logger.warning(
+                "Unrecognized config value: "
+                "'task_container_iteration_strategy = %s' "
+                "(using legacy)",
+                self.task_container_iteration_strategy)
+            self.task_container_iteration_strategy = "legacy"
+
+        # with lots of nodes and lots of tasks a large cache size can
+        # significantly delay processing; and caching tasks to round_robin
+        # target container order may be less necessary if there's only a few
+        # target containers or with randomized task container iteration
+        self.round_robin_task_cache_size = int(
+            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
+
     def _make_internal_client(self, is_legacy_conf):
         if is_legacy_conf:
             ic_conf_path = self.conf_path
@@ -276,7 +301,7 @@ class ObjectExpirer(Daemon):
             obj_cache[cache_key].append(delete_task)
             cnt += 1
 
-            if cnt > MAX_OBJECTS_TO_CACHE:
+            if cnt > self.round_robin_task_cache_size:
                 for task in dump_obj_cache_in_round_robin():
                     yield task
                 cnt = 0
@@ -312,25 +337,27 @@ class ObjectExpirer(Daemon):
         else:
             yield self.expiring_objects_account, 0, 1
 
-    def delete_at_time_of_task_container(self, task_container):
+    def get_task_containers_to_expire(self, task_account):
         """
-        get delete_at timestamp from task_container name
-        """
-        # task_container name is timestamp
-        return Timestamp(task_container)
-
-    def iter_task_containers_to_expire(self, task_account):
-        """
-        Yields task_container names under the task_account if the delete at
+        Collects task_container names under the task_account if the delete at
         timestamp of task_container is past.
         """
+        container_list = []
         for c in self.swift.iter_containers(task_account,
                                             prefix=self.task_container_prefix):
-            task_container = str(c['name'])
-            timestamp = self.delete_at_time_of_task_container(task_container)
-            if timestamp > Timestamp.now():
+            try:
+                task_container_int = int(Timestamp(c['name']))
+            except ValueError:
+                self.logger.error('skipping invalid task container: %s/%s',
+                                  task_account, c['name'])
+                continue
+            if task_container_int > Timestamp.now():
                 break
-            yield task_container
+            container_list.append(str(task_container_int))
+
+        if self.task_container_iteration_strategy == 'randomized':
+            shuffle(container_list)
+        return container_list
 
     def get_delay_reaping(self, target_account, target_container):
         return get_delay_reaping(self.delay_reaping_times, target_account,
@@ -447,7 +474,7 @@ class ObjectExpirer(Daemon):
 
                 task_account_container_list = \
                     [(task_account, task_container) for task_container in
-                     self.iter_task_containers_to_expire(task_account)]
+                     self.get_task_containers_to_expire(task_account)]
 
                 # delete_task_iter is a generator to yield a dict of
                 # task_account, task_container, task_object, delete_timestamp,
