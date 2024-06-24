@@ -40,4 +40,5 @@
         - pytest
         - pytest-cov
         - python-swiftclient
+        # this is duplicated from test-requirements.txt
         - 'boto3>=1.9'
