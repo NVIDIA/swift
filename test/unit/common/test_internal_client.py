@@ -1529,20 +1529,32 @@ class TestInternalClient(unittest.TestCase):
         account, container, obj = path_parts()
         path = make_path_info(account, container, obj)
         client, app = get_client_app()
-        app.register('DELETE', path, swob.HTTPNoContent, {})
-        client.delete_object(account, container, obj)
+        app.register('DELETE', path, swob.HTTPNoContent, {'foo': 'bar'})
+        resp = client.delete_object(account, container, obj)
         self.assertEqual(app.unclosed_requests, {})
         self.assertEqual(1, len(app._calls))
         self.assertEqual({}, app.unread_requests)
         self.assertEqual({}, app.unclosed_requests)
         self.assertEqual(app.backend_user_agent, 'test')
+        self.assertEqual(204, resp.status_int)
+        self.assertEqual({
+            'Content-Length': '0',
+            'Foo': 'bar',
+            'Content-Type': 'text/html; charset=UTF-8',
+        }, resp.headers)
 
-        app.register('DELETE', path, swob.HTTPNotFound, {})
-        client.delete_object(account, container, obj)
+        app.register('DELETE', path, swob.HTTPNotFound, {'bar': 'baz'})
+        resp = client.delete_object(account, container, obj)
         self.assertEqual(app.unclosed_requests, {})
         self.assertEqual(2, len(app._calls))
         self.assertEqual({}, app.unread_requests)
         self.assertEqual({}, app.unclosed_requests)
+        self.assertEqual(404, resp.status_int)
+        self.assertEqual({
+            'Content-Length': '0',
+            'Bar': 'baz',
+            'Content-Type': 'text/html; charset=UTF-8',
+        }, resp.headers)
 
     def test_get_object_metadata(self):
         account, container, obj = path_parts()
