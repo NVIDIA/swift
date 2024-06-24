@@ -14,7 +14,9 @@
 
 from collections import Counter
 import json
+import os
 import random
+from tempfile import mkdtemp
 import time
 import uuid
 import unittest
@@ -31,6 +33,9 @@ from test.probe.brain import BrainSplitter
 
 from swiftclient import client
 from swiftclient.exceptions import ClientException
+
+from test.s3api import get_s3_client
+from boto3.s3.transfer import TransferConfig
 
 
 class TestObjectExpirer(ReplProbeTest):
@@ -610,6 +615,67 @@ class TestObjectExpirer(ReplProbeTest):
 
         self.assertEqual(expected_byte_size_counts, byte_size_counts)
 
+    def test_expirer_object_bytes_s3api_mpu(self):
+        # a mpu is a form an swift SLO, this same test applies but we create
+        # the SLO using boto3 for extra coverage
+        s3api_info = self.cluster_info.get('s3api', {})
+        if not s3api_info:
+            raise unittest.SkipTest('s3api not enabled')
+
+        self.s3 = get_s3_client(1)
+
+        self.bucket_name = 'bucket-%s' % uuid.uuid4()
+        self.mpu_name = 'mpu-%s' % uuid.uuid4()
+
+        self.s3.create_bucket(Bucket=self.bucket_name)
+
+        chunksize = 5 * 2 ** 20
+        num_chunks = 3
+
+        self.tempdir = mkdtemp()
+        filename = os.path.join(self.tempdir, 'big.file')
+        with open(filename, 'wb') as f:
+            c = 'a'
+            for i in range(num_chunks):
+                c = chr(ord(c) + i)
+                chunk = c.encode() * chunksize
+                f.write(chunk)
+        expected_size = chunksize * num_chunks
+
+        config = TransferConfig(multipart_threshold=chunksize,
+                                multipart_chunksize=chunksize)
+        self.s3.upload_file(filename, self.bucket_name, self.mpu_name,
+                            Config=config)
+
+        # set expiration using swift API
+        client.post_object(self.url, self.token,
+                           self.bucket_name, self.mpu_name,
+                           headers={
+                               'X-Delete-After': '1',
+                           })
+
+        # Run the container updater once to register new container containing
+        # expirey queue entry
+        Manager(['container-updater']).once()
+
+        # Find the name of the container containing the expiring object
+        expiring_containers = list(
+            self.client.iter_containers('.expiring_objects')
+        )
+        self.assertEqual(1, len(expiring_containers))
+        expiring_container = expiring_containers[0]
+        expiring_container_name = expiring_container['name']
+
+        # Verify that there is one expiring object
+        expiring_objects = list(
+            self.client.iter_objects('.expiring_objects',
+                                     expiring_container_name)
+        )
+        self.assertEqual(1, len(expiring_objects))
+        found_bytes = extract_expirer_bytes_from_ctype(
+            expiring_objects[0]['content_type'])
+        self.assertEqual(found_bytes, expected_size)
+
     def _test_expirer_delete_outdated_object_version(self, object_exists):
         # This test simulates a case where the expirer tries to delete
         # an outdated version of an object.
@@ -739,6 +805,115 @@ class TestObjectExpirer(ReplProbeTest):
             client.get_object(self.url, self.token,
                               segment_container, 'segment_2')
         self.assertEqual(404, caught.exception.http_status)
+
+    def _make_s3api_bucket_and_key_name(self, s3client):
+        bucket_name = self._make_name('bucket-').decode('utf8')
+        resp = s3client.create_bucket(Bucket=bucket_name)
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        key_name = self._make_name('key-').decode('utf8')
+        return bucket_name, key_name
+
+    def _make_s3api_mpu(self, s3client, bucket_name, key_name, num_parts):
+        create_mpu_resp = s3client.create_multipart_upload(
+            Bucket=bucket_name, Key=key_name)
+        self.assertEqual(200, create_mpu_resp[
+            'ResponseMetadata']['HTTPStatusCode'])
+        upload_id = create_mpu_resp['UploadId']
+
+        parts = []
+        for i in range(1, num_parts + 1):
+            body = ('%d' % i) * 5 * (2 ** 20)
+            part_resp = s3client.upload_part(
+                Body=body, Bucket=bucket_name, Key=key_name,
+                PartNumber=i, UploadId=upload_id)
+            self.assertEqual(200, part_resp[
+                'ResponseMetadata']['HTTPStatusCode'])
+            parts.append({
+                'ETag': part_resp['ETag'],
+                'PartNumber': i,
+            })
+
+        complete_mpu_resp = s3client.complete_multipart_upload(
+            Bucket=bucket_name, Key=key_name,
+            MultipartUpload={
+                'Parts': parts,
+            },
+            UploadId=upload_id,
+        )
+        self.assertEqual(200, complete_mpu_resp[
+            'ResponseMetadata']['HTTPStatusCode'])
+
+        return bucket_name, key_name
+
+    def test_s3api_mpu_delete_at(self):
+        s3api_info = self.cluster_info.get('s3api', {})
+        if not s3api_info:
+            raise unittest.SkipTest('s3api not enabled')
+        if not s3api_info.get('allow_multipart_uploads'):
+            raise unittest.SkipTest('allow_multipart_uploads not enabled')
+
+        # lazy import boto only required if cluster supports s3api
+        from test.s3api import get_s3_client
+
+        s3client = get_s3_client(1)
+
+        # setup bucket and object names and brain
+        bucket_name, key_name = self._make_s3api_bucket_and_key_name(s3client)
+
+        # N.B. with an object layer split brain this test will fail
+        # brain = BrainSplitter(self.url, self.token, bucket_name, key_name,
+        #                       server_type='object', policy=self.policy)
+        # brain.put_object()
+        # brain.stop_primary_half()
+        num_parts = 2
+        self._make_s3api_mpu(s3client, bucket_name, key_name, num_parts)
+
+        # setup expiration (on just the manifest)
+        start = time.time()
+        delete_at = int(start + 2.0)
+        self.client.set_object_metadata(
+            self.account, bucket_name, key_name,
+            {'X-Delete-At': str(delete_at)})
+
+        # brain.start_primary_half()
+
+        segment_container_name = '%s+segments' % bucket_name
+        found_segments = [
+            obj for obj in self.client.iter_objects(
+                self.account, segment_container_name)
+        ]
+        self.assertEqual(len(found_segments), num_parts)
+
+        # wait for expiration to pass and run the expirer
+        for service in ('object', 'container'):
+            Manager(['%s-updater' % service]).once()
+        time.sleep(2 - (time.time() - start))
+        self.expirer.once()
+
+        try:
+            self.client.get_object_metadata(
+                self.account, bucket_name, key_name,
+                acceptable_statuses=(404,))
+        except UnexpectedResponse as e:
+            self.fail(
+                'Expected 404 for HEAD object but got %s' % e.resp.status)
+
+        # and all the segments are gone too!
+        for segment_info in found_segments:
+            try:
+                self.client.get_object_metadata(
+                    self.account, segment_container_name, segment_info['name'],
+                    acceptable_statuses=(404,))
+            except UnexpectedResponse as e:
+                self.fail(
+                    'Expected 404 for HEAD %s/%s but got %s' % (
+                        segment_container_name, segment_info['name'],
+                        e.resp.status))
+        found_segments = [
+            obj for obj in self.client.iter_objects(
+                self.account, segment_container_name)
+        ]
+        self.assertEqual(0, len(found_segments))
 
 
 if __name__ == "__main__":
