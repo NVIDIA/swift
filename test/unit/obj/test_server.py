@@ -5080,6 +5080,32 @@ class TestObjectController(BaseTestCase):
         self.assertTrue(os.path.isfile(ts_1003_file))
         self.assertEqual(len(os.listdir(os.path.dirname(ts_1003_file))), 1)
 
+    def test_DELETE_response_sysmeta(self):
+        put_ts = next(self.ts)
+        path = '/sda1/p/a/c/o'
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': put_ts.normal,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': '4',
+            'X-Object-Sysmeta-1': 'One',
+        }, body='test')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        delete_ts = next(self.ts)
+        req = Request.blank(path, method='DELETE', headers={
+            'X-Timestamp': delete_ts.normal,
+        })
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 204)
+        self.assertEqual({
+            'Content-Type': 'text/html; charset=UTF-8',
+            'Content-Length': '0',
+            'X-Backend-Timestamp': delete_ts.normal,
+            'X-Backend-Content-Type': 'application/octet-stream',
+            'X-Object-Sysmeta-1': 'One',
+        }, resp.headers)
+
     def test_DELETE_bad_timestamp(self):
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'DELETE'},
