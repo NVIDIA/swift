@@ -2557,7 +2557,7 @@ class Controller(object):
         self.logger.debug(
             'Get listing from %s %s' % (subreq.path_qs, headers))
         response = self.app.handle_request(subreq)
-        data = self._parse_listing_response(req, response)
+        data = self._parse_listing_response(subreq, response)
         return data, response
 
     def _parse_namespaces(self, req, listing, response):
