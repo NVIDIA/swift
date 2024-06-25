@@ -23,6 +23,7 @@ from shutil import rmtree
 from collections import defaultdict
 from copy import deepcopy
 import random
+
 from test.debug_logger import debug_logger
 from test.unit import FakeRing, mocked_http_conn, make_timestamp_iter
 from test.unit.common.middleware.helpers import FakeSwift
@@ -1086,13 +1087,6 @@ class TestObjectExpirer(TestCase):
         results = [_ for _ in x.iter_task_accounts_to_expire()]
         self.assertEqual(results, [('.expiring_objects', 1, 2)])
 
-    def test_delete_at_time_of_task_container(self):
-        x = expirer.ObjectExpirer(self.conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual(x.delete_at_time_of_task_container('0000'), 0)
-        self.assertEqual(x.delete_at_time_of_task_container('0001'), 1)
-        self.assertEqual(x.delete_at_time_of_task_container('1000'), 1000)
-
     def test_run_once_nothing_to_do(self):
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=self.fake_swift)
@@ -1155,6 +1149,47 @@ class TestObjectExpirer(TestCase):
             x.logger.get_lines_for_level('info'), [
                 'Pass completed in 0s; 0 objects expired',
             ])
+
+    def test_run_once_with_invalid_container(self):
+        now = time()
+        t0 = Timestamp(now - 100000)
+        t1 = Timestamp(now - 10000)
+        normal_task_container = self.get_expirer_container(t0)
+        self.assertTrue(normal_task_container.isdigit())
+        next_task_container = self.get_expirer_container(t1)
+        for name in (normal_task_container, next_task_container):
+            self.assertTrue(name.isdigit())  # sanity
+
+        strange_task_container = normal_task_container + '-crazy'
+        self.assertFalse(strange_task_container.isdigit())
+
+        task_per_container = 3
+        self._setup_fake_swift({
+            '.expiring_objects': {
+                normal_task_container: [
+                    expirer.build_task_obj(t0, 'a', 'c1', 'o%s' % i)
+                    for i in range(task_per_container)
+                ],
+                strange_task_container: [
+                    expirer.build_task_obj(t0, 'a', 'c2', 'o%s' % i)
+                    for i in range(task_per_container)
+                ],
+                next_task_container: [
+                    expirer.build_task_obj(t1, 'a', 'c3', 'o%s' % i)
+                    for i in range(task_per_container)
+                ],
+            }
+        })
+        # sanity
+        self.assertEqual(
+            sorted(self.expirer.swift.aco_dict['.expiring_objects'].keys()), [
+                normal_task_container,
+                strange_task_container,
+                next_task_container,
+            ])
+        self._expirer_run_once_with_mocks(now=now)
+        # we processed all tasks in all valid containers
+        self.assertEqual(task_per_container * 2, self.expirer.report_objects)
 
     def test_iter_task_to_expire(self):
         # In this test, all tasks are assigned to the tested expirer
@@ -2300,7 +2335,7 @@ class TestObjectExpirer(TestCase):
         x.delete_actual_object('account/bucket+segments/mpu/upload-foo/6', ts,
                                is_async_delete=False)
         self.assertEqual([(
-            'DELETE', '/v1/account/bucket+segment/mpu/upload-foo/6', {
+            'DELETE', '/v1/account/bucket+segments/mpu/upload-foo/6', {
                 'X-Backend-Clean-Expiring-Object-Queue': 'no',
                 'X-If-Delete-At': '0000001234.00000',
                 'X-Timestamp': '0000001234.00000',

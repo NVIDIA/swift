@@ -12,6 +12,7 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import collections
 import contextlib
 import logging
 import mock
@@ -29,12 +30,23 @@ class WARN_DEPRECATED(Exception):
         print(self.msg)
 
 
+SendtoCall = collections.namedtuple('SendToCall', ['payload', 'address'])
+
+
+class RecordingSocket(object):
+    def __init__(self):
+        self.sendto_calls = []
+
+    def sendto(self, payload, address):
+        self.sendto_calls.append(SendtoCall(payload, address))
+
+    def close(self):
+        pass
+
+
 class FakeStatsdClient(statsd_client.StatsdClient):
-    def __init__(self, host, port, base_prefix='', tail_prefix='',
-                 default_sample_rate=1, sample_rate_factor=1, logger=None):
-        super(FakeStatsdClient, self).__init__(
-            host, port, base_prefix, tail_prefix, default_sample_rate,
-            sample_rate_factor, logger)
+    def __init__(self, *args, **kwargs):
+        super(FakeStatsdClient, self).__init__(*args, **kwargs)
         self.clear()
 
         # Capture then call parent pubic stat functions
@@ -57,14 +69,7 @@ class FakeStatsdClient(statsd_client.StatsdClient):
         return None, None
 
     def _open_socket(self):
-        return self
-
-    # sendto and close are mimicing the socket calls.
-    def sendto(self, msg, target):
-        self.sendto_calls.append((msg, target))
-
-    def close(self):
-        pass
+        return self.recording_socket
 
     def _send(self, *args, **kwargs):
         self.send_calls.append((args, kwargs))
@@ -73,7 +78,11 @@ class FakeStatsdClient(statsd_client.StatsdClient):
     def clear(self):
         self.send_calls = []
         self.calls = defaultdict(list)
-        self.sendto_calls = []
+        self.recording_socket = RecordingSocket()
+
+    @property
+    def sendto_calls(self):
+        return self.recording_socket.sendto_calls
 
     def get_increments(self):
         return [call[0][0] for call in self.calls['increment']]
@@ -149,7 +158,7 @@ class FakeLogger(logging.Logger, CaptureLog):
         self.level = logging.NOTSET
         if 'facility' in kwargs:
             self.facility = kwargs['facility']
-        self.statsd_client = FakeStatsdClient(None, 8125)
+        self.statsd_client = FakeStatsdClient('host', 8125)
         self.thread_locals = None
         self.parent = None
         # ensure the NOTICE level has been named, in case it has not already

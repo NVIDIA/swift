@@ -1541,10 +1541,21 @@ class TestGetShardedContainer(BaseTestContainerController):
     def test_GET_sharded_container_with_deleted_shard(self):
         req, resp = self._do_test_GET_sharded_container_with_deleted_shards(
             [404])
-        warnings = self.logger.get_lines_for_level('warning')
-        self.assertEqual(['Failed to get container listing from '
-                          '%s: 404' % req.path_qs],
-                         warnings)
+        warning_lines = self.app.logger.get_lines_for_level('warning')
+        exp_msg = 'Failed to get container listing from /v1/.shards_a/c_b?'
+        actual_parts = warning_lines[0].partition(':')
+        self.assertIn(exp_msg, actual_parts[0])
+        actual_qs = actual_parts[0][len(exp_msg):]
+        actual_params = dict(
+            urllib.parse.parse_qsl(actual_qs, keep_blank_values=True))
+        self.assertEqual({'format': 'json',
+                          'limit': '10000',
+                          'marker': '',
+                          'end_marker': 'b\x00',
+                          'states': 'listing'},
+                         actual_params)
+        self.assertIn('404', actual_parts[2])
+        self.assertFalse(warning_lines[1:])
         self.assertEqual(resp.status_int, 503)
         errors = self.logger.get_lines_for_level('error')
         self.assertEqual(
@@ -1554,9 +1565,21 @@ class TestGetShardedContainer(BaseTestContainerController):
     def test_GET_sharded_container_with_mix_ok_and_deleted_shard(self):
         req, resp = self._do_test_GET_sharded_container_with_deleted_shards(
             [200, 200, 404])
-        warnings = self.logger.get_lines_for_level('warning')
-        self.assertEqual(['Failed to get container listing from '
-                          '%s: 404' % req.path_qs], warnings)
+        warning_lines = self.app.logger.get_lines_for_level('warning')
+        exp_msg = 'Failed to get container listing from /v1/.shards_a/c_?'
+        actual_parts = warning_lines[0].partition(':')
+        self.assertIn(exp_msg, actual_parts[0])
+        actual_qs = actual_parts[0][len(exp_msg):]
+        actual_params = dict(
+            urllib.parse.parse_qsl(actual_qs, keep_blank_values=True))
+        self.assertEqual({'format': 'json',
+                          'limit': '9998',
+                          'marker': 'c',
+                          'end_marker': '',
+                          'states': 'listing'},
+                         actual_params)
+        self.assertIn('404', actual_parts[2])
+        self.assertFalse(warning_lines[1:])
         self.assertEqual(resp.status_int, 503)
         errors = self.logger.get_lines_for_level('error')
         self.assertEqual(
@@ -1566,9 +1589,21 @@ class TestGetShardedContainer(BaseTestContainerController):
     def test_GET_sharded_container_mix_ok_and_unavailable_shards(self):
         req, resp = self._do_test_GET_sharded_container_with_deleted_shards(
             [200, 200, 503])
-        warnings = self.logger.get_lines_for_level('warning')
-        self.assertEqual(['Failed to get container listing from '
-                          '%s: 503' % req.path_qs], warnings[-1:])
+        warning_lines = self.app.logger.get_lines_for_level('warning')
+        exp_msg = 'Failed to get container listing from /v1/.shards_a/c_?'
+        actual_parts = warning_lines[0].partition(':')
+        self.assertIn(exp_msg, actual_parts[0])
+        actual_qs = actual_parts[0][len(exp_msg):]
+        actual_params = dict(
+            urllib.parse.parse_qsl(actual_qs, keep_blank_values=True))
+        self.assertEqual({'format': 'json',
+                          'limit': '9998',
+                          'marker': 'c',
+                          'end_marker': '',
+                          'states': 'listing'},
+                         actual_params)
+        self.assertIn('503', actual_parts[2])
+        self.assertFalse(warning_lines[1:])
         self.assertEqual(resp.status_int, 503)
         errors = self.logger.get_lines_for_level('error')
         self.assertEqual(

@@ -32,10 +32,7 @@ from eventlet.queue import Empty
 import six
 from six import StringIO
 from six.moves import range
-from six.moves.urllib.parse import quote
-
-from swift.proxy.controllers.obj import ECGetResponseCollection
-
+from six.moves.urllib.parse import quote, parse_qsl
 if six.PY2:
     from email.parser import FeedParser as EmailFeedParser
 else:
@@ -7863,9 +7860,16 @@ class TestGetUpdateShard(BaseObjectControllerMixin, unittest.TestCase):
                          captured_hdrs.get('X-Backend-Record-Shard-Format'))
         self.assertIsNone(self.memcache.get('shard-updating-v2/a/c'))
         self.assertIsNone(actual)
-        lines = self.app.logger.get_lines_for_level('error')
-        self.assertEqual(1, len(lines))
-        self.assertIn('Problem with listing response from /v1/a/c/o', lines[0])
+        error_lines = self.app.logger.get_lines_for_level('error')
+        exp_msg = 'Problem with listing response from /v1/a/c?'
+        actual_parts = error_lines[0].partition(':')
+        self.assertIn(exp_msg, actual_parts[0])
+        actual_qs = actual_parts[0][len(exp_msg):]
+        actual_params = dict(parse_qsl(actual_qs, keep_blank_values=True))
+        self.assertEqual({'format': 'json',
+                          'states': 'updating'},
+                         actual_params)
+        self.assertFalse(error_lines[1:])
 
 
 class TestGetUpdateShardUTF8(TestGetUpdateShard):
@@ -7921,8 +7925,16 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
     def test_get_namespaces_not_a_list(self):
         body = json.dumps({}).encode('ascii')
         error_lines = self._check_get_namespaces_bad_data(body)
-        self.assertIn('Problem with listing response', error_lines[0])
-        self.assertIn('not a list', error_lines[0])
+        exp_msg = 'Problem with listing response from /v1/a/c?'
+        actual_parts = error_lines[0].partition(':')
+        self.assertIn(exp_msg, actual_parts[0])
+        actual_qs = actual_parts[0][len(exp_msg):]
+        actual_params = dict(parse_qsl(actual_qs, keep_blank_values=True))
+        self.assertEqual({'format': 'json',
+                          'states': 'updating',
+                          'includes': '1_test'},
+                         actual_params)
+        self.assertIn('ValueError', actual_parts[2])
         self.assertFalse(error_lines[1:])
 
     def test_get_namespaces_key_missing(self):
@@ -7984,8 +7996,16 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
         self.assertIsNone(actual)
         self.assertFalse(self.app.logger.get_lines_for_level('error'))
         warning_lines = self.app.logger.get_lines_for_level('warning')
-        self.assertIn('Failed to get container listing', warning_lines[0])
-        self.assertIn('/a/c', warning_lines[0])
+        exp_msg = 'Failed to get container listing from /v1/a/c?'
+        actual_parts = warning_lines[0].partition(':')
+        self.assertIn(exp_msg, actual_parts[0])
+        actual_qs = actual_parts[0][len(exp_msg):]
+        actual_params = dict(parse_qsl(actual_qs, keep_blank_values=True))
+        self.assertEqual({'format': 'json',
+                          'states': 'updating',
+                          'includes': '1_test'},
+                         actual_params)
+        self.assertIn('404', actual_parts[2])
         self.assertFalse(warning_lines[1:])
 
 
