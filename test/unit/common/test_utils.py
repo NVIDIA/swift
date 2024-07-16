@@ -4205,6 +4205,61 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(populator.set_cache_state, "set")
         self.assertFalse(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
+        self.assertFalse(populator.req_lacks_enough_retries)
+        self.assertEqual(self.infocache[self.cache_key], "backend data")
+        self.assertEqual(
+            self.memcache.incr_calls,
+            [(self.token_key, 1, self.retry_interval * 10)]
+        )
+        self.assertEqual(
+            self.memcache.set_calls,
+            [(self.cache_key, "backend data", self.cache_ttl)]
+        )
+        self.assertGreater(retries[0], 1)
+        self.assertEqual(
+            self.memcache.get_calls, [('NOT_EXISTED_YET')] * retries[0])
+        self.assertEqual(self.memcache.del_calls, [])
+
+    def test_fetch_data_req_lacks_enough_retries(self):
+        # Test the request which doesn't acquire the token, then keep sleeping
+        # and trying to fetch data from the Memcached, but doesn't get enough
+        # retries.
+        retries = [0]
+
+        class CustomizedCache(TestableMemcacheRing):
+            def get(self, key, raise_on_error=False):
+                retries[0] += 1
+                return super(CustomizedCache, self).get("NOT_EXISTED_YET")
+
+        self.memcache = CustomizedCache(['1.2.3.4:11211'], logger=self.logger)
+        mock_cache = MockMemcached()
+        self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock_cache, mock_cache)] * 2)
+        # Simulate that there are three requests who have acquired the tokens.
+        total_requests = self.memcache.incr(self.token_key, delta=3, time=10)
+        self.assertEqual(total_requests, 3)
+        self.memcache.set(self.cache_key, [1, 2, 3])
+        # Test the request without a token
+        self.memcache.incr_calls = []
+        self.memcache.set_calls = []
+        populator = CooperativeCachePopulator(
+            self.infocache,
+            self.memcache,
+            self.cache_key,
+            self.cache_ttl,
+            self.do_fetch_backend,
+            self.retry_interval,
+        )
+        with patch('time.time', ) as mock_time:
+            mock_time.side_effect = itertools.count(4000.99, 1.0)
+            data = populator.fetch_data()
+        self.assertEqual(data, "backend data")
+        self.assertEqual(populator.backend_response, "response")
+        self.do_fetch_backend.assert_called_once()
+        self.assertEqual(populator.set_cache_state, "set")
+        self.assertFalse(populator.is_token_request_done())
+        self.assertFalse(populator.req_served_from_cache)
+        self.assertTrue(populator.req_lacks_enough_retries)
         self.assertEqual(self.infocache[self.cache_key], "backend data")
         self.assertEqual(
             self.memcache.incr_calls,
@@ -4433,7 +4488,10 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         # Simulate multiple concurrent threads issued into a cooperative token
         # session, each thread will issue a "fetch_data" request cooperatively.
         # And the first three requests will acquire the token, but fail to get
-        # data from the backend.
+        # data from the backend. This test also demostrates that even though
+        # all token requests fail to go through, other requests who arrive at
+        # the late stage of same token session and won't get a token still
+        # could be served out of the memcached.
         self.retry_interval = 0.1
         counts = {
             'num_requests_to_backend': 0,
@@ -4495,13 +4553,17 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         # The first three requests will get the token but fails.
         for i in range(3):
             pool.spawn(worker_process, 0, self.retry_interval * 15, True)
-        # The 4th request will go to backend and set data in the memcached.
-        pool.spawn(worker_process, 0, self.retry_interval)
-        # The remaining 16 requests will be served from the memcached.
+        # The 4th request won't get a token, but after it exits its waiting
+        # cycles, it will fetch the data from the backend and set the data into
+        # the memcached.
+        pool.spawn(worker_process, 0, 0)
+        # The remaining 16 requests won't get a token, but will be served out
+        # of the memcached because the 4th request will finish within their
+        # waiting cycles.
         for i in range(16):
             pool.spawn(
                 worker_process,
-                random.uniform(self.retry_interval * 5,
+                random.uniform(self.retry_interval * 7,
                                self.retry_interval * 10),
                 self.retry_interval
             )

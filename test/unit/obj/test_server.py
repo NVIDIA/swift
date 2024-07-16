@@ -8100,6 +8100,7 @@ class TestObjectController(BaseTestCase):
             'account': '.expiring_objects',
             'container': delete_at_container,
             'obj': '%s-a/c/o' % put_delete_at,
+            'db_state': None,
             'headers': {
                 'X-Backend-Storage-Policy-Index': '0',
                 # only POST-1 has to clear the orig PUT delete-at

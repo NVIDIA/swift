@@ -7860,14 +7860,14 @@ class TestGetUpdateShard(BaseObjectControllerMixin, unittest.TestCase):
                          captured_hdrs.get('X-Backend-Record-Shard-Format'))
         self.assertIsNone(self.memcache.get('shard-updating-v2/a/c'))
         self.assertIsNone(actual)
-        error_lines = self.app.logger.get_lines_for_level('error')
-        exp_msg = 'Problem with listing response from /v1/a/c?'
-        actual_parts = error_lines[0].partition(':')
-        self.assertIn(exp_msg, actual_parts[0])
-        actual_qs = actual_parts[0][len(exp_msg):]
+
+        error_lines = self.logger.get_lines_for_level('error')
+        start = 'Problem with container shard listing response from /v1/a/c?'
+        msg, _, _ = error_lines[0].partition(':')
+        self.assertEqual(start, msg[:len(start)])
+        actual_qs = msg[len(start):]
         actual_params = dict(parse_qsl(actual_qs, keep_blank_values=True))
-        self.assertEqual({'format': 'json',
-                          'states': 'updating'},
+        self.assertEqual({'format': 'json', 'states': 'updating'},
                          actual_params)
         self.assertFalse(error_lines[1:])
 
@@ -7915,26 +7915,34 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
 
     def test_get_namespaces_empty_body(self):
         error_lines = self._check_get_namespaces_bad_data(b'')
-        self.assertIn('Problem with listing response', error_lines[0])
+        start = 'Problem with container shard listing response from /v1/a/c?'
+        msg, _, err = error_lines[0].partition(':')
+        self.assertEqual(start, msg[:len(start)])
+        actual_qs = msg[len(start):]
+        actual_params = dict(parse_qsl(actual_qs, keep_blank_values=True))
+        self.assertEqual({'format': 'json',
+                          'includes': '1_test',
+                          'states': 'updating'},
+                         actual_params)
         if six.PY2:
-            self.assertIn('No JSON', error_lines[0])
+            self.assertIn('No JSON', err)
         else:
-            self.assertIn('JSONDecodeError', error_lines[0])
+            self.assertIn('JSONDecodeError', err)
         self.assertFalse(error_lines[1:])
 
     def test_get_namespaces_not_a_list(self):
         body = json.dumps({}).encode('ascii')
         error_lines = self._check_get_namespaces_bad_data(body)
-        exp_msg = 'Problem with listing response from /v1/a/c?'
-        actual_parts = error_lines[0].partition(':')
-        self.assertIn(exp_msg, actual_parts[0])
-        actual_qs = actual_parts[0][len(exp_msg):]
+        start = 'Problem with container shard listing response from /v1/a/c?'
+        msg, _, err = error_lines[0].partition(':')
+        self.assertEqual(start, msg[:len(start)])
+        actual_qs = msg[len(start):]
         actual_params = dict(parse_qsl(actual_qs, keep_blank_values=True))
         self.assertEqual({'format': 'json',
-                          'states': 'updating',
-                          'includes': '1_test'},
+                          'includes': '1_test',
+                          'states': 'updating'},
                          actual_params)
-        self.assertIn('ValueError', actual_parts[2])
+        self.assertIn('ValueError', err)
         self.assertFalse(error_lines[1:])
 
     def test_get_namespaces_key_missing(self):
@@ -7996,16 +8004,16 @@ class TestGetUpdatingNamespacesErrors(BaseObjectControllerMixin,
         self.assertIsNone(actual)
         self.assertFalse(self.app.logger.get_lines_for_level('error'))
         warning_lines = self.app.logger.get_lines_for_level('warning')
-        exp_msg = 'Failed to get container listing from /v1/a/c?'
-        actual_parts = warning_lines[0].partition(':')
-        self.assertIn(exp_msg, actual_parts[0])
-        actual_qs = actual_parts[0][len(exp_msg):]
+        start = 'Failed to get container shard listing from /v1/a/c?'
+        msg, _, status_txn = warning_lines[0].partition(': ')
+        self.assertEqual(start, msg[:len(start)])
+        actual_qs = msg[len(start):]
         actual_params = dict(parse_qsl(actual_qs, keep_blank_values=True))
         self.assertEqual({'format': 'json',
-                          'states': 'updating',
-                          'includes': '1_test'},
+                          'includes': '1_test',
+                          'states': 'updating'},
                          actual_params)
-        self.assertIn('404', actual_parts[2])
+        self.assertEqual('404', status_txn[:3])
         self.assertFalse(warning_lines[1:])
 
 

@@ -1458,7 +1458,7 @@ class TestContainerSharding(BaseAutoContainerSharding):
                 continue
             if async_data[k] != v:
                 errors.append(
-                    "Exp value %s != %s" % (str(v, str(async_data[k]))))
+                    "Exp value %s != %s" % (str(v), str(async_data[k])))
                 continue
 
         if errors:

@@ -1374,13 +1374,13 @@ class CooperativeCachePopulator(object):
         memcached.
     :param do_fetch_backend: a callable object to be called to fetch data from
         the backend; it needs to return a tuple of (data, response).
-    :param cache_encoder: a callable object to be called to convert the data
-        retrieved from the backend to a different format to store in memcache.
-    :param cache_decoder: a callable object to be called to convert the data
-        retrieved from memcache to the same format as returned from backend.
     :param retry_interval: the basic interval to retry getting data from cache
         when waiting for other requests to populate the cache, suggest to be
         set as the average time spent on ``do_fetch_backend``.
+    :param cache_encoder: an optional callable object to convert the data
+        retrieved from the backend to a different format to store in memcache.
+    :param cache_decoder: an optional callable object to convert the data
+        retrieved from memcache to the same format as returned from backend.
     :param num_tokens: the minimum limit of tokens per each usage sesssion,
         also the the minimum limit of in-flight requests allowed to fetch data
         from backend; default to be 3, which give redundancy when any request
@@ -1404,14 +1404,17 @@ class CooperativeCachePopulator(object):
         self._do_fetch_backend = do_fetch_backend
         self._cache_encoder = cache_encoder
         self._cache_decoder = cache_decoder
-        # the status of cache set operations used internally.
+        # The status of cache set operations used internally.
         self.set_cache_state = None
         # Indicates if this request has acquired one token.
         self.token_acquired = False
-        # indicates if this request is served out of Memcached.
+        # Indicates if this request is served out of Memcached.
         self.req_served_from_cache = False
-        # the HttpResponse object returned by ``do_fetch_backend``.
+        # The HttpResponse object returned by ``do_fetch_backend``.
         self.backend_response = None
+        # Indicates if a request who doesn't have token and doesn't get enough
+        # retries due to busy eventlet scheduler.
+        self.req_lacks_enough_retries = False
 
     def query_backend_and_set_cache(self):
         """
@@ -1440,15 +1443,27 @@ class CooperativeCachePopulator(object):
     def _sleep_and_retry_memcache(self):
         """
         Wait for cache value to be set by other requests with intermittent and
-        limited number of sleeps.
+        limited number of sleeps. when ``token_ttl`` is 10 times of
+        ``retry_interval`` and the exponential backoff doubles the retry
+        interval after each retry, normally this function will only sleep and
+        retry 3 times.
 
         :returns: value of the data fetched from Memcached; None if not exist.
         """
         cur_time = time.time()
         cutoff_time = cur_time + self._token_ttl
         retry_interval = self._retry_interval * 1.5
-        while cur_time < cutoff_time:
-            eventlet.sleep(retry_interval)
+        num_waits = 0
+        while cur_time < cutoff_time or num_waits < 3:
+            if cur_time < cutoff_time:
+                eventlet.sleep(retry_interval)
+                num_waits += 1
+            else:
+                # To have one last check, when eventlet scheduling didn't give
+                # this greenthread enough cpu cycles and it didn't have enough
+                # times of retries.
+                self.req_lacks_enough_retries = True
+                num_waits = 3
             cache_data = self._memcache.get(
                 self._cache_key, raise_on_error=False)
             if cache_data:
