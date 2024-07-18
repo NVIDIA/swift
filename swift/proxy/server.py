@@ -55,9 +55,6 @@ from swift.common.wsgi import run_wsgi
 DEFAULT_NAMESPACE_CACHE_USE_TOKEN = False
 DEFAULT_NAMESPACE_CACHE_TOKEN_RETRY_INTERVAL = 0.1  # seconds
 
-DEFAULT_NAMESPACE_CACHE_USE_TOKEN = False
-DEFAULT_NAMESPACE_CACHE_TOKEN_RETRY_INTERVAL = 0.1  # seconds
-
 
 # List of entry points for mandatory middlewares.
 #
