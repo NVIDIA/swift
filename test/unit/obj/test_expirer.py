@@ -2975,10 +2975,6 @@ class TestObjectExpirer(TestCase):
             {'objects': 5, 'errors': 5, 'tasks.assigned': 10},
             self.expirer.logger.statsd_client.get_increment_counts())
 
-        self.assertEqual(
-            {'objects': 5, 'errors': 5},
-            self.expirer.logger.statsd_client.get_increment_counts())
-
     def test_run_forever_initial_sleep_random(self):
         global last_not_sleep
 
