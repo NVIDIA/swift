@@ -594,6 +594,37 @@ class ObjectExpirer(Daemon):
         self.round_robin_task_cache_size = int(
             conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
 
+        valid_task_container_iteration_strategies = {
+            'legacy', 'randomized', "parallel"}
+        self.task_container_iteration_strategy = conf.get(
+            'task_container_iteration_strategy', 'legacy')
+        # XXX temporary shim to support the un-released configuration option
+        if config_true_value(conf.get(
+                'randomized_task_container_iteration', 'false')):
+            self.task_container_iteration_strategy = "randomized"
+        # randomized task container iteration can be useful if there's lots of
+        # tasks in the queue under a configured delay_reaping
+        if self.task_container_iteration_strategy not in \
+                valid_task_container_iteration_strategies:
+            self.logger.warning(
+                "Unrecognized config value: "
+                "'task_container_iteration_strategy = %s' "
+                "(using legacy)",
+                self.task_container_iteration_strategy)
+            self.task_container_iteration_strategy = "legacy"
+
+        if (self.task_container_iteration_strategy == 'parallel' and
+                self.processes < 1):
+            raise ValueError('The parallel task_container_iteration_strategy '
+                             'requires multiple processes.')
+
+        # with lots of nodes and lots of tasks a large cache size can
+        # significantly delay processing; and caching tasks to round_robin
+        # target container order may be less necessary if there's only a few
+        # target containers or with randomized task container iteration
+        self.round_robin_task_cache_size = int(
+            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
+
     def read_conf_for_queue_access(self, swift):
         # This is for common parameter with general task queue in future
         self.task_container_prefix = ''
