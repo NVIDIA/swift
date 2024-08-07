@@ -37,8 +37,12 @@ bind_port = 8080
 # cert_file = /etc/swift/proxy.crt
 # key_file = /etc/swift/proxy.key
 #
-# expiring_objects_container_divisor = 86400
-# expiring_objects_account_name = expiring_objects
+# If you have a 100s of millions of expiring objects per day or 100s of
+# object-expirer nodes you may want to increase this (10x?) for better
+# scalability; otherwise the default is quite good
+# N.B. it MUST be kept consistent with object-[server|expirer].conf and MUST
+# be less than 86400
+# expiring_objects_task_container_per_day = 100
 #
 # You can specify default log routing here if you want:
 # log_name = swift
@@ -70,6 +74,43 @@ bind_port = 8080
 # log_statsd_default_sample_rate = 1.0
 # log_statsd_sample_rate_factor = 1.0
 # log_statsd_metric_prefix =
+#
+# Statsd metrics may include labeling information in a variety of formats.
+# Available options: disabled, dogstatsd, graphite, influxdb, librato, signalfx
+# See also: https://github.com/prometheus/statsd_exporter#tagging-extensions
+# Note that enabling labels will likely increase the number of time series
+# stored, as more labeled metrics may be exposed than may have been previously
+# extracted from the dotted non-labeled legacy metric format.
+# statsd_label_mode = disabled
+#
+# Historically, statsd metrics were emitted with implied labels as part of
+# metric name in a dotted "legacy" format. Once that swift is fully
+# instrumented with labeled metrics, if you have statsd_label_mode enabled you
+# may want to turn off legacy metrics; to do that set this option to False.
+# Defaults to True.
+# statsd_emit_legacy = True
+#
+# Statsd metrics emitted with labels also support user defined labels
+# configured by options. The format is:
+#     statsd_user_label_<name> = <value>
+# where <name> and <value> are restricted to non-whitespace ASCII characters.
+# For example, a proxy-server configuration could use the following to
+# delineate labeled metrics emitted by instances of proxy-logging middleware
+# in the pipeline:
+#     [filter:subrequest-logging]
+#     use = egg:swift#proxy_logging
+#     statsd_user_label_reqctx = subrequest
+# which adds a label with name 'user_reqctx' in specific namespace and value
+# 'subrequest' to any labeled metrics emitted by this proxy-logging instance.
+# This would achieve similar effect as the following proxy-server configuration
+# for non-labeled metrics:
+#     [filter:subrequest-logging]
+#     use = egg:swift#proxy_logging
+#     access_log_statsd_metric_prefix = subrequest
+# Note that non-labeled option 'log_statsd_metric_prefix' does not apply to
+# labeled metrics.
+
+# Defaults to None.
 #
 # List of origin hosts that are allowed for CORS requests in addition to what
 # the container has set.
@@ -176,6 +217,9 @@ use = egg:swift#proxy
 # average time spent on getting updating namespaces from the backend. And the
 # cooperative token session will be 10 times of this interval config value.
 # namespace_cache_token_retry_interval = 0.1
+#
+# Number of cooperative tokens per each token session.
+# namespace_cache_tokens_per_session = 3
 #
 # object_chunk_size = 65536
 # client_chunk_size = 65536
@@ -1022,6 +1066,11 @@ use = egg:swift#etag_quoter
 use = egg:swift#list_endpoints
 # list_endpoints_path = /endpoints/
 
+# Note: The double proxy-logging in the pipeline is not a mistake. The
+# left-most proxy-logging is there to log requests that were handled in
+# middleware and never made it through to the right-most middleware (and
+# proxy server). Double logging is prevented for normal requests. See
+# proxy-logging docs.
 [filter:proxy-logging]
 use = egg:swift#proxy_logging
 # If not set, logging directives from [DEFAULT] without "access_" will be used
@@ -1067,12 +1116,6 @@ use = egg:swift#proxy_logging
 # What HTTP methods are allowed for StatsD logging (comma-sep); request methods
 # not in this list will have "BAD_METHOD" for the <verb> portion of the metric.
 # log_statsd_valid_http_methods = GET,HEAD,POST,PUT,DELETE,COPY,OPTIONS
-#
-# Note: The double proxy-logging in the pipeline is not a mistake. The
-# left-most proxy-logging is there to log requests that were handled in
-# middleware and never made it through to the right-most middleware (and
-# proxy server). Double logging is prevented for normal requests. See
-# proxy-logging docs.
 #
 # Hashing algorithm for log anonymization. Must be one of algorithms supported
 # by Python's hashlib.

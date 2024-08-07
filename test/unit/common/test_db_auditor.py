@@ -171,7 +171,7 @@ class TestAuditor(unittest.TestCase):
                  'container.freelist.percent.10-19': 1,
                  'container.freelist.percent.20-29': 1,
                  'container.freelist.percent.30-39': 1,
-                 'container.freelist.size.0-4MB': 3},
+                 'container.freelist.size.0-1MB': 3},
                 test_auditor.logger.statsd_client.get_increment_counts())
 
         do_test({})
@@ -228,7 +228,7 @@ class TestAuditor(unittest.TestCase):
             'container.freelist.percent.30-39': 1,
             # number is returning the size basically 1, 2 and 3 bytes, so
             # they're all in the same 0-5MB bucket.
-            'container.freelist.size.0-4MB': 3}
+            'container.freelist.size.0-1MB': 3}
         do_test(conf, expected_stats)
 
         # Now a percent check. This test harness is just using the same file
@@ -250,7 +250,7 @@ class TestAuditor(unittest.TestCase):
             'container.freelist.percent.30-39': 1,
             # number is returning the size basically 1, 2 and 3 bytes, so
             # they're all in the same 0-5MB bucket.
-            'container.freelist.size.0-4MB': 3}
+            'container.freelist.size.0-1MB': 3}
         do_test(conf, expected_stats)
 
         # But what's cool, we can also do a percent and a size. Because
@@ -274,8 +274,56 @@ class TestAuditor(unittest.TestCase):
             'container.freelist.percent.30-39': 1,
             # number is returning the size basically 1, 2 and 3 bytes, so
             # they're all in the same 0-5MB bucket.
-            'container.freelist.size.0-4MB': 3}
+            'container.freelist.size.0-1MB': 3}
         do_test(conf, expected_stats)
+
+    def test_generate_freepage_stats(self):
+        def do_test(percent, size, exp_percent_stat, exp_size_stat):
+            broker = mock.Mock()
+            broker.get_freelist_percent.return_value = percent
+            broker.get_freelist_size.return_value = size
+            logger = debug_logger()
+            test_auditor = FakeDatabaseAuditor({}, logger=logger)
+            test_auditor.generate_freepage_stats(broker)
+            stats = logger.statsd_client.get_increment_counts()
+            self.assertIn(exp_percent_stat, stats)
+            self.assertIn(exp_size_stat, stats)
+
+        mb = 1024 * 1024
+        size_tests = (
+            (0, 'container.freelist.size.0-1MB'),
+            (1 * mb, 'container.freelist.size.0-1MB'),
+            (2 * mb - 1, 'container.freelist.size.0-1MB'),
+            # 2MB+ if in the next bucket
+            (2 * mb, 'container.freelist.size.2-3MB'),
+            (4 * mb - 1, 'container.freelist.size.2-3MB'),
+            # buckets get bigger because they're power of 2
+            (4 * mb, 'container.freelist.size.4-7MB'),
+            (8 * mb, 'container.freelist.size.8-15MB'),
+            (16 * mb, 'container.freelist.size.16-31MB'),
+            (32 * mb, 'container.freelist.size.32-63MB'),
+            (64 * mb, 'container.freelist.size.64-127MB'),
+            (128 * mb, 'container.freelist.size.128-255MB'),
+            # and should go even higher
+            (13370 * mb, 'container.freelist.size.8192-16383MB'),
+        )
+        percent_tests = (
+            (0, 'container.freelist.percent.0-9'),
+            (9, 'container.freelist.percent.0-9'),
+            (10, 'container.freelist.percent.10-19'),
+            (19, 'container.freelist.percent.10-19'),
+            (20, 'container.freelist.percent.20-29'),
+            (45, 'container.freelist.percent.40-49'),
+            (59, 'container.freelist.percent.50-59'),
+            (70, 'container.freelist.percent.70-79'),
+            (75, 'container.freelist.percent.70-79'),
+            (99, 'container.freelist.percent.90-99'),
+            (100, 'container.freelist.percent.100-109'),
+            (101, 'container.freelist.percent.100-109'),
+        )
+        for (size, size_stat), (percent, per_stat) \
+                in zip(size_tests, percent_tests):
+            do_test(percent, size, per_stat, size_stat)
 
 
 if __name__ == '__main__':

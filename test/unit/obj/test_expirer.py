@@ -13,9 +13,10 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import itertools
+import contextlib
+import collections
 import os
+import itertools
 from time import time
 from unittest import main, TestCase
 from tempfile import mkdtemp
@@ -35,6 +36,7 @@ from six.moves import urllib
 from swift.common import internal_client, utils, swob
 from swift.common.utils import Timestamp
 from swift.obj import expirer, diskfile
+from swift.obj.expirer import ExpirerConfig
 
 
 def not_random():
@@ -101,6 +103,366 @@ class FakeInternalClient(object):
     def delete_object(self, account, container, obj, *a, **kw):
         self._calls.append(('delete_object', account, container, obj))
         return swob.HTTPNoContent()
+
+
+class TestExpirerConfig(TestCase):
+    def setUp(self):
+        self.logger = debug_logger()
+
+    @mock.patch('swift.obj.expirer.utils.hash_path', return_value=hex(101)[2:])
+    def test_get_expirer_container(self, mock_hash_path):
+        expirer_config = ExpirerConfig(
+            {'expiring_objects_container_divisor': 200})
+        container = expirer_config.get_expirer_container(
+            12340, 'a', 'c', 'o')
+        self.assertEqual(container, '0000012199')
+        expirer_config = ExpirerConfig(
+            {'expiring_objects_container_divisor': 2000})
+        container = expirer_config.get_expirer_container(
+            12340, 'a', 'c', 'o')
+        self.assertEqual(container, '0000011999')
+
+    def test_get_expirer_container_legacy_config(self):
+        per_divisor = 10
+        expirer_config = ExpirerConfig({
+            'expiring_objects_container_divisor': 86400 * 2,
+            # this option is really "per divisor", but we name it "per day"
+            # because the configuration of expirer_divisor to any value other
+            # than 86400 is unnecessarily confusing and has been deprecated
+            'expiring_objects_task_container_per_day': per_divisor,
+        })
+        delete_at = time()
+        found = set()
+        for i in range(per_divisor * 10):
+            c = expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'obj%s' % i)
+            found.add(c)
+        self.assertEqual(per_divisor, len(found))
+
+    def test_get_expirer_config_default(self):
+        conf = {}
+        config = ExpirerConfig(conf, logger=self.logger)
+        self.assertEqual('.expiring_objects', config.account_name)
+        self.assertEqual(86400, config.expirer_divisor)
+        self.assertEqual(100, config.task_container_per_day)
+        self.assertFalse(self.logger.all_log_lines())
+
+    def test_get_expirer_config_legacy(self):
+        conf = {
+            'expiring_objects_account_name': 'exp',
+            'expiring_objects_container_divisor': '1000',
+        }
+        config = ExpirerConfig(conf, logger=self.logger)
+        self.assertEqual('.exp', config.account_name)
+        self.assertEqual(1000, config.expirer_divisor)
+        self.assertEqual(100, config.task_container_per_day)
+        self.assertEqual([
+            'expiring_objects_container_divisor is deprecated; use '
+            'expiring_objects_task_container_per_day instead',
+            'expiring_objects_account_name is deprecated; you need to '
+            'migrate to the standard .expiring_objects account',
+        ], self.logger.get_lines_for_level('warning'))
+
+    def test_get_expirer_config_legacy_no_logger_no_warnings(self):
+        conf = {
+            'expiring_objects_account_name': 'exp',
+            'expiring_objects_container_divisor': '1000',
+        }
+        config = ExpirerConfig(conf, logger=None)
+        self.assertEqual('.exp', config.account_name)
+        self.assertEqual(1000, config.expirer_divisor)
+        self.assertEqual(100, config.task_container_per_day)
+        self.assertFalse(self.logger.all_log_lines())
+
+    def test_get_expirer_config(self):
+        conf = {
+            'expiring_objects_task_container_per_day': 1000,
+        }
+        config = ExpirerConfig(conf, logger=self.logger)
+        self.assertEqual('.expiring_objects', config.account_name)
+        self.assertEqual(86400, config.expirer_divisor)
+        self.assertEqual(1000, config.task_container_per_day)
+        self.assertFalse(self.logger.all_log_lines())
+
+    def test_invalid_task_container_per_day_value(self):
+        invalid_values = ['-1', '54.2', '0']
+        for v in invalid_values:
+            self.assertRaises(ValueError, ExpirerConfig, {
+                'expiring_objects_task_container_per_day': v,
+            })
+
+    def test_invalid_task_container_per_day_divisor_combination(self):
+        # verify task_container_per_day must be < objects_container_divisor
+        with self.assertRaises(ValueError) as cm:
+            ExpirerConfig({
+                'expiring_objects_task_container_per_day': 86400,
+            }, logger=self.logger)
+        self.assertEqual(
+            'expiring_objects_task_container_per_day (86400) MUST be less '
+            'than 86400',
+            str(cm.exception))
+        self.assertFalse(self.logger.all_log_lines())
+
+        with self.assertRaises(ValueError) as cm:
+            ExpirerConfig({
+                'expiring_objects_task_container_per_day': 100000,
+            }, logger=self.logger)
+        self.assertEqual(
+            'expiring_objects_task_container_per_day (100000) MUST be less '
+            'than 86400',
+            str(cm.exception))
+        self.assertFalse(self.logger.all_log_lines())
+
+        with self.assertRaises(ValueError) as cm:
+            ExpirerConfig({
+                'expiring_objects_task_container_per_day': 3600,
+                'expiring_objects_container_divisor': 3600,
+            }, logger=self.logger)
+        self.assertEqual(
+            'expiring_objects_task_container_per_day (3600) MUST be less than '
+            '86400; expiring_objects_container_divisor (3600) SHOULD be '
+            'default value of 86400',
+            str(cm.exception))
+        self.assertEqual([
+            'expiring_objects_container_divisor is deprecated; use '
+            'expiring_objects_task_container_per_day instead',
+        ], self.logger.get_lines_for_level('warning'))
+
+        self.logger.clear()
+        with self.assertRaises(ValueError) as cm:
+            ExpirerConfig({
+                'expiring_objects_task_container_per_day': 3601,
+                'expiring_objects_container_divisor': 3600,
+            }, logger=self.logger)
+        self.assertEqual(
+            'expiring_objects_task_container_per_day (3601) MUST be less than '
+            '86400; expiring_objects_container_divisor (3600) SHOULD be '
+            'default value of 86400',
+            str(cm.exception))
+        self.assertEqual([
+            'expiring_objects_container_divisor is deprecated; use '
+            'expiring_objects_task_container_per_day instead',
+        ], self.logger.get_lines_for_level('warning'))
+
+        # ok...
+        self.logger.clear()
+        config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 86399,
+        }, logger=self.logger)
+        self.assertEqual(86399, config.task_container_per_day)
+        self.assertEqual(86400, config.expirer_divisor)
+        self.assertFalse(self.logger.all_log_lines())
+
+        # ok...but with deprecation warning
+        self.logger.clear()
+        config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 3599,
+            'expiring_objects_container_divisor': 3600,
+        }, logger=self.logger)
+        self.assertEqual(3599, config.task_container_per_day)
+        self.assertEqual(3600, config.expirer_divisor)
+        self.assertEqual([
+            'expiring_objects_container_divisor is deprecated; use '
+            'expiring_objects_task_container_per_day instead',
+        ], self.logger.get_lines_for_level('warning'))
+
+    def test_task_container_per_day_config(self):
+        per_day = 42
+        expirer_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': per_day,
+        })
+        delete_at = time()
+        found = set()
+        for i in range(per_day * 10):
+            c = expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'obj%s' % i)
+            found.add(c)
+            self.assertTrue(expirer_config.is_expected_task_container(int(c)))
+        self.assertEqual(per_day, len(found))
+
+    def test_increase_task_per_day_all_expected(self):
+        per_day = 10
+        expirer_config = ExpirerConfig(
+            {'expiring_objects_task_container_per_day': per_day})
+        delete_at = time()
+        found = set()
+        for i in range(per_day * 10):
+            c = expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'obj%s' % i)
+            found.add(c)
+            self.assertTrue(expirer_config.is_expected_task_container(int(c)))
+        expirer_config = ExpirerConfig(
+            {'expiring_objects_task_container_per_day': 11})
+        for c in found:
+            self.assertTrue(expirer_config.is_expected_task_container(int(c)))
+
+    def test_decrease_task_per_day_unexpected(self):
+        per_day = 12
+        conf = {
+            'expiring_objects_task_container_per_day': per_day
+        }
+        expirer_config = ExpirerConfig(conf)
+        delete_at = time()
+        found = set()
+        for i in range(per_day * 10):
+            c = expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'obj%s' % i)
+            found.add(c)
+            self.assertTrue(expirer_config.is_expected_task_container(int(c)))
+        num_unexpected = 3
+        conf['expiring_objects_task_container_per_day'] -= num_unexpected
+        new_expirer_config = ExpirerConfig(conf)
+        unexpected = set()
+        for c in found:
+            if not new_expirer_config.is_expected_task_container(int(c)):
+                unexpected.add(c)
+        self.assertEqual(num_unexpected, len(unexpected))
+
+    def test_get_expirer_account_and_container_default(self):
+        expirer_config = ExpirerConfig({})
+        delete_at = time()
+        account, container = \
+            expirer_config.get_expirer_account_and_container(
+                delete_at, 'a', 'c', 'o')
+        self.assertEqual('.expiring_objects', account)
+        self.assertTrue(expirer_config.is_expected_task_container(
+            int(container)))
+
+    def test_get_expirer_account_and_container_legacy(self):
+        expirer_config = ExpirerConfig({
+            'expiring_objects_account_name': 'exp',
+            'expiring_objects_expirer_divisor': 1000,
+        })
+        delete_at = time()
+        account, container = expirer_config.get_expirer_account_and_container(
+            delete_at, 'a', 'c', 'o')
+        self.assertEqual('.exp', account)
+        self.assertTrue(expirer_config.is_expected_task_container(
+            int(container)))
+
+    def test_get_delete_at_nodes(self):
+        container_ring = FakeRing()
+        # it seems default FakeRing is very predictable
+        self.assertEqual(32, container_ring._part_shift)
+        self.assertEqual(3, container_ring.replicas)
+        self.assertEqual(3, len(container_ring.devs))
+        expirer_config = ExpirerConfig({}, container_ring=container_ring)
+        delete_at = time()
+        part, nodes, task_container = expirer_config.get_delete_at_nodes(
+            delete_at, 'a', 'c', 'o2')
+        self.assertEqual(0, part)  # only one part
+        self.assertEqual([
+            dict(n, index=i) for i, n in enumerate(container_ring.devs)
+        ], nodes)  # assigned to all ring devices
+        self.assertTrue(expirer_config.is_expected_task_container(
+            int(task_container)))
+
+    def test_get_delete_at_nodes_no_ring(self):
+        expirer_config = ExpirerConfig({})
+        delete_at = time()
+        with self.assertRaises(RuntimeError) as ctx:
+            expirer_config.get_delete_at_nodes(
+                delete_at, 'a', 'c', 'o2')
+        self.assertIn('ExpirerConfig', str(ctx.exception))
+        self.assertIn('container_ring kwarg', str(ctx.exception))
+
+    def test_get_all_task_containers_per_day_only_expected(self):
+        # taks containers per day is 3
+        expirer_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 3,
+        })
+        containers = [86398]
+        self.assertEqual(
+            # within each day, task containers are in descending order.
+            [[86400, 86399, 86398]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86398, 86399, 86400]
+        self.assertEqual(
+            [[86400, 86399, 86398]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86400, 86399, 86398]
+        self.assertEqual(
+            [[86400, 86399, 86398]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86398, 172799]
+        self.assertEqual(
+            [[86400, 86399, 86398], [172800, 172799, 172798]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [172799, 86398, 86399, 86400]
+        self.assertEqual(
+            # days are sorted in ascending order
+            [[86400, 86399, 86398], [172800, 172799, 172798]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [172800, 172798, 172799, 86398, 86399, 86400]
+        self.assertEqual(
+            [[86400, 86399, 86398], [172800, 172799, 172798]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [172799, 259198, 86398]
+        self.assertEqual(
+            [[86400, 86399, 86398], [172800, 172799, 172798],
+                [259200, 259199, 259198]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        # taks containers per day is 100
+        expirer_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 100,
+        })
+        containers = [86398]
+        self.assertEqual(
+            [[86400 - i for i in range(100)]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86396, 86398, 86318]
+        self.assertEqual(
+            [[86400 - i for i in range(100)]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+
+    def test_get_all_task_containers_per_day_only_unexpected(self):
+        expirer_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 3,
+        })
+        containers = [86397]
+        self.assertEqual(
+            # no new containers filled for unexpected task container
+            [[86397]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86393, 86397, 86394]
+        self.assertEqual(
+            # expect no sorting for unexpected task containers
+            [[86393, 86397, 86394]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        containers = [86393, 86397, 86394, 172797, 9999]
+        self.assertEqual(
+            [[86393, 86397, 86394], [172797, 9999]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+
+    def test_get_all_task_containers_per_day_mixed(self):
+        expirer_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 3,
+        })
+        # only one unexpected task container
+        containers = [86398, 172799, 9999]
+        self.assertEqual(
+            [[86400, 86399, 86398], [172800, 172799, 172798], [9999]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
+        # two days of unexpected task containers
+        containers = [86393, 86394, 86397, 86398, 8000, 172797, 172799]
+        self.assertEqual(
+            [[86400, 86399, 86398], [172800, 172799, 172798],
+                [86393, 86394, 86397], [8000, 172797]],
+            expirer_config.get_all_task_containers_per_day(containers)
+        )
 
 
 class TestExpirerHelpers(TestCase):
@@ -262,14 +624,12 @@ class TestObjectExpirer(TestCase):
     internal_client = None
 
     def get_expirer_container(self, delete_at, target_account='a',
-                              target_container='c', target_object='o',
-                              expirer_divisor=86400):
+                              target_container='c', target_object='o'):
         # the actual target a/c/o used only matters for consistent
         # distribution, tests typically only create one task container per-day,
         # but we want the task container names to be realistic
-        return utils.get_expirer_container(
-            delete_at, expirer_divisor,
-            target_account, target_container, target_object)
+        return self.expirer_config.get_expirer_container(
+            delete_at, target_account, target_container, target_object)
 
     def setUp(self):
         global not_sleep
@@ -287,9 +647,12 @@ class TestObjectExpirer(TestCase):
         now = int(time())
 
         self.empty_time = str(now - 864000)
-        self.empty_time_container = self.get_expirer_container(self.empty_time)
+        self.expirer_config = ExpirerConfig(self.conf)
+        self.empty_time_container = self.get_expirer_container(
+            self.empty_time)
         self.past_time = str(now - 86400)
-        self.past_time_container = self.get_expirer_container(self.past_time)
+        self.past_time_container = self.get_expirer_container(
+            self.past_time)
         self.just_past_time = str(now - 1)
         self.just_past_time_container = self.get_expirer_container(
             self.just_past_time)
@@ -342,6 +705,7 @@ class TestObjectExpirer(TestCase):
         self.fake_swift = FakeInternalClient(aco_dict)
         self.expirer = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                              swift=self.fake_swift)
+        self.expirer_config = self.expirer.expirer_config
 
     def make_fake_ic(self, app):
         app._pipeline_final_app = mock.MagicMock()
@@ -360,7 +724,7 @@ class TestObjectExpirer(TestCase):
             use_replication_network=True,
             global_conf={'log_name': 'object-expirer-ic'})])
         self.assertEqual(self.logger.get_lines_for_level('warning'), [])
-        self.assertEqual(x.expiring_objects_account, '.expiring_objects')
+        self.assertEqual(x.expirer_config.account_name, '.expiring_objects')
         self.assertIs(x.swift, self.fake_swift)
 
     def test_init_default_round_robin_cache_default(self):
@@ -443,6 +807,24 @@ class TestObjectExpirer(TestCase):
         x = expirer.ObjectExpirer(conf, logger=self.logger,
                                   swift=self.fake_swift)
         self.assertEqual("randomized", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_parallel(self):
+        conf = {
+            'task_container_iteration_strategy': 'parallel',
+            'processes': '1700',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("parallel", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_parallel_invalid(self):
+        conf = {
+            'task_container_iteration_strategy': 'parallel',
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertIn('multiple processes', str(ctx.exception))
 
     def test_init_task_container_iteration_strategy_invalid(self):
         conf = {
@@ -784,31 +1166,36 @@ class TestObjectExpirer(TestCase):
 
     def test_process_based_concurrency(self):
 
-        class ObjectExpirer(expirer.ObjectExpirer):
+        @contextlib.contextmanager
+        def capture_deleted_objects(exp):
+            captured = defaultdict(set)
 
-            def __init__(self, conf, swift):
-                super(ObjectExpirer, self).__init__(conf, swift=swift)
-                self.processes = 3
-                self.deleted_objects = {}
+            def mock_delete_object(target_path, delete_timestamp,
+                                   task_account, task_container, task_object,
+                                   is_async_delete):
+                captured[task_container].add(task_object)
 
-            def delete_object(self, target_path, delete_timestamp,
-                              task_account, task_container, task_object,
-                              is_async_delete):
-                if task_container not in self.deleted_objects:
-                    self.deleted_objects[task_container] = set()
-                self.deleted_objects[task_container].add(task_object)
+            with mock.patch.object(exp, 'delete_object', mock_delete_object):
+                yield captured
 
-        x = ObjectExpirer(self.conf, swift=self.fake_swift)
+        conf = dict(self.conf, processes=3)
+        x = expirer.ObjectExpirer(
+            conf, swift=self.fake_swift, logger=self.logger)
 
         deleted_objects = defaultdict(set)
         for i in range(3):
             x.process = i
             # reset progress so we know we don't double-up work among processes
-            x.deleted_objects = defaultdict(set)
-            x.run_once()
-            for task_container, deleted in x.deleted_objects.items():
+            with capture_deleted_objects(x) as captured_deleted_objects:
+                x.run_once()
+            for task_container, deleted in captured_deleted_objects.items():
                 self.assertFalse(deleted_objects[task_container] & deleted)
                 deleted_objects[task_container] |= deleted
+
+        self.assertEqual({
+            'tasks.assigned': 10,
+            'tasks.skipped': 20,
+        }, self.logger.statsd_client.get_increment_counts())
 
         # sort for comparison
         deleted_objects = {
@@ -1074,18 +1461,359 @@ class TestObjectExpirer(TestCase):
         self.assertGreater(mod_count[1], 300)
         self.assertGreater(mod_count[2], 300)
 
-    def test_iter_task_accounts_to_expire(self):
+    def _do_test_parallel_strategy(self, containers, processes,
+                                   task_container_per_day):
+        conf = dict(
+            self.conf,
+            processes=processes,
+            expiring_objects_task_container_per_day=task_container_per_day)
+        result_per_proc = {}
+        for process in range(processes):
+            conf['process'] = process
+            x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                      swift=self.fake_swift)
+            index, divisor, selected = x._parallel_strategy(containers)
+            result_per_proc[process] = index, divisor, selected
+        return result_per_proc
+
+    def test_parallel_strategy_expected_containers(self):
+        # 2 days worth at 3 per day
+        containers = [86398, 86399, 86400, 172798, 172799, 172800]
+        actual = self._do_test_parallel_strategy(
+            containers, processes=2, task_container_per_day=3)
+        # expected container sort in descending order across processes
+        self.assertEqual({0: (0, 1, [86398, 86400, 172798, 172800]),
+                          1: (0, 1, [86399, 172799])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=3, task_container_per_day=3)
+        self.assertEqual({0: (0, 1, [86400, 172800]),
+                          1: (0, 1, [86399, 172799]),
+                          2: (0, 1, [86398, 172798])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=4, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86400, 172800]),
+                          1: (0, 1, [86399, 172799]),
+                          2: (0, 1, [86398, 172798]),
+                          3: (1, 2, [86400, 172800])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=5, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86400, 172800]),
+                          1: (0, 2, [86399, 172799]),
+                          2: (0, 1, [86398, 172798]),
+                          3: (1, 2, [86400, 172800]),
+                          4: (1, 2, [86399, 172799])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=6, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86400, 172800]),
+                          1: (0, 2, [86399, 172799]),
+                          2: (0, 2, [86398, 172798]),
+                          3: (1, 2, [86400, 172800]),
+                          4: (1, 2, [86399, 172799]),
+                          5: (1, 2, [86398, 172798])},
+                         actual)
+
+    def test_parallel_strategy_missing_only_unexpected_containers(self):
+        containers = [86396, 86397, 99999]
+        actual = self._do_test_parallel_strategy(
+            containers, processes=2, task_container_per_day=3)
+        # missing containers sort in ascending order across processes
+        self.assertEqual({0: (0, 1, [86396, 99999]),
+                          1: (0, 1, [86397])},
+                         actual)
+
+    def test_parallel_strategy_missing_expected_container(self):
+        # the missing expected container is synthesized
+        containers = [86398, 86400]
+        actual = self._do_test_parallel_strategy(
+            containers, processes=2, task_container_per_day=3)
+        self.assertEqual({0: (0, 1, [86398, 86400]),
+                          1: (0, 1, [86399])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=3, task_container_per_day=3)
+        self.assertEqual({0: (0, 1, [86400]),
+                          1: (0, 1, [86399]),
+                          2: (0, 1, [86398])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=4, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86400]),
+                          1: (0, 1, [86399]),
+                          2: (0, 1, [86398]),
+                          3: (1, 2, [86400])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=5, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86400]),
+                          1: (0, 2, [86399]),
+                          2: (0, 1, [86398]),
+                          3: (1, 2, [86400]),
+                          4: (1, 2, [86399])},
+                         actual)
+
+    def test_parallel_strategy_missing_expected_and_unexpected_container(self):
+        # the missing expected container is synthesized
+        containers = [86396, 86397, 86398, 86400]
+        actual = self._do_test_parallel_strategy(
+            containers, processes=2, task_container_per_day=3)
+        self.assertEqual({0: (0, 1, [86396, 86398, 86400]),
+                          1: (0, 1, [86397, 86399])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=3, task_container_per_day=3)
+        self.assertEqual({0: (0, 1, [86396, 86400]),
+                          1: (0, 1, [86397, 86399]),
+                          2: (0, 1, [86398])},
+                         actual)
+
+        actual = self._do_test_parallel_strategy(
+            containers, processes=4, task_container_per_day=3)
+        self.assertEqual({0: (0, 2, [86396, 86400]),
+                          1: (0, 1, [86397, 86399]),
+                          2: (0, 1, [86398]),
+                          3: (1, 2, [86396, 86400])},
+                         actual)
+
+    def test_select_task_containers_to_expire_single_process(self):
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=self.fake_swift)
-        results = [_ for _ in x.iter_task_accounts_to_expire()]
-        self.assertEqual(results, [('.expiring_objects', 0, 1)])
+        index, divisor, containers = x.select_task_containers_to_expire(
+            '.expiring_objects')
+        self.assertEqual(0, index)
+        self.assertEqual(1, divisor)
+        self.assertEqual([
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ], [str(c) for c in containers])
 
+    def test_select_task_containers_to_expire_multi_node(self):
         self.conf['processes'] = '2'
         self.conf['process'] = '1'
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=self.fake_swift)
-        results = [_ for _ in x.iter_task_accounts_to_expire()]
-        self.assertEqual(results, [('.expiring_objects', 1, 2)])
+        index, divisor, containers = x.select_task_containers_to_expire(
+            '.expiring_objects')
+        self.assertEqual(1, index)
+        self.assertEqual(2, divisor)
+        self.assertEqual([
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ], [str(c) for c in containers])
+
+    def test_select_task_containers_parallel_multi_node_small_cluster(self):
+        # parallel distributed task iteration
+        self.conf['task_container_iteration_strategy'] = 'parallel'
+        num_processes = 2
+        self.conf['processes'] = str(num_processes)
+        container_per_proc = {}
+        for p in range(num_processes):
+            self.conf['process'] = str(p)
+            x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                      swift=self.fake_swift)
+            index, divisor, containers = x.select_task_containers_to_expire(
+                '.expiring_objects')
+            # there's more containers per day than processes, each process does
+            # all tasks in many containers per day
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            container_per_proc[p] = containers
+        # assertions make the most sense against the process set
+        all_selected_containers = set(itertools.chain.from_iterable(
+            container_per_proc.values()))
+        # 3 days worth of containers * 100 containers per day
+        self.assertEqual(300, len(all_selected_containers))
+        # distributed evenly
+        for containers in container_per_proc.values():
+            self.assertEqual(len(all_selected_containers) / num_processes,
+                             len(containers))
+        # including all expected containers
+        expected = [
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ]
+        for container_str in expected:
+            self.assertIn(container_str, all_selected_containers)
+        # and none that aren't ready
+        self.assertNotIn(self.future_time_container,
+                         all_selected_containers)
+
+    def test_select_task_containers_parallel_medium_unexpected_container(self):
+        # add an unexpected container in the account listing
+        unexpected_container = str(int(self.past_time_container) - 200)
+        self.fake_swift.aco_dict['.expiring_objects'][unexpected_container] = [
+            unexpected_container + '-a0/c0/o0',
+        ]
+        # parallel distributed task iteration
+        self.conf['task_container_iteration_strategy'] = 'parallel'
+        num_processes = 100
+        self.conf['processes'] = str(num_processes)
+        container_per_proc = {}
+        for p in range(num_processes):
+            self.conf['process'] = str(p)
+            x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                      swift=self.fake_swift)
+            index, divisor, containers = x.select_task_containers_to_expire(
+                '.expiring_objects')
+            # there's same expected containers per day as processes, each
+            # process does all tasks in one container per day except on the day
+            # when one process also does all the task in the unexpected
+            # containers
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            container_per_proc[p] = containers
+        # assertions make the most sense against the process set
+        all_selected_containers = set(itertools.chain.from_iterable(
+            container_per_proc.values()))
+        # 3 days worth of containers * 100 containers per day (+1 unexpected!)
+        self.assertEqual(301, len(all_selected_containers))
+        # distributed "evenly" (300 / 100 = 3, but one node gets +1 unexpected)
+        found_per_proc_container_len = []
+        for containers in container_per_proc.values():
+            found_per_proc_container_len.append(len(containers))
+        self.assertEqual(found_per_proc_container_len, [4] + [3] * 99)
+        # including all expected containers
+        expected = [
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ]
+        for container_str in expected:
+            self.assertIn(container_str, all_selected_containers)
+        # and the unexpected container
+        self.assertIn(unexpected_container, all_selected_containers)
+        # and none that aren't ready
+        self.assertNotIn(self.future_time_container,
+                         all_selected_containers)
+
+    def test_select_task_containers_parallel_multi_node_large_cluster(self):
+        # parallel distributed task iteration
+        self.conf.update({
+            'task_container_iteration_strategy': 'parallel',
+            'expiring_objects_task_container_per_day': '1000',
+        })
+        num_processes = 500
+        self.conf['processes'] = str(num_processes)
+        container_per_proc = {}
+        for p in range(num_processes):
+            self.conf['process'] = str(p)
+            x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                      swift=self.fake_swift)
+            index, divisor, containers = x.select_task_containers_to_expire(
+                '.expiring_objects')
+            # there's more containers per day (1000) than processes (500), each
+            # process does all tasks in two containers per day
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            container_per_proc[(p, index, divisor)] = containers
+        # assertions make the most sense against the process set
+        all_selected_containers = set(itertools.chain.from_iterable(
+            container_per_proc.values()))
+        # 3 days worth of containers * 1000 containers per day
+        self.assertEqual(3000, len(all_selected_containers))
+        # distributed evenly per day
+        for containers in container_per_proc.values():
+            self.assertEqual(6, len(containers))
+        # including all expected containers
+        expected = [
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ]
+        for container_str in expected:
+            self.assertIn(container_str, all_selected_containers)
+        # and none that aren't ready
+        self.assertNotIn(self.future_time_container,
+                         all_selected_containers)
+
+    def test_select_task_containers_parallel_huge_unexpected_container(self):
+        # add an unexpected container account listing
+        unexpected_containers = [
+            str(int(self.past_time_container) - 200 + i)
+            for i in range(167)]
+        self.fake_swift.aco_dict['.expiring_objects'].update({
+            unexpected_container: [unexpected_container + '-a0/c0/o0']
+            for unexpected_container in unexpected_containers
+        })
+        # parallel distributed task iteration
+        self.conf['task_container_iteration_strategy'] = 'parallel'
+        # way more processes than containers per day, they will share
+        num_processes = 900
+        self.conf['processes'] = str(num_processes)
+        container_per_proc = {}
+        for p in range(num_processes):
+            self.conf['process'] = str(p)
+            x = expirer.ObjectExpirer(self.conf, logger=self.logger,
+                                      swift=self.fake_swift)
+            index, divisor, containers = x.select_task_containers_to_expire(
+                '.expiring_objects')
+            # there's more processes than containers per day, each process will
+            # share the container with a "few" other nodes - still better than
+            # all nodes listing all containers and sharing with all processes!
+            minimum_share = (
+                num_processes // x.expirer_config.task_container_per_day)
+            self.assertIn(divisor, {minimum_share, minimum_share + 1})
+            self.assertIn(index, set(range(divisor)))
+            container_per_proc[(p, index, divisor)] = containers
+        # assertions make the most sense against the process set
+        all_selected_containers = set(itertools.chain.from_iterable(
+            container_per_proc.values()))
+        # 3 days worth of containers * 100 containers per day (+ unexpected!)
+        self.assertEqual(300 + len(unexpected_containers),
+                         len(all_selected_containers))
+
+        found_per_proc_container_len_count = defaultdict(int)
+        per_container_indexes = collections.defaultdict(list)
+        per_container_divisors = collections.defaultdict(list)
+        for (p, index, divisor), containers in container_per_proc.items():
+            found_per_proc_container_len_count[len(containers)] += 1
+            for container in containers:
+                per_container_indexes[container].append(index)
+                per_container_divisors[container].append(divisor)
+        # there's 3 normal days worth of containers, plus another
+        # day-equivalent of unexpected, plus another 67 unexpected. So all
+        # procs get at least 4 containers, then the remaining 67 unexpected
+        # containers are striped across 900 procs with a stride of 100, so 9 *
+        # 67 = 603 procs get a 5th container
+        self.assertEqual(found_per_proc_container_len_count, {
+            5: 603,
+            4: 297,
+        })
+        # verify that, for each container, allocated procs use the same divisor
+        # and collectively cover all indexes
+        for container, indexes in per_container_indexes.items():
+            self.assertEqual(sorted(indexes), [0, 1, 2, 3, 4, 5, 6, 7, 8])
+            divisors = per_container_divisors[container]
+            self.assertEqual(divisors, [9, 9, 9, 9, 9, 9, 9, 9, 9])
+
+        # including all expected containers
+        expected = [
+            self.empty_time_container,
+            self.past_time_container,
+            self.just_past_time_container,
+        ]
+        for container_str in expected:
+            self.assertIn(container_str, all_selected_containers)
+        # and the unexpected containers
+        for unexpected_container in unexpected_containers:
+            self.assertIn(unexpected_container, all_selected_containers)
+        # and none that aren't ready
+        self.assertNotIn(self.future_time_container,
+                         all_selected_containers)
 
     def test_run_once_nothing_to_do(self):
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
@@ -1137,7 +1865,7 @@ class TestObjectExpirer(TestCase):
             for target_path in self.expired_target_paths[self.just_past_time]
         ], 2)])
 
-    def test_skip_task_account_without_task_container(self):
+    def test_run_once_task_account_without_task_container(self):
         fake_swift = FakeInternalClient({
             # task account has no containers
             '.expiring_objects': dict()
@@ -1147,8 +1875,75 @@ class TestObjectExpirer(TestCase):
         x.run_once()
         self.assertEqual(
             x.logger.get_lines_for_level('info'), [
+                'Pass beginning for task account .expiring_objects; '
+                '0 possible containers; 0 possible objects',
                 'Pass completed in 0s; 0 objects expired',
             ])
+
+    def test_select_task_containers_unexpected_container(self):
+        expected = self.get_expirer_container(time())
+        unexpected = str(int(expected) - 200)
+        for name in (expected, unexpected):
+            self.assertTrue(name.isdigit())  # sanity
+
+        container_list = [{'name': unexpected}, {'name': expected}]
+        with mock.patch.object(self.expirer.swift, 'iter_containers',
+                               return_value=container_list):
+            index, divisor, selected_containers = \
+                self.expirer.select_task_containers_to_expire(
+                    self.expirer_config.account_name)
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            self.assertEqual([unexpected, expected],
+                             selected_containers)
+        self.assertEqual(self.expirer.logger.all_log_lines(), {'info': [
+            'processing 1 unexpected task containers (e.g. %s) '
+            'if you have recently changed your expirer config '
+            'this message should go away in a few days.' % unexpected,
+        ]})
+
+        self.expirer.logger.clear()
+        new_config = ExpirerConfig({
+            'expiring_objects_task_container_per_day': 1000,
+        })
+        with mock.patch.object(self.expirer.swift, 'iter_containers',
+                               return_value=container_list):
+            self.expirer.expirer_config = new_config
+            index, divisor, selected_containers = \
+                self.expirer.select_task_containers_to_expire(
+                    self.expirer_config.account_name)
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            self.assertEqual([unexpected, expected],
+                             selected_containers)
+
+    def test_select_task_containers_invalid_container(self):
+        ok_names = ['86301', '86400']
+        bad_names = ['-1', 'rogue']
+        unexpected = ['86300', '86401']
+
+        container_list = [{'name': name} for name in bad_names] + \
+                         [{'name': name} for name in ok_names] + \
+                         [{'name': name} for name in unexpected]
+        with mock.patch.object(self.expirer.swift, 'iter_containers',
+                               return_value=container_list):
+            index, divisor, selected_containers = \
+                self.expirer.select_task_containers_to_expire('task_account')
+            self.assertEqual(0, index)
+            self.assertEqual(1, divisor)
+            self.assertEqual(ok_names + unexpected,
+                             selected_containers)
+        lines = self.expirer.logger.get_lines_for_level('error')
+        self.assertEqual(lines, [
+            'skipping invalid task container: task_account/-1',
+            'skipping invalid task container: task_account/rogue',
+        ])
+        lines = self.expirer.logger.get_lines_for_level('info')
+        self.assertEqual(lines, [
+            'processing 2 unexpected task containers (e.g. 86300 86401) '
+            'if you have recently changed your expirer config '
+            'this message should go away in a few days.'
+        ])
 
     def test_run_once_with_invalid_container(self):
         now = time()
@@ -1209,6 +2004,8 @@ class TestObjectExpirer(TestCase):
         self.assertEqual(mock_delete_container.mock_calls, [
             mock.call('.expiring_objects', self.empty_time_container,
                       acceptable_statuses=(2, 404, 409))])
+        self.assertEqual(
+            {}, self.expirer.logger.statsd_client.get_increment_counts())
 
         # 404 (account/container list race) gets deleted inline
         task_account_container_list = [
@@ -1223,6 +2020,8 @@ class TestObjectExpirer(TestCase):
         self.assertEqual(mock_delete_container.mock_calls, [
             mock.call('.expiring_objects', 'does-not-matter',
                       acceptable_statuses=(2, 404, 409))])
+        self.assertEqual(
+            {}, self.expirer.logger.statsd_client.get_increment_counts())
 
         # ready containers are processed
         task_account_container_list = [
@@ -1241,8 +2040,13 @@ class TestObjectExpirer(TestCase):
                 expected)
         # not empty; not deleted
         self.assertEqual(mock_delete_container.mock_calls, [])
+        self.assertEqual(
+            {'tasks.assigned': 5},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
 
         # the task queue has invalid task object
+        self.expirer.logger.statsd_client.clear()
         invalid_aco_dict = deepcopy(self.fake_swift.aco_dict)
         invalid_aco_dict['.expiring_objects'][self.past_time_container].insert(
             0, self.past_time + '-invalid0')
@@ -1257,8 +2061,13 @@ class TestObjectExpirer(TestCase):
             list(x.iter_task_to_expire(
                 task_account_container_list, my_index, divisor)),
             expected)
+        self.assertEqual(
+            {'tasks.assigned': 5, 'tasks.parse_errors': 2},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
 
         # test some of that async delete
+        self.expirer.logger.statsd_client.clear()
         async_delete_aco_dict = {
             '.expiring_objects': {
                 # this task container will be checked
@@ -1305,6 +2114,104 @@ class TestObjectExpirer(TestCase):
             task_account_container_list, my_index, divisor))
 
         self.assertEqual(expected, found)
+        self.assertEqual(
+            {'tasks.assigned': 10},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
+
+    def test_iter_task_to_expire_with_skipped_tasks_single_process(self):
+        # Only one task is assigned to the tested expirer
+        my_index = 0
+        divisor = 10
+        task_account_container_list = [
+            (".expiring_objects", self.past_time_container)
+        ]
+
+        expected = [
+            self.make_task(
+                self.past_time_container,
+                self.past_time,
+                self.expired_target_paths[self.past_time][0],
+            )
+        ]
+        # Use mock of hash_mod to output predictable result.
+        with mock.patch.object(self.expirer, "hash_mod",
+                               side_effect=itertools.cycle(range(10))):
+            self.assertEqual(
+                expected,
+                list(
+                    self.expirer.iter_task_to_expire(
+                        task_account_container_list, my_index, divisor
+                    )
+                )
+            )
+        self.assertEqual(
+            {"tasks.assigned": 1, "tasks.skipped": 4},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
+
+    def test_iter_task_to_expire_with_skipped_tasks_multi_processes(self):
+        processes = 10
+        task_account_container_list = [
+            (".expiring_objects", self.past_time_container),
+            (".expiring_objects", self.just_past_time_container),
+            (".expiring_objects", self.future_time_container),
+        ]
+
+        total_tasks = 0
+        for i in range(processes):
+            yielded_tasks = list(
+                self.expirer.iter_task_to_expire(
+                    task_account_container_list, i, processes
+                ))
+            total_tasks += len(yielded_tasks)
+        # Ten tasks, each process gets 1 on average.
+        # N.B. each process may get 0 or multiple tasks, since hash_mod is
+        # based on names of current time.
+        self.assertEqual(10, total_tasks)
+
+        # On average, each process was assigned 1 task and skipped 9
+        self.assertEqual({
+            'tasks.assigned': 10,
+            'tasks.skipped': 90,
+        }, self.expirer.logger.statsd_client.get_increment_counts())
+
+    def test_iter_task_to_expire_with_skipped_and_delayed_tasks(self):
+        divisor = 3
+        task_account_container_list = [
+            (".expiring_objects", self.past_time_container),
+            (".expiring_objects", self.just_past_time_container),
+        ]
+        expected_task_paths = [
+            path
+            for path in sorted(self.expired_target_paths[self.past_time] +
+                               self.expired_target_paths[self.just_past_time])
+            if not path.startswith('a1')  # delayed task
+        ]
+        self.assertEqual(9, len(expected_task_paths))  # sanity check
+
+        actual_task_paths = []
+        proc_stats = defaultdict(int)
+        for process in range(divisor):
+            self.conf['delay_reaping_a1'] = 2 * 86400
+            self.conf['process'] = process
+            self.conf['processes'] = 3
+            x = expirer.ObjectExpirer(self.conf, logger=debug_logger(),
+                                      swift=self.fake_swift)
+            actual_task_paths.extend(
+                sorted([task['target_path'] for task in
+                       x.iter_task_to_expire(
+                        task_account_container_list, process, divisor)]))
+            for k, v in x.logger.statsd_client.get_increment_counts().items():
+                proc_stats[k] += v
+
+        self.assertEqual(
+            {"tasks.skipped": 20,
+             "tasks.delayed": 1,
+             "tasks.assigned": 9},
+            proc_stats,
+        )
+        self.assertEqual(expected_task_paths, sorted(actual_task_paths))
 
     def test_iter_task_to_expire_with_delay_reaping(self):
         aco_dict = {
@@ -1362,8 +2269,13 @@ class TestObjectExpirer(TestCase):
         observed = list(x.iter_task_to_expire(
             task_account_container_list, 0, 1))
         self.assertEqual(expected, observed)
+        self.assertEqual(
+            {'tasks.assigned': 6},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
 
         # configure delay for account a1
+        self.expirer.logger.statsd_client.clear()
         self.conf['delay_reaping_a1'] = 300.0
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
                                   swift=fake_swift)
@@ -1390,10 +2302,15 @@ class TestObjectExpirer(TestCase):
         observed = list(x.iter_task_to_expire(
             task_account_container_list, 0, 1))
         self.assertEqual(expected, observed)
+        self.assertEqual(
+            {'tasks.assigned': 4, 'tasks.delayed': 2},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
 
         # configure delay for account a1 and for account a1 and container c2
         # container a1/c2 expires expires almost immediately
         # but other containers in account a1 remain (a1/c1 and a1/c3)
+        self.expirer.logger.statsd_client.clear()
         self.conf['delay_reaping_a1'] = 300.0
         self.conf['delay_reaping_a1/c2'] = 0.1
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
@@ -1423,9 +2340,14 @@ class TestObjectExpirer(TestCase):
         observed = list(x.iter_task_to_expire(
             task_account_container_list, 0, 1))
         self.assertEqual(expected, observed)
+        self.assertEqual(
+            {'tasks.assigned': 5, 'tasks.delayed': 1},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
 
         # configure delay for account a1 and for account a1 and container c2
         # container a1/c2 does not expire but others in account a1 do
+        self.expirer.logger.statsd_client.clear()
         self.conf['delay_reaping_a1'] = 0.1
         self.conf['delay_reaping_a1/c2'] = 300.0
         x = expirer.ObjectExpirer(self.conf, logger=self.logger,
@@ -1455,6 +2377,10 @@ class TestObjectExpirer(TestCase):
         observed = list(x.iter_task_to_expire(
             task_account_container_list, 0, 1))
         self.assertEqual(expected, observed)
+        self.assertEqual(
+            {'tasks.assigned': 5, 'tasks.delayed': 1},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
 
     def test_iter_task_to_expire_with_delay_reaping_is_async(self):
         aco_dict = {
@@ -1778,6 +2704,12 @@ class TestObjectExpirer(TestCase):
             self._do_test_task_queue_iteration_order()
         print('default: %s == %s' % (observed, worst_case))
         self.assertEqual(observed, worst_case)
+        self.assertEqual(
+            {'tasks.assigned': 1260,
+             'tasks.delayed': 6740,
+             'objects': 1260},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
 
     def test_in_order_task_container_iteration_delays_deletes(self):
         # "in order" is the least optimized "randomization"
@@ -1786,6 +2718,12 @@ class TestObjectExpirer(TestCase):
             self._do_test_task_queue_iteration_order(stub_shuffle)
         print('in order: %s == %s' % (observed, worst_case))
         self.assertEqual(observed, worst_case)
+        self.assertEqual(
+            {'tasks.assigned': 1260,
+             'tasks.delayed': 6740,
+             'objects': 1260},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
 
     def test_reversed_task_container_iteration_hastens_deletes(self):
         # "shuffle newer to front" is the most optimized "randomization"
@@ -1795,6 +2733,12 @@ class TestObjectExpirer(TestCase):
             self._do_test_task_queue_iteration_order(stub_shuffle)
         print('reversed: %s == %s' % (observed, best_case))
         self.assertEqual(observed, best_case)
+        self.assertEqual(
+            {'tasks.assigned': 1260,
+             'tasks.delayed': 6740,
+             'objects': 1260},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
 
     def test_randomized_task_container_iteration_hastens_deletes(self):
         # randomized sits in the middle
@@ -1804,6 +2748,74 @@ class TestObjectExpirer(TestCase):
         print('randomized: %s <= %s < %s' % (best_case, observed, worst_case))
         self.assertGreaterEqual(observed, best_case)
         self.assertLess(observed, worst_case)
+        self.assertEqual(
+            {'tasks.assigned': 1260,
+             'tasks.delayed': 6740,
+             'objects': 1260},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
+
+    def test_parallel_task_container_iteration_hastens_deletes(self):
+        now = time()
+        num_days_before_now = 2
+        num_days_after_now = 1
+        self.conf['round_robin_task_cache_size'] = 200
+        containers_per_day = 100  # just like for realz!
+        num_tasks_per_container = 10
+        self.conf['delay_reaping_a0'] = 86400 * 8
+        self.conf['delay_reaping_a1/c1a'] = 86400 * 3
+        self.conf['delay_reaping_a2'] = 86400
+        target_account_containers = [
+            # the backlog will have ONLY tasks under grace
+            ('a0', 'c0'),
+            ('a1', 'c1a'),
+            ('a2', 'c2'),
+            # these are always reapable, and only show up on todays backlog
+            ('a1', 'c1b'),
+            ('a1', 'c1c'),
+            ('a3', 'c3'),
+            ('a4', 'c4'),
+        ]
+        self._setup_a_bunch_of_tasks(now, num_days_before_now,
+                                     num_days_after_now, containers_per_day,
+                                     num_tasks_per_container,
+                                     target_account_containers)
+        # calculate expectations based on serial process configuration
+        task_containers = self.fake_swift.aco_dict['.expiring_objects'].keys()
+        expected_calls = self._count_expected_calls(
+            now, sorted(task_containers))
+
+        # ... but take observation of distributed process configuration
+        self.conf['task_container_iteration_strategy'] = 'parallel'
+        num_processes = 3
+        self.conf['processes'] = str(num_processes)
+        observation_per_proc = {}
+        for p in range(num_processes):
+            self.conf['process'] = str(p)
+            self._setup_fake_swift(self.fake_swift.aco_dict)
+            self._expirer_run_once_with_mocks(now=now)
+            observation_per_proc[p] = self._sort_out_fake_swift_calls()
+
+        self.assertEqual(
+            {'tasks.assigned': 1000,
+             'tasks.delayed': 2000,
+             'objects': 1000},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
+
+        all_iter_object_count = 0
+        all_delete_object_count = 0
+        for o_iter_object, o_delete_object, o_num_iter_before_delete in \
+                observation_per_proc.values():
+            all_iter_object_count += len(o_iter_object)
+            all_delete_object_count += len(o_delete_object)
+            # each process gets into today/ready after listing fewer containers
+            self.assertLess(o_num_iter_before_delete,
+                            expected_calls['listing_before_delete'])
+
+        # but in aggregate all containers are listed and ready tasks reaped
+        self.assertEqual(all_iter_object_count, expected_calls['listing'])
+        self.assertEqual(all_delete_object_count, expected_calls['delete'])
 
     def test_run_once_unicode_problem(self):
         requests = []
@@ -1857,8 +2869,12 @@ class TestObjectExpirer(TestCase):
 
         # no tasks are popped from the queue
         self.assertEqual(mock_method.call_args_list, [])
+        self.assertEqual(
+            {'errors': 10, 'tasks.assigned': 10},
+            self.expirer.logger.statsd_client.get_increment_counts())
 
         # all tasks are done
+        self.expirer.logger.clear()
         with mock.patch.object(self.expirer, 'delete_actual_object',
                                lambda o, t, b: None), \
                 mock.patch('swift.obj.expirer.shuffle', lambda a: None), \
@@ -1875,6 +2891,9 @@ class TestObjectExpirer(TestCase):
              self.just_past_time + '-' + target_path)
              for target_path
              in self.expired_target_paths[self.just_past_time]])
+        self.assertEqual(
+            {'objects': 10, 'tasks.assigned': 10},
+            self.expirer.logger.statsd_client.get_increment_counts())
 
     def test_success_gets_counted(self):
         self.assertEqual(self.expirer.report_objects, 0)
@@ -1886,6 +2905,10 @@ class TestObjectExpirer(TestCase):
                                   lambda a, c, o: None):
             self.expirer.run_once()
         self.assertEqual(self.expirer.report_objects, 10)
+        self.assertEqual(
+            {'tasks.assigned': 10, 'objects': 10},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
 
     def test_delete_actual_object_gets_native_string(self):
         got_str = [False]
@@ -1944,6 +2967,13 @@ class TestObjectExpirer(TestCase):
                       self.past_time + '-' + target_path)
             for target_path in self.expired_target_paths[self.past_time]
         ])
+        self.assertEqual(
+            {'errors': 5, 'objects': 5, 'tasks.assigned': 10},
+            self.expirer.logger.statsd_client.get_increment_counts())
+
+        self.assertEqual(
+            {'objects': 5, 'errors': 5, 'tasks.assigned': 10},
+            self.expirer.logger.statsd_client.get_increment_counts())
 
         self.assertEqual(
             {'objects': 5, 'errors': 5},

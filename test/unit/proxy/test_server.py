@@ -2303,6 +2303,7 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         mock_statsd.assert_called_once_with(
             'example.com', 8125, base_prefix='', tail_prefix='proxy-server',
             default_sample_rate=1.0, sample_rate_factor=1.0,
+            emit_legacy=True,
             logger=app.logger.logger)
 
         conf_sections = """
@@ -2330,6 +2331,7 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         mock_statsd.assert_called_once_with(
             'example.com', 8125, base_prefix='', tail_prefix='proxy-server',
             default_sample_rate=1.0, sample_rate_factor=1.0,
+            emit_legacy=True,
             logger=app.logger.logger)
 
 
@@ -5051,6 +5053,39 @@ class TestReplicatedObjectController(
         do_test('PUT', 'sharding')
         do_test('PUT', 'sharded')
 
+    def test_get_backend_updating_shard_with_cooperative_token_configs(self):
+        conf = {}
+        self.app = proxy_server.Application(
+            conf,
+            logger=self.logger,
+            account_ring=FakeRing(),
+            container_ring=FakeRing())
+        self.assertEqual(self.app.namespace_cache_use_token, False)
+        self.assertEqual(self.app.namespace_cache_token_retry_interval, 0.1)
+        self.assertEqual(self.app.namespace_cache_tokens_per_session, 3)
+
+        conf = {'namespace_cache_use_token': 'True'}
+        self.app = proxy_server.Application(
+            conf,
+            logger=self.logger,
+            account_ring=FakeRing(),
+            container_ring=FakeRing())
+        self.assertEqual(self.app.namespace_cache_use_token, True)
+        self.assertEqual(self.app.namespace_cache_token_retry_interval, 0.1)
+        self.assertEqual(self.app.namespace_cache_tokens_per_session, 3)
+
+        conf = {'namespace_cache_use_token': 'True',
+                'namespace_cache_token_retry_interval': 0.2,
+                'namespace_cache_tokens_per_session': 1}
+        self.app = proxy_server.Application(
+            conf,
+            logger=self.logger,
+            account_ring=FakeRing(),
+            container_ring=FakeRing())
+        self.assertEqual(self.app.namespace_cache_use_token, True)
+        self.assertEqual(self.app.namespace_cache_token_retry_interval, 0.2)
+        self.assertEqual(self.app.namespace_cache_tokens_per_session, 1)
+
     @patch_policies([
         StoragePolicy(0, 'zero', is_default=True, object_ring=FakeRing()),
         StoragePolicy(1, 'one', object_ring=FakeRing()),
@@ -6133,7 +6168,9 @@ class TestReplicatedObjectController(
                         'Handoff requested (5)',
                         'Handoff requested (6)',
                     ])
-                stats = self.app.logger.statsd_client.get_increment_counts()
+                stats = (
+                    self.app.logger.statsd_client.get_increment_counts()
+                )
                 self.assertEqual(2, stats.get('error_limiter.is_limited', 0))
                 self.assertEqual(2, stats.get('object.handoff_count', 0))
 
@@ -6161,7 +6198,9 @@ class TestReplicatedObjectController(
                         'Handoff requested (9)',
                         'Handoff requested (10)',
                     ])
-                stats = self.app.logger.statsd_client.get_increment_counts()
+                stats = (
+                    self.app.logger.statsd_client.get_increment_counts()
+                )
                 self.assertEqual(4, stats.get('error_limiter.is_limited', 0))
                 self.assertEqual(4, stats.get('object.handoff_count', 0))
                 self.assertEqual(1, stats.get('object.handoff_all_count', 0))
@@ -8041,9 +8080,8 @@ class TestReplicatedObjectController(
         self.app.container_ring.set_replicas(2)
 
         delete_at_timestamp = int(time.time()) + 100000
-        delete_at_container = utils.get_expirer_container(
-            delete_at_timestamp, self.app.expiring_objects_container_divisor,
-            'a', 'c', 'o')
+        delete_at_container = self.app.expirer_config.get_expirer_container(
+            delete_at_timestamp, 'a', 'c', 'o')
         req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'Content-Type': 'application/stuff',
                                      'Content-Length': '0',
@@ -8078,9 +8116,8 @@ class TestReplicatedObjectController(
         self.app.expiring_objects_container_divisor = 60
 
         delete_at_timestamp = int(time.time()) + 100000
-        delete_at_container = utils.get_expirer_container(
-            delete_at_timestamp, self.app.expiring_objects_container_divisor,
-            'a', 'c', 'o')
+        delete_at_container = self.app.expirer_config.get_expirer_container(
+            delete_at_timestamp, 'a', 'c', 'o')
         req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'Content-Type': 'application/stuff',
                                      'Content-Length': 0,

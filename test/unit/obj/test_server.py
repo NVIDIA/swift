@@ -40,6 +40,7 @@ from eventlet.green import httplib
 
 from swift import __version__ as swift_version
 from swift.common.http import is_success
+from swift.obj.expirer import ExpirerConfig
 from test import listen_zero, BaseTestCase
 from test.debug_logger import debug_logger
 from test.unit import mocked_http_conn, \
@@ -1496,10 +1497,10 @@ class TestObjectController(BaseTestCase):
     def _update_delete_at_headers(self, headers, a='a', c='c', o='o',
                                   node_count=1):
         delete_at = headers['X-Delete-At']
-        delete_at_container = utils.get_expirer_container(delete_at, 84600,
-                                                          a, c, o)
-        part, nodes = self.container_ring.get_nodes(
-            '.expiring_objects', delete_at_container)
+        expirer_config = ExpirerConfig(
+            self.conf, container_ring=self.container_ring)
+        part, nodes, delete_at_container = expirer_config.get_delete_at_nodes(
+            delete_at, a, c, o)
         # proxy assigns each replica a node, index 0 for test stability
         nodes = nodes[:node_count]
         headers.update({
@@ -2734,6 +2735,8 @@ class TestObjectController(BaseTestCase):
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
+        self.assertEqual(self.logger.statsd_client.get_increment_counts(),
+                         {'sync_update.success.201': 1})
         timestamp = normalize_timestamp(time())
         req = Request.blank(
             '/sda1/p/a/c/o',
@@ -2745,11 +2748,14 @@ class TestObjectController(BaseTestCase):
                      'X-Container-Timestamp': '1',
                      'Content-Type': 'application/new1',
                      'Content-Length': '0'})
+        self.logger.clear()
         with mock.patch.object(
                 object_server, 'http_connect', mock_http_connect(500)):
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
+        self.assertEqual(self.logger.statsd_client.get_increment_counts(),
+                         {'sync_update.error.500': 1, 'async_pendings': 1})
         timestamp = normalize_timestamp(time())
         req = Request.blank(
             '/sda1/p/a/c/o',
@@ -2761,12 +2767,16 @@ class TestObjectController(BaseTestCase):
                      'X-Container-Timestamp': '1',
                      'Content-Type': 'application/new1',
                      'Content-Length': '0'})
+        self.logger.clear()
         with mock.patch.object(
                 object_server, 'http_connect',
                 mock_http_connect(500, with_exc=True)):
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
+        self.assertEqual(self.logger.statsd_client.get_increment_counts(),
+                         {'sync_update.error.exception': 1,
+                          'async_pendings': 1})
 
     def test_EC_PUT_GET_data(self):
         for policy in self.ec_policies:
@@ -5770,7 +5780,7 @@ class TestObjectController(BaseTestCase):
         self.object_controller._diskfile_router = diskfile.DiskFileRouter(
             self.conf, self.object_controller.logger)
         policy = random.choice(list(POLICIES))
-        self.object_controller.expiring_objects_account = 'exp'
+        self.object_controller.expirer_config.account_name = 'exp'
 
         http_connect_args = []
 
@@ -6291,6 +6301,7 @@ class TestObjectController(BaseTestCase):
             headers.update(override_headers)
             req = Request.blank('/sda1/0/a/c/o', method='PUT',
                                 headers=headers, body='')
+            self.logger.clear()
             with mocked_http_conn(
                     200, give_connect=capture_updates) as fake_conn:
                 with fake_spawn():
@@ -6314,6 +6325,8 @@ class TestObjectController(BaseTestCase):
                 'x-trans-id': '123',
                 'referer': 'PUT http://localhost/sda1/0/a/c/o',
                 'x-foo': 'bar'}))
+            self.assertEqual(self.logger.statsd_client.get_increment_counts(),
+                             {'sync_update.success.200': 1})
 
         # EC policy override headers
         do_test({
@@ -6340,10 +6353,9 @@ class TestObjectController(BaseTestCase):
             'X-Backend-Container-Update-Override-Content-Type': 'ignored',
             'X-Backend-Container-Update-Override-Foo': 'ignored'})
 
-    def test_PUT_container_update_to_old_style_shard(self):
-        # verify that alternate container update path is respected when
-        # included in request headers
-        def do_test(container_path, expected_path, expected_container_path):
+    def _put_container_update_to_shard(self, container_path_key):
+        def do_test(container_path, expected_path, expected_container_path,
+                    expect_skip_to_async=False):
             policy = random.choice(list(POLICIES))
             container_updates = []
 
@@ -6372,26 +6384,38 @@ class TestObjectController(BaseTestCase):
                 'X-Backend-Storage-Policy-Index': int(policy),
             }
             if container_path is not None:
-                headers['X-Backend-Container-Path'] = container_path
+                headers[container_path_key] = container_path
                 headers['X-Container-Root-Db-State'] = 'sharded'
 
             req = Request.blank('/sda1/0/a/c/o', method='PUT',
                                 headers=headers, body='')
-            with mocked_http_conn(
-                    500, give_connect=capture_updates) as fake_conn:
+            self.logger.clear()
+            if expect_skip_to_async:
                 with fake_spawn():
                     resp = req.get_response(self.object_controller)
-            with self.assertRaises(StopIteration):
-                next(fake_conn.code_iter)
+                self.assertEqual(
+                    self.logger.statsd_client.get_increment_counts(),
+                    {'sync_update.skip': 1})
+                self.assertEqual(len(container_updates), 0)
+            else:
+                with mocked_http_conn(
+                        500, give_connect=capture_updates) as fake_conn:
+                    with fake_spawn():
+                        resp = req.get_response(self.object_controller)
+                with self.assertRaises(StopIteration):
+                    next(fake_conn.code_iter)
+                self.assertEqual(
+                    self.logger.statsd_client.get_increment_counts(),
+                    {'sync_update.error.500': 1})
+                self.assertEqual(len(container_updates), 1)
+                # verify expected path used in update request
+                ip, port, method, path, headers = container_updates[0]
+                self.assertEqual(ip, 'chost')
+                self.assertEqual(port, 'cport')
+                self.assertEqual(method, 'PUT')
+                self.assertEqual(
+                    path, '/cdevice/cpartition/%s/o' % expected_path)
             self.assertEqual(resp.status_int, 201)
-            self.assertEqual(len(container_updates), 1)
-            # verify expected path used in update request
-            ip, port, method, path, headers = container_updates[0]
-            self.assertEqual(ip, 'chost')
-            self.assertEqual(port, 'cport')
-            self.assertEqual(method, 'PUT')
-            self.assertEqual(path, '/cdevice/cpartition/%s/o' % expected_path)
-
             # verify that the picked update *always* has root container
             self.assertEqual(1, len(pickle_async_update_args))
             (objdevice, account, container, obj, data, timestamp,
@@ -6424,111 +6448,26 @@ class TestObjectController(BaseTestCase):
             self.assertEqual(expected_data, data)
 
         do_test('a_shard/c_shard', 'a_shard/c_shard', 'a_shard/c_shard')
-        do_test('', 'a/c', None)
+        do_test('', 'a/c', None, expect_skip_to_async=True)
         do_test(None, 'a/c', None)
         # TODO: should these cases trigger a 400 response rather than
         # defaulting to root path?
-        do_test('garbage', 'a/c', None)
-        do_test('/', 'a/c', None)
-        do_test('/no-acct', 'a/c', None)
-        do_test('no-cont/', 'a/c', None)
-        do_test('too/many/parts', 'a/c', None)
-        do_test('/leading/slash', 'a/c', None)
+        do_test('garbage', 'a/c', None, expect_skip_to_async=False)
+        do_test('/', 'a/c', None, expect_skip_to_async=False)
+        do_test('/no-acct', 'a/c', None, expect_skip_to_async=False)
+        do_test('no-cont/', 'a/c', None, expect_skip_to_async=False)
+        do_test('too/many/parts', 'a/c', None, expect_skip_to_async=False)
+        do_test('/leading/slash', 'a/c', None, expect_skip_to_async=False)
+
+    def test_PUT_container_update_to_old_style_shard(self):
+        # verify that old style container update path is respected when
+        # included in request headers
+        self._put_container_update_to_shard('X-Backend-Container-Path')
 
     def test_PUT_container_update_to_shard(self):
         # verify that alternate container update path is respected when
         # included in request headers
-        def do_test(container_path, expected_path, expected_container_path):
-            policy = random.choice(list(POLICIES))
-            container_updates = []
-
-            def capture_updates(
-                    ip, port, method, path, headers, *args, **kwargs):
-                container_updates.append((ip, port, method, path, headers))
-
-            pickle_async_update_args = []
-
-            def fake_pickle_async_update(*args):
-                pickle_async_update_args.append(args)
-
-            diskfile_mgr = self.object_controller._diskfile_router[policy]
-            diskfile_mgr.pickle_async_update = fake_pickle_async_update
-
-            ts_put = next(self.ts)
-            headers = {
-                'X-Timestamp': ts_put.internal,
-                'X-Trans-Id': '123',
-                'X-Container-Host': 'chost:cport',
-                'X-Container-Partition': 'cpartition',
-                'X-Container-Device': 'cdevice',
-                'X-Container-Root-Db-State': 'unsharded',
-                'Content-Type': 'text/plain',
-                'X-Object-Sysmeta-Ec-Frag-Index': 0,
-                'X-Backend-Storage-Policy-Index': int(policy),
-            }
-            if container_path is not None:
-                headers['X-Backend-Quoted-Container-Path'] = container_path
-                headers['X-Container-Root-Db-State'] = 'sharded'
-
-            req = Request.blank('/sda1/0/a/c/o', method='PUT',
-                                headers=headers, body='')
-            with mocked_http_conn(
-                    500, give_connect=capture_updates) as fake_conn:
-                with fake_spawn():
-                    resp = req.get_response(self.object_controller)
-            with self.assertRaises(StopIteration):
-                next(fake_conn.code_iter)
-            self.assertEqual(resp.status_int, 201)
-            self.assertEqual(len(container_updates), 1)
-            # verify expected path used in update request
-            ip, port, method, path, headers = container_updates[0]
-            self.assertEqual(ip, 'chost')
-            self.assertEqual(port, 'cport')
-            self.assertEqual(method, 'PUT')
-            self.assertEqual(path, '/cdevice/cpartition/%s/o' % expected_path)
-
-            # verify that the picked update *always* has root container
-            self.assertEqual(1, len(pickle_async_update_args))
-            (objdevice, account, container, obj, data, timestamp,
-             policy) = pickle_async_update_args[0]
-            self.assertEqual(objdevice, 'sda1')
-            self.assertEqual(account, 'a')  # NB user account
-            self.assertEqual(container, 'c')  # NB root container
-            self.assertEqual(obj, 'o')
-            self.assertEqual(timestamp, ts_put.internal)
-            self.assertEqual(policy, policy)
-            expected_data = {
-                'headers': HeaderKeyDict({
-                    'X-Size': '0',
-                    'User-Agent': 'object-server %s' % os.getpid(),
-                    'X-Content-Type': 'text/plain',
-                    'X-Timestamp': ts_put.internal,
-                    'X-Trans-Id': '123',
-                    'Referer': 'PUT http://localhost/sda1/0/a/c/o',
-                    'X-Backend-Storage-Policy-Index': int(policy),
-                    'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e'}),
-                'obj': 'o',
-                'account': 'a',
-                'container': 'c',
-                'op': 'PUT',
-                'db_state': 'unsharded'}
-            if expected_container_path:
-                expected_data['container_path'] = expected_container_path
-            if container_path is not None:
-                expected_data['db_state'] = 'sharded'
-            self.assertEqual(expected_data, data)
-
-        do_test('a_shard/c_shard', 'a_shard/c_shard', 'a_shard/c_shard')
-        do_test('', 'a/c', None)
-        do_test(None, 'a/c', None)
-        # TODO: should these cases trigger a 400 response rather than
-        # defaulting to root path?
-        do_test('garbage', 'a/c', None)
-        do_test('/', 'a/c', None)
-        do_test('/no-acct', 'a/c', None)
-        do_test('no-cont/', 'a/c', None)
-        do_test('too/many/parts', 'a/c', None)
-        do_test('/leading/slash', 'a/c', None)
+        self._put_container_update_to_shard('X-Backend-Quoted-Container-Path')
 
     def test_container_update_async(self):
         policy = random.choice(list(POLICIES))
@@ -6633,7 +6572,7 @@ class TestObjectController(BaseTestCase):
                      headers_out, 'sda1', POLICIES[0]),
                     {'logger_thread_locals': (None, None),
                      'container_path': None,
-                     'db_state': 'unsharded'}]
+                     'db_state': 'unsharded', 'attempt_sync_update': True}]
         self.assertEqual(called_async_update_args, [expected])
 
     def test_container_update_as_greenthread_with_timeout(self):
@@ -6807,9 +6746,10 @@ class TestObjectController(BaseTestCase):
         self.object_controller.delete_at_update(
             'DELETE', 12345678901, 'a', 'c', 'o', req, 'sda1', policy)
         expiring_obj_container = given_args.pop(2)
-        expected_exp_cont = utils.get_expirer_container(
-            utils.normalize_delete_at_timestamp(12345678901),
-            86400, 'a', 'c', 'o')
+        expected_exp_cont = \
+            self.object_controller.expirer_config.get_expirer_container(
+                utils.normalize_delete_at_timestamp(12345678901),
+                'a', 'c', 'o')
         self.assertEqual(expiring_obj_container, expected_exp_cont)
 
         self.assertEqual(given_args, [
@@ -6887,6 +6827,9 @@ class TestObjectController(BaseTestCase):
                      'X-Backend-Storage-Policy-Index': int(policy)})
         self.object_controller.delete_at_update('PUT', 2, 'a', 'c', 'o',
                                                 req, 'sda1', policy)
+        # proxy servers started sending the x-delete-at-container along with
+        # host/part/device in 2013 Ia0081693f01631d3f2a59612308683e939ced76a
+        # it may be no longer necessary to say "warning: upgrade faster"
         self.assertEqual(
             self.logger.get_lines_for_level('warning'),
             ['X-Delete-At-Container header must be specified for expiring '
@@ -6897,6 +6840,60 @@ class TestObjectController(BaseTestCase):
                 'PUT', '.expiring_objects', '0000000000', '0000000002-a/c/o',
                 '127.0.0.1:1234',
                 '3', 'sdc1', HeaderKeyDict({
+                    # the .expiring_objects account is always policy-0
+                    'X-Backend-Storage-Policy-Index': 0,
+                    'x-size': '0',
+                    'x-etag': 'd41d8cd98f00b204e9800998ecf8427e',
+                    'x-content-type': 'text/plain',
+                    'x-timestamp': utils.Timestamp('1').internal,
+                    'x-trans-id': '1234',
+                    'referer': 'PUT http://localhost/v1/a/c/o'}),
+                'sda1', policy])
+
+    def test_delete_at_update_put_with_info_but_wrong_container(self):
+        # Same as test_delete_at_update_put_with_info, but the
+        # X-Delete-At-Container is "wrong"
+        policy = random.choice(list(POLICIES))
+        given_args = []
+
+        def fake_async_update(*args):
+            given_args.extend(args)
+
+        self.object_controller.async_update = fake_async_update
+        self.object_controller.logger = self.logger
+        delete_at = time()
+        req_headers = {
+            'X-Timestamp': 1,
+            'X-Trans-Id': '1234',
+            'X-Delete-At': delete_at,
+            'X-Backend-Storage-Policy-Index': int(policy),
+        }
+        self._update_delete_at_headers(req_headers)
+        delete_at = str(int(time() + 30))
+        expected_container = \
+            self.object_controller.expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'o')
+        unexpected_container = str(int(delete_at) + 100)
+        req_headers['X-Delete-At-Container'] = unexpected_container
+        req = Request.blank(
+            '/v1/a/c/o',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers=req_headers)
+        self.object_controller.delete_at_update('PUT', delete_at,
+                                                'a', 'c', 'o',
+                                                req, 'sda1', policy)
+        self.assertEqual({'debug': [
+            "Proxy X-Delete-At-Container '%s' does not match expected "
+            "'%s' for current expirer_config." % (unexpected_container,
+                                                  expected_container)
+        ]}, self.logger.all_log_lines())
+        self.assertEqual(
+            given_args, [
+                'PUT', '.expiring_objects', unexpected_container,
+                '%s-a/c/o' % delete_at,
+                req_headers['X-Delete-At-Host'],
+                req_headers['X-Delete-At-Partition'],
+                req_headers['X-Delete-At-Device'], HeaderKeyDict({
                     # the .expiring_objects account is always policy-0
                     'X-Backend-Storage-Policy-Index': 0,
                     'x-size': '0',
@@ -6949,8 +6946,9 @@ class TestObjectController(BaseTestCase):
 
         self.object_controller.async_update = fake_async_update
         self.object_controller.logger = self.logger
-        delete_at_container = utils.get_expirer_container(
-            '1', 84600, 'a', 'c', 'o')
+        delete_at_container = \
+            self.object_controller.expirer_config.get_expirer_container(
+                '1', 'a', 'c', 'o')
         req = Request.blank(
             '/v1/a/c/o',
             environ={'REQUEST_METHOD': 'PUT'},
@@ -7774,10 +7772,9 @@ class TestObjectController(BaseTestCase):
     def test_extra_headers_contain_object_bytes(self):
         timestamp1 = next(self.ts).normal
         delete_at_timestamp1 = int(time() + 1000)
-        delete_at_container1 = str(
-            delete_at_timestamp1 /
-            self.object_controller.expiring_objects_container_divisor *
-            self.object_controller.expiring_objects_container_divisor)
+        delete_at_container1 = \
+            self.object_controller.expirer_config.get_expirer_container(
+                delete_at_timestamp1, 'a', 'c', 'o')
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
             headers={'X-Timestamp': timestamp1,
@@ -7862,8 +7859,9 @@ class TestObjectController(BaseTestCase):
 
         policy = random.choice(list(POLICIES))
         delete_at = int(next(self.ts)) + 30
-        delete_at_container = utils.get_expirer_container(delete_at, 86400,
-                                                          'a', 'c', 'o')
+        delete_at_container = \
+            self.object_controller.expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'o')
         base_headers = {
             'X-Backend-Storage-Policy-Index': int(policy),
             'Content-Type': 'application/octet-stream',
@@ -7958,8 +7956,9 @@ class TestObjectController(BaseTestCase):
         put_ts = next(self.ts)
         put_size = 1548
         put_delete_at = int(next(self.ts)) + 30
-        put_delete_at_container = utils.get_expirer_container(
-            put_delete_at, 86400, 'a', 'c', 'o')
+        put_delete_at_container = \
+            self.object_controller.expirer_config.get_expirer_container(
+                put_delete_at, 'a', 'c', 'o')
         put_req = Request.blank(
             '/sda1/p/a/c/o', method='PUT', body='\x01' * put_size,
             headers={
@@ -8009,8 +8008,9 @@ class TestObjectController(BaseTestCase):
 
         delete_at = int(next(self.ts)) + 100
         self.assertNotEqual(delete_at, put_delete_at)  # sanity
-        delete_at_container = utils.get_expirer_container(
-            delete_at, 86400, 'a', 'c', 'o')
+        delete_at_container = \
+            self.object_controller.expirer_config.get_expirer_container(
+                delete_at, 'a', 'c', 'o')
 
         base_headers = {
             'X-Backend-Storage-Policy-Index': int(policy),
@@ -8120,10 +8120,9 @@ class TestObjectController(BaseTestCase):
         self.object_controller.delete_at_update = fake_delete_at_update
         timestamp1 = normalize_timestamp(time())
         delete_at_timestamp1 = int(time() + 1000)
-        delete_at_container1 = str(
-            delete_at_timestamp1 /
-            self.object_controller.expiring_objects_container_divisor *
-            self.object_controller.expiring_objects_container_divisor)
+        delete_at_container1 = \
+            self.object_controller.expirer_config.get_expirer_container(
+                delete_at_timestamp1, 'a', 'c', 'o')
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
             headers={'X-Timestamp': timestamp1,

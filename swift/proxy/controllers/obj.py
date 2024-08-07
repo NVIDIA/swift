@@ -46,7 +46,7 @@ from functools import partial
 from swift.common.utils import (
     clean_content_type, config_true_value, ContextPool, csv_append,
     GreenAsyncPile, GreenthreadSafeIterator, Timestamp, WatchdogTimeout,
-    normalize_delete_at_timestamp, public, get_expirer_container,
+    normalize_delete_at_timestamp, public,
     document_iters_to_http_response_body, parse_content_range,
     quorum_size, reiterate, close_if_possible, safe_json_loads, md5,
     NamespaceBoundList, CooperativeIterator, cache_from_env,
@@ -347,8 +347,7 @@ class BaseObjectController(Controller):
         # pull full set of updating namespaces from backend
         namespaces, backend_response = self._do_get_updating_namespaces(
             req, account, container)
-        ns_bound_list = NamespaceBoundList.parse(
-            namespaces) if namespaces else None
+        ns_bound_list = NamespaceBoundList.parse(namespaces)
         return ns_bound_list, backend_response
 
     def _populate_updating_namespaces(self, req, account,
@@ -403,7 +402,8 @@ class BaseObjectController(Controller):
             infocache, memcache, cache_key,
             self.app.recheck_updating_shard_ranges, do_fetch_backend,
             self.app.namespace_cache_token_retry_interval,
-            namespace_list_to_bounds, namespace_bounds_to_list)
+            namespace_list_to_bounds, namespace_bounds_to_list,
+            self.app.namespace_cache_tokens_per_session)
         ns_bound_list = cache_populator.fetch_data()
         if cache_populator.set_cache_state:
             record_cache_op_metrics(
@@ -455,15 +455,12 @@ class BaseObjectController(Controller):
             # the full set of updating shard ranges from the backend and set in
             # the memcache.
             if self.app.namespace_cache_use_token:
-                (
-                    ns_bound_list,
-                    response,
-                ) = self._populate_updating_namespaces_cooperatively(
-                    req, account, container, cache_key
-                )
+                populate_func = \
+                    self._populate_updating_namespaces_cooperatively
             else:
-                ns_bound_list, response = self._populate_updating_namespaces(
-                    req, account, container, cache_key)
+                populate_func = self._populate_updating_namespaces
+            ns_bound_list, response = populate_func(
+                req, account, container, cache_key)
         record_cache_op_metrics(
             self.logger, self.server_type.lower(), 'shard_updating',
             get_cache_state, response)
@@ -721,13 +718,10 @@ class BaseObjectController(Controller):
 
             append_log_info(req.environ, 'x-delete-at:%s' % x_delete_at)
 
-            delete_at_container = get_expirer_container(
-                x_delete_at, self.app.expiring_objects_container_divisor,
-                self.account_name, self.container_name, self.object_name)
-
-            delete_at_part, delete_at_nodes = \
-                self.app.container_ring.get_nodes(
-                    self.app.expiring_objects_account, delete_at_container)
+            delete_at_part, delete_at_nodes, delete_at_container = \
+                self.app.expirer_config.get_delete_at_nodes(
+                    x_delete_at, self.account_name, self.container_name,
+                    self.object_name)
 
         return req, delete_at_container, delete_at_part, delete_at_nodes
 

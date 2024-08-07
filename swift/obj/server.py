@@ -32,7 +32,7 @@ from eventlet.greenthread import spawn
 from swift.common.utils import public, get_logger, \
     config_true_value, timing_stats, replication, \
     normalize_delete_at_timestamp, get_log_line, Timestamp, \
-    get_expirer_container, parse_mime_headers, \
+    parse_mime_headers, \
     iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads, \
     config_auto_int_value, split_path, get_redirect_data, \
     normalize_timestamp, md5, parse_options
@@ -45,7 +45,7 @@ from swift.common.exceptions import ConnectionTimeout, DiskFileQuarantined, \
     ChunkReadError, DiskFileXattrNotSupported, DiskFileStateChanged
 from swift.common.request_helpers import resolve_ignore_range_header, \
     OBJECT_SYSMETA_CONTAINER_UPDATE_OVERRIDE_PREFIX
-from swift.obj import ssync_receiver
+from swift.obj import ssync_receiver, expirer
 from swift.common.http import is_success, HTTP_MOVED_PERMANENTLY
 from swift.common.base_storage_server import BaseStorageServer
 from swift.common.header_key_dict import HeaderKeyDict
@@ -61,6 +61,7 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPServerError, bytes_to_wsgi, wsgi_to_bytes, wsgi_to_str, \
     normalize_etag, HTTPServiceUnavailable
 from swift.common.wsgi import run_wsgi
+from swift.container.backend import SHARDED
 from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter
 from swift.obj.expirer import build_task_obj, embed_expirer_bytes_in_ctype, \
     X_DELETE_TYPE
@@ -133,6 +134,7 @@ class EventletPlungerString(bytes):
     eventlet.wsgi to force the headers out, so we use an
     EventletPlungerString to empty out all of Eventlet's buffers.
     """
+
     def __len__(self):
         return wsgi.MINIMUM_CHUNK_SIZE + 1
 
@@ -189,10 +191,7 @@ class ObjectController(BaseStorageServer):
                 self.allowed_headers.add(header)
 
         self.auto_create_account_prefix = AUTO_CREATE_ACCOUNT_PREFIX
-        self.expiring_objects_account = self.auto_create_account_prefix + \
-            (conf.get('expiring_objects_account_name') or 'expiring_objects')
-        self.expiring_objects_container_divisor = \
-            int(conf.get('expiring_objects_container_divisor') or 86400)
+        self.expirer_config = expirer.ExpirerConfig(conf, logger=self.logger)
         # Initialization was successful, so now apply the network chunk size
         # parameter as the default read / write buffer size for the network
         # sockets.
@@ -285,7 +284,7 @@ class ObjectController(BaseStorageServer):
     def async_update(self, op, account, container, obj, host, partition,
                      contdevice, headers_out, objdevice, policy,
                      logger_thread_locals=None, container_path=None,
-                     db_state=None):
+                     db_state=None, attempt_sync_update=True):
         """
         Sends or saves an async update.
 
@@ -309,6 +308,8 @@ class ObjectController(BaseStorageServer):
             ``container`` params.
         :param db_state: The current database state of the container as
             supplied to us by the proxy.
+        :param attempt_sync_update: boolean, when false all spawned threads
+                                    write the update data directly to async
         """
         if logger_thread_locals:
             self.logger.thread_locals = logger_thread_locals
@@ -319,9 +320,13 @@ class ObjectController(BaseStorageServer):
         else:
             full_path = '/%s/%s/%s' % (account, container, obj)
 
-        redirect_data = None
-        if all([host, partition, contdevice]):
-            try:
+        redirect_data = status_or_error = None
+        success = False
+        skip = not attempt_sync_update or \
+            not all([host, partition, contdevice])
+        try:
+            if not skip:
+                # Do an sync update
                 with ConnectionTimeout(self.conn_timeout):
                     ip, port = host.rsplit(':', 1)
                     conn = http_connect(ip, port, contdevice, partition, op,
@@ -329,7 +334,9 @@ class ObjectController(BaseStorageServer):
                 with Timeout(self.node_timeout):
                     response = conn.getresponse()
                     response.read()
+                status_or_error = response.status
                 if is_success(response.status):
+                    success = True
                     return
 
                 if response.status == HTTP_MOVED_PERMANENTLY:
@@ -339,6 +346,8 @@ class ObjectController(BaseStorageServer):
                         self.logger.error(
                             'Container update failed for %r; problem with '
                             'redirect location: %s' % (obj, err))
+                    else:
+                        success = True
                 else:
                     self.logger.error(
                         'ERROR Container update failed '
@@ -346,11 +355,26 @@ class ObjectController(BaseStorageServer):
                         'response from %(ip)s:%(port)s/%(dev)s',
                         {'status': response.status, 'ip': ip, 'port': port,
                          'dev': contdevice})
-            except (Exception, Timeout):
-                self.logger.exception(
-                    'ERROR container update failed with '
-                    '%(ip)s:%(port)s/%(dev)s (saving for async update later)',
-                    {'ip': ip, 'port': port, 'dev': contdevice})
+
+        except (Exception, Timeout) as e:
+            if isinstance(e, Timeout):
+                status_or_error = 'timeout'
+            else:
+                status_or_error = 'exception'
+            self.logger.exception(
+                'ERROR container update failed (%(error_type)s) with '
+                '%(ip)s:%(port)s/%(dev)s (saving for async update later)',
+                {'ip': ip, 'port': port, 'dev': contdevice,
+                 'error_type': status_or_error})
+        finally:
+            # self.stats.increment('sync_update', **sync_update_ctx)
+            if skip:
+                legacy_ctx = 'skip'
+            else:
+                legacy_ctx = 'success' if success else 'error'
+                legacy_ctx += '.%s' % (status_or_error)
+            legacy_metric_name = 'sync_update.%s' % legacy_ctx
+            self.logger.increment(legacy_metric_name)
         data = {'op': op, 'account': account, 'container': container,
                 'obj': obj, 'headers': headers_out, 'db_state': db_state}
         if redirect_data:
@@ -405,6 +429,12 @@ class ObjectController(BaseStorageServer):
         else:
             contpath = headers_in.get('X-Backend-Container-Path')
 
+        # If db_state is sharded but we didn't get the shard to pass it to
+        # must mean we failed to get this info from the proxy.  This is
+        # usually caused by the container servers being overloaded.  We
+        # don't want to add to the problem so skip trying to query the
+        # root synchronously and write directly to async_pending
+        skip_sync_update = (contdbstate == SHARDED and not contpath)
         if contpath:
             try:
                 # TODO: this is very late in request handling to be validating
@@ -437,7 +467,8 @@ class ObjectController(BaseStorageServer):
                        conthost, contpartition, contdevice, headers_out,
                        objdevice, policy,
                        logger_thread_locals=self.logger.thread_locals,
-                       container_path=contpath, db_state=contdbstate)
+                       container_path=contpath, db_state=contdbstate,
+                       attempt_sync_update=not skip_sync_update)
             update_greenthreads.append(gt)
         # Wait a little bit to see if the container updates are successful.
         # If we immediately return after firing off the greenthread above, then
@@ -473,11 +504,9 @@ class ObjectController(BaseStorageServer):
         if config_true_value(
                 request.headers.get('x-backend-replication', 'f')):
             return
-        delete_at = normalize_delete_at_timestamp(delete_at)
-        updates = [(None, None)]
 
-        partition = None
-        hosts = contdevices = [None]
+        delete_at = normalize_delete_at_timestamp(delete_at)
+
         headers_in = request.headers
         headers_out = HeaderKeyDict({
             # system accounts are always Policy-0
@@ -485,26 +514,42 @@ class ObjectController(BaseStorageServer):
             'x-timestamp': request.timestamp.internal,
             'x-trans-id': headers_in.get('x-trans-id', '-'),
             'referer': request.as_referer()})
+
+        expiring_objects_account_name, delete_at_container = \
+            self.expirer_config.get_expirer_account_and_container(
+                delete_at, account, container, obj)
         if op != 'DELETE':
             hosts = headers_in.get('X-Delete-At-Host', None)
             if hosts is None:
                 # If header is missing, no update needed as sufficient other
                 # object servers should perform the required update.
                 return
-            delete_at_container = headers_in.get('X-Delete-At-Container', None)
-            if not delete_at_container:
-                # older proxy servers did not send X-Delete-At-Container so for
-                # backwards compatibility calculate the value here, but also
-                # log a warning because this is prone to inconsistent
-                # expiring_objects_container_divisor configurations.
-                # See https://bugs.launchpad.net/swift/+bug/1187200
-                self.logger.warning(
-                    'X-Delete-At-Container header must be specified for '
-                    'expiring objects background %s to work properly. Making '
-                    'best guess as to the container name for now.' % op)
-                delete_at_container = get_expirer_container(
-                    delete_at, self.expiring_objects_container_divisor,
-                    account, container, obj)
+
+            proxy_delete_at_container = headers_in.get(
+                'X-Delete-At-Container', None)
+            if delete_at_container != proxy_delete_at_container:
+                if not proxy_delete_at_container:
+                    # We carry this warning around for pre-2013 proxies
+                    self.logger.warning(
+                        'X-Delete-At-Container header must be specified for '
+                        'expiring objects background %s to work properly. '
+                        'Making best guess as to the container name '
+                        'for now.', op)
+                    proxy_delete_at_container = delete_at_container
+                else:
+                    # Inconsistent configuration may lead to orphaned expirer
+                    # task queue objects when X-Delete-At is updated, which can
+                    # stick around for a whole reclaim age.
+                    self.logger.debug(
+                        'Proxy X-Delete-At-Container %r does not match '
+                        'expected %r for current expirer_config.',
+                        proxy_delete_at_container, delete_at_container)
+                # it's not possible to say which is "more correct", this will
+                # at least match the host/part/device
+                delete_at_container = normalize_delete_at_timestamp(
+                    proxy_delete_at_container)
+
+            # new updates need to enqueue new x-delete-at
             partition = headers_in.get('X-Delete-At-Partition', None)
             contdevices = headers_in.get('X-Delete-At-Device', '')
             updates = [upd for upd in
@@ -523,23 +568,13 @@ class ObjectController(BaseStorageServer):
                 request.headers.get(
                     'X-Backend-Clean-Expiring-Object-Queue', 't')):
                 return
-
-            # DELETEs of old expiration data have no way of knowing what the
-            # old X-Delete-At-Container was at the time of the initial setting
-            # of the data, so a best guess is made here.
-            # Worst case is a DELETE is issued now for something that doesn't
-            # exist there and the original data is left where it is, where
-            # it will be ignored when the expirer eventually tries to issue the
-            # object DELETE later since the X-Delete-At value won't match up.
-            delete_at_container = get_expirer_container(
-                delete_at, self.expiring_objects_container_divisor,
-                account, container, obj)
-        delete_at_container = normalize_delete_at_timestamp(
-            delete_at_container)
+            # DELETE op always go directly to async_pending
+            partition = None
+            updates = [(None, None)]
 
         for host, contdevice in updates:
             self.async_update(
-                op, self.expiring_objects_account, delete_at_container,
+                op, expiring_objects_account_name, delete_at_container,
                 build_task_obj(delete_at, account, container, obj),
                 host, partition, contdevice, headers_out, objdevice,
                 policy)

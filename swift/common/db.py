@@ -35,7 +35,7 @@ from swift.common.constraints import MAX_META_COUNT, MAX_META_OVERALL_SIZE, \
     check_utf8
 from swift.common import utils
 from swift.common.utils import Timestamp, renamer, \
-    mkdirs, lock_parent_directory, fallocate_with_reserve, md5
+    mkdirs, lock_parent_directory, fallocate, md5
 from swift.common.exceptions import LockTimeout, DatabaseException, \
     DatabasePragmaException
 from swift.common.swob import HTTPBadRequest
@@ -140,7 +140,8 @@ class GreenDBConnection(sqlite3.Connection):
             timeout = BROKER_TIMEOUT
         self.timeout = timeout
         self.db_file = database
-        super(GreenDBConnection, self).__init__(database, 0, *args, **kwargs)
+        super(GreenDBConnection, self).__init__(
+            database, timeout=0, *args, **kwargs)
 
     def cursor(self, cls=None):
         if cls is None:
@@ -1200,9 +1201,15 @@ class DatabaseBroker(object):
     def _get_pragma_value(self, key):
         with self.get() as conn:
             row = conn.execute('PRAGMA {}'.format(key))
-            if row:
-                return row.fetchone()[0]
-            else:
+            try:
+                if row:
+                    return row.fetchone()[0]
+                else:
+                    raise ValueError()
+            except (ValueError, Exception):
+                # non-exising pragmas actaully return a None value in the
+                # row. So a value error should always be raised. Exception
+                # is just a catch all.
                 raise DatabasePragmaException(
                     'Failed to use Pragma {}'.format(key))
 
@@ -1217,8 +1224,9 @@ class DatabaseBroker(object):
             page_size = self._get_pragma_value('page_size')
             freelist_count = self._get_pragma_value('freelist_count')
             return freelist_count * page_size
-        except DatabasePragmaException:
-            raise ValueError('Failed to calculate freelist size')
+        except DatabasePragmaException as ex:
+            raise ValueError(
+                'Failed to calculate freelist size: %s' % str(ex))
 
     def get_freelist_percent(self):
         try:
@@ -1227,8 +1235,9 @@ class DatabaseBroker(object):
                 return 0
             freelist_count = self._get_pragma_value('freelist_count')
             return float(freelist_count) / float(page_count) * 100
-        except DatabasePragmaException:
-            raise ValueError('Failed to calulate freelist percent')
+        except DatabasePragmaException as ex:
+            raise ValueError(
+                'Failed to calulate freelist percent: %s' % str(ex))
 
     def vacuum(self):
         """Vacuum the DB this broker is pointing to.

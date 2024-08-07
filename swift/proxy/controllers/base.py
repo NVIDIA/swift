@@ -816,17 +816,25 @@ def record_cooperative_token_metrics(logger, cache_populator, op_type):
     :param  op_type: the name of the operation type, includes 'shard_listing',
               'shard_updating', and etc.
     """
+    # Total number of requests equals to 'cache_served_reqs' plus
+    # 'backend_reqs.with_token' and 'backend_reqs.no_token'.
     resp = cache_populator.backend_response
     if cache_populator.token_acquired:
+        # Request with token acquired.
         if resp:
             logger.increment('token.%s.backend_reqs.with_token.%d' %
                              (op_type, resp.status_int))
         if cache_populator.is_token_request_done():
+            # Request who has acquired a token, retrieved the data from backend
+            # , and has successfully set the data into the memcached.
             logger.increment('token.%s.done_token_reqs' % op_type)
         return
 
     # Request with no token acquired.
     if cache_populator.req_lacks_enough_retries:
+        # Request who didn't get enough retries when waiting for other requests
+        # to fill in the data into cache, could be 'cache_served_reqs' if the
+        # makeup retry works in the end, or 'backend_reqs.no_token' if not.
         logger.increment('token.%s.lack_retries' % op_type)
     if cache_populator.req_served_from_cache:
         logger.increment('token.%s.cache_served_reqs' % op_type)

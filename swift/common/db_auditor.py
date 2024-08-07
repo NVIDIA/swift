@@ -18,6 +18,7 @@ import time
 from random import random
 
 from eventlet import Timeout
+from math import pow
 
 import swift.common.db
 from swift.common.utils import get_logger, audit_location_generator, \
@@ -140,18 +141,24 @@ class DatabaseAuditor(Daemon):
         that information as a dict, so we don't have to bother the broker
         again.
         """
-        def get_size_bucket(number, increment):
+        def get_size_bucket(number):
+            lower = 0
+            i = 1
             in_mb = int(number / 1024 / 1024)
-            return int(in_mb / increment) * increment
+            while True:
+                cur = pow(2, i)
+                if cur > in_mb:
+                    return lower, int(cur)
+                lower = cur
+                i += 1
 
         def get_percent_bucket(number, increment):
             return int(number / increment) * increment
 
         freelist_size = broker.get_freelist_size()
-        size_increment = 5
-        size_bucket = get_size_bucket(freelist_size, size_increment)
+        lower, upper = get_size_bucket(freelist_size)
         size_stat = "%s.freelist.size.%d-%dMB" % (
-            self.server_type, size_bucket, size_bucket + (size_increment - 1))
+            self.server_type, lower, upper - 1)
         self.logger.increment(size_stat)
 
         freelist_percent = broker.get_freelist_percent()

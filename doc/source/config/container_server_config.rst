@@ -637,31 +637,14 @@ containers_per_second     200                Maximum containers audited per seco
                                              Should be tuned according to individual
                                              system specs. 0 is unlimited.
 recon_cache_path          /var/cache/swift   Path to recon cache
-vacuum_threshold_size     0                  As an SQLite database rows are deleted
-                                             the file can become more sparse and
-                                             fragmented. A good indicator of
-                                             sparsness in the file is the freelist
-                                             page count. The higher this number,
-                                             the more sparse the file is getting.
-                                             Using the sqlite page_size we can
-                                             determine how much space we're using, so
-                                             we can monitor this number and when it
-                                             gets high enough we can trigger a vacuum.
-                                             The vacuum_threshold_size, in bytes, is at
-                                             what point a vacuum would be triggered. a
-                                             value of 0 means we never vacuum.
-vacuum_threshold_percent  0                  As an SQLite database rows are deleted
-                                             the file can become more sparse and
-                                             fragmented. A good indicator of
-                                             sparsness in the file is the freelist
-                                             page count. The higher this number,
-                                             the more sparse the file is getting.
-                                             We can monitor the ratio of used and
-                                             freelist pages and use this as a
-                                             percentage to trigger a vacuum.
-                                             The vacuum_threshold_percent is at
-                                             what point a vacuum would be triggered.
-                                             a value of 0 means we never vacuum.
+vacuum_threshold_size     0                  The size in bytes of the data on the
+                                             freelist data structure in the audited
+                                             database file, above which vacuum is
+                                             triggered. Zero means never vacuum.
+vacuum_threshold_percent  0                  Ratio of data on the freelist to the
+                                             total size of the audited database file,
+                                             above which vacuum is triggered.
+                                             Zero means never vacuum.
 nice_priority             None               Scheduling priority of server processes.
                                              Niceness values range from -20 (most
                                              favorable to the process) to 19 (least

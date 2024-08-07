@@ -2919,9 +2919,14 @@ class BaseDiskFile(object):
         :param modernize: whether to update the on-disk files to the newest
                           format
         :returns: an opened data file pointer
-        :raises DiskFileStateChanged: if the on-disk files could not be read.
-        :raises DiskFileError: various exceptions from
-                    :func:`swift.obj.diskfile.DiskFile._verify_data_file`
+        :raises DiskFileStateChanged: if any of the on-disk files could not be
+            read
+        :raises DiskFileCollision: if the metadata stored name does not match
+                                   the referenced name of the file
+        :raises DiskFileExpired: if the object has expired
+        :raises DiskFileQuarantined: if data inconsistencies were detected
+                                     between the metadata and the file-system
+                                     metadata
         """
         try:
             fp = open(data_file, 'rb')

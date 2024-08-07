@@ -2994,6 +2994,10 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertRaises(ValueError, utils.StrAnonymizer,
                           'Swift is great!', 'sha257', '')
 
+        anon = utils.StrAnonymizer(None, 'sha1', 'salty_secret')
+        self.assertEqual(anon, '')
+        self.assertEqual(anon.anonymized, '')
+
     def test_str_anonymizer_python_maddness(self):
         with mock.patch('swift.common.utils.base.hashlib') as mocklib:
             if six.PY2:
@@ -4113,6 +4117,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
     def test_fetch_data_cache_hit_without_token(self):
         # Test the request which doesn't acquire the token, then keep sleeping
         # and trying to fetch data from the Memcached until it succeeds.
+        num_tokens_per_session = random.randint(1, 3)
         total_retries = random.randint(1, 10)
         retries = [0]
 
@@ -4129,9 +4134,11 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         mock_cache = MockMemcached()
         self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock_cache, mock_cache)] * 2)
-        # Simulate that there are three requests who have acquired the tokens.
-        total_requests = self.memcache.incr(self.token_key, delta=3, time=10)
-        self.assertEqual(total_requests, 3)
+        # Simulate that there were 'num_tokens_per_session' requests who have
+        # acquired the tokens.
+        total_requests = self.memcache.incr(
+            self.token_key, delta=num_tokens_per_session, time=10)
+        self.assertEqual(total_requests, num_tokens_per_session)
         self.memcache.set(self.cache_key, [1, 2, 3])
         # Test the request without a token
         self.memcache.incr_calls = []
@@ -4143,6 +4150,9 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             self.cache_ttl,
             self.do_fetch_backend,
             self.retry_interval,
+            None,
+            None,
+            num_tokens_per_session
         )
         populator._token_ttl = 10
         data = populator.fetch_data()
@@ -4172,6 +4182,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         # Test the request which doesn't acquire the token, then keep sleeping
         # and trying to fetch data from the Memcached, but enventually all
         # retries exhausted with cache misses.
+        num_tokens_per_session = random.randint(1, 3)
         retries = [0]
 
         class CustomizedCache(TestableMemcacheRing):
@@ -4183,9 +4194,11 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         mock_cache = MockMemcached()
         self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock_cache, mock_cache)] * 2)
-        # Simulate that there are three requests who have acquired the tokens.
-        total_requests = self.memcache.incr(self.token_key, delta=3, time=10)
-        self.assertEqual(total_requests, 3)
+        # Simulate that there are 'num_tokens_per_session' requests who have
+        # acquired the tokens.
+        total_requests = self.memcache.incr(
+            self.token_key, delta=num_tokens_per_session, time=10)
+        self.assertEqual(total_requests, num_tokens_per_session)
         self.memcache.set(self.cache_key, [1, 2, 3])
         # Test the request without a token
         self.memcache.incr_calls = []
@@ -4197,6 +4210,9 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             self.cache_ttl,
             self.do_fetch_backend,
             self.retry_interval,
+            None,
+            None,
+            num_tokens_per_session
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
@@ -4494,7 +4510,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         # could be served out of the memcached.
         self.retry_interval = 0.1
         counts = {
-            'num_requests_to_backend': 0,
+            'num_backend_success': 0,
             'num_requests_served_from_cache': 0,
             'num_backend_failures': 0,
         }
@@ -4534,7 +4550,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             else:
                 self.assertEqual(data, "backend data")
             if populator.set_cache_state == 'set':
-                counts['num_requests_to_backend'] += 1
+                counts['num_backend_success'] += 1
                 self.assertFalse(populator.req_served_from_cache)
                 self.assertEqual(
                     populator._infocache[self.cache_key], "backend data")
@@ -4563,8 +4579,8 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         for i in range(16):
             pool.spawn(
                 worker_process,
-                random.uniform(self.retry_interval * 7,
-                               self.retry_interval * 10),
+                random.uniform(self.retry_interval * 3,
+                               self.retry_interval * 6),
                 self.retry_interval
             )
 
@@ -4573,7 +4589,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         # The first three requests of the first token session failed to get
         # data from the backend.
         self.assertEqual(counts['num_backend_failures'], 3)
-        self.assertEqual(counts['num_requests_to_backend'], 1)
+        self.assertEqual(counts['num_backend_success'], 1)
         self.assertEqual(counts['num_requests_served_from_cache'], 16)
         self.assertEqual(len(self.memcache.incr_calls), 20)
         self.assertEqual(len(self.memcache.del_calls), 0)
@@ -4585,7 +4601,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         # token, but fail to fetch data from backend.
         self.retry_interval = 0.1
         counts = {
-            'num_requests_to_backend': 0,
+            'num_backend_success': 0,
             'num_requests_served_from_cache': 0,
             'num_backend_failures': 0,
         }
@@ -4625,7 +4641,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             else:
                 self.assertEqual(data, "backend data")
             if populator.set_cache_state == 'set':
-                counts['num_requests_to_backend'] += 1
+                counts['num_backend_success'] += 1
                 self.assertFalse(populator.req_served_from_cache)
                 self.assertEqual(
                     populator._infocache[self.cache_key], "backend data")
@@ -4668,11 +4684,11 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         # The first three requests of the first token session failed to get
         # data from the backend.
         self.assertEqual(counts['num_backend_failures'], 3)
-        self.assertGreaterEqual(counts['num_requests_to_backend'], 3)
+        self.assertGreaterEqual(counts['num_backend_success'], 3)
         self.assertEqual(
             counts['num_requests_served_from_cache'],
             40 - counts['num_backend_failures'] -
-            counts['num_requests_to_backend']
+            counts['num_backend_success']
         )
         self.assertEqual(len(self.memcache.incr_calls), 40)
         # The first three requests of the second token session will delete the
@@ -6112,16 +6128,6 @@ class TestParseContentDisposition(unittest.TestCase):
         self.assertEqual(attrs, {'name': 'somefile', 'filename': 'test.html'})
 
 
-class TestGetExpirerContainer(unittest.TestCase):
-
-    @mock.patch.object(utils, 'hash_path', return_value=hex(101)[2:])
-    def test_get_expirer_container(self, mock_hash_path):
-        container = utils.get_expirer_container(1234, 20, 'a', 'c', 'o')
-        self.assertEqual(container, '0000001219')
-        container = utils.get_expirer_container(1234, 200, 'a', 'c', 'o')
-        self.assertEqual(container, '0000001199')
-
-
 class TestIterMultipartMimeDocuments(unittest.TestCase):
 
     def test_bad_start(self):
@@ -6625,6 +6631,15 @@ class TestPipeMutex(unittest.TestCase):
         self.mutex.release()
         self.assertTrue(eventlet.spawn(try_acquire_lock).wait())
 
+    def test_context_manager_api(self):
+        def try_acquire_lock():
+            return self.mutex.acquire(blocking=False)
+
+        with self.mutex as ref:
+            self.assertIs(ref, self.mutex)
+            self.assertFalse(eventlet.spawn(try_acquire_lock).wait())
+        self.assertTrue(eventlet.spawn(try_acquire_lock).wait())
+
     def test_release_without_acquire(self):
         self.assertRaises(RuntimeError, self.mutex.release)
 
@@ -6757,6 +6772,24 @@ class TestPipeMutex(unittest.TestCase):
     def tearDownClass(cls):
         # PipeMutex turns this off when you instantiate one
         eventlet.debug.hub_prevent_multiple_readers(True)
+
+
+class TestNoopMutex(unittest.TestCase):
+    def setUp(self):
+        self.mutex = utils.NoopMutex()
+
+    def test_acquire_release_api(self):
+        # Prior to 3.13, logging called these explicitly
+        self.mutex.acquire()
+        self.mutex.release()
+
+    def test_context_manager_api(self):
+        # python 3.13 started using it as a context manager
+        def try_acquire_lock():
+            return self.mutex.acquire(blocking=False)
+
+        with self.mutex as ref:
+            self.assertIs(ref, self.mutex)
 
 
 class TestDistributeEvenly(unittest.TestCase):
