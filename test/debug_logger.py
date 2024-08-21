@@ -65,8 +65,8 @@ class FakeStatsdClient(statsd_client.StatsdClient):
             return func(*args, **kwargs)
         return wrapper
 
-    def _determine_sock_family(self, host, port):
-        return None, None
+    def _set_sock_family_and_target(self, host, port):
+        self._target = (host, port)
 
     def _open_socket(self):
         return self.recording_socket
@@ -172,11 +172,76 @@ class FakeLabeledStatsdClient(statsd_client.LabeledStatsdClient):
         return dict(counts)
 
 
+class FakeLabeledStatsdClient(statsd_client.LabeledStatsdClient):
+    def __init__(self, *args, **kwargs):
+        super(FakeLabeledStatsdClient, self).__init__(*args, **kwargs)
+        self.clear()
+
+        # Capture then call parent pubic stat functions
+        self.update_stats = self._capture("update_stats")
+        self.increment = self._capture("increment")
+        self.decrement = self._capture("decrement")
+        self.timing = self._capture("timing")
+        self.timing_since = self._capture("timing_since")
+        self.transfer_rate = self._capture("transfer_rate")
+
+    def _capture(self, func_name):
+        func = getattr(super(FakeLabeledStatsdClient, self), func_name)
+
+        def wrapper(*args, **kwargs):
+            self.calls[func_name].append((args, kwargs))
+            return func(*args, **kwargs)
+        return wrapper
+
+    def _determine_sock_family(self, host, port):
+        return None, None
+
+    def _open_socket(self):
+        return self.recording_socket
+
+    def _send(self, *args, **kwargs):
+        self.send_calls.append((args, kwargs))
+        super(FakeLabeledStatsdClient, self)._send(*args, **kwargs)
+
+    def clear(self):
+        self.send_calls = []
+        self.calls = defaultdict(list)
+        self.recording_socket = RecordingSocket()
+
+    @property
+    def sendto_calls(self):
+        return self.recording_socket.sendto_calls
+
+    def get_increments(self):
+        return [call[0][0] for call in self.calls['increment']]
+
+    def get_increment_counts(self):
+        # note: this method reports the sum of stats sent via the increment
+        # method only; consider using get_stats_counts instead to get the sum
+        # of stats sent via both the increment and update_stats methods
+        counts = defaultdict(int)
+        for metric in self.get_increments():
+            counts[metric] += 1
+        # convert to normal dict for better failure messages
+        return dict(counts)
+
+    def get_update_stats(self):
+        return [call[0][:2] for call in self.calls['update_stats']]
+
+    def get_stats_counts(self):
+        counts = defaultdict(int)
+        for metric, step in self.get_update_stats():
+            counts[metric] += step
+        # convert to normal dict for better failure messages
+        return dict(counts)
+
+
 class CaptureLog(object):
     """
     Captures log records passed to the ``handle`` method and provides accessor
     functions to the captured logs.
     """
+
     def __init__(self):
         self.clear()
 
@@ -358,6 +423,7 @@ class ForwardingLogHandler(logging.NullHandler):
     to a given handler function. This can be useful to forward records to a
     handler without the handler itself needing to subclass LogHandler.
     """
+
     def __init__(self, handler_fn):
         super(ForwardingLogHandler, self).__init__()
         self.handler_fn = handler_fn
@@ -371,6 +437,7 @@ class CaptureLogAdapter(utils.LogAdapter, CaptureLog):
     A LogAdapter that is capable of capturing logs for inspection via accessor
     methods.
     """
+
     def __init__(self, logger, name):
         super(CaptureLogAdapter, self).__init__(logger, name)
         self.clear()
