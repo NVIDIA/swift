@@ -875,7 +875,8 @@ def link_fd_to_path(fd, target_path, dirs_created=0, retries=2, fsync=True):
     """
     Creates a link to file descriptor at target_path specified. This method
     does not close the fd for you. Unlike rename, as linkat() cannot
-    overwrite target_path if it exists, we unlink and try again.
+    overwrite target_path if it exists, and will raise OSError with
+    errno.EEXIST.
 
     Attempts to fix / hide race conditions like empty object directories
     being removed by backend processes during uploads, by retrying.
@@ -901,12 +902,6 @@ def link_fd_to_path(fd, target_path, dirs_created=0, retries=2, fsync=True):
                 raise
             if err.errno == errno.ENOENT:
                 dirs_created = makedirs_count(dirpath)
-            elif err.errno == errno.EEXIST:
-                try:
-                    os.unlink(target_path)
-                except OSError as e:
-                    if e.errno != errno.ENOENT:
-                        raise
             else:
                 raise
 
