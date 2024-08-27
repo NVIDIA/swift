@@ -90,12 +90,25 @@ DROP_CACHE_WINDOW = 1024 * 1024
 # They should be lowercase.
 RESERVED_DATAFILE_META = {'content-length', 'deleted', 'etag'}
 DATAFILE_SYSTEM_META = {'x-static-large-object'}
+COLLISION_METADATA_KEYS = (
+    'X-Timestamp',
+    'ETag',
+    'X-Object-Sysmeta-Ec-Etag',
+)
 DATADIR_BASE = 'objects'
 ASYNCDIR_BASE = 'async_pending'
 TMP_BASE = 'tmp'
 MIN_TIME_UPDATE_AUDITOR_STATUS = 60
 # This matches rsync tempfiles, like ".<timestamp>.data.Xy095a"
 RE_RSYNC_TEMPFILE = re.compile(r'^\..*\.([a-zA-Z0-9_]){6}$')
+
+
+def _collision_metadata(metadata):
+    return {
+        key: metadata[key]
+        for key in COLLISION_METADATA_KEYS
+        if key in metadata
+    }
 
 
 def get_data_dir(policy_or_index):
@@ -1953,6 +1966,41 @@ class BaseDiskFileWriter(object):
         """
         return self._upload_size, self._chunks_etag.hexdigest()
 
+    def _safe_metadata_linkat(self, target_path, metadata):
+        try:
+            # It was an unnamed temp file created by open() with O_TMPFILE
+            link_fd_to_path(self._fd, target_path,
+                            self._diskfile._dirs_created)
+        except FileExistsError:
+            # The file already exists at target_path. This can happen in two
+            # scenarios:
+            # 1. created by replication: ssync replicated this object to the
+            #    node before the client's PUT request arrived. In this case,
+            #    the existing_metadata will be identical to metadata, and we
+            #    should silently succeed to maintain idempotency.
+            #
+            # 2. Timestamp collision with conflicting data: Two concurrent PUT
+            #    requests with the same timestamp but different content (e.g.
+            #    due to different encryption IVs used) raced to create the same
+            #    object. In this case, metadata will differ and we must raise
+            #    an error to prevent silent data corruption.
+            with open(target_path, 'rb') as f:
+                existing_metadata = read_metadata(f)
+            mismatching_keys = sorted(dict(set(existing_metadata.items())
+                                           ^ set(metadata.items())).keys())
+            if mismatching_keys:
+                emeta, meta = [
+                    _collision_metadata(m)
+                    for m in (existing_metadata, metadata)]
+                op = '==' if emeta == meta else '!='
+                emeta, meta = [
+                    json.dumps(m, sort_keys=True)
+                    for m in (emeta, meta)]
+                raise FileExistsError(
+                    'Conflicting pre-existing metadata for keys %s '
+                    '%s %s %s (incoming)'
+                    % (json.dumps(mismatching_keys), emeta, op, meta))
+
     def _finalize_put(self, metadata, target_path, cleanup,
                       logger_thread_locals):
         if self._diskfile.timing_breakdown:
@@ -1978,9 +2026,7 @@ class BaseDiskFileWriter(object):
             # It was a named temp file created by mkstemp()
             renamer(self._tmppath, target_path)
         else:
-            # It was an unnamed temp file created by open() with O_TMPFILE
-            link_fd_to_path(self._fd, target_path,
-                            self._diskfile._dirs_created)
+            self._safe_metadata_linkat(target_path, metadata)
 
         # Check if the partition power will/has been increased
         new_target_path = None
@@ -2132,6 +2178,7 @@ class BaseDiskFileReader(object):
     :param etag_validate_frac: the probability that we should perform etag
                                validation during a complete file read
     """
+
     def __init__(self, fp, data_file, obj_size, etag,
                  disk_chunk_size, keep_cache_size, device_path, logger,
                  quarantine_hook, use_splice, pipe_size, diskfile,
