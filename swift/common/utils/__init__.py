@@ -899,12 +899,6 @@ def link_fd_to_path(fd, target_path, dirs_created=0, retries=2, fsync=True):
                 raise
             if err.errno == errno.ENOENT:
                 dirs_created = makedirs_count(dirpath)
-            elif err.errno == errno.EEXIST:
-                try:
-                    os.unlink(target_path)
-                except OSError as e:
-                    if e.errno != errno.ENOENT:
-                        raise
             else:
                 raise
 
