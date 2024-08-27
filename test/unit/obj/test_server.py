@@ -45,7 +45,7 @@ from test.debug_logger import debug_logger, FakeStatsdClient, \
 from test.unit import mocked_http_conn, \
     make_timestamp_iter, DEFAULT_TEST_EC_TYPE, skip_if_no_xattrs, \
     connect_tcp, readuntil2crlfs, patch_policies, encode_frag_archive_bodies, \
-    mock_check_drive, FakeRing
+    mock_check_drive, FakeRing, requires_o_tmpfile_support_in_tmp
 from swift.obj import server as object_server
 from swift.obj import updater, diskfile
 from swift.common import utils, bufferedhttp, http_protocol
@@ -1890,6 +1890,88 @@ class TestObjectController(BaseTestCase):
         req.body = 'VERIFY'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 412)
+
+    def test_PUT_timestamp_collision(self):
+        t0 = next(self.ts)
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere'})
+        req.body = 'VERIFY'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere'})
+        req.body = 'VERIFY'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 409)
+
+    @requires_o_tmpfile_support_in_tmp
+    def test_PUT_timestamp_collision_linkat_race(self):
+        t0 = next(self.ts)
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere'})
+        req.body = 'VERIFY'
+        orig_linkat = diskfile.link_fd_to_path
+        calls = []
+
+        def race_linkat(fd, target_path, *args, **kwargs):
+            calls.append(target_path)
+            with open(target_path, 'w') as f:
+                f.write('VERIFY')
+                diskfile.write_metadata(f, {'foo': 'bar'})
+            return orig_linkat(fd, target_path, *args, **kwargs)
+
+        with mock.patch('swift.obj.diskfile.link_fd_to_path', race_linkat):
+            resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 500)
+        self.assertIn('linkat: File exists', self.logger.records['ERROR'][0])
+        self.assertIn('FileExistsError: Conflicting pre-existing metadata',
+                      self.logger.records['ERROR'][0])
+        self.assertEqual([mock.ANY], calls)
+
+    @requires_o_tmpfile_support_in_tmp
+    def test_PUT_timestamp_collision_linkat_race_metadata_match(self):
+        t0 = next(self.ts)
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere'})
+        req.body = 'VERIFY'
+        metadata = {
+            'X-Timestamp': t0.internal,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': '6',
+            'ETag': '0b4c12d7e0a73840c1c4f148fda3b037',
+            'name': '/a/c/o',
+        }
+        orig_linkat = diskfile.link_fd_to_path
+        calls = []
+
+        def race_linkat(fd, target_path, *args, **kwargs):
+            calls.append(target_path)
+            with open(target_path, 'w') as f:
+                f.write('VERIFY')
+                diskfile.write_metadata(f, metadata)
+            return orig_linkat(fd, target_path, *args, **kwargs)
+
+        with mock.patch('swift.obj.diskfile.link_fd_to_path', race_linkat):
+            resp = req.get_response(self.object_controller)
+        # N.B. probably makes more sense to return 202 or something else?
+        self.assertEqual(resp.status_int, 201)
+        self.assertEqual([mock.ANY], calls)
 
     def _update_delete_at_headers(self, headers, a='a', c='c', o='o',
                                   node_count=1):
