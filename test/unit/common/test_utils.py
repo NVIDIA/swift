@@ -2320,7 +2320,7 @@ cluster_dfw1 = http://dfw1.host/v1/
     @requires_o_tmpfile_support_in_tmp
     @with_tempdir
     def test_link_fd_to_path_target_exists(self, tempdir):
-        # Create and write to a file
+        # unlike os.rename linkat will not allow timestamp collision
         fd, path = tempfile.mkstemp(dir=tempdir)
         os.write(fd, b"hello world")
         os.fsync(fd)
@@ -2331,10 +2331,12 @@ cluster_dfw1 = http://dfw1.host/v1/
         try:
             os.write(fd, b"bye world")
             os.fsync(fd)
-            utils.link_fd_to_path(fd, path, 0, fsync=False)
-            # Original file now should have been over-written
+            with self.assertRaises(OSError) as ctx:
+                utils.link_fd_to_path(fd, path, 0, fsync=False)
+            self.assertEqual(ctx.exception.errno, errno.EEXIST)
+            # Original file should NOT have been over-written
             with open(path, 'rb') as f:
-                self.assertEqual(f.read(), b"bye world")
+                self.assertEqual(f.read(), b"hello world")
         finally:
             os.close(fd)
 
