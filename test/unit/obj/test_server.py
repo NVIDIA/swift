@@ -46,7 +46,8 @@ from test.debug_logger import debug_logger, FakeStatsdClient, \
 from test.unit import mocked_http_conn, \
     make_timestamp_iter, DEFAULT_TEST_EC_TYPE, skip_if_no_xattrs, \
     connect_tcp, readuntil2crlfs, patch_policies, encode_frag_archive_bodies, \
-    mock_check_drive, FakeRing, BaseUnitTestCase, mock_timestamp_now
+    mock_check_drive, FakeRing, BaseUnitTestCase, mock_timestamp_now, \
+    requires_o_tmpfile_support_in_tmp
 from swift.obj import server as object_server
 from swift.obj import updater, diskfile
 from swift.common import utils, bufferedhttp, http_protocol
@@ -1962,6 +1963,271 @@ class TestObjectController(BaseUnitTestCase):
         req.body = 'VERIFY'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 412)
+
+    def test_PUT_timestamp_collision(self):
+        t0 = self.ts()
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere'})
+        req.body = 'VERIFY'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere'})
+        req.body = 'VERIFY'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 409)
+
+    def _parse_conflicting_metadata_log(self, error_log):
+        line = [line for line in error_log.splitlines() if line][-1]
+        prefix = 'FileExistsError: Conflicting pre-existing metadata for keys '
+        suffix = ' (incoming)'
+        self.assertTrue(line.startswith(prefix), line)
+        self.assertTrue(line.endswith(suffix), line)
+        metadata_comparison = line[len(prefix):-len(suffix)]
+        decoder = json.JSONDecoder()
+        # raw_decode will consume one json object and stop:
+        # https://docs.python.org/3/library/json.html#json.JSONDecoder.raw_decode
+        keys, end = decoder.raw_decode(metadata_comparison)
+        metadata_comparison = metadata_comparison[end + 1:]
+        emeta, end = decoder.raw_decode(metadata_comparison)
+        op, metadata_comparison = metadata_comparison[end:].split(None, 1)
+        self.assertIn(op, ('==', '!='))
+        meta, end = decoder.raw_decode(metadata_comparison)
+        self.assertEqual('', metadata_comparison[end:].strip())
+        return keys, emeta, op, meta
+
+    @requires_o_tmpfile_support_in_tmp
+    def test_PUT_timestamp_collision_linkat_race_filtered_metadata_mismatch(
+            self):
+        t0 = self.ts()
+        etag = '0b4c12d7e0a73840c1c4f148fda3b037'
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere',
+                     'X-Object-Meta-Secret': 'incoming-user-metadata',
+                     'X-Object-Sysmeta-Crypto-Body-Meta':
+                         'incoming-encrypted-metadata',
+                     'X-Object-Sysmeta-Crypto-Etag':
+                         'incoming-encrypted-etag',
+                     'X-Object-Transient-Sysmeta-Crypto-Meta':
+                         'incoming-transient-crypto-metadata',
+                     'X-Object-Sysmeta-Ec-Etag': 'incoming-ec-etag'})
+        req.body = 'VERIFY'
+        orig_linkat = diskfile.link_fd_to_path
+        existing_metadata = {'foo': 'bar'}
+        calls = []
+
+        def race_linkat(fd, target_path, *args, **kwargs):
+            calls.append(target_path)
+            with open(target_path, 'w') as f:
+                f.write('VERIFY')
+                diskfile.write_metadata(f, existing_metadata)
+            return orig_linkat(fd, target_path, *args, **kwargs)
+
+        with mock.patch('swift.obj.diskfile.link_fd_to_path', race_linkat):
+            resp = req.get_response(self.object_controller)
+        error_log = self.logger.records['ERROR'][0]
+        self.assertEqual(resp.status_int, 500)
+        self.assertIn('linkat: File exists', error_log)
+        keys, emeta, op, meta = self._parse_conflicting_metadata_log(error_log)
+        self.assertEqual('!=', op)
+        self.assertEqual({}, emeta)
+        self.assertEqual({
+            'X-Timestamp': t0.internal,
+            'ETag': etag,
+            'X-Object-Sysmeta-Ec-Etag': 'incoming-ec-etag',
+        }, meta)
+        self.assertEqual(
+            ['Content-Length',
+             'Content-Type',
+             'ETag',
+             'X-Object-Meta-Secret',
+             'X-Object-Sysmeta-Crypto-Body-Meta',
+             'X-Object-Sysmeta-Crypto-Etag',
+             'X-Object-Sysmeta-Ec-Etag',
+             'X-Object-Transient-Sysmeta-Crypto-Meta',
+             'X-Timestamp',
+             'foo',
+             'name'], keys)
+        expected_file_path = os.path.join(
+            self.testdir, 'sda1',
+            storage_directory('objects', 'p', hash_path('a', 'c', 'o')),
+            '%s.data' % t0.internal)
+        self.assertEqual([expected_file_path], calls)
+        with open(expected_file_path, 'r') as f:
+            self.assertEqual('VERIFY', f.read())
+            self.assertEqual(existing_metadata, diskfile.read_metadata(f))
+
+    @requires_o_tmpfile_support_in_tmp
+    def test_PUT_timestamp_collision_linkat_race_etag_mismatch(self):
+        t0 = self.ts()
+        etag = '0b4c12d7e0a73840c1c4f148fda3b037'
+        different_etag = 'abcd0b4c12d7e0a73840c1c4f148fda3'
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere',
+                     'X-Object-Meta-Secret': 'incoming-user-metadata',
+                     'X-Object-Sysmeta-Ec-Etag': 'same-ec-etag'})
+        req.body = 'VERIFY'
+        orig_linkat = diskfile.link_fd_to_path
+        existing_metadata = {
+            'X-Timestamp': t0.internal,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': '6',
+            'ETag': different_etag,
+            'name': '/a/c/o',
+            'X-Object-Meta-Secret': 'existing-user-metadata',
+            'X-Object-Sysmeta-Ec-Etag': 'same-ec-etag',
+        }
+        calls = []
+
+        def race_linkat(fd, target_path, *args, **kwargs):
+            calls.append(target_path)
+            with open(target_path, 'w') as f:
+                f.write('VERIFY')
+                diskfile.write_metadata(f, existing_metadata)
+            return orig_linkat(fd, target_path, *args, **kwargs)
+
+        with mock.patch('swift.obj.diskfile.link_fd_to_path', race_linkat):
+            resp = req.get_response(self.object_controller)
+        error_log = self.logger.records['ERROR'][0]
+        self.assertEqual(resp.status_int, 500)
+        self.assertIn('linkat: File exists', error_log)
+        keys, emeta, op, meta = self._parse_conflicting_metadata_log(error_log)
+        self.assertEqual('!=', op)
+        expected_meta = {
+            'X-Timestamp': t0.internal,
+            'ETag': etag,
+            'X-Object-Sysmeta-Ec-Etag': 'same-ec-etag',
+        }
+        expected_emeta = {
+            'X-Timestamp': t0.internal,
+            'ETag': different_etag,
+            'X-Object-Sysmeta-Ec-Etag': 'same-ec-etag',
+        }
+        self.assertEqual(expected_emeta, emeta)
+        self.assertEqual(expected_meta, meta)
+        self.assertEqual(['ETag', 'X-Object-Meta-Secret'], keys)
+        expected_file_path = os.path.join(
+            self.testdir, 'sda1',
+            storage_directory('objects', 'p', hash_path('a', 'c', 'o')),
+            '%s.data' % t0.internal)
+        self.assertEqual([expected_file_path], calls)
+        with open(expected_file_path, 'r') as f:
+            self.assertEqual('VERIFY', f.read())
+            self.assertEqual(existing_metadata, diskfile.read_metadata(f))
+
+    @requires_o_tmpfile_support_in_tmp
+    def test_PUT_timestamp_collision_linkat_race_filtered_metadata_match(self):
+        # filtered metadata subset matches but not all metadata matches -> 500
+        t0 = self.ts()
+        etag = '0b4c12d7e0a73840c1c4f148fda3b037'
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere',
+                     'X-Object-Meta-Secret': 'incoming-user-metadata',
+                     'X-Object-Sysmeta-Ec-Etag': 'same-ec-etag'})
+        req.body = 'VERIFY'
+        orig_linkat = diskfile.link_fd_to_path
+        existing_metadata = {
+            'X-Timestamp': t0.internal,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': '6',
+            'ETag': etag,
+            'name': '/a/c/o',
+            'X-Object-Meta-Secret': 'existing-user-metadata',
+            'X-Object-Sysmeta-Ec-Etag': 'same-ec-etag',
+        }
+        calls = []
+
+        def race_linkat(fd, target_path, *args, **kwargs):
+            calls.append(target_path)
+            with open(target_path, 'w') as f:
+                f.write('VERIFY')
+                diskfile.write_metadata(f, existing_metadata)
+            return orig_linkat(fd, target_path, *args, **kwargs)
+
+        with mock.patch('swift.obj.diskfile.link_fd_to_path', race_linkat):
+            resp = req.get_response(self.object_controller)
+        error_log = self.logger.records['ERROR'][0]
+        self.assertEqual(resp.status_int, 500)
+        self.assertIn('linkat: File exists', error_log)
+        keys, emeta, op, meta = self._parse_conflicting_metadata_log(error_log)
+        self.assertEqual('==', op)
+        expected = {
+            'X-Timestamp': t0.internal,
+            'ETag': etag,
+            'X-Object-Sysmeta-Ec-Etag': 'same-ec-etag',
+        }
+        self.assertEqual(expected, emeta)
+        self.assertEqual(expected, meta)
+        self.assertEqual(['X-Object-Meta-Secret'], keys)
+        expected_file_path = os.path.join(
+            self.testdir, 'sda1',
+            storage_directory('objects', 'p', hash_path('a', 'c', 'o')),
+            '%s.data' % t0.internal)
+        self.assertEqual([expected_file_path], calls)
+        with open(expected_file_path, 'r') as f:
+            self.assertEqual('VERIFY', f.read())
+            self.assertEqual(existing_metadata, diskfile.read_metadata(f))
+
+    @requires_o_tmpfile_support_in_tmp
+    def test_PUT_timestamp_collision_linkat_race_all_metadata_match(self):
+        t0 = self.ts()
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere'})
+        req.body = 'VERIFY'
+        metadata = {
+            'X-Timestamp': t0.internal,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': '6',
+            'ETag': '0b4c12d7e0a73840c1c4f148fda3b037',
+            'name': '/a/c/o',
+        }
+        orig_linkat = diskfile.link_fd_to_path
+        calls = []
+
+        def race_linkat(fd, target_path, *args, **kwargs):
+            calls.append(target_path)
+            with open(target_path, 'w') as f:
+                f.write('VERIFY')
+                diskfile.write_metadata(f, metadata)
+            return orig_linkat(fd, target_path, *args, **kwargs)
+
+        with mock.patch('swift.obj.diskfile.link_fd_to_path', race_linkat):
+            resp = req.get_response(self.object_controller)
+        # N.B. probably makes more sense to return 202 or something else?
+        self.assertEqual(resp.status_int, 201)
+        self.assertFalse(self.logger.records['ERROR'])
+        expected_file_path = os.path.join(
+            self.testdir, 'sda1',
+            storage_directory('objects', 'p', hash_path('a', 'c', 'o')),
+            '%s.data' % t0.internal)
+        self.assertEqual([expected_file_path], calls)
+        with open(expected_file_path, 'r') as f:
+            self.assertEqual('VERIFY', f.read())
+            self.assertEqual(metadata, diskfile.read_metadata(f))
 
     def _update_delete_at_headers(self, headers, a='a', c='c', o='o',
                                   node_count=1):
