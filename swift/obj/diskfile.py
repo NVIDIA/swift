@@ -633,7 +633,8 @@ def object_audit_location_generator(devices, datadir, mount_check=True,
             try:
                 suffixes = listdir(part_path)
             except OSError as e:
-                if e.errno not in (errno.ENOTDIR, errno.ENODATA):
+                if e.errno not in (errno.ENOTDIR, errno.ENODATA,
+                                   errno.EUCLEAN):
                     raise
                 continue
             for asuffix in suffixes:
@@ -641,7 +642,8 @@ def object_audit_location_generator(devices, datadir, mount_check=True,
                 try:
                     hashes = listdir(suff_path)
                 except OSError as e:
-                    if e.errno not in (errno.ENOTDIR, errno.ENODATA):
+                    if e.errno not in (errno.ENOTDIR, errno.ENODATA,
+                                       errno.EUCLEAN):
                         raise
                     continue
                 for hsh in hashes:
@@ -1247,7 +1249,7 @@ class BaseDiskFileManager(object):
                         'it is not a directory', {'hsh_path': hsh_path,
                                                   'quar_path': quar_path})
                     continue
-                elif err.errno == errno.ENODATA:
+                elif err.errno in (errno.ENODATA, errno.EUCLEAN):
                     try:
                         # We've seen cases where bad sectors lead to ENODATA
                         # here; use a similar hack as above
@@ -1602,7 +1604,7 @@ class BaseDiskFileManager(object):
                     'it is not a directory', {'object_path': object_path,
                                               'quar_path': quar_path})
                 raise DiskFileNotExist()
-            elif err.errno == errno.ENODATA:
+            elif err.errno in (errno.ENODATA, errno.EUCLEAN):
                 try:
                     # We've seen cases where bad sectors lead to ENODATA here;
                     # use a similar hack as above
@@ -2645,7 +2647,7 @@ class BaseDiskFile(object):
                     # want this one file and not its parent.
                     os.path.join(self._datadir, "made-up-filename"),
                     "Expected directory, found file at %s" % self._datadir)
-            elif err.errno == errno.ENODATA:
+            elif err.errno in (errno.ENODATA, errno.EUCLEAN):
                 try:
                     # We've seen cases where bad sectors lead to ENODATA here
                     raise self._quarantine(
@@ -2675,7 +2677,7 @@ class BaseDiskFile(object):
             self._fp = self._construct_from_data_file(
                 current_time=current_time, modernize=modernize, **file_info)
         except IOError as e:
-            if e.errno == errno.ENODATA:
+            if e.errno in (errno.ENODATA, errno.EUCLEAN):
                 raise self._quarantine(
                     file_info['data_file'],
                     "Failed to open %s: %s" % (file_info['data_file'], e))

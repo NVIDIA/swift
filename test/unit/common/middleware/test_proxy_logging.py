@@ -32,7 +32,8 @@ from swift.common.registry import register_sensitive_header, \
 from swift.common.swob import Request, Response, HTTPServiceUnavailable
 from swift.common import constraints, registry
 from swift.common.storage_policy import StoragePolicy
-from test.debug_logger import debug_logger, FakeStatsdClient, \
+from test.debug_logger import debug_logger, \
+    FakeStatsdClient, FakeLabeledStatsdClient, \
     debug_statsd_client, debug_labeled_statsd_client
 from test.unit import patch_policies
 from test.unit.common.middleware.helpers import FakeAppThatExcepts, FakeSwift
@@ -126,7 +127,7 @@ class TestProxyLogging(unittest.TestCase):
         # really, this would come by way of base_prefix/tail_prefix in
         # get_logger, ultimately tracing back to our hard-coded
         # statsd_tail_prefix
-        self.logger.statsd_client._prefix = 'proxy-server.'
+        self.logger.logger.statsd_client._prefix = 'proxy-server.'
         self.statsd = debug_labeled_statsd_client({})
 
     def _clear(self):
@@ -298,6 +299,27 @@ class TestProxyLogging(unittest.TestCase):
             [(b'access_foo.proxy-server.baz:1|c|@0.6', ('access.com', 5678))],
             statsd_client.sendto_calls)
 
+    def test_init_statsd_options_user_labels(self):
+        conf = {
+            'log_statsd_host': 'example.com',
+            'log_statsd_port': '1234',
+            'statsd_label_mode': 'dogstatsd',
+            'statsd_emit_legacy': False,
+            'statsd_user_label_reqctx': 'subrequest',
+        }
+        with mock.patch('swift.common.statsd_client.LabeledStatsdClient',
+                        FakeLabeledStatsdClient):
+            app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), conf)
+
+        statsd = app.statsd
+        self.assertIsInstance(statsd, FakeLabeledStatsdClient)
+        with mock.patch.object(statsd, 'random', return_value=0):
+            statsd.increment('baz', labels={'label_foo': 'foo'})
+        self.assertEqual(
+            [(b'baz:1|c|#label_foo:foo,user_reqctx:subrequest',
+             ('example.com', 1234))],
+            statsd.sendto_calls)
+
     def test_logger_statsd_prefix(self):
         app = proxy_logging.ProxyLoggingMiddleware(
             FakeApp(), {'log_statsd_host': 'example.com'})
@@ -321,24 +343,47 @@ class TestProxyLogging(unittest.TestCase):
     def test_log_request_statsd_invalid_stats_types(self):
         app = proxy_logging.ProxyLoggingMiddleware(
             FakeApp(), {}, logger=self.logger)
-        for url in ['/', '/foo', '/foo/bar', '/v1']:
+        for url in ['/', '/foo', '/foo/bar', '/v1', '/v1.0']:
+            self.logger.clear()
             req = Request.blank(url, environ={'REQUEST_METHOD': 'GET'})
             resp = app(req.environ, start_response)
             # get body
             b''.join(resp)
-            self.assertEqual([], app.access_logger.log_dict['timing'])
-            self.assertEqual([], app.access_logger.log_dict['update_stats'])
+            self.assertEqual(
+                [(('UNKNOWN.GET.200.first-byte.timing', mock.ANY), {}),
+                 (('UNKNOWN.GET.200.timing', mock.ANY), {})],
+                app.access_logger.statsd_client.calls['timing'])
+            self.assertEqual(
+                [(('UNKNOWN.GET.200.xfer', mock.ANY), {})],
+                app.access_logger.statsd_client.calls['update_stats'])
 
     def test_log_request_stat_type_bad(self):
-        for bad_path in ['', '/', '/bad', '/baddy/mc_badderson', '/v1',
-                         '/v1/']:
-            app = proxy_logging.ProxyLoggingMiddleware(
-                FakeApp(), {}, logger=self.logger)
+        app = proxy_logging.ProxyLoggingMiddleware(
+            FakeApp(), {}, logger=self.logger)
+        for bad_path in [
+                '',
+                '/',
+                '/bad',
+                '/baddy/mc_badderson',
+                '/v1',
+                '/v1/',
+                '/v1.0',
+                '/v1.0/',
+                '/v1.0//',
+                '/v1.0//c',
+                '/v1.0/a//',
+                '/v1.0/a//o',
+        ]:
             req = Request.blank(bad_path, environ={'REQUEST_METHOD': 'GET'})
             now = 10000.0
             app.log_request(req, 123, 7, 13, now, now + 2.71828182846)
-            self.assertEqual([], app.access_logger.log_dict['timing'])
-            self.assertEqual([], app.access_logger.log_dict['update_stats'])
+            self.assertEqual(
+                [(('UNKNOWN.GET.123.timing', 2718.2818284600216), {})],
+                app.access_logger.statsd_client.calls['timing'])
+            self.assertEqual(
+                [(('UNKNOWN.GET.123.xfer', 20), {})],
+                app.access_logger.statsd_client.calls['update_stats'])
+            app.access_logger.clear()
 
     def test_log_request_stat_type_good(self):
         """
@@ -362,6 +407,15 @@ class TestProxyLogging(unittest.TestCase):
             '/v1/a/c/o/p': 'object',
             '/v1/a/c/o/p/': 'object',
             '/v1/a/c/o/p/p2': 'object',
+            '/v1.0/a': 'account',
+            '/v1.0/a/': 'account',
+            '/v1.0/a/c': 'container',
+            '/v1.0/a/c/': 'container',
+            '/v1.0/a/c/o': 'object',
+            '/v1.0/a/c/o/': 'object',
+            '/v1.0/a/c/o/p': 'object',
+            '/v1.0/a/c/o/p/': 'object',
+            '/v1.0/a/c/o/p/p2': 'object',
         }
         conf = {
             'log_statsd_host': 'host',
@@ -456,11 +510,12 @@ class TestProxyLogging(unittest.TestCase):
                 stub_times = [18.0, 20.71828182846]
                 iter_response = app(req.environ, lambda *_: None)
                 self.assertEqual(b'7654321', b''.join(iter_response))
-                self.assertEqual([], app.access_logger.log_dict['timing'])
-                self.assertEqual([],
-                                 app.access_logger.log_dict['timing_since'])
-                self.assertEqual([],
-                                 app.access_logger.log_dict['update_stats'])
+                self.assertEqual(
+                    [], app.access_logger.statsd_client.calls['timing'])
+                self.assertEqual(
+                    [], app.access_logger.statsd_client.calls['timing_since'])
+                self.assertEqual(
+                    [], app.access_logger.statsd_client.calls['update_stats'])
 
                 # PUT (no first-byte timing!)
                 self._clear()

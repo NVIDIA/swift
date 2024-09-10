@@ -141,26 +141,17 @@ class ProxyLoggingMiddleware(object):
                      'GET,HEAD,POST,PUT,DELETE,COPY,OPTIONS'))
         self.valid_methods = [m.strip().upper() for m in
                               self.valid_methods.split(',') if m.strip()]
-        access_log_conf = {}
-        for key in ('log_facility', 'log_name', 'log_level', 'log_udp_host',
-                    'log_udp_port', 'log_statsd_host', 'log_statsd_port',
-                    'log_statsd_default_sample_rate',
-                    'log_statsd_sample_rate_factor',
-                    'log_statsd_metric_prefix'):
-            value = conf.get('access_' + key, conf.get(key, None))
-            if value:
-                access_log_conf[key] = value
-        for key in ('statsd_label_mode',
-                    'statsd_emit_legacy'):
-            value = conf.get(key, None)
-            if value:
-                access_log_conf[key] = value
+        log_conf = dict(conf)
+        access_prefix_len = len('access_')
+        for k, v in conf.items():
+            if k.startswith('access_log_'):
+                log_conf[k[access_prefix_len:]] = v
         self.access_logger = logger or get_logger(
-            access_log_conf,
+            log_conf,
             log_route=conf.get('access_log_route', 'proxy-access'),
             statsd_tail_prefix='proxy-server')
         self.statsd = get_labeled_statsd_client(
-            access_log_conf, self.access_logger.logger)
+            log_conf, self.access_logger.logger)
         self.reveal_sensitive_prefix = int(
             conf.get('reveal_sensitive_prefix', 16))
         self.check_log_msg_template_validity()
@@ -357,9 +348,7 @@ class ProxyLoggingMiddleware(object):
 
         labels = self.statsd_metric_labels(
             req, method, status_int=status_int,
-            acc=replacements['account'],
-            cont=replacements['container'],
-            policy_index=policy_index)
+            acc=acc, cont=cont, policy_index=policy_index)
         if labels is not None:
             self.statsd.timing(
                 'swift_proxy_request_timing',
@@ -454,13 +443,6 @@ class ProxyLoggingMiddleware(object):
         self.mark_req_logged(env)
 
         start_response_args = [None]
-        req = Request(env)
-        swift_path = req.environ.get('swift.backend_path', req.path)
-        acc, cont, obj = self.get_aco_from_path(swift_path)
-        acc = StrAnonymizer(acc, self.anonymization_method,
-                            self.anonymization_salt)
-        cont = StrAnonymizer(cont, self.anonymization_method,
-                             self.anonymization_salt)
 
         input_proxy = InputProxy(env['wsgi.input'])
         env['wsgi.input'] = input_proxy
@@ -500,6 +482,9 @@ class ProxyLoggingMiddleware(object):
             wire_status_int = int(start_response_args[0][0].split(' ', 1)[0])
             resp_headers = dict(start_response_args[0][1])
             start_response(*start_response_args[0])
+
+            swift_path = req.environ.get('swift.backend_path', req.path)
+            acc, cont, _ = self.get_aco_from_path(swift_path)
 
             policy_index = get_policy_index(req.headers, resp_headers)
             labels = self.statsd_metric_labels(

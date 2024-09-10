@@ -93,7 +93,9 @@ bind_port = 8080
 # Statsd metrics emitted with labels also support user defined labels
 # configured by options. The format is:
 #     statsd_user_label_<name> = <value>
-# where <name> and <value> are restricted to non-whitespace ASCII characters.
+# where <name> and <value> are restricted to a subset of non-whitespace ASCII
+# characters, both can include letters (upper and lower), numbers and
+# underscores. Value may also contain a period (.).
 # For example, a proxy-server configuration could use the following to
 # delineate labeled metrics emitted by instances of proxy-logging middleware
 # in the pipeline:

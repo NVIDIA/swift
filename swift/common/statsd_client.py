@@ -80,13 +80,6 @@ class LabeledFormats(object):
         return line
 
 
-def build_line_legacy_format(prefix, name, value, type, sample_rate):
-    parts = ['%s%s:%s' % (prefix, name, value), type]
-    if sample_rate < 1:
-        parts.append('@%s' % (sample_rate,))
-    return '|'.join(parts)
-
-
 def get_statsd_client(conf=None, tail_prefix='', logger=None):
     """
     Get an instance of StatsdClient using config settings.
@@ -295,8 +288,11 @@ class StatsdClient(AbstractStatsdClient):
     def _send(self, m_name, m_value, m_type, sample_rate):
         is_emitted, sample_rate = self._is_emitted(sample_rate)
         if self.emit_legacy and is_emitted:
-            return self._send_line(build_line_legacy_format(
-                self._prefix, m_name, m_value, m_type, sample_rate))
+            parts = ['%s%s:%s' % (self._prefix, m_name, m_value), m_type]
+            if sample_rate < 1:
+                parts.append('@%s' % (sample_rate,))
+            line = '|'.join(parts)
+            return self._send_line(line)
 
     def _set_prefix(self, tail_prefix):
         """
@@ -390,11 +386,10 @@ class LabeledStatsdClient(AbstractStatsdClient):
                 m_name, m_value, m_type, sample_rate, labels))
 
     def _build_line(self, m_name, m_value, m_type, sample_rate, labels):
-        build_line_f = self._label_line_f
-        if not build_line_f:
+        if not self._label_line_f:
             return
         labels = dict(self.default_labels, **labels)
-        return build_line_f(
+        return self._label_line_f(
             m_name,
             m_value,
             m_type,

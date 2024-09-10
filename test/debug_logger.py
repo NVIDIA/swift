@@ -44,12 +44,11 @@ class RecordingSocket(object):
         pass
 
 
-class FakeStatsdClient(statsd_client.StatsdClient):
-    def __init__(self, *args, **kwargs):
-        super(FakeStatsdClient, self).__init__(*args, **kwargs)
+class BaseFakeStatsdClient(object):
+    def __init__(self):
         self.clear()
 
-        # Capture then call parent pubic stat functions
+        # Capture then call parent public stat functions
         self.update_stats = self._capture("update_stats")
         self.increment = self._capture("increment")
         self.decrement = self._capture("decrement")
@@ -58,7 +57,9 @@ class FakeStatsdClient(statsd_client.StatsdClient):
         self.transfer_rate = self._capture("transfer_rate")
 
     def _capture(self, func_name):
-        func = getattr(super(FakeStatsdClient, self), func_name)
+        # this works in subclasses because super() searches the next inherited
+        # class after BaseFakeStatsdClient i.e. the real StatsdClient class
+        func = getattr(super(BaseFakeStatsdClient, self), func_name)
 
         def wrapper(*args, **kwargs):
             self.calls[func_name].append((args, kwargs))
@@ -71,12 +72,7 @@ class FakeStatsdClient(statsd_client.StatsdClient):
     def _open_socket(self):
         return self.recording_socket
 
-    def _send(self, *args, **kwargs):
-        self.send_calls.append((args, kwargs))
-        super(FakeStatsdClient, self)._send(*args, **kwargs)
-
     def clear(self):
-        self.send_calls = []
         self.calls = defaultdict(list)
         self.recording_socket = RecordingSocket()
 
@@ -108,68 +104,17 @@ class FakeStatsdClient(statsd_client.StatsdClient):
         return dict(counts)
 
 
-class FakeLabeledStatsdClient(statsd_client.LabeledStatsdClient):
+class FakeStatsdClient(BaseFakeStatsdClient, statsd_client.StatsdClient):
     def __init__(self, *args, **kwargs):
-        super(FakeLabeledStatsdClient, self).__init__(*args, **kwargs)
-        self.clear()
+        super(FakeStatsdClient, self).__init__()
+        super(BaseFakeStatsdClient, self).__init__(*args, **kwargs)
 
-        # Capture then call parent pubic stat functions
-        self.update_stats = self._capture("update_stats")
-        self.increment = self._capture("increment")
-        self.decrement = self._capture("decrement")
-        self.timing = self._capture("timing")
-        self.timing_since = self._capture("timing_since")
-        self.transfer_rate = self._capture("transfer_rate")
 
-    def _capture(self, func_name):
-        func = getattr(super(FakeLabeledStatsdClient, self), func_name)
-
-        def wrapper(*args, **kwargs):
-            self.calls[func_name].append((args, kwargs))
-            return func(*args, **kwargs)
-        return wrapper
-
-    def _determine_sock_family(self, host, port):
-        return None, None
-
-    def _open_socket(self):
-        return self.recording_socket
-
-    def _send(self, *args, **kwargs):
-        self.send_calls.append((args, kwargs))
-        super(FakeLabeledStatsdClient, self)._send(*args, **kwargs)
-
-    def clear(self):
-        self.send_calls = []
-        self.calls = defaultdict(list)
-        self.recording_socket = RecordingSocket()
-
-    @property
-    def sendto_calls(self):
-        return self.recording_socket.sendto_calls
-
-    def get_increments(self):
-        return [call[0][0] for call in self.calls['increment']]
-
-    def get_increment_counts(self):
-        # note: this method reports the sum of stats sent via the increment
-        # method only; consider using get_stats_counts instead to get the sum
-        # of stats sent via both the increment and update_stats methods
-        counts = defaultdict(int)
-        for metric in self.get_increments():
-            counts[metric] += 1
-        # convert to normal dict for better failure messages
-        return dict(counts)
-
-    def get_update_stats(self):
-        return [call[0][:2] for call in self.calls['update_stats']]
-
-    def get_stats_counts(self):
-        counts = defaultdict(int)
-        for metric, step in self.get_update_stats():
-            counts[metric] += step
-        # convert to normal dict for better failure messages
-        return dict(counts)
+class FakeLabeledStatsdClient(BaseFakeStatsdClient,
+                              statsd_client.LabeledStatsdClient):
+    def __init__(self, *args, **kwargs):
+        super(FakeLabeledStatsdClient, self).__init__()
+        super(BaseFakeStatsdClient, self).__init__(*args, **kwargs)
 
 
 class CaptureLog(object):

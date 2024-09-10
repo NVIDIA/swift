@@ -44,7 +44,7 @@ from swift.common import utils, swob, exceptions
 from swift.common.exceptions import ChunkWriteTimeout, ShortReadError, \
     ChunkReadTimeout, RangeAlreadyComplete
 from swift.common.utils import Timestamp, list_from_csv, md5, FileLikeIter, \
-    ShardRange, Namespace, NamespaceBoundList
+    ShardRange, Namespace, NamespaceBoundList, quorum_size
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers import obj
 from swift.proxy.controllers.base import \
@@ -85,7 +85,12 @@ def set_http_connect(*args, **kwargs):
         yield new_connect
         left_over_status = list(new_connect.code_iter)
         if left_over_status:
-            raise AssertionError('left over status %r' % left_over_status)
+            raise AssertionError('%d left over statuses %r'
+                                 % (len(left_over_status), left_over_status))
+        if new_connect.unexpected_requests:
+            raise AssertionError(' %d unexpected requests'
+                                 % len(new_connect.unexpected_requests))
+
     finally:
         swift.proxy.controllers.base.http_connect = old_connect
         swift.proxy.controllers.obj.http_connect = old_connect
@@ -523,6 +528,30 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             for n in container_nodes}
         self.assertEqual(container_hosts, expected_container_hosts)
 
+    def test_DELETE_all_found(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        codes = [204] * self.replicas()
+        headers = []
+        ts = self.ts()
+        for _ in codes:
+            headers.append({'x-backend-timestamp': ts.internal})
+        with mocked_http_conn(*codes, headers=headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 204)
+        self.assertEqual(ts.internal, resp.headers.get('X-Backend-Timestamp'))
+
+    def test_DELETE_none_found(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        codes = [404] * self.replicas()
+        headers = []
+        ts = self.ts()
+        for _ in codes:
+            headers.append({'x-backend-timestamp': ts.internal})
+        with mocked_http_conn(*codes, headers=headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(ts.internal, resp.headers.get('X-Backend-Timestamp'))
+
     def test_DELETE_missing_one(self):
         # Obviously this test doesn't work if we're testing 1 replica.
         # In that case, we don't have any failovers to check.
@@ -535,7 +564,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
 
-    def test_DELETE_not_found(self):
+    def test_DELETE_one_found(self):
         # Obviously this test doesn't work if we're testing 1 replica.
         # In that case, we don't have any failovers to check.
         if self.replicas() == 1:
@@ -563,6 +592,94 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
+
+    def test_DELETE_insufficient_found_plus_404_507(self):
+        # one less 204 than a quorum...
+        primary_success = quorum_size(self.replicas()) - 1
+        primary_failure = self.replicas() - primary_success - 1
+        primary_codes = [204] * primary_success + [404] + \
+                        [507] * primary_failure
+        handoff_codes = [404] * primary_failure
+        ts = self.ts()
+        headers = []
+        for status in primary_codes + handoff_codes:
+            if status in (204, 404):
+                headers.append({'x-backend-timestamp': ts.internal})
+            else:
+                headers.append({})
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        with mocked_http_conn(*(primary_codes + handoff_codes),
+                              headers=headers):
+            resp = req.get_response(self.app)
+        # primary and handoff 404s form a quorum...
+        self.assertEqual(resp.status_int, 404,
+                         'replicas = %s' % self.replicas())
+        self.assertEqual(ts.internal, resp.headers.get('X-Backend-Timestamp'))
+
+    def test_DELETE_insufficient_found_plus_timeouts(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        req.method = 'DELETE'
+        primary_success = quorum_size(self.replicas()) - 1
+        primary_failure = self.replicas() - primary_success
+        primary_codes = [204] * primary_success + [Timeout()] * primary_failure
+        handoff_codes = [404] * primary_failure
+        ts = self.ts()
+        headers = []
+        for status in primary_codes + handoff_codes:
+            if status in (204, 404):
+                headers.append({'x-backend-timestamp': ts.internal})
+            else:
+                headers.append({})
+        with mocked_http_conn(*(primary_codes + handoff_codes),
+                              headers=headers):
+            resp = req.get_response(self.app)
+        # handoff 404s form a quorum...
+        self.assertEqual(404, resp.status_int,
+                         'replicas = %s' % self.replicas())
+        self.assertEqual(ts.internal, resp.headers.get('X-Backend-Timestamp'))
+
+    def test_DELETE_insufficient_found_plus_404_507_and_handoffs_fail(self):
+        if self.replicas() < 3:
+            return
+        primary_success = quorum_size(self.replicas()) - 1
+        primary_failure = self.replicas() - primary_success - 1
+        primary_codes = [204] * primary_success + [404] + \
+                        [507] * primary_failure
+        handoff_codes = [507] * self.replicas()
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        ts = self.ts()
+        headers = []
+        for status in primary_codes + handoff_codes:
+            if status in (204, 404):
+                headers.append({'x-backend-timestamp': ts.internal})
+            else:
+                headers.append({})
+        with mocked_http_conn(*(primary_codes + handoff_codes),
+                              headers=headers):
+            resp = req.get_response(self.app)
+        # overrides convert the 404 to a 204 so a quorum is formed...
+        self.assertEqual(resp.status_int, 204,
+                         'replicas = %s' % self.replicas())
+
+    def test_DELETE_insufficient_found_plus_507_and_handoffs_fail(self):
+        primary_success = quorum_size(self.replicas()) - 1
+        primary_failure = self.replicas() - primary_success
+        primary_codes = [204] * primary_success + [507] * primary_failure
+        handoff_codes = [507] * self.replicas()
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        ts = self.ts()
+        headers = []
+        for status in primary_codes + handoff_codes:
+            if status in (204, 404):
+                headers.append({'x-backend-timestamp': ts.internal})
+            else:
+                headers.append({})
+        with mocked_http_conn(*(primary_codes + handoff_codes),
+                              headers=headers):
+            resp = req.get_response(self.app)
+        # no quorum...
+        self.assertEqual(resp.status_int, 503,
+                         'replicas = %s' % self.replicas())
 
     def test_DELETE_half_not_found_statuses(self):
         self.obj_ring.set_replicas(4)
@@ -962,7 +1079,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
     def test_HEAD_x_newest(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD',
                                               headers={'X-Newest': 'true'})
-        with set_http_connect(*([200] * self.replicas())):
+        with set_http_connect(*([200] * 2 * self.replicas())):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
@@ -970,14 +1087,15 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         req = swob.Request.blank('/v1/a/c/o', method='HEAD',
                                  headers={'X-Newest': 'true'})
         ts = (utils.Timestamp(t) for t in itertools.count(int(time.time())))
-        timestamps = [next(ts) for i in range(self.replicas())]
+        num_expected_requests = 2 * self.replicas()
+        timestamps = [next(ts) for i in range(num_expected_requests)]
         newest_timestamp = timestamps[-1]
         random.shuffle(timestamps)
         backend_response_headers = [{
             'X-Backend-Timestamp': t.internal,
             'X-Timestamp': t.normal
         } for t in timestamps]
-        with set_http_connect(*([200] * self.replicas()),
+        with set_http_connect(*([200] * num_expected_requests),
                               headers=backend_response_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
@@ -988,14 +1106,15 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                                  headers={'X-Newest': 'true'})
         ts = (utils.Timestamp.now(offset=offset)
               for offset in itertools.count())
-        timestamps = [next(ts) for i in range(self.replicas())]
+        num_expected_requests = 2 * self.replicas()
+        timestamps = [next(ts) for i in range(num_expected_requests)]
         newest_timestamp = timestamps[-1]
         random.shuffle(timestamps)
         backend_response_headers = [{
             'X-Backend-Timestamp': t.internal,
             'X-Timestamp': t.normal
         } for t in timestamps]
-        with set_http_connect(*([200] * self.replicas()),
+        with set_http_connect(*([200] * num_expected_requests),
                               headers=backend_response_headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
@@ -1296,6 +1415,94 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         # policy 1 inherits default affinity to r0, overrides node count
         self._check_write_affinity(conf, policy_conf, POLICIES[1], [0],
                                    3 * self.replicas(POLICIES[1]))
+
+    def test_POST_all_primaries_succeed(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
+        primary_codes = [202] * self.replicas()
+        with mocked_http_conn(*primary_codes):
+            resp = req.get_response(self.app)
+        self.assertEqual(202, resp.status_int,
+                         'replicas = %s' % self.replicas())
+
+    def test_POST_sufficient_primaries_succeed_others_404(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
+        # NB: for POST to EC object quorum_size is sufficient for success
+        # rather than policy.quorum
+        primary_success = quorum_size(self.replicas())
+        primary_failure = self.replicas() - primary_success
+        primary_codes = [202] * primary_success + [404] * primary_failure
+        with mocked_http_conn(*primary_codes):
+            resp = req.get_response(self.app)
+        self.assertEqual(202, resp.status_int,
+                         'replicas = %s' % self.replicas())
+
+    def test_POST_sufficient_primaries_succeed_others_fail(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
+        # NB: for POST to EC object quorum_size is sufficient for success
+        # rather than policy.quorum
+        primary_success = quorum_size(self.replicas())
+        primary_failure = self.replicas() - primary_success
+        primary_codes = [202] * primary_success + [Timeout()] * primary_failure
+        handoff_codes = [404] * primary_failure
+        with mocked_http_conn(*(primary_codes + handoff_codes)):
+            resp = req.get_response(self.app)
+        self.assertEqual(202, resp.status_int,
+                         'replicas = %s' % self.replicas())
+
+    def test_POST_insufficient_primaries_succeed_others_404(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
+        primary_success = quorum_size(self.replicas()) - 1
+        primary_failure = self.replicas() - primary_success
+        primary_codes = [404] * primary_failure + [202] * primary_success
+        with mocked_http_conn(*primary_codes):
+            resp = req.get_response(self.app)
+        # TODO: should this be a 503?
+        self.assertEqual(404, resp.status_int,
+                         'replicas = %s' % self.replicas())
+
+    def test_POST_insufficient_primaries_others_fail_handoffs_404(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
+        primary_success = quorum_size(self.replicas()) - 1
+        primary_failure = self.replicas() - primary_success
+        primary_codes = [Timeout()] * primary_failure + [202] * primary_success
+        handoff_codes = [404] * primary_failure
+        with mocked_http_conn(*(primary_codes + handoff_codes)):
+            resp = req.get_response(self.app)
+        self.assertEqual(503, resp.status_int,
+                         'replicas = %s' % self.replicas())
+
+    def test_POST_insufficient_primaries_others_fail_handoffs_fail(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
+        primary_success = quorum_size(self.replicas()) - 1
+        primary_failure = self.replicas() - primary_success
+        primary_codes = [Timeout()] * primary_failure + [202] * primary_success
+        handoff_codes = [507] * self.replicas()
+        with mocked_http_conn(*(primary_codes + handoff_codes)):
+            resp = req.get_response(self.app)
+        self.assertEqual(503, resp.status_int,
+                         'replicas = %s' % self.replicas())
+
+    def test_POST_all_primaries_fail_insufficient_handoff_succeeds(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
+        handoff_success = quorum_size(self.replicas()) - 1
+        handoff_not_found = self.replicas() - handoff_success
+        primary_codes = [Timeout()] * self.replicas()
+        handoff_codes = [202] * handoff_success + [404] * handoff_not_found
+        with mocked_http_conn(*(primary_codes + handoff_codes)):
+            resp = req.get_response(self.app)
+        self.assertEqual(503, resp.status_int,
+                         'replicas = %s' % self.replicas())
+
+    def test_POST_all_primaries_fail_sufficient_handoff_succeeds(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
+        handoff_success = quorum_size(self.replicas())
+        handoff_not_found = self.replicas() - handoff_success
+        primary_codes = [Timeout()] * self.replicas()
+        handoff_codes = [202] * handoff_success + [404] * handoff_not_found
+        with mocked_http_conn(*(primary_codes + handoff_codes)):
+            resp = req.get_response(self.app)
+        self.assertEqual(202, resp.status_int,
+                         'replicas = %s' % self.replicas())
 
 # end of CommonObjectControllerMixin
 
@@ -3260,9 +3467,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
 
     def _test_if_match(self, method):
-        num_responses = self.policy.ec_ndata if method == 'GET' else 1
-
-        def _do_test(match_value, backend_status,
+        def _do_test(match_value, backend_status, num_responses,
                      etag_is_at='X-Object-Sysmeta-Does-Not-Exist'):
             req = swift.common.swob.Request.blank(
                 '/v1/a/c/o', method=method,
@@ -3277,30 +3482,33 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             self.assertEqual('data_etag', resp.headers['Etag'])
             return resp
 
+        num_ok_responses = self.policy.ec_ndata if method == 'GET' else 1
         # wildcard
-        resp = _do_test('*', 200)
+        resp = _do_test('*', 200, num_ok_responses)
         self.assertEqual(resp.status_int, 200)
 
         # match
-        resp = _do_test('"data_etag"', 200)
+        resp = _do_test('"data_etag"', 200, num_ok_responses)
         self.assertEqual(resp.status_int, 200)
 
         # no match
-        resp = _do_test('"frag_etag"', 412)
+        resp = _do_test('"frag_etag"', 412,
+                        2 * self.policy.ec_n_unique_fragments)
         self.assertEqual(resp.status_int, 412)
 
         # match wildcard against an alternate etag
-        resp = _do_test('*', 200,
+        resp = _do_test('*', 200, num_ok_responses,
                         etag_is_at='X-Object-Sysmeta-Alternate-Etag')
         self.assertEqual(resp.status_int, 200)
 
         # match against an alternate etag
-        resp = _do_test('"alt_etag"', 200,
+        resp = _do_test('"alt_etag"', 200, num_ok_responses,
                         etag_is_at='X-Object-Sysmeta-Alternate-Etag')
         self.assertEqual(resp.status_int, 200)
 
         # no match against an alternate etag
         resp = _do_test('"data_etag"', 412,
+                        2 * self.policy.ec_n_unique_fragments,
                         etag_is_at='X-Object-Sysmeta-Alternate-Etag')
         self.assertEqual(resp.status_int, 412)
 
@@ -3311,9 +3519,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self._test_if_match('HEAD')
 
     def _test_if_none_match(self, method):
-        num_responses = self.policy.ec_ndata if method == 'GET' else 1
-
-        def _do_test(match_value, backend_status,
+        def _do_test(match_value, backend_status, num_responses,
                      etag_is_at='X-Object-Sysmeta-Does-Not-Exist'):
             req = swift.common.swob.Request.blank(
                 '/v1/a/c/o', method=method,
@@ -3328,30 +3534,38 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             self.assertEqual('data_etag', resp.headers['Etag'])
             return resp
 
+        if method == 'GET':
+            num_ok_responses = self.policy.ec_ndata
+            num_304_responses = 2 * self.policy.ec_n_unique_fragments
+        else:
+            num_ok_responses = num_304_responses = 1
+
         # wildcard
-        resp = _do_test('*', 304)
+        resp = _do_test('*', 304, num_304_responses)
         self.assertEqual(resp.status_int, 304)
 
         # match
-        resp = _do_test('"data_etag"', 304)
+        resp = _do_test('"data_etag"', 304, num_304_responses)
         self.assertEqual(resp.status_int, 304)
 
         # no match
-        resp = _do_test('"frag_etag"', 200)
+        resp = _do_test('"frag_etag"', 200, num_ok_responses)
         self.assertEqual(resp.status_int, 200)
 
         # match wildcard against an alternate etag
         resp = _do_test('*', 304,
+                        num_304_responses,
                         etag_is_at='X-Object-Sysmeta-Alternate-Etag')
         self.assertEqual(resp.status_int, 304)
 
         # match against an alternate etag
         resp = _do_test('"alt_etag"', 304,
+                        num_304_responses,
                         etag_is_at='X-Object-Sysmeta-Alternate-Etag')
         self.assertEqual(resp.status_int, 304)
 
         # no match against an alternate etag
-        resp = _do_test('"data_etag"', 200,
+        resp = _do_test('"data_etag"', 200, num_ok_responses,
                         etag_is_at='X-Object-Sysmeta-Alternate-Etag')
         self.assertEqual(resp.status_int, 200)
 
@@ -3378,7 +3592,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
     def test_GET_no_response_error(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
-        with set_http_connect():
+        num_responses = 2 * self.policy.ec_n_unique_fragments
+        with set_http_connect(*([Timeout()] * num_responses)):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
 
