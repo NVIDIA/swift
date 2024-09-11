@@ -838,6 +838,187 @@ class TestObjectExpirer(TestCase):
             "= next-great-thing' (using legacy)"
         ], self.logger.get_lines_for_level('warning'))
 
+    def test_init_internal_client_path(self):
+        # default -> /etc/swift/object-expirer.conf
+        conf = {'internal_client_conf_path': 'ignored'}
+        with mock.patch.object(expirer, 'InternalClient',
+                               return_value=self.fake_swift) as mock_ic:
+            x = expirer.ObjectExpirer(conf, logger=self.logger)
+        self.assertEqual(mock_ic.mock_calls, [mock.call(
+            '/etc/swift/object-expirer.conf', 'Swift Object Expirer', 3,
+            use_replication_network=True,
+            global_conf={'log_name': 'object-expirer-ic'})])
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+        self.assertIs(x.swift, self.fake_swift)
+
+        # conf read from /etc/swift/object-expirer.conf
+        # -> /etc/swift/object-expirer.conf
+        conf = {'__file__': '/etc/swift/object-expirer.conf',
+                'internal_client_conf_path': 'ignored'}
+        with mock.patch.object(expirer, 'InternalClient',
+                               return_value=self.fake_swift) as mock_ic:
+            x = expirer.ObjectExpirer(conf, logger=self.logger)
+        self.assertEqual(mock_ic.mock_calls, [mock.call(
+            '/etc/swift/object-expirer.conf', 'Swift Object Expirer', 3,
+            use_replication_network=True,
+            global_conf={'log_name': 'object-expirer-ic'})])
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+        self.assertIs(x.swift, self.fake_swift)
+
+        # conf read from object-server.conf, no internal_client_conf_path
+        # specified -> /etc/swift/internal-client.conf
+        conf = {'__file__': '/etc/swift/object-server.conf'}
+        with mock.patch.object(expirer, 'InternalClient',
+                               return_value=self.fake_swift) as mock_ic:
+            x = expirer.ObjectExpirer(conf, logger=self.logger)
+        self.assertEqual(mock_ic.mock_calls, [mock.call(
+            '/etc/swift/internal-client.conf', 'Swift Object Expirer', 3,
+            use_replication_network=True,
+            global_conf={'log_name': 'object-expirer-ic'})])
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+        self.assertIs(x.swift, self.fake_swift)
+
+        # conf read from object-server.conf, internal_client_conf_path is
+        # specified -> internal_client_conf_path value
+        conf = {'__file__': '/etc/swift/object-server.conf',
+                'internal_client_conf_path':
+                    '/etc/swift/other-internal-client.conf'}
+        with mock.patch.object(expirer, 'InternalClient',
+                               return_value=self.fake_swift) as mock_ic:
+            x = expirer.ObjectExpirer(conf, logger=self.logger)
+        self.assertEqual(mock_ic.mock_calls, [mock.call(
+            '/etc/swift/other-internal-client.conf', 'Swift Object Expirer', 3,
+            use_replication_network=True,
+            global_conf={'log_name': 'object-expirer-ic'})])
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+        self.assertIs(x.swift, self.fake_swift)
+
+        # conf read from other file, internal_client_conf_path is
+        # specified -> internal_client_conf_path value
+        conf = {'__file__': '/etc/swift/other-object-server.conf',
+                'internal_client_conf_path':
+                    '/etc/swift/other-internal-client.conf'}
+        with mock.patch.object(expirer, 'InternalClient',
+                               return_value=self.fake_swift) as mock_ic:
+            x = expirer.ObjectExpirer(conf, logger=self.logger)
+        self.assertEqual(mock_ic.mock_calls, [mock.call(
+            '/etc/swift/other-internal-client.conf', 'Swift Object Expirer', 3,
+            use_replication_network=True,
+            global_conf={'log_name': 'object-expirer-ic'})])
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+        self.assertIs(x.swift, self.fake_swift)
+
+    def test_init_default_round_robin_cache_default(self):
+        conf = {}
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual(x.round_robin_task_cache_size,
+                         expirer.MAX_OBJECTS_TO_CACHE)
+
+    def test_init_large_round_robin_cache(self):
+        conf = {
+            'round_robin_task_cache_size': '1000000',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual(x.round_robin_task_cache_size, 1000000)
+
+    def test_xxx_randomized_task_container_iteration_shim(self):
+        conf = {
+            'randomized_task_container_iteration': 'yes',
+            'round_robin_task_cache_size': '3000',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("randomized", x.task_container_iteration_strategy)
+        self.assertEqual(x.round_robin_task_cache_size, 3000)
+
+    def test_xxx_randomized_task_container_iteration_old_vs_new(self):
+        conf = {
+            'randomized_task_container_iteration': 'false',
+            'task_container_iteration_strategy': 'randomized',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("randomized", x.task_container_iteration_strategy)
+
+        conf = {
+            'randomized_task_container_iteration': 'yes',
+            'task_container_iteration_strategy': 'legacy',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("randomized", x.task_container_iteration_strategy)
+
+    def test_init_medium_round_robin_cache(self):
+        conf = {
+            'round_robin_task_cache_size': '3000',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual(x.round_robin_task_cache_size, 3000)
+
+    def test_init_round_robin_task_cache_size_invalid(self):
+        conf = {
+            'round_robin_task_cache_size': '-2.x',
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertIn('invalid literal for int', str(ctx.exception))
+
+    def test_init_task_container_iteration_strategy_default(self):
+        conf = {}
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("legacy", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_legacy(self):
+        conf = {
+            'task_container_iteration_strategy': 'legacy',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("legacy", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_randomized(self):
+        conf = {
+            'task_container_iteration_strategy': 'randomized',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("randomized", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_parallel(self):
+        conf = {
+            'task_container_iteration_strategy': 'parallel',
+            'processes': '1700',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("parallel", x.task_container_iteration_strategy)
+
+    def test_init_task_container_iteration_strategy_parallel_invalid(self):
+        conf = {
+            'task_container_iteration_strategy': 'parallel',
+        }
+        with self.assertRaises(ValueError) as ctx:
+            expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertIn('multiple processes', str(ctx.exception))
+
+    def test_init_task_container_iteration_strategy_invalid(self):
+        conf = {
+            'task_container_iteration_strategy': 'next-great-thing',
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("legacy", x.task_container_iteration_strategy)
+        self.assertEqual([
+            "Unrecognized config value: 'task_container_iteration_strategy "
+            "= next-great-thing' (using legacy)"
+        ], self.logger.get_lines_for_level('warning'))
+
     def test_init_internal_client_log_name(self):
         def _do_test_init_ic_log_name(conf, exp_internal_client_log_name):
             with mock.patch(
