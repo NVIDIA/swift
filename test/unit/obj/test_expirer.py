@@ -35,6 +35,7 @@ from six.moves import urllib
 
 from swift.common import internal_client, utils, swob
 from swift.common.utils import Timestamp
+from swift.common.swob import Response
 from swift.obj import expirer, diskfile
 from swift.obj.expirer import ExpirerConfig
 
@@ -89,7 +90,7 @@ class FakeInternalClient(object):
     def delete_container(*a, **kw):
         pass
 
-    def iter_objects(self, account, container):
+    def iter_objects(self, account, container, **kwargs):
         self._calls.append(('iter_objects', account, container))
         acc_dict = self.aco_dict[account]
         obj_iter = acc_dict.get(container, [])
@@ -817,6 +818,16 @@ class TestObjectExpirer(TestCase):
                                   swift=self.fake_swift)
         self.assertEqual("parallel", x.task_container_iteration_strategy)
 
+    def test_init_task_container_iteration_strategy_parallel_overridden(self):
+        conf = {
+            'task_container_iteration_strategy': 'parallel',
+            'processes': '1700',
+            'randomized_task_container_iteration': True
+        }
+        x = expirer.ObjectExpirer(conf, logger=self.logger,
+                                  swift=self.fake_swift)
+        self.assertEqual("randomized", x.task_container_iteration_strategy)
+
     def test_init_task_container_iteration_strategy_parallel_invalid(self):
         conf = {
             'task_container_iteration_strategy': 'parallel',
@@ -838,9 +849,9 @@ class TestObjectExpirer(TestCase):
             "= next-great-thing' (using legacy)"
         ], self.logger.get_lines_for_level('warning'))
 
-    def test_init_internal_client_path(self):
-        # default -> /etc/swift/object-expirer.conf
-        conf = {'internal_client_conf_path': 'ignored'}
+    def test_init_internal_client_path_from_expirer_conf(self):
+        # conf read from object-expirer.conf, no internal_client_conf_path
+        conf = {'__file__': '/etc/swift/object-expirer.conf'}
         with mock.patch.object(expirer, 'InternalClient',
                                return_value=self.fake_swift) as mock_ic:
             x = expirer.ObjectExpirer(conf, logger=self.logger)
@@ -851,20 +862,23 @@ class TestObjectExpirer(TestCase):
         self.assertEqual(self.logger.get_lines_for_level('warning'), [])
         self.assertIs(x.swift, self.fake_swift)
 
+    def test_init_internal_client_path_from_internal_and_other_conf(self):
         # conf read from /etc/swift/object-expirer.conf
         # -> /etc/swift/object-expirer.conf
         conf = {'__file__': '/etc/swift/object-expirer.conf',
-                'internal_client_conf_path': 'ignored'}
+                'internal_client_conf_path':
+                    '/etc/swift/other-internal-client.conf'}
         with mock.patch.object(expirer, 'InternalClient',
                                return_value=self.fake_swift) as mock_ic:
             x = expirer.ObjectExpirer(conf, logger=self.logger)
         self.assertEqual(mock_ic.mock_calls, [mock.call(
-            '/etc/swift/object-expirer.conf', 'Swift Object Expirer', 3,
+            '/etc/swift/other-internal-client.conf', 'Swift Object Expirer', 3,
             use_replication_network=True,
             global_conf={'log_name': 'object-expirer-ic'})])
         self.assertEqual(self.logger.get_lines_for_level('warning'), [])
         self.assertIs(x.swift, self.fake_swift)
 
+    def test_init_internal_client_path_from_server_conf(self):
         # conf read from object-server.conf, no internal_client_conf_path
         # specified -> /etc/swift/internal-client.conf
         conf = {'__file__': '/etc/swift/object-server.conf'}
@@ -878,6 +892,7 @@ class TestObjectExpirer(TestCase):
         self.assertEqual(self.logger.get_lines_for_level('warning'), [])
         self.assertIs(x.swift, self.fake_swift)
 
+    def test_init_internal_client_path_from_server_and_other_conf(self):
         # conf read from object-server.conf, internal_client_conf_path is
         # specified -> internal_client_conf_path value
         conf = {'__file__': '/etc/swift/object-server.conf',
@@ -893,6 +908,7 @@ class TestObjectExpirer(TestCase):
         self.assertEqual(self.logger.get_lines_for_level('warning'), [])
         self.assertIs(x.swift, self.fake_swift)
 
+    def test_init_internal_client_path_from_other_and_other_conf(self):
         # conf read from other file, internal_client_conf_path is
         # specified -> internal_client_conf_path value
         conf = {'__file__': '/etc/swift/other-object-server.conf',
@@ -908,116 +924,17 @@ class TestObjectExpirer(TestCase):
         self.assertEqual(self.logger.get_lines_for_level('warning'), [])
         self.assertIs(x.swift, self.fake_swift)
 
-    def test_init_default_round_robin_cache_default(self):
+    def test_init_internal_client_path_from_empty_conf(self):
         conf = {}
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual(x.round_robin_task_cache_size,
-                         expirer.MAX_OBJECTS_TO_CACHE)
-
-    def test_init_large_round_robin_cache(self):
-        conf = {
-            'round_robin_task_cache_size': '1000000',
-        }
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual(x.round_robin_task_cache_size, 1000000)
-
-    def test_xxx_randomized_task_container_iteration_shim(self):
-        conf = {
-            'randomized_task_container_iteration': 'yes',
-            'round_robin_task_cache_size': '3000',
-        }
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual("randomized", x.task_container_iteration_strategy)
-        self.assertEqual(x.round_robin_task_cache_size, 3000)
-
-    def test_xxx_randomized_task_container_iteration_old_vs_new(self):
-        conf = {
-            'randomized_task_container_iteration': 'false',
-            'task_container_iteration_strategy': 'randomized',
-        }
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual("randomized", x.task_container_iteration_strategy)
-
-        conf = {
-            'randomized_task_container_iteration': 'yes',
-            'task_container_iteration_strategy': 'legacy',
-        }
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual("randomized", x.task_container_iteration_strategy)
-
-    def test_init_medium_round_robin_cache(self):
-        conf = {
-            'round_robin_task_cache_size': '3000',
-        }
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual(x.round_robin_task_cache_size, 3000)
-
-    def test_init_round_robin_task_cache_size_invalid(self):
-        conf = {
-            'round_robin_task_cache_size': '-2.x',
-        }
-        with self.assertRaises(ValueError) as ctx:
-            expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertIn('invalid literal for int', str(ctx.exception))
-
-    def test_init_task_container_iteration_strategy_default(self):
-        conf = {}
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual("legacy", x.task_container_iteration_strategy)
-
-    def test_init_task_container_iteration_strategy_legacy(self):
-        conf = {
-            'task_container_iteration_strategy': 'legacy',
-        }
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual("legacy", x.task_container_iteration_strategy)
-
-    def test_init_task_container_iteration_strategy_randomized(self):
-        conf = {
-            'task_container_iteration_strategy': 'randomized',
-        }
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual("randomized", x.task_container_iteration_strategy)
-
-    def test_init_task_container_iteration_strategy_parallel(self):
-        conf = {
-            'task_container_iteration_strategy': 'parallel',
-            'processes': '1700',
-        }
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual("parallel", x.task_container_iteration_strategy)
-
-    def test_init_task_container_iteration_strategy_parallel_invalid(self):
-        conf = {
-            'task_container_iteration_strategy': 'parallel',
-        }
-        with self.assertRaises(ValueError) as ctx:
-            expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertIn('multiple processes', str(ctx.exception))
-
-    def test_init_task_container_iteration_strategy_invalid(self):
-        conf = {
-            'task_container_iteration_strategy': 'next-great-thing',
-        }
-        x = expirer.ObjectExpirer(conf, logger=self.logger,
-                                  swift=self.fake_swift)
-        self.assertEqual("legacy", x.task_container_iteration_strategy)
-        self.assertEqual([
-            "Unrecognized config value: 'task_container_iteration_strategy "
-            "= next-great-thing' (using legacy)"
-        ], self.logger.get_lines_for_level('warning'))
+        with mock.patch.object(expirer, 'InternalClient',
+                               return_value=self.fake_swift) as mock_ic:
+            x = expirer.ObjectExpirer(conf, logger=self.logger)
+        self.assertEqual(mock_ic.mock_calls, [mock.call(
+            '/etc/swift/object-expirer.conf', 'Swift Object Expirer', 3,
+            use_replication_network=True,
+            global_conf={'log_name': 'object-expirer-ic'})])
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+        self.assertIs(x.swift, self.fake_swift)
 
     def test_init_internal_client_log_name(self):
         def _do_test_init_ic_log_name(conf, exp_internal_client_log_name):
@@ -2013,8 +1930,9 @@ class TestObjectExpirer(TestCase):
             self.expirer.run_once()
         self.assertEqual(
             self.expirer.logger.get_lines_for_level('info'), [
-                'Pass beginning for task account .expiring_objects; '
-                '4 possible containers; 12 possible objects',
+                'Pass beginning (legacy strategy) for task account '
+                '.expiring_objects; 4 possible containers; '
+                '12 possible objects',
                 'Pass completed in 0s; 10 objects expired',
             ])
 
@@ -2056,8 +1974,8 @@ class TestObjectExpirer(TestCase):
         x.run_once()
         self.assertEqual(
             x.logger.get_lines_for_level('info'), [
-                'Pass beginning for task account .expiring_objects; '
-                '0 possible containers; 0 possible objects',
+                'Pass beginning (legacy strategy) for task account '
+                '.expiring_objects; 0 possible containers; 0 possible objects',
                 'Pass completed in 0s; 0 objects expired',
             ])
 
@@ -2656,6 +2574,172 @@ class TestObjectExpirer(TestCase):
             task_account_container_list, 0, 1))
         self.assertEqual(expected, observed)
 
+    def test_iter_task_to_expire_unexpected_response(self):
+        # Test that object listing on the first container returns 503 and raise
+        # UnexpectedResponse, and expect the second task container will
+        # continue to be processed.
+        # In this test, all tasks are assigned to the tested expirer.
+        my_index = 0
+        divisor = 1
+
+        # Store reference to the real method before mocking
+        real_iter_objects = self.fake_swift.iter_objects
+
+        def mock_iter_objects(account, container, **kwargs):
+            if container == self.just_past_time_container:
+                mock_resp = Response(status=503)
+                raise internal_client.UnexpectedResponse(
+                    'Mocked error', mock_resp)
+            return real_iter_objects(account, container)
+
+        task_account_container_list = [
+            ('.expiring_objects', self.just_past_time_container),
+            ('.expiring_objects', self.past_time_container)
+        ]
+        expected = [
+            self.make_task(self.past_time_container, self.past_time,
+                           target_path)
+            for target_path in self.expired_target_paths[self.past_time]]
+
+        with mock.patch.object(self.expirer.swift, 'iter_objects',
+                               mock_iter_objects):
+            with mock.patch.object(self.expirer.swift, 'delete_container') \
+                    as mock_delete_container:
+                self.assertEqual(
+                    list(self.expirer.iter_task_to_expire(
+                        task_account_container_list, my_index, divisor)),
+                    expected)
+                self.assertEqual(mock_delete_container.mock_calls, [])
+
+        log_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(
+            log_lines,
+            ['Unexpected response while listing objects in container '
+             '.expiring_objects %s: Mocked error'
+             % self.just_past_time_container]
+        )
+        self.assertEqual(
+            {'tasks.assigned': 5},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
+
+    def test_iter_task_to_expire_exception(self):
+        # Test that object listing on the first container raise Exception, and
+        # expect the second task container will continue to be processed.
+        # In this test, all tasks are assigned to the tested expirer.
+        my_index = 0
+        divisor = 1
+
+        # Store reference to the real method before mocking
+        real_iter_objects = self.fake_swift.iter_objects
+
+        def mock_iter_objects(account, container, **kwargs):
+            if container == self.just_past_time_container:
+                raise Exception('failed to connect')
+            return real_iter_objects(account, container)
+
+        task_account_container_list = [
+            ('.expiring_objects', self.just_past_time_container),
+            ('.expiring_objects', self.past_time_container)
+        ]
+        expected = [
+            self.make_task(self.past_time_container, self.past_time,
+                           target_path)
+            for target_path in self.expired_target_paths[self.past_time]]
+
+        with mock.patch.object(self.expirer.swift, 'iter_objects',
+                               mock_iter_objects):
+            with mock.patch.object(self.expirer.swift, 'delete_container') \
+                    as mock_delete_container:
+                self.assertEqual(
+                    list(self.expirer.iter_task_to_expire(
+                        task_account_container_list, my_index, divisor)),
+                    expected)
+            self.assertEqual(mock_delete_container.mock_calls, [])
+
+        log_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(
+            log_lines,
+            ['Exception while listing objects in container '
+             '.expiring_objects %s: failed to connect'
+             % self.just_past_time_container]
+        )
+        self.assertEqual(
+            {'tasks.assigned': 5},
+            self.expirer.logger.statsd_client.get_increment_counts()
+        )
+
+    def test_iter_task_to_expire_404_response_on_empty_container(self):
+        # Test that object listing on an empty container returns 404 and
+        # raise UnexpectedResponse, and expect ``iter_task_to_expire`` won't
+        # delete this task container.
+        # In this test, all tasks are assigned to the tested expirer.
+        my_index = 0
+        divisor = 1
+
+        err_resp = Response(status=404)
+        err = internal_client.UnexpectedResponse('Mocked error', err_resp)
+
+        task_account_container_list = [
+            ('.expiring_objects', self.empty_time_container)
+        ]
+
+        with mock.patch.object(self.expirer.swift, 'iter_objects',
+                               side_effect=err) as mock_method:
+            with mock.patch.object(self.expirer.swift, 'delete_container') \
+                    as mock_delete_container:
+                self.assertEqual(
+                    list(self.expirer.iter_task_to_expire(
+                        task_account_container_list, my_index, divisor)),
+                    [])
+        log_lines = self.logger.get_lines_for_level('error')
+        self.assertFalse(log_lines)
+        # This empty task container won't get deleted.
+        self.assertEqual(mock_delete_container.mock_calls, [])
+        self.assertEqual(
+            {}, self.expirer.logger.statsd_client.get_increment_counts())
+        self.assertEqual(mock_method.call_args_list, [
+            mock.call('.expiring_objects',
+                      self.empty_time_container,
+                      acceptable_statuses=[2])
+        ])
+
+    def test_iter_task_to_expire_503_response_on_empty_container(self):
+        # Test that object listing on an empty container returns 503 and
+        # raise UnexpectedResponse, and expect ``iter_task_to_expire`` won't
+        # delete this task container.
+        # In this test, all tasks are assigned to the tested expirer.
+        my_index = 0
+        divisor = 1
+
+        def mock_iter_objects(account, container, **kwargs):
+            mock_resp = Response(status=503)
+            raise internal_client.UnexpectedResponse('Mocked error', mock_resp)
+
+        task_account_container_list = [
+            ('.expiring_objects', self.empty_time_container)
+        ]
+
+        with mock.patch.object(self.expirer.swift, 'iter_objects',
+                               side_effect=mock_iter_objects):
+            with mock.patch.object(self.expirer.swift, 'delete_container') \
+                    as mock_delete_container:
+                self.assertEqual(
+                    list(self.expirer.iter_task_to_expire(
+                        task_account_container_list, my_index, divisor)),
+                    [])
+        log_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(
+            log_lines[0],
+            'Unexpected response while listing objects in container '
+            '.expiring_objects %s: Mocked error'
+            % self.empty_time_container,
+        )
+        # This empty task container won't get deleted.
+        self.assertEqual(mock_delete_container.mock_calls, [])
+        self.assertEqual(
+            {}, self.expirer.logger.statsd_client.get_increment_counts())
+
     def _setup_a_bunch_of_tasks(
             self, now, num_days_before_now, num_days_after_now,
             containers_per_day, num_task_per_container,
@@ -3018,9 +3102,15 @@ class TestObjectExpirer(TestCase):
         expected = {c[0] for c in mock_method.call_args_list}
         # iter_objects is called only for past_time, not future_time
         self.assertEqual(mock_method.call_args_list, [
-            mock.call('.expiring_objects', self.empty_time_container),
-            mock.call('.expiring_objects', self.past_time_container),
-            mock.call('.expiring_objects', self.just_past_time_container)])
+            mock.call('.expiring_objects',
+                      self.empty_time_container,
+                      acceptable_statuses=[2]),
+            mock.call('.expiring_objects',
+                      self.past_time_container,
+                      acceptable_statuses=[2]),
+            mock.call('.expiring_objects',
+                      self.just_past_time_container,
+                      acceptable_statuses=[2])])
 
     def test_object_timestamp_break(self):
         with mock.patch.object(self.expirer, 'delete_actual_object') \
@@ -3139,8 +3229,8 @@ class TestObjectExpirer(TestCase):
             for target_path in self.expired_target_paths[self.just_past_time]
         ])
         self.assertEqual(self.expirer.logger.get_lines_for_level('info'), [
-            'Pass beginning for task account .expiring_objects; '
-            '4 possible containers; 12 possible objects',
+            'Pass beginning (legacy strategy) for task account '
+            '.expiring_objects; 4 possible containers; 12 possible objects',
             'Pass completed in 0s; 5 objects expired',
         ])
         self.assertEqual(mock_pop.mock_calls, [

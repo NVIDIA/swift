@@ -3005,8 +3005,9 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.cache_key = "test_key"
         self.token_key = "_cache_token/%s" % self.cache_key
         self.cache_ttl = 60
+        self.backend_resp = Response(status=200, body=b'response')
         self.do_fetch_backend = mock.Mock(
-            return_value=("backend data", "response"))
+            return_value=("backend data", self.backend_resp))
         self.retry_interval = 0.001
 
     def test_populator_constructor(self):
@@ -3030,8 +3031,10 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(obj._token_ttl, self.retry_interval * 10)
         self.assertEqual(obj._num_tokens, 10)
         self.assertEqual(obj._do_fetch_backend, self.do_fetch_backend)
-        self.assertIsNone(obj._cache_encoder)
-        self.assertIsNone(obj._cache_decoder)
+        self.assertTrue(callable(obj._cache_encoder))
+        self.assertEqual(obj._cache_encoder(42), 42)
+        self.assertTrue(callable(obj._cache_decoder))
+        self.assertEqual(obj._cache_decoder(42), 42)
         self.assertIsNone(obj.set_cache_state)
         self.assertFalse(obj.is_token_request_done())
         self.assertFalse(obj.req_served_from_cache)
@@ -3050,7 +3053,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
-        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.backend_response, self.backend_resp)
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
         self.assertTrue(populator.is_token_request_done())
@@ -3082,7 +3085,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
-        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.backend_response, self.backend_resp)
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
         self.assertTrue(populator.is_token_request_done())
@@ -3110,12 +3113,12 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
-        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.backend_response, self.backend_resp)
         self.do_fetch_backend.assert_called_once()
         self.assertIsNone(populator.set_cache_state)
         self.assertFalse(populator.is_token_request_done())
         self.assertFalse(populator.req_served_from_cache)
-        self.assertEqual(self.infocache, {})
+        self.assertEqual(self.infocache, {'test_key': 'backend data'})
         self.assertEqual(self.memcache.incr_calls, [])
         self.assertEqual(self.memcache.set_calls, [])
         self.assertEqual(self.memcache.del_calls, [])
@@ -3140,7 +3143,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
-        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.backend_response, self.backend_resp)
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
         self.assertTrue(populator.is_token_request_done())
@@ -3258,7 +3261,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
-        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.backend_response, self.backend_resp)
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
         self.assertFalse(populator.is_token_request_done())
@@ -3312,7 +3315,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             mock_time.side_effect = itertools.count(4000.99, 1.0)
             data = populator.fetch_data()
         self.assertEqual(data, "backend data")
-        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.backend_response, self.backend_resp)
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
         self.assertFalse(populator.is_token_request_done())
@@ -3350,7 +3353,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
-        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.backend_response, self.backend_resp)
         self.assertEqual(populator.set_cache_state, "set")
         self.do_fetch_backend.assert_called_once()
         self.assertFalse(populator.is_token_request_done())
@@ -3385,7 +3388,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
-        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.backend_response, self.backend_resp)
         self.assertEqual(populator.set_cache_state, "set_error")
         self.do_fetch_backend.assert_called_once()
         self.assertFalse(populator.is_token_request_done())
@@ -3421,7 +3424,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
-        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.backend_response, self.backend_resp)
         self.assertEqual(populator.set_cache_state, "set_error")
         self.do_fetch_backend.assert_called_once()
         self.assertFalse(populator.is_token_request_done())
@@ -3463,7 +3466,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
-        self.assertEqual(populator.backend_response, "response")
+        self.assertEqual(populator.backend_response, self.backend_resp)
         self.do_fetch_backend.assert_called_once()
         self.assertEqual(populator.set_cache_state, "set")
         self.assertFalse(populator.is_token_request_done())
@@ -3495,7 +3498,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
 
             def delayed_do_fetch_backend():
                 eventlet.sleep(self.retry_interval)
-                return "backend data", "response"
+                return "backend data", self.backend_resp
 
             # Initialize new populator instance in each process.
             populator = CooperativeCachePopulator(
@@ -3516,7 +3519,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                 self.assertFalse(populator.req_served_from_cache)
                 self.assertEqual(
                     populator._infocache[self.cache_key], "backend data")
-                self.assertEqual(populator.backend_response, "response")
+                self.assertEqual(populator.backend_response, self.backend_resp)
             else:
                 counts['num_requests_served_from_cache'] += 1
                 self.assertTrue(populator.req_served_from_cache)
@@ -3567,7 +3570,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                 if fetch_backend_failure:
                     return None, None
                 else:
-                    return "backend data", "response"
+                    return "backend data", self.backend_resp
 
             # Initialize new populator instance in each process.
             mocked_fetch_backend = partial(
@@ -3596,7 +3599,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                 self.assertFalse(populator.req_served_from_cache)
                 self.assertEqual(
                     populator._infocache[self.cache_key], "backend data")
-                self.assertEqual(populator.backend_response, "response")
+                self.assertEqual(populator.backend_response, self.backend_resp)
             elif not fetch_backend_failure:
                 counts['num_requests_served_from_cache'] += 1
                 self.assertTrue(populator.req_served_from_cache)
@@ -3658,7 +3661,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                 if fetch_backend_failure:
                     return None, None
                 else:
-                    return "backend data", "response"
+                    return "backend data", self.backend_resp
 
             # Initialize new populator instance in each process.
             mocked_fetch_backend = partial(
@@ -3687,7 +3690,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                 self.assertFalse(populator.req_served_from_cache)
                 self.assertEqual(
                     populator._infocache[self.cache_key], "backend data")
-                self.assertEqual(populator.backend_response, "response")
+                self.assertEqual(populator.backend_response, self.backend_resp)
             elif not fetch_backend_failure:
                 counts['num_requests_served_from_cache'] += 1
                 self.assertTrue(populator.req_served_from_cache)

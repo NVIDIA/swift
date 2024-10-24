@@ -161,6 +161,11 @@ from swift.common.utils.ipaddrs import (  # noqa
 from swift.common.statsd_client import StatsdClient # noqa
 import logging
 
+EUCLEAN = getattr(errno, 'EUCLEAN', 117)  # otherwise not present on osx
+
+# These are lazily pulled from libc elsewhere
+_sys_fallocate = None
+
 # If set to non-zero, fallocate routines will fail based on free space
 # available being at or below this amount, in bytes.
 FALLOCATE_RESERVE = 0
@@ -1402,8 +1407,8 @@ class CooperativeCachePopulator(object):
         self._token_ttl = retry_interval * 10
         self._num_tokens = num_tokens
         self._do_fetch_backend = do_fetch_backend
-        self._cache_encoder = cache_encoder
-        self._cache_decoder = cache_decoder
+        self._cache_encoder = cache_encoder if cache_encoder else (lambda x: x)
+        self._cache_decoder = cache_decoder if cache_decoder else (lambda x: x)
         # The status of cache set operations used internally.
         self.set_cache_state = None
         # Indicates if this request has acquired one token.
@@ -1429,8 +1434,7 @@ class CooperativeCachePopulator(object):
         if self._infocache is not None:
             self._infocache[self._cache_key] = data
         try:
-            encoded_data = self._cache_encoder(
-                data) if self._cache_encoder else data
+            encoded_data = self._cache_encoder(data)
             self._memcache.set(
                 self._cache_key, encoded_data,
                 time=self._cache_ttl, raise_on_error=True)
@@ -1469,8 +1473,7 @@ class CooperativeCachePopulator(object):
             if cache_data:
                 # cache hit.
                 self.req_served_from_cache = True
-                decoded_data = self._cache_decoder(
-                    cache_data) if self._cache_decoder else cache_data
+                decoded_data = self._cache_decoder(cache_data)
                 return decoded_data
             # cache miss, retry again with exponential backoff
             retry_interval *= 2
@@ -1489,13 +1492,15 @@ class CooperativeCachePopulator(object):
         data = None
         if not self._memcache:
             data, self.backend_response = self._do_fetch_backend()
+            if self._infocache is not None and data:
+                self._infocache[self._cache_key] = data
             return data
 
         # Try to get a cooperative token by using memcache increments.
         total_requests = 0
         try:
             total_requests = self._memcache.incr(
-                self._token_key, delta=1, time=self._token_ttl)
+                self._token_key, time=self._token_ttl)
         except swift.common.exceptions.MemcacheConnectionError:
             self.set_cache_state = 'inc_error'
 

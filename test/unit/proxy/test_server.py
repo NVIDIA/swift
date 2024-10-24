@@ -5185,6 +5185,31 @@ class TestReplicatedObjectController(
                 req.environ['swift.infocache'][cache_key].bounds,
                 cached_namespaces.bounds)
 
+            # make sure backend requests included expected container headers
+            container_headers = {}
+
+            for request in backend_requests[3:]:
+                req_headers = request['headers']
+                device = req_headers['x-container-device']
+                container_headers[device] = req_headers['x-container-host']
+                expectations = {
+                    'method': method,
+                    'path': '/0/a/c/o',
+                    'headers': {
+                        'X-Container-Partition': '0',
+                        'Host': 'localhost:80',
+                        'Referer': '%s http://localhost/v1/a/c/o' % method,
+                        'X-Backend-Storage-Policy-Index': '1',
+                        'X-Backend-Quoted-Container-Path': shard_ranges[1].name
+                    },
+                }
+                self._check_request(request, **expectations)
+
+            expected = {}
+            for i, device in enumerate(['sda', 'sdb', 'sdc']):
+                expected[device] = '10.0.0.%d:100%d' % (i, i)
+            self.assertEqual(container_headers, expected)
+
         do_test('POST', 'sharding')
         do_test('POST', 'sharded')
         do_test('DELETE', 'sharding')
@@ -5199,7 +5224,8 @@ class TestReplicatedObjectController(
     def test_get_backend_updating_shard_wo_cooperative_token_acquired(self):
         # verify that the request to get updating shard from the container
         # backend will be served out of memcached when other requests have
-        # grabbed all available cooperative tokens.
+        # grabbed all available cooperative tokens and filled the updating
+        # shard ranges into the memcache.
         # reset the router post patch_policies
         conf = {'namespace_cache_use_token': 'True',
                 'namespace_cache_token_retry_interval': 0.005}
@@ -5236,8 +5262,8 @@ class TestReplicatedObjectController(
 
             # we want the container_info response to say policy index of 1 and
             # sharding state
-            # acc HEAD, cont HEAD, cont shard GET, obj POSTs
-            status_codes = (200, 200, 200, 202, 202)
+            # acc HEAD, cont HEAD, obj POSTs
+            status_codes = (200, 200, 202, 202, 202)
             resp_headers = {'X-Backend-Storage-Policy-Index': 1,
                             'x-backend-sharding-state': sharding_state,
                             'X-Backend-Record-Type': 'shard'}
@@ -5294,6 +5320,31 @@ class TestReplicatedObjectController(
                 req.environ['swift.cache'].store[cache_key],
                 cached_namespaces.bounds)
 
+            # make sure backend requests included expected container headers
+            container_headers = {}
+
+            for request in backend_requests[2:]:
+                req_headers = request['headers']
+                device = req_headers['x-container-device']
+                container_headers[device] = req_headers['x-container-host']
+                expectations = {
+                    'method': method,
+                    'path': '/0/a/c/o',
+                    'headers': {
+                        'X-Container-Partition': '0',
+                        'Host': 'localhost:80',
+                        'Referer': '%s http://localhost/v1/a/c/o' % method,
+                        'X-Backend-Storage-Policy-Index': '1',
+                        'X-Backend-Quoted-Container-Path': shard_ranges[1].name
+                    },
+                }
+                self._check_request(request, **expectations)
+
+            expected = {}
+            for i, device in enumerate(['sda', 'sdb', 'sdc']):
+                expected[device] = '10.0.0.%d:100%d' % (i, i)
+            self.assertEqual(container_headers, expected)
+
         do_test('POST', 'sharding')
         do_test('POST', 'sharded')
         do_test('DELETE', 'sharding')
@@ -5348,8 +5399,8 @@ class TestReplicatedObjectController(
 
             # we want the container_info response to say policy index of 1 and
             # sharding state
-            # acc HEAD, cont HEAD, cont shard GET, obj POSTs
-            status_codes = (200, 200, 200, 202, 202)
+            # acc HEAD, cont HEAD, obj POSTs
+            status_codes = (200, 200, 202, 202, 202)
             resp_headers = {'X-Backend-Storage-Policy-Index': 1,
                             'x-backend-sharding-state': sharding_state,
                             'X-Backend-Record-Type': 'shard'}
@@ -5408,6 +5459,31 @@ class TestReplicatedObjectController(
             self.assertEqual(
                 req.environ['swift.cache'].store[cache_key],
                 cached_namespaces.bounds)
+
+            # make sure backend requests included expected container headers
+            container_headers = {}
+
+            for request in backend_requests[2:]:
+                req_headers = request['headers']
+                device = req_headers['x-container-device']
+                container_headers[device] = req_headers['x-container-host']
+                expectations = {
+                    'method': method,
+                    'path': '/0/a/c/o',
+                    'headers': {
+                        'X-Container-Partition': '0',
+                        'Host': 'localhost:80',
+                        'Referer': '%s http://localhost/v1/a/c/o' % method,
+                        'X-Backend-Storage-Policy-Index': '1',
+                        'X-Backend-Quoted-Container-Path': shard_ranges[1].name
+                    },
+                }
+                self._check_request(request, **expectations)
+
+            expected = {}
+            for i, device in enumerate(['sda', 'sdb', 'sdc']):
+                expected[device] = '10.0.0.%d:100%d' % (i, i)
+            self.assertEqual(container_headers, expected)
 
         do_test('POST', 'sharding')
         do_test('POST', 'sharded')
@@ -5521,6 +5597,31 @@ class TestReplicatedObjectController(
             self.assertEqual(
                 req.environ['swift.infocache'][cache_key].bounds,
                 cached_namespaces.bounds)
+
+            # make sure backend requests included expected container headers
+            container_headers = {}
+
+            for request in backend_requests[3:]:
+                req_headers = request['headers']
+                device = req_headers['x-container-device']
+                container_headers[device] = req_headers['x-container-host']
+                expectations = {
+                    'method': method,
+                    'path': '/0/a/c/o',
+                    'headers': {
+                        'X-Container-Partition': '0',
+                        'Host': 'localhost:80',
+                        'Referer': '%s http://localhost/v1/a/c/o' % method,
+                        'X-Backend-Storage-Policy-Index': '1',
+                        'X-Backend-Quoted-Container-Path': shard_ranges[1].name
+                    },
+                }
+                self._check_request(request, **expectations)
+
+            expected = {}
+            for i, device in enumerate(['sda', 'sdb', 'sdc']):
+                expected[device] = '10.0.0.%d:100%d' % (i, i)
+            self.assertEqual(container_headers, expected)
 
         do_test('POST', 'sharding')
         do_test('POST', 'sharded')

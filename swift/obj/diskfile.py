@@ -44,7 +44,7 @@ import logging
 import traceback
 import xattr
 from os.path import basename, dirname, exists, join, splitext
-from random import shuffle
+import random
 from tempfile import mkstemp
 from contextlib import contextmanager
 from collections import defaultdict
@@ -66,7 +66,7 @@ from swift.common.utils import mkdirs, Timestamp, \
     MD5_OF_EMPTY_STRING, link_fd_to_path, \
     O_TMPFILE, makedirs_count, replace_partition_in_path, remove_directory, \
     md5, is_file_older, non_negative_float, config_fallocate_value, \
-    fs_has_free_space, CooperativeIterator
+    fs_has_free_space, CooperativeIterator, EUCLEAN
 from swift.common.splice import splice, tee
 from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
@@ -609,7 +609,7 @@ def object_audit_location_generator(devices, datadir, mount_check=True,
         device_dirs = list(
             set(listdir(devices)).intersection(set(device_dirs)))
     # randomize devices in case of process restart before sweep completed
-    shuffle(device_dirs)
+    random.shuffle(device_dirs)
 
     base, policy = split_policy_string(datadir)
     for device in device_dirs:
@@ -634,7 +634,7 @@ def object_audit_location_generator(devices, datadir, mount_check=True,
                 suffixes = listdir(part_path)
             except OSError as e:
                 if e.errno not in (errno.ENOTDIR, errno.ENODATA,
-                                   errno.EUCLEAN):
+                                   EUCLEAN):
                     raise
                 continue
             for asuffix in suffixes:
@@ -643,7 +643,7 @@ def object_audit_location_generator(devices, datadir, mount_check=True,
                     hashes = listdir(suff_path)
                 except OSError as e:
                     if e.errno not in (errno.ENOTDIR, errno.ENODATA,
-                                       errno.EUCLEAN):
+                                       EUCLEAN):
                         raise
                     continue
                 for hsh in hashes:
@@ -1249,7 +1249,7 @@ class BaseDiskFileManager(object):
                         'it is not a directory', {'hsh_path': hsh_path,
                                                   'quar_path': quar_path})
                     continue
-                elif err.errno in (errno.ENODATA, errno.EUCLEAN):
+                elif err.errno in (errno.ENODATA, EUCLEAN):
                     try:
                         # We've seen cases where bad sectors lead to ENODATA
                         # here; use a similar hack as above
@@ -1604,7 +1604,7 @@ class BaseDiskFileManager(object):
                     'it is not a directory', {'object_path': object_path,
                                               'quar_path': quar_path})
                 raise DiskFileNotExist()
-            elif err.errno in (errno.ENODATA, errno.EUCLEAN):
+            elif err.errno in (errno.ENODATA, EUCLEAN):
                 try:
                     # We've seen cases where bad sectors lead to ENODATA here;
                     # use a similar hack as above
@@ -2149,11 +2149,14 @@ class BaseDiskFileReader(object):
     :param keep_cache: should resulting reads be kept in the buffer cache
     :param cooperative_period: the period parameter when does cooperative
                                yielding during file read
+    :param etag_validate_frac: the probability that we should perform etag
+                               validation during a complete file read
     """
     def __init__(self, fp, data_file, obj_size, etag,
                  disk_chunk_size, keep_cache_size, device_path, logger,
                  quarantine_hook, use_splice, pipe_size, diskfile,
-                 keep_cache=False, cooperative_period=0):
+                 keep_cache=False, cooperative_period=0,
+                 etag_validate_frac=1):
         # Parameter tracking
         self._fp = fp
         self._data_file = data_file
@@ -2173,6 +2176,7 @@ class BaseDiskFileReader(object):
         else:
             self._keep_cache = False
         self._cooperative_period = cooperative_period
+        self._etag_validate_frac = etag_validate_frac
 
         # Internal Attributes
         self._iter_etag = None
@@ -2190,7 +2194,8 @@ class BaseDiskFileReader(object):
     def _init_checks(self):
         if self._fp.tell() == 0:
             self._started_at_0 = True
-            self._iter_etag = md5(usedforsecurity=False)
+            if random.random() < self._etag_validate_frac:
+                self._iter_etag = md5(usedforsecurity=False)
 
     def _update_checks(self, chunk):
         if self._iter_etag:
@@ -2647,7 +2652,7 @@ class BaseDiskFile(object):
                     # want this one file and not its parent.
                     os.path.join(self._datadir, "made-up-filename"),
                     "Expected directory, found file at %s" % self._datadir)
-            elif err.errno in (errno.ENODATA, errno.EUCLEAN):
+            elif err.errno in (errno.ENODATA, EUCLEAN):
                 try:
                     # We've seen cases where bad sectors lead to ENODATA here
                     raise self._quarantine(
@@ -2677,7 +2682,7 @@ class BaseDiskFile(object):
             self._fp = self._construct_from_data_file(
                 current_time=current_time, modernize=modernize, **file_info)
         except IOError as e:
-            if e.errno in (errno.ENODATA, errno.EUCLEAN):
+            if e.errno in (errno.ENODATA, EUCLEAN):
                 raise self._quarantine(
                     file_info['data_file'],
                     "Failed to open %s: %s" % (file_info['data_file'], e))
@@ -3033,6 +3038,7 @@ class BaseDiskFile(object):
             return self.get_metadata()
 
     def reader(self, keep_cache=False, cooperative_period=0,
+               etag_validate_frac=1,
                _quarantine_hook=lambda m: None):
         """
         Return a :class:`swift.common.swob.Response` class compatible
@@ -3046,6 +3052,8 @@ class BaseDiskFile(object):
                            OS buffer cache
         :param cooperative_period: the period parameter for cooperative
                                    yielding during file read
+        :param etag_validate_frac: the probability that we should perform etag
+                                   validation during a complete file read
         :param _quarantine_hook: 1-arg callable called when obj quarantined;
                                  the arg is the reason for quarantine.
                                  Default is to ignore it.
@@ -3058,7 +3066,8 @@ class BaseDiskFile(object):
             self._manager.keep_cache_size, self._device_path, self._logger,
             use_splice=self._use_splice, quarantine_hook=_quarantine_hook,
             pipe_size=self._pipe_size, diskfile=self, keep_cache=keep_cache,
-            cooperative_period=cooperative_period)
+            cooperative_period=cooperative_period,
+            etag_validate_frac=etag_validate_frac)
         # At this point the reader object is now responsible for closing
         # the file pointer.
         self._fp = None
@@ -3221,12 +3230,13 @@ class ECDiskFileReader(BaseDiskFileReader):
     def __init__(self, fp, data_file, obj_size, etag,
                  disk_chunk_size, keep_cache_size, device_path, logger,
                  quarantine_hook, use_splice, pipe_size, diskfile,
-                 keep_cache=False, cooperative_period=0):
+                 keep_cache=False, cooperative_period=0,
+                 etag_validate_frac=1):
         super(ECDiskFileReader, self).__init__(
             fp, data_file, obj_size, etag,
             disk_chunk_size, keep_cache_size, device_path, logger,
             quarantine_hook, use_splice, pipe_size, diskfile, keep_cache,
-            cooperative_period)
+            cooperative_period, etag_validate_frac)
         self.frag_buf = None
         self.frag_offset = 0
         self.frag_size = self._diskfile.policy.fragment_size

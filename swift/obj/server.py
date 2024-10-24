@@ -30,7 +30,7 @@ from eventlet import sleep, wsgi, Timeout, tpool
 from eventlet.greenthread import spawn
 
 from swift.common.utils import public, get_logger, \
-    config_true_value, timing_stats, replication, \
+    config_true_value, config_percent_value, timing_stats, replication, \
     normalize_delete_at_timestamp, get_log_line, Timestamp, \
     parse_mime_headers, \
     iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads, \
@@ -168,6 +168,8 @@ class ObjectController(BaseStorageServer):
         self.keep_cache_slo_manifest = \
             config_true_value(conf.get('keep_cache_slo_manifest', 'false'))
         self.cooperative_period = int(conf.get("cooperative_period", 0))
+        self.etag_validate_frac = config_percent_value(
+            conf.get("etag_validate_pct", 100))
 
         default_allowed_headers = '''
             content-disposition,
@@ -1181,6 +1183,7 @@ class ObjectController(BaseStorageServer):
                 app_iter = disk_file.reader(
                     keep_cache=keep_cache,
                     cooperative_period=self.cooperative_period,
+                    etag_validate_frac=self.etag_validate_frac,
                 )
                 response = Response(
                     app_iter=app_iter, request=request,
