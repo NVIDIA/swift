@@ -2649,8 +2649,9 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                          found_host_device)
 
     def test_POST_delete_at_configure_task_container_per_day(self):
+        self.conf['expiring_objects_task_container_per_day'] = 10
         self._make_app()
-        self.assertEqual(100, self.app.expirer_config.task_container_per_day)
+        self.assertEqual(10, self.app.expirer_config.task_container_per_day)
         t = str(int(time.time() + 100))
         expected_part, expected_nodes, expected_delete_at_container = \
             self.app.expirer_config.get_delete_at_nodes(t, 'a', 'c', 'o')
