@@ -27,149 +27,150 @@ The following configuration sections are available:
 [DEFAULT]
 *********
 
-================================ ==========  ============================================
-Option                           Default     Description
--------------------------------- ----------  --------------------------------------------
-swift_dir                        /etc/swift  Swift configuration directory
-devices                          /srv/node   Parent directory of where devices are
-                                             mounted
-mount_check                      true        Whether or not check if the devices are
-                                             mounted to prevent accidentally writing
-                                             to the root device
-bind_ip                          0.0.0.0     IP Address for server to bind to
-bind_port                        6200        Port for server to bind to
-keep_idle                        600         Value to set for socket TCP_KEEPIDLE
-bind_timeout                     30          Seconds to attempt bind before giving up
-backlog                          4096        Maximum number of allowed pending
-                                             connections
-workers                          auto        Override the number of pre-forked workers
-                                             that will accept connections.  If set it
-                                             should be an integer, zero means no fork.
-                                             If unset, it will try to default to the
-                                             number of effective cpu cores and fallback
-                                             to one. Increasing the number of workers
-                                             helps slow filesystem operations in one
-                                             request from negatively impacting other
-                                             requests, but only the
-                                             :ref:`servers_per_port
-                                             <server-per-port-configuration>` option
-                                             provides complete I/O isolation with no
-                                             measurable overhead.
-servers_per_port                 0           If each disk in each storage policy ring
-                                             has unique port numbers for its "ip"
-                                             value, you can use this setting to have
-                                             each object-server worker only service
-                                             requests for the single disk matching the
-                                             port in the ring. The value of this
-                                             setting determines how many worker
-                                             processes run for each port (disk) in the
-                                             ring. If you have 24 disks per server, and
-                                             this setting is 4, then each storage node
-                                             will have 1 + (24 * 4) = 97 total
-                                             object-server processes running. This
-                                             gives complete I/O isolation, drastically
-                                             reducing the impact of slow disks on
-                                             storage node performance. The
-                                             object-replicator and object-reconstructor
-                                             need to see this setting too, so it must
-                                             be in the [DEFAULT] section.
-                                             See :ref:`server-per-port-configuration`.
-max_clients                      1024        Maximum number of clients one worker can
-                                             process simultaneously (it will actually
-                                             accept(2) N + 1). Setting this to one (1)
-                                             will only handle one request at a time,
-                                             without accepting another request
-                                             concurrently.
-disable_fallocate                false       Disable "fast fail" fallocate checks if
-                                             the underlying filesystem does not support
-                                             it.
-log_name                         swift       Label used when logging
-log_facility                     LOG_LOCAL0  Syslog log facility
-log_level                        INFO        Logging level
-log_address                      /dev/log    Logging directory
-log_max_line_length              0           Caps the length of log lines to the
-                                             value given; no limit if set to 0, the
-                                             default.
-log_custom_handlers              None        Comma-separated list of functions to call
-                                             to setup custom log handlers.
-log_udp_host                                 Override log_address
-log_udp_port                     514         UDP log port
-log_statsd_host                  None        Enables StatsD logging; IPv4/IPv6
-                                             address or a hostname.  If a
-                                             hostname resolves to an IPv4 and IPv6
-                                             address, the IPv4 address will be
-                                             used.
-log_statsd_port                  8125
-log_statsd_default_sample_rate   1.0
-log_statsd_sample_rate_factor    1.0
+======================================== ==========  ============================================
+Option                                   Default     Description
+---------------------------------------- ----------  --------------------------------------------
+swift_dir                                /etc/swift  Swift configuration directory
+devices                                  /srv/node   Parent directory of where devices are
+                                                     mounted
+mount_check                              true        Whether or not check if the devices are
+                                                     mounted to prevent accidentally writing
+                                                     to the root device
+bind_ip                                  0.0.0.0     IP Address for server to bind to
+bind_port                                6200        Port for server to bind to
+keep_idle                                600         Value to set for socket TCP_KEEPIDLE
+bind_timeout                             30          Seconds to attempt bind before giving up
+backlog                                  4096        Maximum number of allowed pending
+                                                     connections
+workers                                  auto        Override the number of pre-forked workers
+                                                     that will accept connections.  If set it
+                                                     should be an integer, zero means no fork.
+                                                     If unset, it will try to default to the
+                                                     number of effective cpu cores and fallback
+                                                     to one. Increasing the number of workers
+                                                     helps slow filesystem operations in one
+                                                     request from negatively impacting other
+                                                     requests, but only the
+                                                     :ref:`servers_per_port
+                                                     <server-per-port-configuration>` option
+                                                     provides complete I/O isolation with no
+                                                     measurable overhead.
+servers_per_port                         0           If each disk in each storage policy ring
+                                                     has unique port numbers for its "ip"
+                                                     value, you can use this setting to have
+                                                     each object-server worker only service
+                                                     requests for the single disk matching the
+                                                     port in the ring. The value of this
+                                                     setting determines how many worker
+                                                     processes run for each port (disk) in the
+                                                     ring. If you have 24 disks per server, and
+                                                     this setting is 4, then each storage node
+                                                     will have 1 + (24 * 4) = 97 total
+                                                     object-server processes running. This
+                                                     gives complete I/O isolation, drastically
+                                                     reducing the impact of slow disks on
+                                                     storage node performance. The
+                                                     object-replicator and object-reconstructor
+                                                     need to see this setting too, so it must
+                                                     be in the [DEFAULT] section.
+                                                     See :ref:`server-per-port-configuration`.
+max_clients                              1024        Maximum number of clients one worker can
+                                                     process simultaneously (it will actually
+                                                     accept(2) N + 1). Setting this to one (1)
+                                                     will only handle one request at a time,
+                                                     without accepting another request
+                                                     concurrently.
+disable_fallocate                        false       Disable "fast fail" fallocate checks if
+                                                     the underlying filesystem does not support
+                                                     it.
+expiring_objects_task_container_per_day  100
+log_name                                 swift       Label used when logging
+log_facility                             LOG_LOCAL0  Syslog log facility
+log_level                                INFO        Logging level
+log_address                              /dev/log    Logging directory
+log_max_line_length                      0           Caps the length of log lines to the
+                                                     value given; no limit if set to 0, the
+                                                     default.
+log_custom_handlers                      None        Comma-separated list of functions to call
+                                                     to setup custom log handlers.
+log_udp_host                                         Override log_address
+log_udp_port                             514         UDP log port
+log_statsd_host                          None        Enables StatsD logging; IPv4/IPv6
+                                                     address or a hostname.  If a
+                                                     hostname resolves to an IPv4 and IPv6
+                                                     address, the IPv4 address will be
+                                                     used.
+log_statsd_port                          8125
+log_statsd_default_sample_rate           1.0
+log_statsd_sample_rate_factor            1.0
 log_statsd_metric_prefix
-eventlet_debug                   false       If true, turn on debug logging for
-                                             eventlet
-fallocate_reserve                1%          You can set fallocate_reserve to the
-                                             number of bytes or percentage of disk
-                                             space you'd like fallocate to reserve,
-                                             whether there is space for the given
-                                             file size or not. Percentage will be used
-                                             if the value ends with a '%'. This is
-                                             useful for systems that behave badly when
-                                             they completely run out of space; you can
-                                             make the services pretend they're out of
-                                             space early.
-conn_timeout                     0.5         Time to wait while attempting to connect
-                                             to another backend node.
-node_timeout                     3           Time to wait while sending each chunk of
-                                             data to another backend node.
-client_timeout                   60          Time to wait while receiving each chunk of
-                                             data from a client or another backend node
-network_chunk_size               65536       Size of chunks to read/write over the
-                                             network
-disk_chunk_size                  65536       Size of chunks to read/write to disk
-container_update_timeout         1           Time to wait while sending a container
-                                             update on object update.
-reclaim_age                      604800      Time elapsed in seconds before the tombstone
-                                             file representing a deleted object can be
-                                             reclaimed.  This is the maximum window for
-                                             your consistency engine.  If a node that was
-                                             disconnected from the cluster because of a
-                                             fault is reintroduced into the cluster after
-                                             this window without having its data purged
-                                             it will result in dark data.  This setting
-                                             should be consistent across all object
-                                             services.
-commit_window                    60          Non-durable data files may also
-                                             get reclaimed if they are older
-                                             than reclaim_age, but not if the
-                                             time they were written to disk
-                                             (i.e. mtime) is less than
-                                             commit_window seconds ago. A
-                                             commit_window greater than zero is
-                                             strongly recommended to avoid
-                                             unintended reclamation of data
-                                             files that were about to become
-                                             durable; commit_window should be
-                                             much less than reclaim_age.
-nice_priority                    None        Scheduling priority of server processes.
-                                             Niceness values range from -20 (most
-                                             favorable to the process) to 19 (least
-                                             favorable to the process). The default
-                                             does not modify priority.
-ionice_class                     None        I/O scheduling class of server processes.
-                                             I/O niceness class values are IOPRIO_CLASS_RT
-                                             (realtime), IOPRIO_CLASS_BE (best-effort),
-                                             and IOPRIO_CLASS_IDLE (idle).
-                                             The default does not modify class and
-                                             priority. Linux supports io scheduling
-                                             priorities and classes since 2.6.13 with
-                                             the CFQ io scheduler.
-                                             Work only with ionice_priority.
-ionice_priority                  None        I/O scheduling priority of server
-                                             processes. I/O niceness priority is
-                                             a number which goes from 0 to 7.
-                                             The higher the value, the lower the I/O
-                                             priority of the process. Work only with
-                                             ionice_class.
-                                             Ignored if IOPRIO_CLASS_IDLE is set.
-================================ ==========  ============================================
+eventlet_debug                           false       If true, turn on debug logging for
+                                                     eventlet
+fallocate_reserve                        1%          You can set fallocate_reserve to the
+                                                     number of bytes or percentage of disk
+                                                     space you'd like fallocate to reserve,
+                                                     whether there is space for the given
+                                                     file size or not. Percentage will be used
+                                                     if the value ends with a '%'. This is
+                                                     useful for systems that behave badly when
+                                                     they completely run out of space; you can
+                                                     make the services pretend they're out of
+                                                     space early.
+conn_timeout                             0.5         Time to wait while attempting to connect
+                                                     to another backend node.
+node_timeout                             3           Time to wait while sending each chunk of
+                                                     data to another backend node.
+client_timeout                           60          Time to wait while receiving each chunk of
+                                                     data from a client or another backend node
+network_chunk_size                       65536       Size of chunks to read/write over the
+                                                     network
+disk_chunk_size                          65536       Size of chunks to read/write to disk
+container_update_timeout                 1           Time to wait while sending a container
+                                                     update on object update.
+reclaim_age                              604800      Time elapsed in seconds before the tombstone
+                                                     file representing a deleted object can be
+                                                     reclaimed.  This is the maximum window for
+                                                     your consistency engine.  If a node that was
+                                                     disconnected from the cluster because of a
+                                                     fault is reintroduced into the cluster after
+                                                     this window without having its data purged
+                                                     it will result in dark data.  This setting
+                                                     should be consistent across all object
+                                                     services.
+commit_window                            60          Non-durable data files may also
+                                                     get reclaimed if they are older
+                                                     than reclaim_age, but not if the
+                                                     time they were written to disk
+                                                     (i.e. mtime) is less than
+                                                     commit_window seconds ago. A
+                                                     commit_window greater than zero is
+                                                     strongly recommended to avoid
+                                                     unintended reclamation of data
+                                                     files that were about to become
+                                                     durable; commit_window should be
+                                                     much less than reclaim_age.
+nice_priority                            None        Scheduling priority of server processes.
+                                                     Niceness values range from -20 (most
+                                                     favorable to the process) to 19 (least
+                                                     favorable to the process). The default
+                                                     does not modify priority.
+ionice_class                             None        I/O scheduling class of server processes.
+                                                     I/O niceness class values are IOPRIO_CLASS_RT
+                                                     (realtime), IOPRIO_CLASS_BE (best-effort),
+                                                     and IOPRIO_CLASS_IDLE (idle).
+                                                     The default does not modify class and
+                                                     priority. Linux supports io scheduling
+                                                     priorities and classes since 2.6.13 with
+                                                     the CFQ io scheduler.
+                                                     Work only with ionice_priority.
+ionice_priority                          None        I/O scheduling priority of server
+                                                     processes. I/O niceness priority is
+                                                     a number which goes from 0 to 7.
+                                                     The higher the value, the lower the I/O
+                                                     priority of the process. Work only with
+                                                     ionice_class.
+                                                     Ignored if IOPRIO_CLASS_IDLE is set.
+======================================== ==========  ============================================
 
 .. _object-server-options:
 
@@ -691,75 +692,75 @@ ionice_priority             None                I/O scheduling priority of serve
 [object-expirer]
 ****************
 
-============================= =============================== ==========================================
-Option                        Default                         Description
------------------------------ ------------------------------- ------------------------------------------
-log_name                      object-expirer                  Label used when logging
-log_facility                  LOG_LOCAL0                      Syslog log facility
-log_level                     INFO                            Logging level
-log_address                   /dev/log                        Logging directory
-interval                      300                             Time in seconds to wait between
-                                                              expirer passes
-report_interval               300                             Frequency of status logs in seconds.
-concurrency                   1                               Level of concurrency to use to do the work,
-                                                              this value must be set to at least 1
-dequeue_from_legacy           False                           This service will look for jobs on the
-                                                              legacy expirer task queue.
-round_robin_task_cache_size   100000                          Number of tasks objects to cache before processing.
-processes                     0                               How many parts to divide the legacy work into,
-                                                              one part per process that will be doing the work.
-                                                              When set 0 means that a single legacy
-                                                              process will be doing all the work.
-                                                              This can only be used in conjunction with
-                                                              ``dequeue_from_legacy``.
-process                       0                               Which of the parts a particular legacy process will
-                                                              work on. It is "zero based", if you want to use 3
-                                                              processes, you should run processes with process
-                                                              set to 0, 1, and 2.
-                                                              This can only be used in conjunction with
-                                                              ``dequeue_from_legacy``.
-reclaim_age                   604800                          How long an un-processable expired object
-                                                              marker will be retried before it is abandoned.
-                                                              It is not coupled with the tombstone reclaim age
-                                                              in the consistency engine.
-request_tries                 3                               The number of times the expirer's internal client
-                                                              will attempt any given request in the event
-                                                              of failure
-recon_cache_path              /var/cache/swift                Path to recon cache
-nice_priority                 None                            Scheduling priority of server processes.
-                                                              Niceness values range from -20 (most
-                                                              favorable to the process) to 19 (least
-                                                              favorable to the process). The default
-                                                              does not modify priority.
-ionice_class                  None                            I/O scheduling class of server processes.
-                                                              I/O niceness class values are IOPRIO_CLASS_RT
-                                                              (realtime), IOPRIO_CLASS_BE (best-effort),
-                                                              and IOPRIO_CLASS_IDLE (idle).
-                                                              The default does not modify class and
-                                                              priority. Linux supports io scheduling
-                                                              priorities and classes since 2.6.13 with
-                                                              the CFQ io scheduler.
-                                                              Work only with ionice_priority.
-ionice_priority               None                            I/O scheduling priority of server
-                                                              processes. I/O niceness priority is
-                                                              a number which goes from 0 to 7.
-                                                              The higher the value, the lower the I/O
-                                                              priority of the process. Work only with
-                                                              ionice_class.
-                                                              Ignored if IOPRIO_CLASS_IDLE is set.
-delay_reaping_<ACCT>           0.0                            A dynamic configuration option for
-                                                              setting account level delay_reaping values.
-                                                              The delay_reaping value is configured for
-                                                              the account with the name placed in
-                                                              <ACCT>. The object expirer will reap objects in
-                                                              this account from disk only after this delay
-                                                              following their x-delete-at time.
-delay_reaping_<ACCT>/<CNTR>    0.0                            A dynamic configuration option for
-                                                              setting container level delay_reaping values.
-                                                              The delay_reaping value is configured for
-                                                              the container with the account name placed
-                                                              in <ACCT> and the container name in <CNTR>.
-                                                              The object expirer will reap objects in this
-                                                              container from disk only after this delay
-                                                              following their x-delete-at time.
-============================= =============================== ==========================================
+======================================== =============================== ==========================================
+Option                                   Default                         Description
+---------------------------------------- ------------------------------- ------------------------------------------
+log_name                                 object-expirer                  Label used when logging
+log_facility                             LOG_LOCAL0                      Syslog log facility
+log_level                                INFO                            Logging level
+log_address                              /dev/log                        Logging directory
+interval                                 300                             Time in seconds to wait between
+                                                                         expirer passes
+report_interval                          300                             Frequency of status logs in seconds.
+concurrency                              1                               Level of concurrency to use to do the work,
+                                                                         this value must be set to at least 1
+expiring_objects_task_container_per_day  100
+dequeue_from_legacy                      False                           This service will look for jobs on the legacy expirer task queue.
+round_robin_task_cache_size              100000                          Number of tasks objects to cache before processing.
+processes                                0                               How many parts to divide the legacy work into,
+                                                                         one part per process that will be doing the work.
+                                                                         When set 0 means that a single legacy
+                                                                         process will be doing all the work.
+                                                                         This can only be used in conjunction with
+                                                                         ``dequeue_from_legacy``.
+process                                  0                               Which of the parts a particular legacy process will
+                                                                         work on. It is "zero based", if you want to use 3
+                                                                         processes, you should run processes with process
+                                                                         set to 0, 1, and 2.
+                                                                         This can only be used in conjunction with
+                                                                         ``dequeue_from_legacy``.
+reclaim_age                              604800                          How long an un-processable expired object
+                                                                         marker will be retried before it is abandoned.
+                                                                         It is not coupled with the tombstone reclaim age
+                                                                         in the consistency engine.
+request_tries                            3                               The number of times the expirer's internal client
+                                                                         will attempt any given request in the event
+                                                                         of failure
+recon_cache_path                         /var/cache/swift                Path to recon cache
+nice_priority                            None                            Scheduling priority of server processes.
+                                                                         Niceness values range from -20 (most
+                                                                         favorable to the process) to 19 (least
+                                                                         favorable to the process). The default
+                                                                         does not modify priority.
+ionice_class                             None                            I/O scheduling class of server processes.
+                                                                         I/O niceness class values are IOPRIO_CLASS_RT
+                                                                         (realtime), IOPRIO_CLASS_BE (best-effort),
+                                                                         and IOPRIO_CLASS_IDLE (idle).
+                                                                         The default does not modify class and
+                                                                         priority. Linux supports io scheduling
+                                                                         priorities and classes since 2.6.13 with
+                                                                         the CFQ io scheduler.
+                                                                         Work only with ionice_priority.
+ionice_priority                          None                            I/O scheduling priority of server
+                                                                         processes. I/O niceness priority is
+                                                                         a number which goes from 0 to 7.
+                                                                         The higher the value, the lower the I/O
+                                                                         priority of the process. Work only with
+                                                                         ionice_class.
+                                                                         Ignored if IOPRIO_CLASS_IDLE is set.
+delay_reaping_<ACCT>                     0.0                             A dynamic configuration option for
+                                                                         setting account level delay_reaping values.
+                                                                         The delay_reaping value is configured for
+                                                                         the account with the name placed in
+                                                                         <ACCT>. The object expirer will reap objects in
+                                                                         this account from disk only after this delay
+                                                                         following their x-delete-at time.
+delay_reaping_<ACCT>/<CNTR>              0.0                             A dynamic configuration option for
+                                                                         setting container level delay_reaping values.
+                                                                         The delay_reaping value is configured for
+                                                                         the container with the account name placed
+                                                                         in <ACCT> and the container name in <CNTR>.
+                                                                         The object expirer will reap objects in this
+                                                                         container from disk only after this delay
+                                                                         following their x-delete-at time.
+======================================== =============================== ==========================================
