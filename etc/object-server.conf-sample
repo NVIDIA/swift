@@ -10,6 +10,13 @@ bind_port = 6200
 # mount_check = true
 # disable_fallocate = false
 #
+# If you have a 100s of millions of expiring objects per day or 100s of
+# object-expirer nodes you may want to increase this (10x?) for better
+# scalability; otherwise the default is quite good
+# N.B. it MUST be kept consistent with [proxy-server|object-expirer].conf and
+# MUST be less than 86400
+# expiring_objects_task_container_per_day = 100
+#
 # Use an integer to override the number of pre-forked processes that will
 # accept connections.  NOTE: if servers_per_port is set, this setting is
 # ignored.
