@@ -28,127 +28,127 @@ The following configuration sections are available:
 [DEFAULT]
 *********
 
-====================================  ========================  ========================================
-Option                                Default                   Description
-------------------------------------  ------------------------  ----------------------------------------
-bind_ip                               0.0.0.0                   IP Address for server to
-                                                                bind to
-bind_port                             80                        Port for server to bind to
-keep_idle                             600                       Value to set for socket TCP_KEEPIDLE
-bind_timeout                          30                        Seconds to attempt bind before
-                                                                giving up
-backlog                               4096                      Maximum number of allowed pending
-                                                                connections
-swift_dir                             /etc/swift                Swift configuration directory
-workers                               auto                      Override the number of
-                                                                pre-forked workers that will
-                                                                accept connections.  If set it
-                                                                should be an integer, zero
-                                                                means no fork.  If unset, it
-                                                                will try to default to the
-                                                                number of effective cpu cores
-                                                                and fallback to one.  See
-                                                                :ref:`general-service-tuning`.
-max_clients                           1024                      Maximum number of clients one
-                                                                worker can process
-                                                                simultaneously (it will
-                                                                actually accept(2) N +
-                                                                1). Setting this to one (1)
-                                                                will only handle one request at
-                                                                a time, without accepting
-                                                                another request
-                                                                concurrently.
-user                                  swift                     User to run as
-cert_file                                                       Path to the ssl .crt. This
-                                                                should be enabled for testing
-                                                                purposes only.
-key_file                                                        Path to the ssl .key. This
-                                                                should be enabled for testing
-                                                                purposes only.
-cors_allow_origin                                               List of origin hosts that are allowed
-                                                                for CORS requests in addition to what
-                                                                the container has set.
-strict_cors_mode                      True                      If True (default) then CORS
-                                                                requests are only allowed if their
-                                                                Origin header matches an allowed
-                                                                origin. Otherwise, any Origin is
-                                                                allowed.
-cors_expose_headers                                             This is a list of headers that
-                                                                are included in the header
-                                                                Access-Control-Expose-Headers
-                                                                in addition to what the container
-                                                                has set.
-client_timeout                        60
-trans_id_suffix                                                 This optional suffix (default is empty)
-                                                                that would be appended to the swift
-                                                                transaction id allows one to easily
-                                                                figure out from which cluster that
-                                                                X-Trans-Id belongs to. This is very
-                                                                useful when one is managing more than
-                                                                one swift cluster.
-log_name                              swift                     Label used when logging
-log_facility                          LOG_LOCAL0                Syslog log facility
-log_level                             INFO                      Logging level
-log_headers                           False
-log_address                           /dev/log                  Logging directory
-log_max_line_length                   0                         Caps the length of log
-                                                                lines to the value given;
-                                                                no limit if set to 0, the
-                                                                default.
-log_custom_handlers                   None                      Comma separated list of functions
-                                                                to call to setup custom log
-                                                                handlers.
-log_udp_host                                                    Override log_address
-log_udp_port                          514                       UDP log port
-log_statsd_host                       None                      Enables StatsD logging; IPv4/IPv6
-                                                                address or a hostname.  If a
-                                                                hostname resolves to an IPv4 and IPv6
-                                                                address, the IPv4 address will be
-                                                                used.
-log_statsd_port                       8125
-log_statsd_default_sample_rate        1.0
-log_statsd_sample_rate_factor         1.0
+=======================================  ========================  ========================================
+Option                                   Default                   Description
+---------------------------------------  ------------------------  ----------------------------------------
+bind_ip                                  0.0.0.0                   IP Address for server to
+                                                                   bind to
+bind_port                                80                        Port for server to bind to
+keep_idle                                600                       Value to set for socket TCP_KEEPIDLE
+bind_timeout                             30                        Seconds to attempt bind before
+                                                                   giving up
+backlog                                  4096                      Maximum number of allowed pending
+                                                                   connections
+swift_dir                                /etc/swift                Swift configuration directory
+workers                                  auto                      Override the number of
+                                                                   pre-forked workers that will
+                                                                   accept connections.  If set it
+                                                                   should be an integer, zero
+                                                                   means no fork.  If unset, it
+                                                                   will try to default to the
+                                                                   number of effective cpu cores
+                                                                   and fallback to one.  See
+                                                                   :ref:`general-service-tuning`.
+max_clients                              1024                      Maximum number of clients one
+                                                                   worker can process
+                                                                   simultaneously (it will
+                                                                   actually accept(2) N +
+                                                                   1). Setting this to one (1)
+                                                                   will only handle one request at
+                                                                   a time, without accepting
+                                                                   another request
+                                                                   concurrently.
+user                                     swift                     User to run as
+cert_file                                                          Path to the ssl .crt. This
+                                                                   should be enabled for testing
+                                                                   purposes only.
+key_file                                                           Path to the ssl .key. This
+                                                                   should be enabled for testing
+                                                                   purposes only.
+cors_allow_origin                                                  List of origin hosts that are allowed
+                                                                   for CORS requests in addition to what
+                                                                   the container has set.
+strict_cors_mode                         True                      If True (default) then CORS
+                                                                   requests are only allowed if their
+                                                                   Origin header matches an allowed
+                                                                   origin. Otherwise, any Origin is
+                                                                   allowed.
+cors_expose_headers                                                This is a list of headers that
+                                                                   are included in the header
+                                                                   Access-Control-Expose-Headers
+                                                                   in addition to what the container
+                                                                   has set.
+client_timeout                           60
+trans_id_suffix                                                    This optional suffix (default is empty)
+                                                                   that would be appended to the swift
+                                                                   transaction id allows one to easily
+                                                                   figure out from which cluster that
+                                                                   X-Trans-Id belongs to. This is very
+                                                                   useful when one is managing more than
+                                                                   one swift cluster.
+log_name                                 swift                     Label used when logging
+log_facility                             LOG_LOCAL0                Syslog log facility
+log_level                                INFO                      Logging level
+log_headers                              False
+log_address                              /dev/log                  Logging directory
+log_max_line_length                      0                         Caps the length of log
+                                                                   lines to the value given;
+                                                                   no limit if set to 0, the
+                                                                   default.
+log_custom_handlers                      None                      Comma separated list of functions
+                                                                   to call to setup custom log
+                                                                   handlers.
+log_udp_host                                                       Override log_address
+log_udp_port                             514                       UDP log port
+log_statsd_host                          None                      Enables StatsD logging; IPv4/IPv6
+                                                                   address or a hostname.  If a
+                                                                   hostname resolves to an IPv4 and IPv6
+                                                                   address, the IPv4 address will be
+                                                                   used.
+log_statsd_port                          8125
+log_statsd_default_sample_rate           1.0
+log_statsd_sample_rate_factor            1.0
 log_statsd_metric_prefix
-eventlet_debug                        false                     If true, turn on debug logging
-                                                                for eventlet
-
-expose_info                           true                      Enables exposing configuration
-                                                                settings via HTTP GET /info.
-admin_key                                                       Key to use for admin calls that
-                                                                are HMAC signed.  Default
-                                                                is empty, which will
-                                                                disable admin calls to
-                                                                /info.
-disallowed_sections                   swift.valid_api_versions  Allows the ability to withhold
-                                                                sections from showing up in the
-                                                                public calls to /info. You can
-                                                                withhold subsections by separating
-                                                                the dict level with a ".".
-nice_priority                         None                      Scheduling priority of server
-                                                                processes.
-                                                                Niceness values range from -20 (most
-                                                                favorable to the process) to 19 (least
-                                                                favorable to the process). The default
-                                                                does not modify priority.
-ionice_class                          None                      I/O scheduling class of server
-                                                                processes. I/O niceness class values
-                                                                are IOPRIO_CLASS_RT (realtime),
-                                                                IOPRIO_CLASS_BE (best-effort) and
-                                                                IOPRIO_CLASS_IDLE (idle).
-                                                                The default does not
-                                                                modify class and priority. Linux
-                                                                supports io scheduling priorities
-                                                                and classes since 2.6.13 with
-                                                                the CFQ io scheduler.
-                                                                Work only with ionice_priority.
-ionice_priority                       None                      I/O scheduling priority of server
-                                                                processes. I/O niceness priority is
-                                                                a number which goes from 0 to 7.
-                                                                The higher the value, the lower
-                                                                the I/O priority of the process.
-                                                                Work only with ionice_class.
-                                                                Ignored if IOPRIO_CLASS_IDLE is set.
-====================================  ========================  ========================================
+eventlet_debug                           false                     If true, turn on debug logging
+                                                                   for eventlet
+expose_info                              true                      Enables exposing configuration
+                                                                   settings via HTTP GET /info.
+admin_key                                                          Key to use for admin calls that
+                                                                   are HMAC signed.  Default
+                                                                   is empty, which will
+                                                                   disable admin calls to
+                                                                   /info.
+disallowed_sections                      swift.valid_api_versions  Allows the ability to withhold
+                                                                   sections from showing up in the
+                                                                   public calls to /info. You can
+                                                                   withhold subsections by separating
+                                                                   the dict level with a ".".
+expiring_objects_task_container_per_day  100
+nice_priority                            None                      Scheduling priority of server
+                                                                   processes.
+                                                                   Niceness values range from -20 (most
+                                                                   favorable to the process) to 19 (least
+                                                                   favorable to the process). The default
+                                                                   does not modify priority.
+ionice_class                             None                      I/O scheduling class of server
+                                                                   processes. I/O niceness class values
+                                                                   are IOPRIO_CLASS_RT (realtime),
+                                                                   IOPRIO_CLASS_BE (best-effort) and
+                                                                   IOPRIO_CLASS_IDLE (idle).
+                                                                   The default does not
+                                                                   modify class and priority. Linux
+                                                                   supports io scheduling priorities
+                                                                   and classes since 2.6.13 with
+                                                                   the CFQ io scheduler.
+                                                                   Work only with ionice_priority.
+ionice_priority                          None                      I/O scheduling priority of server
+                                                                   processes. I/O niceness priority is
+                                                                   a number which goes from 0 to 7.
+                                                                   The higher the value, the lower
+                                                                   the I/O priority of the process.
+                                                                   Work only with ionice_class.
+                                                                   Ignored if IOPRIO_CLASS_IDLE is set.
+=======================================  ========================  ========================================
 
 **************
 [proxy-server]
