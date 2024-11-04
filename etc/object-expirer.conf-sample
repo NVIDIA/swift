@@ -36,6 +36,13 @@
 # the I/O priority of the process. Work only with ionice_class.
 # ionice_class =
 # ionice_priority =
+#
+# If you have a 100s of millions of expiring objects per day or 100s of
+# object-expirer nodes you may want to increase this (10x?) for better
+# scalability; otherwise the default is quite good
+# N.B. it MUST be kept consistent with [proxy|object]-server.conf and MUST
+# be less than 86400
+# expiring_objects_task_container_per_day = 100
 
 [object-expirer]
 # interval = 300.0
