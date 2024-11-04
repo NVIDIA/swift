@@ -1806,6 +1806,7 @@ class TestSloDeleteManifest(SloTestCase):
         slo_conf = {
             'expiring_objects_account_name': 'exp',
             'expiring_objects_container_divisor': '5400',
+            'expiring_objects_task_container_per_day': '1000',
         }
         self.slo = slo.filter_factory(slo_conf)(self.app)
         now = Timestamp(time.time())
