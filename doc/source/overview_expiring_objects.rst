@@ -130,6 +130,48 @@ When using a temporary URL to access the object, this feature is not enabled.
 This means that adding the header will not allow requests to temporary URLs
 to access expired objects.
 
+Scaling Expiring Objects Queue
+------------------------------
+
+As expiring objects are added to the system, the object servers will record the
+expirations in a hidden ``.expiring_objects`` account for the
+``swift-object-expirer`` to handle later.  The records inserted into the
+"task_containers" of the ``.expiring_objects`` account are not automatically
+distributed across multiple containers; instead each day's worth of delete
+tasks are hashed into a configurable number of "task_containers" (100 by
+default).
+
+When the number of expiration tasks per day grows larger than 100 times the
+native sharding threshold for containers (1M by default, i.e. more than 100M
+delete tasks per day) you will want to increase the configured value of
+``expiring_objects_task_container_per_day``. Please note that this config needs
+to be changed on both object-server, expirer and proxy-server.
+
+When changing the value of ``expiring_objects_task_container_per_day`` many of
+the pre-existing enqueued expiration tasks will be in the "wrong
+task_container".  While these expirations will continue to be processed as
+normal, if any referenced object has its ``x-delete-at`` timestamp updated the
+"stale task cleanup" will target the wrong "task_container" which will leave
+the misplaced stale tasks in the queue.
+
+You can avoid this inefficiency by using the ``swift-expirer-rebalancer`` CLI
+tool.  It can be run on any single node  with access to rings, configs and
+container-servers in order to create a copy of the misplaced tasks in the
+"correct task_container" and then delete the misplaced tasks.
+
+By default the tool runs on only the "next days" worth of task_containers. This
+works well to help ops estimate the runtime to process the entire queue. You'll
+need to run the ``swift-expirer-rebalancer`` multiple times with increasing
+values for ``--num-days`` in order to process the entire expirer queue. You can
+use the ``--start-day-offset`` to avoid re-evaluating sections of the
+task_container namespace that have already been processed or scale up the
+process from multiple nodes each working on different days worth of tasks.
+Also, there is a ``--dry-run`` option to run this tool without doing the actual
+rebalancing, in order to check how many deletion tasks would be moved.
+
+The ``swift-expirer-rebalancer`` tool is designed to be idempotent and can
+safely be run as many times as needed.
+
 Upgrading impact: General Task Queue vs Legacy Queue
 ----------------------------------------------------
 
