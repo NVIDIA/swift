@@ -37,6 +37,12 @@ bind_port = 8080
 # cert_file = /etc/swift/proxy.crt
 # key_file = /etc/swift/proxy.key
 #
+# If you have a 100s of millions of expiring objects per day or 100s of
+# object-expirer nodes you may want to increase this (10x?) for better
+# scalability; otherwise the default is quite good
+# N.B. it MUST be kept consistent with object-[server|expirer].conf and MUST
+# be less than 86400
+# expiring_objects_task_container_per_day = 100
 #
 # You can specify default log routing here if you want:
 # log_name = swift
