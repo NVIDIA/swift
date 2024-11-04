@@ -8207,7 +8207,8 @@ class TestReplicatedObjectController(
                 'expiring_objects_container_divisor': 600,
             }, logger=self.logger, container_ring=self.app.container_ring)
         self.assertEqual([
-            'expiring_objects_container_divisor is deprecated',
+            'expiring_objects_container_divisor is deprecated; use '
+            'expiring_objects_task_container_per_day instead',
             'expiring_objects_account_name is deprecated; you need to migrate '
             'to the standard .expiring_objects account',
         ], self.logger.get_lines_for_level('warning'))
