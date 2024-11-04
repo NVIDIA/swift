@@ -48,6 +48,9 @@ ASYNC_DELETE_TYPE = 'application/async-deleted'
 EXPIRER_ACCOUNT_NAME = AUTO_CREATE_ACCOUNT_PREFIX + 'expiring_objects'
 # Most clusters use the default "expiring_objects_container_divisor" of 86400
 EXPIRER_CONTAINER_DIVISOR = 86400
+# The number of expirer task containers "per day" is configurable and useful to
+# increase if you have a lot of expirer tasks to prevent the task containers
+# from getting too large and needing to shard
 EXPIRER_CONTAINER_PER_DIVISOR = 100
 
 
@@ -68,7 +71,8 @@ class ExpirerConfig(object):
         logger = logger or get_logger(conf)
         if 'expiring_objects_container_divisor' in conf:
             logger.warning(
-                'expiring_objects_container_divisor is deprecated')
+                'expiring_objects_container_divisor is deprecated; use '
+                'expiring_objects_task_container_per_day instead')
             expirer_divisor = config_positive_int_value(
                 conf['expiring_objects_container_divisor'])
         else:
@@ -84,9 +88,13 @@ class ExpirerConfig(object):
             account_name = EXPIRER_ACCOUNT_NAME
         self.account_name = account_name
         self.expirer_divisor = expirer_divisor
-        self.task_container_per_day = EXPIRER_CONTAINER_PER_DIVISOR
+        self.task_container_per_day = config_positive_int_value(
+            conf.get('expiring_objects_task_container_per_day',
+                     EXPIRER_CONTAINER_PER_DIVISOR))
         if self.task_container_per_day >= self.expirer_divisor:
-            msg = 'expiring_objects_container_divisor MUST be greater than 100'
+            msg = 'expiring_objects_task_container_per_day (%s) MUST be ' \
+                  'less than %d' \
+                  % (self.task_container_per_day, self.expirer_divisor)
             if self.expirer_divisor != 86400:
                 msg += '; expiring_objects_container_divisor (%s) SHOULD be ' \
                        'default value of %d' \
@@ -448,7 +456,9 @@ class ObjectExpirer(Daemon):
 
         if unexpected_task_containers['count']:
             self.logger.info(
-                'processing %s unexpected task containers (e.g. %s)',
+                'Processing %s unexpected task containers (e.g. %s). '
+                'If you have recently changed your expirer config '
+                'you can run swift-expirer-rebalancer to move tasks.',
                 unexpected_task_containers['count'],
                 ' '.join(unexpected_task_containers['examples']))
         return container_list
