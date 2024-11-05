@@ -704,6 +704,15 @@ use = egg:swift#backend_ratelimit
 # queue.
 # reclaim_age = 604800
 
+# When the expirer is configured in "multi-process" mode using the
+# process/processes configuration each process will handle a subset of the
+# .expiring_objects account's "task_containers" in parallel.  In an earlier
+# version of swift all expirers would iterate all task_containers and skip most
+# of the available work assuming it would be handled by another process.  You
+# can re-enable this legacy multi-process task_container iteration strategy by
+# setting this option to true.  This option may be removed in a future version.
+# legacy_multi_process_task_container_iteration = false
+
 # Number of tasks objects to cache before processing.  With many nodes it may
 # take some time to fill a larger cache_size but may also have a better chance
 # to distribute DELETEs to multiple target containers.
