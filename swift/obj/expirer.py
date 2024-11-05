@@ -162,6 +162,57 @@ class ExpirerConfig(object):
             account_name, task_container)
         return part, nodes, task_container
 
+    def get_all_task_containers_per_day(self, task_container_ints):
+        """
+        :params task_container_ints: a list of ints, all task_containers taken
+                                     from listing of the expiring objects
+                                     account converted to integer timestamps
+
+        :returns: a list of list, each sub-list has task_container_per_day
+                  elements representing a days worth of the expected
+                  task_container_ints, except for the last element(s) which are
+                  task_container_per_day sized lists of any remaining
+                  unexpected task_container_ints
+        """
+        all_expected_containers_by_day = {}
+        unexpected_containers = []
+
+        for task_container_time in task_container_ints:
+            if not self.is_expected_task_container(task_container_time):
+                unexpected_containers.append(task_container_time)
+                continue
+            # Calculate the number of days since epoch for task container time.
+            # N.B. "days" refers to the default configured divisor of 86400
+            num_days, _ = divmod(
+                task_container_time + self.task_container_per_day,
+                self.expirer_divisor)
+            if num_days not in all_expected_containers_by_day:
+                # N.B. if we observe *any* task container for this "day" we
+                # operate as if *all* containers for this "day" are (or at
+                # least assume *were*) available; this ensures better stability
+                # of task assignment across processes at the edge of a cycle
+                # when task_containers may be getting cleaned up
+                all_expected_containers_by_day[num_days] = [
+                    (num_days * self.expirer_divisor) - i
+                    for i in range(self.task_container_per_day)
+                ]
+            assert (task_container_time in
+                    all_expected_containers_by_day[num_days])
+            assert all(self.is_expected_task_container(c)
+                       for c in all_expected_containers_by_day[num_days])
+
+        expected_containers_by_day = [
+            all_expected_containers_by_day[k]
+            for k in sorted(all_expected_containers_by_day)
+        ]
+        unexpected_containers_groups = [
+            unexpected_containers[i: i + self.task_container_per_day]
+            for i in range(
+                0, len(unexpected_containers), self.task_container_per_day
+            )
+        ]
+        return expected_containers_by_day + unexpected_containers_groups
+
 
 def build_task_obj(timestamp, target_account, target_container,
                    target_obj, high_precision=False):
@@ -308,6 +359,16 @@ class ObjectExpirer(Daemon):
         self.round_robin_task_cache_size = int(
             conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
 
+        if self.processes < 1 or config_true_value(conf.get(
+                'legacy_multi_process_task_container_iteration', False)):
+            self.task_container_iteration_strategy = 'serial'
+        else:
+            self.task_container_iteration_strategy = 'parallel'
+        self._task_containter_iteration_strategy = {
+            'serial': self._serial_strategy,
+            'parallel': self._parallel_strategy,
+        }[self.task_container_iteration_strategy]
+
     def _make_internal_client(self, is_legacy_conf):
         default_ic_conf_path = '/etc/swift/internal-client.conf'
         if is_legacy_conf:
@@ -451,7 +512,7 @@ class ObjectExpirer(Daemon):
                     unexpected_task_containers['examples'].append(c['name'])
             if task_container_int > Timestamp.now():
                 break
-            container_list.append(str(task_container_int))
+            container_list.append(task_container_int)
 
         if unexpected_task_containers['count']:
             self.logger.info(
@@ -461,14 +522,108 @@ class ObjectExpirer(Daemon):
                 unexpected_task_containers['count'],
                 ' '.join(unexpected_task_containers['examples']))
 
+        i, d, selected = self._task_containter_iteration_strategy(
+            container_list)
+        return i, d, [str(c) for c in selected]
+
+    def _serial_strategy(self, container_list):
+        """
+        Implements a serial strategy for task container distribution.
+
+        This strategy allows all processes to list all task containers.
+
+        :param container_list: List of task containers to be processed
+        :return: Tuple of (my_index, divisor, container_list)
+            my_index: The index of the current process;
+            divisor: Total number of processes;
+            container_list: List of containers this process should iterate
+            through and share delete tasks with all other processes.
+        """
         if self.processes <= 0:
-            # this single process will handle *all* tasks in *all*
-            # task_containers
+            # this single process will handle *all* tasks
+            # in *all* task_containers
             return 0, 1, container_list
         else:
             # each process will *list* all tasks in *all* task_containers
             # (and "handle" only a subset)
             return self.process, self.processes, container_list
+
+    def _parallel_strategy(self, container_list):
+        """
+        Implements a parallel strategy for task container distribution.
+
+        This strategy distributes task containers among multiple process groups
+        efficiently, adapting to different ratios of total processes to
+        task_container_per_day. Each process group (one or multiple processes)
+        will own one or multiple containers in task_container_per_day, and all
+        processes within the same group will share the delete tasks from those
+        task containers. This allows a parallel and balanced workload
+        processing across all available expirer processes.
+
+        The given ``containers_list`` is expanded to include all expected
+        containers for each day that any expected container is present.
+        Therefore, when only expected containers are found in the given
+        ``containers_list``, the length of the expanded list is an integer
+        multiple of ``task_container_per_day``. Processes are mapped to
+        container indices in the range of ``task_container_per_day``, so in
+        this case each process will map to the same number of containers.
+
+        However, if the given ``containers_list`` contains unexpected
+        containers then the length of the expanded list may not be an integer
+        multiple of ``task_container_per_day`` and some processes may map to
+        one less container than others.
+
+        When processes < task_container_per_day, containers have an N:1 mapping
+        to processes. For example, 2 processes and 3 task_container_per_day:
+          process 0 -> index=0, divisor=1, containers[t-2, t-0]
+          process 1 -> index=0, divisor=1, containers[t-1]
+
+        When processes == task_container_per_day, containers have a 1:1 mapping
+        to processes. For example, 3 processes and 3 task_container_per_day:
+          process 0 -> index=0, divisor=1, containers[t-0]
+          process 1 -> index=0, divisor=1, containers[t-1]
+          process 2 -> index=0, divisor=1, containers[t-2]
+
+        When processes > task_container_per_day, containers have a 1:N mapping
+        to processes. For example, 4 processes and 3 task_container_per_day:
+          process 0 -> index=0, divisor=2, containers[t-0]
+          process 1 -> index=0, divisor=1, containers[t-1]
+          process 2 -> index=0, divisor=1, containers[t-2]
+          process 3 -> index=1, divisor=2, containers[t-0]
+
+        There is no N:N mapping of containers to processes.
+
+        :param container_list: List of task containers to be processed
+        :return: Tuple of (my_index, divisor, my_containers)
+            my_index: The index of this process within its group;
+            divisor: Number of processes in this process's group;
+            my_containers: List of containers this process should iterate
+            through and share delete tasks within its process group.
+        """
+        task_container_per_day = self.expirer_config.task_container_per_day
+        my_containers = []
+        if self.processes >= task_container_per_day:
+            # each process maps to one task container per day, and handles a
+            # 1/divisor tasks in that container; each container maps to one or
+            # more processes.
+            process_group_index = self.process % task_container_per_day
+            my_index = self.process // task_container_per_day
+            divisor = self.processes // task_container_per_day
+            if process_group_index < self.processes % task_container_per_day:
+                divisor += 1
+        else:
+            # each process maps one or more containers, and handles all the
+            # tasks in each container; each container maps to one process.
+            process_group_index = self.process
+            my_index = 0
+            divisor = 1
+        container_slice = slice(process_group_index, task_container_per_day,
+                                self.processes)
+        for containers in \
+            self.expirer_config.get_all_task_containers_per_day(
+                container_list):
+            my_containers.extend(containers[container_slice])
+        return my_index, divisor, sorted(my_containers)
 
     def get_delay_reaping(self, target_account, target_container):
         return get_delay_reaping(self.delay_reaping_times, target_account,
@@ -600,9 +755,11 @@ class ObjectExpirer(Daemon):
                 self.swift.get_account_info(self.expirer_config.account_name)
 
             self.logger.info(
-                'Pass beginning for task account %(account)s; '
+                'Pass beginning (%(strategy)s strategy) '
+                'for task account %(account)s; '
                 '%(container_count)s possible containers; '
                 '%(obj_count)s possible objects', {
+                    'strategy': self.task_container_iteration_strategy,
                     'account': self.expirer_config.account_name,
                     'container_count': container_count,
                     'obj_count': obj_count})
