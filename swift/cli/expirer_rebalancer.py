@@ -45,7 +45,7 @@ parser.add_argument('-v', '--verbose', action='count', default=0,
                     help='increase verbosity')
 # main options
 parser.add_argument('--workers', type=config_positive_int_value, default=3,
-                    help='listing worker processes')
+                    help='worker processes')
 parser.add_argument('--start-day-offset', type=int, default=0,
                     help="how many days from today (positive or negative) "
                     "to start the task_container search for movable tasks")
