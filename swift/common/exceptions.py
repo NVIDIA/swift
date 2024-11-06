@@ -121,6 +121,14 @@ class DeviceUnavailable(SwiftException):
     pass
 
 
+class DatabaseException(SwiftException):
+    pass
+
+
+class DatabasePragmaException(SwiftException):
+    pass
+
+
 class DatabaseAuditorException(SwiftException):
     pass
 
