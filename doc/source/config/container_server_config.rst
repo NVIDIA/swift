@@ -613,38 +613,46 @@ ionice_priority           None               I/O scheduling priority of server
 [container-auditor]
 *******************
 
-=====================  =================  =======================================
-Option                 Default            Description
----------------------  -----------------  ---------------------------------------
-log_name               container-auditor  Label used when logging
-log_facility           LOG_LOCAL0         Syslog log facility
-log_level              INFO               Logging level
-log_address            /dev/log           Logging directory
-interval               1800               Minimum time for a pass to take
-containers_per_second  200                Maximum containers audited per second.
-                                          Should be tuned according to individual
-                                          system specs. 0 is unlimited.
-recon_cache_path       /var/cache/swift   Path to recon cache
-nice_priority          None               Scheduling priority of server processes.
-                                          Niceness values range from -20 (most
-                                          favorable to the process) to 19 (least
-                                          favorable to the process). The default
-                                          does not modify priority.
-ionice_class           None               I/O scheduling class of server processes.
-                                          I/O niceness class values are
-                                          IOPRIO_CLASS_RT (realtime),
-                                          IOPRIO_CLASS_BE (best-effort),
-                                          and IOPRIO_CLASS_IDLE (idle).
-                                          The default does not modify class and
-                                          priority. Linux supports io scheduling
-                                          priorities and classes since 2.6.13 with
-                                          the CFQ io scheduler.
-                                          Work only with ionice_priority.
-ionice_priority        None               I/O scheduling priority of server
-                                          processes. I/O niceness priority is
-                                          a number which goes from 0 to 7.
-                                          The higher the value, the lower the I/O
-                                          priority of the process. Work only with
-                                          ionice_class.
-                                          Ignored if IOPRIO_CLASS_IDLE is set.
-=====================  =================  =======================================
+========================  =================  =======================================
+Option                    Default            Description
+------------------------  -----------------  ---------------------------------------
+log_name                  container-auditor  Label used when logging
+log_facility              LOG_LOCAL0         Syslog log facility
+log_level                 INFO               Logging level
+log_address               /dev/log           Logging directory
+interval                  1800               Minimum time for a pass to take
+containers_per_second     200                Maximum containers audited per second.
+                                             Should be tuned according to individual
+                                             system specs. 0 is unlimited.
+recon_cache_path          /var/cache/swift   Path to recon cache
+vacuum_threshold_size     0                  The size in bytes of the data on the
+                                             freelist data structure in the audited
+                                             database file, above which vacuum is
+                                             triggered. Zero means never vacuum.
+vacuum_threshold_percent  0                  Ratio of data on the freelist to the
+                                             total size of the audited database file,
+                                             above which vacuum is triggered.
+                                             Zero means never vacuum.
+nice_priority             None               Scheduling priority of server processes.
+                                             Niceness values range from -20 (most
+                                             favorable to the process) to 19 (least
+                                             favorable to the process). The default
+                                             does not modify priority.
+ionice_class              None               I/O scheduling class of server processes.
+                                             I/O niceness class values are
+                                             IOPRIO_CLASS_RT (realtime),
+                                             IOPRIO_CLASS_BE (best-effort),
+                                             and IOPRIO_CLASS_IDLE (idle).
+                                             The default does not modify class and
+                                             priority. Linux supports io scheduling
+                                             priorities and classes since 2.6.13 with
+                                             the CFQ io scheduler.
+                                             Work only with ionice_priority.
+ionice_priority           None               I/O scheduling priority of server
+                                             processes. I/O niceness priority is
+                                             a number which goes from 0 to 7.
+                                             The higher the value, the lower the I/O
+                                             priority of the process. Work only with
+                                             ionice_class.
+                                             Ignored if IOPRIO_CLASS_IDLE is set.
+========================  =================  =======================================
