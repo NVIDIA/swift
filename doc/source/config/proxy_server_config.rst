@@ -111,7 +111,6 @@ log_statsd_sample_rate_factor            1.0
 log_statsd_metric_prefix
 eventlet_debug                           false                     If true, turn on debug logging
                                                                    for eventlet
-
 expose_info                              true                      Enables exposing configuration
                                                                    settings via HTTP GET /info.
 admin_key                                                          Key to use for admin calls that

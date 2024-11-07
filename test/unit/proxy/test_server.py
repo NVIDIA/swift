@@ -8213,8 +8213,19 @@ class TestReplicatedObjectController(
     @mock.patch('time.time', new=lambda: STATIC_TIME)
     def test_PUT_x_delete_at_with_more_container_replicas(self):
         self.app.container_ring.set_replicas(4)
-        self.app.expiring_objects_account = 'expires'
-        self.app.expiring_objects_container_divisor = 60
+        self.app.expirer_config = proxy_server.expirer.ExpirerConfig(
+            {
+                'expiring_objects_account_name': 'expires',
+                'expiring_objects_container_divisor': 600,
+            }, logger=self.logger, container_ring=self.app.container_ring)
+        self.assertEqual([
+            'expiring_objects_container_divisor is deprecated; use '
+            'expiring_objects_task_container_per_day instead',
+            'expiring_objects_account_name is deprecated; you need to migrate '
+            'to the standard .expiring_objects account',
+        ], self.logger.get_lines_for_level('warning'))
+        self.assertIs(self.app.container_ring,
+                      self.app.expirer_config.container_ring)
 
         delete_at_timestamp = int(time.time()) + 100000
         delete_at_container = self.app.expirer_config.get_expirer_container(

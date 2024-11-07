@@ -46,7 +46,6 @@
 
 [object-expirer]
 # interval = 300.0
-# expiring_objects_account_name = expiring_objects
 # report_interval = 300.0
 #
 # request_tries is the number of times the expirer's internal client will
@@ -101,16 +100,14 @@
 # N.B. By default no delay_reaping value is configured for any accounts or
 # containers.
 
-# The order in which expired objects are reaped is always random to a degree,
-# because of how tasks are randomly distributed into 100 containers for each
-# day's worth of expirations.  However the default object-expirer task
-# container iteration strategy "legacy" will tend to reap your "most expired
-# days" tasks *first* if you've had a node offline for awhile.  Alternatively,
-# the expirer supports a task container iteration strategy "randomized" which
-# will result in MORE randomness to the order in which expired objects are
-# reaped and may be useful to create less hot spots listing task_containers
-# from many processes.
-# task_container_iteration_strategy = legacy
+# When the expirer is configured in "multi-process" mode using the
+# process/processes configuration each process will handle a subset of the
+# .expiring_objects account's "task_containers" in parallel.  In an earlier
+# version of swift all expirers would iterate all task_containers and skip most
+# of the available work assuming it would be handled by another process.  You
+# can re-enable this legacy multi-process task_container iteration strategy by
+# setting this option to true.  This option may be removed in a future version.
+# legacy_multi_process_task_container_iteration = false
 
 # Number of tasks objects to cache before processing.  With many nodes it may
 # take some time to fill a larger cache_size but may also have a better chance

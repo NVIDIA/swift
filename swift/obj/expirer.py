@@ -29,9 +29,9 @@ from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common.daemon import Daemon, run_daemon
 from swift.common.http import is_success
 from swift.common.internal_client import InternalClient, UnexpectedResponse
+from swift.common import utils
 from swift.common.middleware.s3api.utils import sysmeta_header as \
     s3_sysmeta_header
-from swift.common import utils
 from swift.common.utils import get_logger, dump_recon_cache, split_path, \
     Timestamp, config_true_value, normalize_delete_at_timestamp, \
     RateLimitedIterator, md5, non_negative_float, non_negative_int, \
@@ -71,22 +71,22 @@ class ExpirerConfig(object):
         :param conf: a config dictionary
         :param container_ring: optional, required in proxy context to lookup
                                task container (part, nodes)
+        :param logger: optional, will create one from the conf if not given
         """
+        logger = logger or get_logger(conf)
         if 'expiring_objects_container_divisor' in conf:
-            if logger:
-                logger.warn(
-                    'expiring_objects_container_divisor is deprecated; use '
-                    'expiring_objects_task_container_per_day instead')
+            logger.warning(
+                'expiring_objects_container_divisor is deprecated; use '
+                'expiring_objects_task_container_per_day instead')
             expirer_divisor = config_positive_int_value(
                 conf['expiring_objects_container_divisor'])
         else:
             expirer_divisor = EXPIRER_CONTAINER_DIVISOR
 
         if 'expiring_objects_account_name' in conf:
-            if logger:
-                logger.warn(
-                    'expiring_objects_account_name is deprecated; you need '
-                    'to migrate to the standard .expiring_objects account')
+            logger.warning(
+                'expiring_objects_account_name is deprecated; you need '
+                'to migrate to the standard .expiring_objects account')
             account_name = (AUTO_CREATE_ACCOUNT_PREFIX +
                             conf['expiring_objects_account_name'])
         else:
@@ -159,8 +159,7 @@ class ExpirerConfig(object):
         :returns: a tuple, (part, nodes, task_container_name)
         """
         if not self.container_ring:
-            raise RuntimeError('%s was not created with '
-                               'container_ring kwarg' % self)
+            raise RuntimeError('%s was not created with container_ring' % self)
         account_name, task_container = self.get_expirer_account_and_container(
             x_delete_at, acc, cont, obj)
         part, nodes = self.container_ring.get_nodes(
@@ -389,450 +388,18 @@ class ObjectExpirer(Daemon):
         self.grace_periods = read_conf_for_grace_periods(conf)
 
         self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        self.randomized_task_container_iteration = config_true_value(
-            conf.get('randomized_task_container_iteration', 'false'))
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; which may be less necessary with only
-        # a few target containers or randomized task container iteration
         self.round_robin_task_cache_size = int(
             conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
 
-        valid_task_container_iteration_strategies = {'legacy', 'randomized'}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {'legacy', 'randomized'}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {'legacy', 'randomized'}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {'legacy', 'randomized'}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {'legacy', 'randomized'}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {
-            'legacy', 'randomized', "parallel"}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        if (self.task_container_iteration_strategy == 'parallel' and
-                self.processes < 1):
-            raise ValueError('The parallel task_container_iteration_strategy '
-                             'requires multiple processes.')
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {
-            'legacy', 'randomized', "parallel"}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        if (self.task_container_iteration_strategy == 'parallel' and
-                self.processes < 1):
-            raise ValueError('The parallel task_container_iteration_strategy '
-                             'requires multiple processes.')
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {
-            'legacy', 'randomized', "parallel"}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        if (self.task_container_iteration_strategy == 'parallel' and
-                self.processes < 1):
-            raise ValueError('The parallel task_container_iteration_strategy '
-                             'requires multiple processes.')
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {
-            'legacy', 'randomized', "parallel"}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        if (self.task_container_iteration_strategy == 'parallel' and
-                self.processes < 1):
-            raise ValueError('The parallel task_container_iteration_strategy '
-                             'requires multiple processes.')
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {
-            'legacy', 'randomized', "parallel"}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        if (self.task_container_iteration_strategy == 'parallel' and
-                self.processes < 1):
-            raise ValueError('The parallel task_container_iteration_strategy '
-                             'requires multiple processes.')
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {
-            'legacy', 'randomized', "parallel"}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        if (self.task_container_iteration_strategy == 'parallel' and
-                self.processes < 1):
-            raise ValueError('The parallel task_container_iteration_strategy '
-                             'requires multiple processes.')
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {
-            'legacy', 'randomized', "parallel"}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        if (self.task_container_iteration_strategy == 'parallel' and
-                self.processes < 1):
-            raise ValueError('The parallel task_container_iteration_strategy '
-                             'requires multiple processes.')
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {
-            'legacy', 'randomized', "parallel"}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        if (self.task_container_iteration_strategy == 'parallel' and
-                self.processes < 1):
-            raise ValueError('The parallel task_container_iteration_strategy '
-                             'requires multiple processes.')
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {
-            'legacy', 'randomized', "parallel"}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        if (self.task_container_iteration_strategy == 'parallel' and
-                self.processes < 1):
-            raise ValueError('The parallel task_container_iteration_strategy '
-                             'requires multiple processes.')
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
-
-        valid_task_container_iteration_strategies = {
-            'legacy', 'randomized', "parallel"}
-        self.task_container_iteration_strategy = conf.get(
-            'task_container_iteration_strategy', 'legacy')
-        # XXX temporary shim to support the un-released configuration option
-        if config_true_value(conf.get(
-                'randomized_task_container_iteration', 'false')):
-            self.task_container_iteration_strategy = "randomized"
-        # randomized task container iteration can be useful if there's lots of
-        # tasks in the queue under a configured delay_reaping
-        if self.task_container_iteration_strategy not in \
-                valid_task_container_iteration_strategies:
-            self.logger.warning(
-                "Unrecognized config value: "
-                "'task_container_iteration_strategy = %s' "
-                "(using legacy)",
-                self.task_container_iteration_strategy)
-            self.task_container_iteration_strategy = "legacy"
-
-        if (self.task_container_iteration_strategy == 'parallel' and
-                self.processes < 1):
-            raise ValueError('The parallel task_container_iteration_strategy '
-                             'requires multiple processes.')
-
-        # with lots of nodes and lots of tasks a large cache size can
-        # significantly delay processing; and caching tasks to round_robin
-        # target container order may be less necessary if there's only a few
-        # target containers or with randomized task container iteration
-        self.round_robin_task_cache_size = int(
-            conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
+        if self.processes < 1 or config_true_value(conf.get(
+                'legacy_multi_process_task_container_iteration', False)):
+            self.task_container_iteration_strategy = 'serial'
+        else:
+            self.task_container_iteration_strategy = 'parallel'
+        self._task_containter_iteration_strategy = {
+            'serial': self._serial_strategy,
+            'parallel': self._parallel_strategy,
+        }[self.task_container_iteration_strategy]
 
     def _make_internal_client(self, is_legacy_conf):
         default_ic_conf_path = '/etc/swift/internal-client.conf'
@@ -979,13 +546,12 @@ class ObjectExpirer(Daemon):
             self.logger.info(
                 'processing %s unexpected task containers (e.g. %s) '
                 'if you have recently changed your expirer config '
-                'this message should go away in a few days.',
+                'you can run swift-expirer-rebalancer.',
                 unexpected_task_containers['count'],
                 ' '.join(unexpected_task_containers['examples']))
-        if self.task_container_iteration_strategy == "parallel":
-            i, d, selected = self._parallel_strategy(container_list)
-        else:
-            i, d, selected = self._serial_strategy(container_list)
+
+        i, d, selected = self._task_containter_iteration_strategy(
+            container_list)
         return i, d, [str(c) for c in selected]
 
     def _serial_strategy(self, container_list):
@@ -1001,9 +567,6 @@ class ObjectExpirer(Daemon):
             container_list: List of containers this process should iterate
             through and share delete tasks with all other processes.
         """
-        # Optionally randomize the order of containers
-        if self.task_container_iteration_strategy == 'randomized':
-            shuffle(container_list)
         if self.processes <= 0:
             # this single process will handle *all* tasks
             # in *all* task_containers

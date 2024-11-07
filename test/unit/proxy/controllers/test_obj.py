@@ -2650,9 +2650,9 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                          found_host_device)
 
     def test_POST_delete_at_configure_task_container_per_day(self):
-        self.conf['expiring_objects_task_container_per_day'] = 1
+        self.conf['expiring_objects_task_container_per_day'] = 10
         self._make_app()
-        self.assertEqual(1, self.app.expirer_config.task_container_per_day)
+        self.assertEqual(10, self.app.expirer_config.task_container_per_day)
         t = str(int(time.time() + 100))
         expected_part, expected_nodes, expected_delete_at_container = \
             self.app.expirer_config.get_delete_at_nodes(t, 'a', 'c', 'o')
@@ -2712,11 +2712,8 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                 self.assertIn('X-Delete-At-Container', given_headers)
 
         # Check when allow_open_expired config is set to true
-        conf = {'allow_open_expired': 'true'}
-        self.app = PatchedObjControllerApp(
-            conf, account_ring=FakeRing(),
-            container_ring=FakeRing(), logger=self.logger)
-        self.app.container_info = dict(self.fake_container_info())
+        self.conf['allow_open_expired'] = 'true'
+        self._make_app()
         self.obj_ring = self.app.get_object_ring(int(self.policy))
 
         post_headers = []

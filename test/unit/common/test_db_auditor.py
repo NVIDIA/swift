@@ -167,11 +167,7 @@ class TestAuditor(unittest.TestCase):
             self.assertEqual(test_auditor.passes, 3)
             self.assertEqual(
                 {'passes': 3,
-                 'failures': 2,
-                 'container.freelist.percent.10-19': 1,
-                 'container.freelist.percent.20-29': 1,
-                 'container.freelist.percent.30-39': 1,
-                 'container.freelist.size.0-1MB': 3},
+                 'failures': 2},
                 test_auditor.logger.statsd_client.get_increment_counts())
 
         do_test({})
@@ -192,17 +188,22 @@ class TestAuditor(unittest.TestCase):
                  'vacuum_threshold_size': 3})
 
     def test_database_auditor_freelist_vacuum_configs(self):
-        def do_test(config, expected_stats):
-            self.logger = debug_logger()
-            test_auditor = FakeDatabaseAuditor(config, logger=self.logger)
+        def mock_audit_loc_generator(*args, **kargs):
             files = os.listdir(self.testdir)
             for f in files:
                 path = os.path.join(self.testdir, f)
-                test_auditor.audit(path)
+                yield path, "", ""
+
+        def do_test(config, expected_inc_stats):
+            self.logger = debug_logger()
+            with mock.patch('swift.common.db_auditor.audit_location_generator',
+                            mock_audit_loc_generator):
+                test_auditor = FakeDatabaseAuditor(config, logger=self.logger)
+                test_auditor.run_once()
             self.assertEqual(test_auditor.failures, 2)
             self.assertEqual(test_auditor.passes, 3)
             self.assertEqual(
-                expected_stats,
+                expected_inc_stats,
                 test_auditor.logger.statsd_client.get_increment_counts())
             warn_lines = self.logger.get_lines_for_level('warning')
             self.assertIn("Vacuum failed on ", warn_lines[0])
@@ -213,52 +214,38 @@ class TestAuditor(unittest.TestCase):
         # filename, and set it to 1 below, so only true{2,3}.db will attempt
         # to be vacuumed.
         conf = {'vacuum_threshold_size': 1}
-        expected_stats = {
+        expected_inc_stats = {
             'passes': 3,
             'failures': 2,
             # free list size check was matched twice to trigger a vacuum
             'freelist_size': 2,
-            'vacuum.success': 1,
+            'vacuum.successes': 1,
             # odd numbers fail vacuum in this test harness ie true3.db
             # just so we can test metrics.
-            'vacuum.failure': 1,
-            # each number if giving us a differ percentage
-            'container.freelist.percent.10-19': 1,
-            'container.freelist.percent.20-29': 1,
-            'container.freelist.percent.30-39': 1,
-            # number is returning the size basically 1, 2 and 3 bytes, so
-            # they're all in the same 0-5MB bucket.
-            'container.freelist.size.0-1MB': 3}
-        do_test(conf, expected_stats)
+            'vacuum.failures': 1}
+        do_test(conf, expected_inc_stats)
 
         # Now a percent check. This test harness is just using the same file
         # numbers, but then x 10. So the max itemlist_percentage is 30%.
         # let's basically do the same check.
         conf = {'vacuum_threshold_percent': 10}
-        expected_stats = {
+        expected_inc_stats = {
             'passes': 3,
             'failures': 2,
             # free list size check was matched twice to trigger a vacuum
             'freelist_percent': 2,
-            'vacuum.success': 1,
+            'vacuum.successes': 1,
             # odd numbers fail vacuum in this test harness ie true3.db
             # just so we can test metrics.
-            'vacuum.failure': 1,
-            # each number if giving us a differ percentage
-            'container.freelist.percent.10-19': 1,
-            'container.freelist.percent.20-29': 1,
-            'container.freelist.percent.30-39': 1,
-            # number is returning the size basically 1, 2 and 3 bytes, so
-            # they're all in the same 0-5MB bucket.
-            'container.freelist.size.0-1MB': 3}
-        do_test(conf, expected_stats)
+            'vacuum.failures': 1}
+        do_test(conf, expected_inc_stats)
 
         # But what's cool, we can also do a percent and a size. Because
         # percent is really a ratio of the pages to free pages.
         conf = {'vacuum_threshold_percent': 10,
                 # now we should only get the *3.db files matched for size
                 'vacuum_threshold_size': 2}
-        expected_stats = {
+        expected_inc_stats = {
             'passes': 3,
             'failures': 2,
             # percent was matched twice like before
@@ -266,16 +253,9 @@ class TestAuditor(unittest.TestCase):
             # size only matched with 1 db.
             'freelist_size': 1,
             # Yet we still only attempted to only call vacuum the 2 times.
-            'vacuum.success': 1,
-            'vacuum.failure': 1,
-            # each number if giving us a differ percentage
-            'container.freelist.percent.10-19': 1,
-            'container.freelist.percent.20-29': 1,
-            'container.freelist.percent.30-39': 1,
-            # number is returning the size basically 1, 2 and 3 bytes, so
-            # they're all in the same 0-5MB bucket.
-            'container.freelist.size.0-1MB': 3}
-        do_test(conf, expected_stats)
+            'vacuum.successes': 1,
+            'vacuum.failures': 1}
+        do_test(conf, expected_inc_stats)
 
     def test_generate_freepage_stats(self):
         def do_test(percent, size, exp_percent_stat, exp_size_stat):
@@ -284,10 +264,11 @@ class TestAuditor(unittest.TestCase):
             broker.get_freelist_size.return_value = size
             logger = debug_logger()
             test_auditor = FakeDatabaseAuditor({}, logger=logger)
+            test_auditor._init_vacuum_stats()
             test_auditor.generate_freepage_stats(broker)
-            stats = logger.statsd_client.get_increment_counts()
-            self.assertIn(exp_percent_stat, stats)
-            self.assertIn(exp_size_stat, stats)
+            self.assertIn(exp_percent_stat,
+                          test_auditor.freelist_stats['percent'])
+            self.assertIn(exp_size_stat, test_auditor.freelist_stats['size'])
 
         mb = 1024 * 1024
         size_tests = (

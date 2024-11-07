@@ -1498,7 +1498,7 @@ class TestObjectController(BaseTestCase):
                                   node_count=1):
         delete_at = headers['X-Delete-At']
         expirer_config = ExpirerConfig(
-            self.conf, container_ring=self.container_ring)
+            self.conf, logger=self.logger, container_ring=self.container_ring)
         part, nodes, delete_at_container = expirer_config.get_delete_at_nodes(
             delete_at, a, c, o)
         # proxy assigns each replica a node, index 0 for test stability
