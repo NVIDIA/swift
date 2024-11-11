@@ -41,7 +41,7 @@ from gzip import GzipFile
 import pyeclib.ec_iface
 
 from eventlet import hubs, timeout, tpool
-from swift.obj.diskfile import update_auditor_status, EUCLEAN
+from swift.obj.diskfile import update_auditor_status, EUCLEAN, read_hashes
 from test import BaseTestCase
 from test.debug_logger import debug_logger
 from test.unit import (mock as unit_mock, temptree, mock_check_drive,
@@ -58,7 +58,8 @@ from swift.common.exceptions import DiskFileNotExist, DiskFileQuarantined, \
     DiskFileDeviceUnavailable, DiskFileDeleted, DiskFileNotOpen, \
     DiskFileError, ReplicationLockTimeout, DiskFileCollision, \
     DiskFileExpired, SwiftException, DiskFileNoSpace, \
-    DiskFileXattrNotSupported, PartitionLockTimeout, DiskFileStateChanged
+    DiskFileXattrNotSupported, PartitionLockTimeout, DiskFileStateChanged, \
+    SuffixSyncError
 from swift.common.storage_policy import (
     POLICIES, get_policy_string, StoragePolicy, ECStoragePolicy, REPL_POLICY,
     EC_POLICY, PolicyError)
@@ -9581,8 +9582,8 @@ class TestSuffixHashes(unittest.TestCase):
             mkdirs(part_path)
             # first create an empty pickle
             df_mgr.get_hashes(self.existing_device, '0', [], policy)
-            self.assertTrue(os.path.exists(os.path.join(
-                part_path, diskfile.HASH_FILE)))
+            hashes_file = os.path.join(part_path, diskfile.HASH_FILE)
+            self.assertTrue(os.path.exists(hashes_file))
             non_local = {'suffix_count': 1}
             calls = []
 
@@ -9599,8 +9600,15 @@ class TestSuffixHashes(unittest.TestCase):
                 return rv
             with mock.patch('swift.obj.diskfile.read_hashes',
                             mock_read_hashes):
-                df_mgr.get_hashes(self.existing_device, '0', ['123'],
-                                  policy)
+                rv = df_mgr.get_hashes(self.existing_device, '0',
+                                       ['123'], policy)
+                self.assertEqual({
+                    '000': 'fake',
+                    '001': 'fake',
+                    '002': 'fake',
+                    '003': 'fake',
+                    '004': 'fake',
+                }, rv)
 
             self.assertEqual(calls, [
                 {'000': 'fake'},  # read
@@ -9613,6 +9621,50 @@ class TestSuffixHashes(unittest.TestCase):
                 {'000': 'fake', '001': 'fake', '002': 'fake',
                  '003': 'fake', '004': 'fake'},  # not modifed
             ])
+            self.assertEqual({
+                '000': 'fake',
+                '001': 'fake',
+                '002': 'fake',
+                '003': 'fake',
+                '004': 'fake',
+                'valid': True,
+                'updated': mock.ANY,
+            }, read_hashes(part_path))
+
+    def test_get_hashes_modified_recursive_depth(self):
+        policy = POLICIES.default
+        df_mgr = self.df_router[policy]
+        part_path = os.path.join(self.devices, self.existing_device,
+                                 diskfile.get_data_dir(policy), '0')
+        mkdirs(part_path)
+        # first create an empty pickle
+        df_mgr.get_hashes(self.existing_device, '0', [], policy)
+        hashes_file = os.path.join(part_path, diskfile.HASH_FILE)
+        self.assertTrue(os.path.exists(hashes_file))
+        non_local = {'suffix_count': 1}
+        calls = []
+
+        def mock_read_hashes(filename):
+            rv = {'%03x' % i: 'fake'
+                  for i in range(non_local['suffix_count'])}
+            # this will make the *next* call get slightly
+            # different content
+            non_local['suffix_count'] += 1
+            # track exactly the value for every return
+            calls.append(dict(rv))
+            rv['valid'] = True
+            return rv
+        with mock.patch('swift.obj.diskfile.read_hashes', mock_read_hashes), \
+                mock.patch('swift.obj.diskfile.sleep') as mock_sleep, \
+                self.assertRaises(SuffixSyncError) as ctx:
+            df_mgr.get_hashes(self.existing_device, '0', ['123'], policy)
+        self.assertEqual('Too many attempts to get_hashes', str(ctx.exception))
+        # 2 calls per 1 + 5 retries?
+        self.assertEqual(12, len(calls), calls)
+        self.assertEqual([mock.call(s) for s in [0.1, 0.2, 0.4, 0.8, 1.6]],
+                         mock_sleep.call_args_list)
+        self.assertEqual({'updated': -1, 'valid': False},
+                         read_hashes(hashes_file))
 
 
 class TestHashesHelpers(unittest.TestCase):
