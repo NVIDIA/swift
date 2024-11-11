@@ -50,7 +50,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from datetime import timedelta
 
-from eventlet import Timeout, tpool
+from eventlet import Timeout, tpool, sleep
 from eventlet.hubs import trampoline
 from pyeclib.ec_iface import ECDriverError, ECInvalidFragmentMetadata, \
     ECBadFragmentChecksum, ECInvalidParameter
@@ -71,7 +71,8 @@ from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
     DiskFileDeleted, DiskFileError, DiskFileNotOpen, PathNotDir, \
     ReplicationLockTimeout, DiskFileExpired, DiskFileXattrNotSupported, \
-    DiskFileBadMetadataChecksum, PartitionLockTimeout, DiskFileStateChanged
+    DiskFileBadMetadataChecksum, PartitionLockTimeout, DiskFileStateChanged, \
+    SuffixSyncError
 from swift.common.swob import multi_range_iterator
 from swift.common.storage_policy import (
     get_policy_string, split_policy_string, PolicyError, POLICIES,
@@ -1291,7 +1292,7 @@ class BaseDiskFileManager(object):
         return hashed, hashes
 
     def __get_hashes(self, device, partition, policy, recalculate=None,
-                     do_listdir=False):
+                     do_listdir=False, recursion_depth=0):
         """
         Get hashes for each suffix dir in a partition.  do_listdir causes it to
         mistrust the hash cache for suffix existence at the (unexpectedly high)
@@ -1369,9 +1370,15 @@ class BaseDiskFileManager(object):
                 if read_hashes(partition_path) == orig_hashes:
                     write_hashes(partition_path, hashes)
                     return hashed, hashes
+            if recursion_depth >= 5:
+                # >>> sum([2 ** i * 0.1 for i in range(5)])
+                # 3.1
+                raise SuffixSyncError('Too many attempts to get_hashes')
+            sleep(2 ** recursion_depth * 0.1)
             return self.__get_hashes(device, partition, policy,
                                      recalculate=recalculate,
-                                     do_listdir=do_listdir)
+                                     do_listdir=do_listdir,
+                                     recursion_depth=recursion_depth + 1)
         else:
             return hashed, hashes
 
