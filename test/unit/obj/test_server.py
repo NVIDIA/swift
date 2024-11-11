@@ -53,7 +53,7 @@ from swift.common import utils, bufferedhttp, http_protocol
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
     NullLogger, storage_directory, public, replication, encode_timestamps, \
-    Timestamp, md5
+    Timestamp, md5, lock_path
 from swift.common import constraints
 from swift.common.request_helpers import get_reserved_name
 from swift.common.swob import Request, WsgiBytesIO, \
@@ -8542,12 +8542,63 @@ class TestObjectController(BaseTestCase):
                 mock.patch.object(tpool, 'execute', my_tpool_execute), \
                 mock.patch('swift.obj.diskfile.os.path.exists',
                            return_value=True):
-            diskfile.DiskFileManager._get_hashes = fake_get_hashes
-            tpool.execute = my_tpool_execute
             req = Request.blank('/sda1/p/',
                                 environ={'REQUEST_METHOD': 'REPLICATE'},
                                 headers={})
             self.assertRaises(Timeout, self.object_controller.REPLICATE, req)
+
+    def test_REPLICATE_partition_timeout(self):
+        req = Request.blank('/sda1/0/', method='REPLICATE')
+        partition_dir = os.path.join(self.testdir, 'sda1', 'objects', '0')
+        with lock_path(partition_dir), \
+                mock.patch('swift.common.utils.DEFAULT_LOCK_TIMEOUT', 0.01), \
+                mock.patch('swift.common.utils.sleep', lambda x: sleep(0)):
+            gt = spawn(req.get_response, self.object_controller)
+            resp = gt.wait()
+        self.assertEqual(resp.status_int, 500)
+        msg = resp.body.decode()
+        self.assertIn('Traceback', msg)
+        self.assertIn('in __call__', msg)
+        self.assertIn('in REPLICATE', msg)
+        self.assertIn('LockTimeout', msg)
+
+    def test_REPLICATE_suffix_sync_error(self):
+        # the last test creates the partition with the lock, here we create it
+        # manually otherwise get_hashes noops early
+        partition_dir = os.path.join(self.testdir, 'sda1', 'objects', '0')
+        mkdirs(partition_dir)
+
+        non_local = {'suffix_count': 1}
+        calls = []
+
+        def mock_read_hashes(filename):
+            # the diskfile test uses "fake" for the stub suffix hash and forces
+            # the read hashes to be considered "modified" because it passes in
+            # some a suffix to recalculate with the default skip_rehash=False,
+            # but it seems the REPLICATE API *always* does skip_rehash=True if
+            # you pass in suffixes; so the only way to get a rehash and trigger
+            # "modified" recursion is to "fake" an unhashed suffix with None
+            rv = {'%03x' % i: None
+                  for i in range(non_local['suffix_count'])}
+            # this will make the *next* call get slightly
+            # different content
+            non_local['suffix_count'] += 1
+            # track exactly the value for every return
+            calls.append(dict(rv))
+            rv['valid'] = True
+            return rv
+
+        req = Request.blank('/sda1/0/', method='REPLICATE')
+        with mock.patch('swift.obj.diskfile.read_hashes', mock_read_hashes), \
+                mock.patch('swift.obj.diskfile.sleep', lambda x: sleep(0)):
+            gt = spawn(req.get_response, self.object_controller)
+            resp = gt.wait()
+        self.assertEqual(resp.status_int, 500)
+        msg = resp.body.decode()
+        self.assertIn('Traceback', msg)
+        self.assertIn('in __call__', msg)
+        self.assertIn('in REPLICATE', msg)
+        self.assertIn('SuffixSyncError', msg)
 
     def test_REPLICATE_reclaims_tombstones(self):
         conf = {'devices': self.testdir, 'mount_check': False,
