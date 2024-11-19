@@ -1270,6 +1270,23 @@ class ObjectController(BaseStorageServer):
             pass
         return response
 
+    def _is_delete_task_stale(self, request, orig_metadata):
+        if 'x-backend-expirer-task-timestamp' not in request.headers:
+            # Older version expirer, can't tell.
+            return False
+
+        delete_task_ts_val = request.headers[
+            "x-backend-expirer-task-timestamp"
+        ]
+        delete_task_ts = Timestamp(delete_task_ts_val)
+        metadata_ts = Timestamp(orig_metadata.get('X-Timestamp') or 0)
+        if delete_task_ts < metadata_ts:
+            # this expirer queue entry is older than the time when the newer
+            # x-delete-at got updated, it's stale and not needed.
+            return True
+        else:
+            return False
+
     @public
     @timing_stats()
     def DELETE(self, request):
@@ -1333,6 +1350,8 @@ class ObjectController(BaseStorageServer):
                 # Found a newer object -- return 409 as work item is stale
                 return HTTPConflict()
             if orig_delete_at != req_if_delete_at:
+                if self._is_delete_task_stale(request, orig_metadata):
+                    return HTTPConflict()
                 return HTTPPreconditionFailed(
                     request=request,
                     body='X-If-Delete-At and X-Delete-At do not match')
