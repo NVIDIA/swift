@@ -7825,6 +7825,7 @@ class TestObjectController(BaseTestCase):
 
     def test_DELETE_if_delete_at(self):
         test_time = time() + 10000
+        # Create an object without an an expiration time.
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
             headers={'X-Timestamp': normalize_timestamp(test_time - 99),
@@ -7834,6 +7835,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
+        # Normal delete request will delete it.
         req = Request.blank(
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'DELETE'},
@@ -7841,6 +7843,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 204)
 
+        # Create an object with an an expiration time.
         delete_at_timestamp = int(test_time - 1)
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -7853,6 +7856,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
+        # Delete this object with incorrect 'X-If-Delete-At'.
         req = Request.blank(
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'DELETE'},
@@ -7861,6 +7865,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 412)
 
+        # Normal delete request without 'X-If-Delete-At' will delete it too.
         req = Request.blank(
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'DELETE'},
@@ -7868,6 +7873,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 204)
 
+        # Create an object with an an expiration time.
         delete_at_timestamp = int(test_time - 1)
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -7880,6 +7886,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
+        # Delete this object with incorrect 'X-If-Delete-At'.
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'DELETE'},
             headers={'X-Timestamp': normalize_timestamp(test_time - 92),
@@ -7887,6 +7894,15 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 412)
 
+        # Invalid format for 'X-If-Delete-At'.
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'DELETE'},
+            headers={'X-Timestamp': normalize_timestamp(test_time - 92),
+                     'X-If-Delete-At': 'abc'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 400)
+
+        # Delete this object with correct 'X-If-Delete-At'.
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'DELETE'},
             headers={'X-Timestamp': normalize_timestamp(test_time - 92),
@@ -7894,12 +7910,283 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 204)
 
+        # Invalid format for 'X-If-Delete-At' still returns 400.
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'DELETE'},
             headers={'X-Timestamp': normalize_timestamp(test_time - 92),
                      'X-If-Delete-At': 'abc'})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 400)
+
+    def test_DELETE_delete_task_timestamp(self):
+        create_object_ts = next(self.ts)
+        update_object_ts = next(self.ts)
+        orig_delete_at = utils.normalize_delete_at_timestamp(
+            next(self.ts).normal)
+        new_delete_at = utils.normalize_delete_at_timestamp(
+            next(self.ts).normal)
+
+        # Create an object with an an expiration time.
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers=self._update_delete_at_headers({
+                'X-Timestamp': create_object_ts.normal,
+                'X-Delete-At': orig_delete_at,
+                'Content-Length': '4',
+                'Content-Type': 'application/octet-stream'})
+        )
+        req.body = 'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # Before the object expires, update its 'X-Delete-At'.
+        req = Request.blank(
+            '/sda1/p/a/c/o', method='POST',
+            headers={'X-Timestamp': update_object_ts.normal,
+                     'X-Delete-At': new_delete_at}
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 202)
+
+        # an old expirer won't send x-backend-expirer-task-timestamp, we return
+        #  412 so it will try again because we don't know if our metadata is
+        # newer than the task-timestamp
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={'X-Timestamp': Timestamp(orig_delete_at).normal,
+                     'X-If-Delete-At': orig_delete_at})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 412)
+
+        # a new expirer will send x-backend-expirer-task-timestamp, so we can
+        # tell it this x-if-delete-at does not match and never will because we
+        # have newer metadata with a different x-delete-at
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': create_object_ts.normal,
+                'X-If-Delete-At': orig_delete_at
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 409)
+
+        # no expirer should ever mix up the x-if-delete-at with a different
+        # task-timestamp; but even if the task-timestamp matches our
+        # metadata-timestamp we shouldn't delete if x-if-delete-at does not.
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': update_object_ts.normal,
+                'X-If-Delete-At': orig_delete_at
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 412)
+        # ... no matter how much "newer" the expirer thinks its task-timestamp
+        # is, it needs to keep trying until we have a matching x-if-delete-at
+        even_newer_task_ts = next(self.ts)
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': even_newer_task_ts.normal,
+                'X-Backend-Expirer-Task-Timestamp': even_newer_task_ts.normal,
+                'X-If-Delete-At': orig_delete_at
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 412)
+
+        # finally some expirer should pick up the new entry
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(new_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': update_object_ts.normal,
+                'X-If-Delete-At': new_delete_at
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 204)
+
+    def test_invalid_delete_task_timestamp(self):
+        create_object_ts = next(self.ts)
+        orig_delete_at = utils.normalize_delete_at_timestamp(
+            next(self.ts).normal)
+        wrong_delete_at = utils.normalize_delete_at_timestamp(
+            next(self.ts).normal)
+
+        # Create an object with an expiration time.
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers=self._update_delete_at_headers({
+                'X-Timestamp': create_object_ts.normal,
+                'X-Delete-At': orig_delete_at,
+                'Content-Length': '4',
+                'Content-Type': 'application/octet-stream'})
+        )
+        req.body = 'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # if the expirer ever sent an invalid x-if-delete-at it'd get a 400
+        # until we fix the bug (good!)
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-If-Delete-At': 'some-nonsense',
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 400)
+        self.assertEqual(b'Bad X-If-Delete-At header value', resp.body)
+
+        # if you send an *non-matching* x-if-delete-at AND some invalid
+        # task-timestamps we blow up until we fix the bug (also fine)
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': 'some-nonsense',
+                'X-If-Delete-At': wrong_delete_at,
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 412)
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(
+            "Exception reading 'x-backend-expirer-task-timestamp': could not "
+            "convert string to float: 'some-nonsense': ",
+            error_lines[-1]
+        )
+
+        # if you send the *correct* x-delete-at the invalid task timestamp
+        # doesn't even matter! (fair enough)
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': 'some-nonsense',
+                'X-If-Delete-At': orig_delete_at,
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 204)
+
+    def test_stale_delete_task_timestamp_404(self):
+        task_timestamp_ts = create_object_ts = next(self.ts)
+        user_deleted_at = next(self.ts)
+        orig_delete_at = utils.normalize_delete_at_timestamp(
+            next(self.ts).normal)
+
+        # we'll use this helper to peak into updates that go to async
+        def gather_async_pendings():
+            async_pendings = []
+            async_pending_dir = os.path.join(
+                self.testdir, 'sda1',
+                diskfile.get_async_dir(POLICIES.default))
+            for dirpath, _, filenames in os.walk(async_pending_dir):
+                for filename in filenames:
+                    with open(os.path.join(dirpath, filename), 'rb') as fh:
+                        async_update = pickle.load(fh)
+                    async_pendings.append(async_update)
+            return async_pendings
+
+        # First, create an object with an an expiration time.
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers=self._update_delete_at_headers({
+                'X-Timestamp': create_object_ts.normal,
+                'X-Delete-At': orig_delete_at,
+                'Content-Length': '4',
+                'Content-Type': 'application/octet-stream'})
+        )
+        req.body = 'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # it seems that since this test has no container-servers running the
+        # assigned X-Delete-At-Host in the PUT request goes to async
+        # N.B.  there's no async-pending for the user namespace container
+        # update because we didn't assign those headers to our stub request!
+        async_pendings = gather_async_pendings()
+        self.assertEqual(
+            [('PUT', '.expiring_objects', task_timestamp_ts)],
+            [(u['op'], u['account'], Timestamp(
+                u['headers']['X-Timestamp']))
+             for u in async_pendings])
+
+        # before the expirer gets a chance to do anything DELETE it!
+        req = Request.blank('/sda1/p/a/c/o', method='DELETE',
+                            headers={
+                                'X-Timestamp': user_deleted_at.normal,
+                            })
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 204)
+
+        # N.B. no x-delete-at host, an overwrite/update of an object with
+        # x-delete-at will "always" generate cleanup task asyncs
+        async_pendings = gather_async_pendings()
+        self.assertEqual(2, len(async_pendings))
+        self.assertEqual({
+            ('PUT', '.expiring_objects', task_timestamp_ts),
+            ('DELETE', '.expiring_objects', user_deleted_at),
+        }, {
+            (u['op'], u['account'], Timestamp(
+                u['headers']['X-Timestamp']))
+            for u in async_pendings
+        })
+
+        # ... but the object *is* a tombstone
+        req = Request.blank('/sda1/p/a/c/o', method='HEAD')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(user_deleted_at,
+                         Timestamp(resp.headers['X-Backend-Timestamp']))
+        # this should be sufficient to say that the task is stale
+        self.assertGreater(Timestamp(resp.headers['X-Backend-Timestamp']),
+                           task_timestamp_ts)
+
+        # when the exprier processes the task-timestamp; it should be "stale"
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            method='DELETE',
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': task_timestamp_ts.normal,
+                'X-If-Delete-At': orig_delete_at,
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        # Returns 412 instead of 409 here because deleted object only has
+        # tombstone file left, and won't return 'X-Delete-At' header anymore
+        # when openning the data file;
+        #
+        # NOTE: ``disk_file.read_metadata`` returns ``DiskFileDeleted`` during
+        # object server DELETE handling, but ``HTTPNotFound`` will be ignored
+        # during the following ``x-delete-at`` handling, this probably should
+        # be fixed and ideally object server DELETE should return 404.
+        self.assertEqual(resp.status_int, 412)
+        # this is unfortunate
+        self.assertNotIn('X-Backend-Timestamp', resp.headers)
+
+        # at least we don't create any new asyncs
+        async_pendings = gather_async_pendings()
+        self.assertEqual(2, len(async_pendings))
+        # ... and the expirer will "only" keep trying until the async_pending
+        # for the DELETE into the .expiring objects account gets processed to
+        # wipe out the stale task.
 
     def test_extra_headers_contain_object_bytes(self):
         timestamp1 = next(self.ts).normal
