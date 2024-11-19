@@ -90,6 +90,28 @@ def check_content_type(req):
     return None
 
 
+# Keep the number of expirer-queue deletes to a reasonable number.
+#
+# In the best case, at least one object server writes out an
+# async_pending for an expirer-queue update. In the worst case, no
+# object server does so, and an expirer-queue row remains that
+# refers to an already-deleted object. In this case, upon attempting
+# to delete the object, the object expirer will notice that the
+# object does not exist and then remove the row from the expirer
+# queue.
+#
+# In other words: expirer-queue updates on object DELETE are nice to
+# have, but not strictly necessary for correct operation.
+#
+# Also, each queue update results in an async_pending record, which
+# causes the object updater to talk to all container servers. If we
+# have N async_pendings and Rc container replicas, we cause N * Rc
+# requests from object updaters to container servers (possibly more,
+# depending on retries). Thus, it is helpful to keep this number
+# small.
+NUM_CLEAN_EXPIRER_QUEUE_UPDATES = 2
+
+
 def num_container_updates(container_replicas, container_quorum,
                           object_replicas, object_quorum):
     """
@@ -595,29 +617,10 @@ class BaseObjectController(Controller):
                 set_delete_at_headers(n_outgoing - 1 - index, next(dan_iter))
             existing_updates += 1
 
-        # Keep the number of expirer-queue deletes to a reasonable number.
-        #
-        # In the best case, at least one object server writes out an
-        # async_pending for an expirer-queue update. In the worst case, no
-        # object server does so, and an expirer-queue row remains that
-        # refers to an already-deleted object. In this case, upon attempting
-        # to delete the object, the object expirer will notice that the
-        # object does not exist and then remove the row from the expirer
-        # queue.
-        #
-        # In other words: expirer-queue updates on object DELETE are nice to
-        # have, but not strictly necessary for correct operation.
-        #
-        # Also, each queue update results in an async_pending record, which
-        # causes the object updater to talk to all container servers. If we
-        # have N async_pendings and Rc container replicas, we cause N * Rc
-        # requests from object updaters to container servers (possibly more,
-        # depending on retries). Thus, it is helpful to keep this number
-        # small.
-        n_desired_queue_updates = 2
+        # limit async_pendings for x-delete-at-update
         for i in range(len(headers)):
-            headers[i].setdefault('X-Backend-Clean-Expiring-Object-Queue',
-                                  't' if i < n_desired_queue_updates else 'f')
+            v = 't' if i < NUM_CLEAN_EXPIRER_QUEUE_UPDATES else 'f'
+            headers[i].setdefault('X-Backend-Clean-Expiring-Object-Queue', v)
 
         return headers
 
