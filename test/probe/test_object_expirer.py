@@ -19,12 +19,13 @@ import time
 import uuid
 import unittest
 from io import BytesIO
+import pickle
 
 from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.manager import Manager
 from swift.common.utils import Timestamp, config_true_value
 from swift.common import direct_client
-from swift.obj.expirer import extract_expirer_bytes_from_ctype
+from swift.obj import expirer
 
 from test.probe.common import ReplProbeTest, ENABLED_POLICIES
 from test.probe.brain import BrainSplitter
@@ -62,6 +63,14 @@ class TestObjectExpirer(ReplProbeTest):
                 return True
 
         return False
+
+    def assertObjectInListing(self):
+        self.assertTrue(self._check_obj_in_container_listing(),
+                        msg='Did not find listing for %s' % self.object_name)
+
+    def assertObjectNotInListing(self):
+        self.assertFalse(self._check_obj_in_container_listing(),
+                         msg='Found listing for %s' % self.object_name)
 
     @unittest.skipIf(len(ENABLED_POLICIES) < 2, "Need more than one policy")
     def test_expirer_object_split_brain(self):
@@ -104,8 +113,7 @@ class TestObjectExpirer(ReplProbeTest):
                          create_timestamp)
 
         # but it is still in the listing
-        self.assertTrue(self._check_obj_in_container_listing(),
-                        msg='Did not find listing for %s' % self.object_name)
+        self.assertObjectInListing()
 
         # clear proxy cache
         client.post_container(self.url, self.token, self.container_name, {})
@@ -113,8 +121,7 @@ class TestObjectExpirer(ReplProbeTest):
         self.expirer.once()
 
         # object is not in the listing
-        self.assertFalse(self._check_obj_in_container_listing(),
-                         msg='Found listing for %s' % self.object_name)
+        self.assertObjectNotInListing()
 
         # and validate object is tombstoned
         found_in_policy = None
@@ -703,7 +710,7 @@ class TestObjectExpirer(ReplProbeTest):
 
         # Check for inconsistent metadata
         byte_size_counts = Counter([
-            extract_expirer_bytes_from_ctype(resp['content_type'])
+            expirer.extract_expirer_bytes_from_ctype(resp['content_type'])
             for resp in listing_records
         ])
         expected_byte_size_counts = {
@@ -726,7 +733,7 @@ class TestObjectExpirer(ReplProbeTest):
 
         # Ensure that metadata is now consistent
         byte_size_counts = Counter([
-            extract_expirer_bytes_from_ctype(resp['content_type'])
+            expirer.extract_expirer_bytes_from_ctype(resp['content_type'])
             for resp in listing_records
         ])
         expected_byte_size_counts = {t1_content_length: 3}
@@ -799,6 +806,118 @@ class TestObjectExpirer(ReplProbeTest):
 
     def test_expirer_delete_returns_outdated_412(self):
         self._test_expirer_delete_outdated_object_version(object_exists=True)
+
+    def gather_expirer_tasks(self):
+        """
+        :returns: a list of dicts of all expirer task queue entries.
+        """
+        # make sure auto-created expirer-queue containers get in the account
+        # listing so the expirer can find them
+        Manager(['container-updater']).once()
+        # make sure if *any* expirer replicas got an update they all have it
+        Manager(['container-replicator']).once()
+        expirer_tasks = []
+        for task_container_info in self.client.iter_containers(
+                '.expiring_objects'):
+            for task_obj_info in self.client.iter_objects(
+                    '.expiring_objects', task_container_info['name']):
+                expirer_tasks.append(task_obj_info)
+        return expirer_tasks
+
+    def test_expirer_outdated_task_timestamp_409(self):
+        # when an object has it's x-delete-at updated an async_pending is
+        # created to clean the entry of the old x-delete-at task from the the
+        # queue; if that cleanup fails (for whatever reason, e.g. POST lands on
+        # stale state and doesn't see the orig-x-delete-at, or object-updater
+        # hasn't processed async-pendings yet, or ops updated the
+        # task_container_per_day option and cleanups are sent to the wrong
+        # container) the stale expirer queue entry may remain and trigger
+        # expiration; but it should fail to reap because it's x-if-delete-at
+        # doesn't match the x-delete-at of the current version.
+        #
+        # If the object-server metadata is stale, when the expirer attempts to
+        # reap the updated x-if-delete-at time it will still reject expiration
+        # for "safety" but the expirer should retry to ensure the object is
+        # eventually reaped as expected, see
+        #     test_expirer_delete_returns_outdated_412
+        #
+        # However, in the case when any of the update-to-date metdata is
+        # available for the object's current value of x-delete-at an attempt to
+        # process the stale queue entry can be rejected immeidately similar to
+        # when an object is overwritten, see
+        #     test_expirer_object_should_not_be_expired
+
+        # self.brain is server_type='container' for testing mixed-policy stuff
+        self.assertEqual('replication', self.policy.policy_type)  # sanity?
+        brain = BrainSplitter(self.url, self.token, self.container_name,
+                              self.object_name, server_type='object',
+                              policy=self.policy)
+        brain.put_container()
+        # create an object that will expire later
+        orig_delete_at = int(time.time()) + 3
+        client.put_object(
+            self.url, self.token, self.container_name, self.object_name,
+            headers={'X-Delete-At': orig_delete_at})
+        # shutdown *some object* servers (keep majority online so POST works)
+        brain.stop_handoff_half()
+        # update the object before it expires!
+        new_delete_at = max(orig_delete_at, int(time.time())) + 1
+        client.post_object(
+            self.url, self.token, self.container_name, self.object_name,
+            headers={'X-Delete-At': new_delete_at})
+        async_updates = []
+        for pickle_path in self.gather_async_pendings():
+            with open(pickle_path, 'rb') as f:
+                async_updates.append(pickle.load(f))
+        # there won't be more than 2 expirer task cleanup async, see
+        # proxy.controller.obj.NUM_CLEAN_EXPIRER_QUEUE_UPDATES
+        self.assertLessEqual(len(async_updates), 2)
+        for up in async_updates:
+            self.assertEqual('DELETE', up['op'])
+            self.assertEqual('.expiring_objects', up['account'])
+            self.assertTrue(up['obj'].startswith(str(int(orig_delete_at))))
+
+        # wait for the object to expire
+        brain.start_handoff_half()
+        timeout = time.time() + 10
+        while True:
+            try:
+                client.head_object(
+                    self.url, self.token,
+                    self.container_name, self.object_name)
+            except ClientException as e:
+                self.assertEqual(404, e.http_status)
+                break
+            if time.time() > timeout:
+                self.fail('%s/%s should be expired at %s,'
+                          ' but still readable after %s' % (
+                              self.object_name, self.container_name,
+                              new_delete_at, timeout))
+            time.sleep(1.0)
+
+        # it's basically terrifying that if we don't run the object
+        # replicators here first, the stale entry might "work" on the
+        # handoff node, even tho the expirer-ic returns 409 (?)
+        Manager(['object-replicator']).once()
+
+        # object is expired, but not yet reaped
+        self.assertObjectInListing()
+        # since we haven't run the object-updater both tasks are still in the
+        # queue, the one with orig_delete_at is "stale"
+        expirer_tasks = self.gather_expirer_tasks()
+        self.assertEqual(2, len(expirer_tasks))
+        # attempt to process both queue
+        self.expirer.once()
+
+        # object is now reaped
+        self.assertObjectNotInListing()
+        # all queue tasks are popped
+        self.assertFalse(self.gather_expirer_tasks())
+        # async's have no effect
+        Manager(['object-updater']).once()
+        self.assertFalse(self.gather_async_pendings())
+        # ... queue is still empty
+        self.assertFalse(self.gather_expirer_tasks())
 
     def test_slo_async_delete(self):
         if not self.cluster_info.get('slo', {}).get('allow_async_delete'):
