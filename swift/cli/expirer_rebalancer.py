@@ -28,7 +28,7 @@ from swift.common.direct_client import direct_put_container_object
 from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER
 from swift.common.utils.config import readconf, config_positive_int_value
-from swift.common.utils.logs import PrefixLoggerAdapter
+from swift.common.utils.logs import get_prefixed_logger
 from swift.common.utils.timestamp import Timestamp
 from swift.common.utils import (get_logger, eventlet_monkey_patch,
                                 distribute_evenly)
@@ -55,7 +55,7 @@ parser.add_argument('--num-days', type=int, default=1,
 parser.add_argument('--concurrency', type=int, default=10,
                     help='number of concurrent tasks per worker')
 parser.add_argument('--timeout', type=float, default=5.0,
-                    help='how much second(s) to give direct operations')
+                    help='how many second(s) to give direct operations')
 parser.add_argument('--limit-per-task-container', type=int, default=None,
                     help='Only process a few task entries per task_container')
 parser.add_argument('--dry-run', action='store_true',
@@ -102,7 +102,7 @@ class BaseRebalancer(object):
 
     def get_logger(self, args):
         """
-        Base method so Worker's can override to add a prefix.
+        Base method so Workers can override to add a prefix.
         """
         if hasattr(args, 'logger'):
             # N.B. just for tests
@@ -136,7 +136,7 @@ class BaseRebalancer(object):
                             self.retries, use_replication_network=True,
                             global_conf={'log_name': log_name})
         yield ic
-        # we're done with the eventlet sillyness!
+        # we're done with the eventlet silliness!
         ic.app._pipeline_final_app.watchdog._run_gth.kill()
         eventlet.hubs.get_hub().abort(wait=True)
 
@@ -158,8 +158,8 @@ class RebalancerWorker(BaseRebalancer):
 
     def get_logger(self, args):
         logger = super(RebalancerWorker, self).get_logger(args)
-        worker_logger = PrefixLoggerAdapter(logger, {})
-        worker_logger.set_prefix('%s ' % _get_worker_prefix())
+        worker_logger = get_prefixed_logger(
+            logger, '%s ' % _get_worker_prefix())
         return worker_logger
 
     def _retry(self, func):

@@ -182,45 +182,6 @@ class DatabaseAuditor(Daemon):
         return dict(freelist_percent=freelist_percent,
                     freelist_size=freelist_size)
 
-    def generate_freepage_stats(self, broker):
-        """Generate and send freepage stats.
-
-        This calls into the broker to get free page information. So return
-        that information as a dict, so we don't have to bother the broker
-        again.
-        """
-        def get_size_bucket(number):
-            lower = 0
-            i = 1
-            in_mb = int(number / 1024 / 1024)
-            while True:
-                cur = pow(2, i)
-                if cur > in_mb:
-                    return lower, int(cur)
-                lower = cur
-                i += 1
-
-        def get_percent_bucket(number, increment):
-            return int(number / increment) * increment
-
-        freelist_size = broker.get_freelist_size()
-        lower, upper = get_size_bucket(freelist_size)
-        size_stat = "%s.freelist.size.%d-%dMB" % (
-            self.server_type, lower, upper - 1)
-        self.logger.increment(size_stat)
-
-        freelist_percent = broker.get_freelist_percent()
-        percent_increment = 10
-        percent_bucket = get_percent_bucket(
-            freelist_percent, percent_increment)
-        percent_stat = "%s.freelist.percent.%d-%d" % (
-            self.server_type, percent_bucket,
-            percent_bucket + (percent_increment - 1))
-        self.logger.increment(percent_stat)
-
-        return dict(freelist_percent=freelist_percent,
-                    freelist_size=freelist_size)
-
     def audit(self, path):
         """
         Audits the given database path
