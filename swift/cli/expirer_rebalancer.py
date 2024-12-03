@@ -28,7 +28,7 @@ from swift.common.direct_client import direct_put_container_object
 from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER
 from swift.common.utils.config import readconf, config_positive_int_value
-from swift.common.utils.logs import get_prefixed_logger
+from swift.common.utils import get_prefixed_logger
 from swift.common.utils.timestamp import Timestamp
 from swift.common.utils import (get_logger, eventlet_monkey_patch,
                                 distribute_evenly)

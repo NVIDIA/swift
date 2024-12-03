@@ -281,7 +281,23 @@ class DebugLogAdapter(utils.logs.SwiftLogAdapter):
 
 def debug_logger(name='test'):
     """get a named adapted debug logger"""
-    return DebugLogAdapter(DebugLogger(), name)
+    adapted_logger = DebugLogAdapter(DebugLogger(), name)
+    utils._patch_statsd_methods(adapted_logger, adapted_logger.logger)
+    return adapted_logger
+
+
+def debug_statsd_client(conf):
+    """get a configured statsd client"""
+    with mock.patch('swift.common.statsd_client.StatsdClient',
+                    FakeStatsdClient):
+        return statsd_client.get_statsd_client(conf)
+
+
+def debug_labeled_statsd_client(conf):
+    """get a configured labeled statsd client"""
+    with mock.patch('swift.common.statsd_client.LabeledStatsdClient',
+                    FakeLabeledStatsdClient):
+        return statsd_client.get_labeled_statsd_client(conf)
 
 
 def debug_statsd_client(conf):
@@ -350,7 +366,7 @@ def capture_logger(conf, *args, **kwargs):
     """
     with mock.patch('swift.common.utils.logs.SwiftLogAdapter',
                     CaptureLogAdapter):
-        log_adapter = utils.logs.get_logger(conf, *args, **kwargs)
+        log_adapter = utils.get_logger(conf, *args, **kwargs)
     log_adapter.start_capture()
     try:
         yield log_adapter

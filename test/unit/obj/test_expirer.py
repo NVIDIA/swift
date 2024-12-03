@@ -37,6 +37,10 @@ from test.debug_logger import debug_logger
 from test.unit import FakeRing, mocked_http_conn, make_timestamp_iter
 from test.unit.common.middleware.helpers import FakeSwift
 
+from test.debug_logger import debug_logger
+from test.unit import FakeRing, mocked_http_conn, make_timestamp_iter
+from test.unit.common.middleware.helpers import FakeSwift
+
 import mock
 import six
 from six.moves import urllib
