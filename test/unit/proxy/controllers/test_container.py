@@ -365,7 +365,7 @@ class TestContainerController(BaseTestContainerController):
 
     def test_response_codes_for_GET(self):
         nodes = self.app.container_ring.replicas
-        handoffs = self.app.request_node_count(nodes) - nodes
+        handoffs = self.app.request_node_count_fn(nodes) - nodes
         GET_TEST_CASES = [
             ([socket.error()] * (nodes + handoffs), 503),
             ([500] * (nodes + handoffs), 503),
@@ -417,7 +417,7 @@ class TestContainerController(BaseTestContainerController):
 
     def test_handoff_has_deleted_database(self):
         nodes = self.app.container_ring.replicas
-        handoffs = self.app.request_node_count(nodes) - nodes
+        handoffs = self.app.request_node_count_fn(nodes) - nodes
         status = [Timeout()] * nodes + [404] * handoffs
         timestamps = tuple([None] * nodes + ['1'] + [None] * (handoffs - 1))
         with mocked_http_conn(*status, timestamps=timestamps):

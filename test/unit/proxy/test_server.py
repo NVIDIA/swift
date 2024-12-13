@@ -1700,7 +1700,8 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         for policy, options in exp_options.items():
             for k, v in options.items():
                 actual = getattr(app.get_policy_options(policy), k)
-                if k == "write_affinity_node_count_fn":
+                if k in ("write_affinity_node_count_fn",
+                         "request_node_count_fn"):
                     if policy:  # this check only applies when using a policy
                         actual = actual(policy.object_ring.replica_count)
                         self.assertEqual(v, actual)
@@ -1749,20 +1750,23 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         write_affinity_node_count = 1 * replicas
         write_affinity_handoff_delete_count = 4
         rebalance_missing_suppression_count = 2
+        request_node_count = 3 * replicas
         """
         expected_default = {"read_affinity": "",
                             "sorting_method": "shuffle",
                             "write_affinity": "",
                             "write_affinity_node_count_fn": 6,
                             "write_affinity_handoff_delete_count": None,
-                            "rebalance_missing_suppression_count": 1}
+                            "rebalance_missing_suppression_count": 1,
+                            "request_node_count_fn": 6}
         exp_options = {None: expected_default,
                        POLICIES[0]: {"read_affinity": "r1=100",
                                      "sorting_method": "affinity",
                                      "write_affinity": "r1",
                                      "write_affinity_node_count_fn": 3,
                                      "write_affinity_handoff_delete_count": 4,
-                                     "rebalance_missing_suppression_count": 2},
+                                     "rebalance_missing_suppression_count": 2,
+                                     "request_node_count_fn": 9},
                        POLICIES[1]: expected_default}
         exp_is_local = {POLICIES[0]: [({'region': 1, 'zone': 2}, True),
                                       ({'region': 2, 'zone': 1}, False)],
@@ -1778,7 +1782,8 @@ class TestProxyServerConfigLoading(unittest.TestCase):
             "'write_affinity_handoff_delete_count': None, "
             "'rebalance_missing_suppression_count': 1, "
             "'concurrent_gets': False, 'concurrency_timeout': 0.5, "
-            "'concurrent_ec_extra_requests': 0"
+            "'concurrent_ec_extra_requests': 0, "
+            "'request_node_count': '2 * replicas'"
             "}, app)",
             repr(default_options))
         self.assertEqual(default_options, eval(repr(default_options), {
@@ -1792,7 +1797,8 @@ class TestProxyServerConfigLoading(unittest.TestCase):
             "'write_affinity_handoff_delete_count': 4, "
             "'rebalance_missing_suppression_count': 2, "
             "'concurrent_gets': False, 'concurrency_timeout': 0.5, "
-            "'concurrent_ec_extra_requests': 0"
+            "'concurrent_ec_extra_requests': 0, "
+            "'request_node_count': '3 * replicas'"
             "}, app)",
             repr(policy_0_options))
         self.assertEqual(policy_0_options, eval(repr(policy_0_options), {
@@ -1829,6 +1835,7 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         sorting_method = affinity
         write_affinity_node_count = 1 * replicas
         write_affinity_handoff_delete_count = 3
+        request_node_count = 1 * replicas
 
         [proxy-server:policy:0]
         read_affinity = r1=100
@@ -1838,7 +1845,8 @@ class TestProxyServerConfigLoading(unittest.TestCase):
                             "sorting_method": "affinity",
                             "write_affinity": "",
                             "write_affinity_node_count_fn": 3,
-                            "write_affinity_handoff_delete_count": 3}
+                            "write_affinity_handoff_delete_count": 3,
+                            "request_node_count_fn": 3}
         exp_options = {None: expected_default,
                        POLICIES[0]: {"read_affinity": "r1=100",
                                      "sorting_method": "affinity",
@@ -1920,11 +1928,30 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         app = self._write_conf_and_load_app(conf_sections)
         self._check_policy_options(app, exp_options, {})
 
+    def test_per_policy_conf_overrides_default_request_node_count(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        request_node_count = 1 * replicas
+
+        [proxy-server:policy:0]
+        request_node_count = 5
+
+        [proxy-server:policy:1]
+        request_node_count = 2 * replicas
+        """
+        exp_options = {None: {"request_node_count_fn": 3},
+                       POLICIES[0]: {"request_node_count_fn": 5},
+                       POLICIES[1]: {"request_node_count_fn": 6}}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, {})
+
     def test_per_policy_conf_with_DEFAULT_options(self):
         conf_body = """
         [DEFAULT]
         write_affinity = r0
         read_affinity = r0=100
+        request_node_count = 1 * replicas
         swift_dir = %s
 
         [pipeline:main]
@@ -1936,15 +1963,18 @@ class TestProxyServerConfigLoading(unittest.TestCase):
         write_affinity = r2
         # ...but the use of 'set' overrides the DEFAULT section value
         set read_affinity = r1=100
+        set request_node_count = 7
 
         [proxy-server:policy:0]
         # not a paste-deploy section so any value here overrides DEFAULT
         sorting_method = affinity
         write_affinity = r2
         read_affinity = r2=100
+        request_node_count = 2 * replicas
 
         [proxy-server:policy:1]
         sorting_method = affinity
+        request_node_count = 3 * replicas
         """ % self.tempdir
 
         # Don't just use _write_conf_and_load_app, as we don't want to have
@@ -1960,20 +1990,23 @@ class TestProxyServerConfigLoading(unittest.TestCase):
                    "sorting_method": "shuffle",
                    "write_affinity": "r0",
                    "write_affinity_node_count_fn": 6,
-                   "write_affinity_handoff_delete_count": None},
+                   "write_affinity_handoff_delete_count": None,
+                   "request_node_count_fn": 7},
             # policy 0 read affinity is r2, dictated by policy 0 section
             POLICIES[0]: {"read_affinity": "r2=100",
                           "sorting_method": "affinity",
                           "write_affinity": "r2",
                           "write_affinity_node_count_fn": 6,
-                          "write_affinity_handoff_delete_count": None},
+                          "write_affinity_handoff_delete_count": None,
+                          "request_node_count_fn": 6},
             # policy 1 read_affinity is r0, dictated by DEFAULT section,
             # overrides proxy server section
             POLICIES[1]: {"read_affinity": "r0=100",
                           "sorting_method": "affinity",
                           "write_affinity": "r0",
                           "write_affinity_node_count_fn": 6,
-                          "write_affinity_handoff_delete_count": None}}
+                          "write_affinity_handoff_delete_count": None,
+                          "request_node_count_fn": 9}}
         exp_is_local = {
             # default write_affinity is r0, dictated by DEFAULT section
             None: [({'region': 0, 'zone': 2}, True),
@@ -2228,6 +2261,35 @@ class TestProxyServerConfigLoading(unittest.TestCase):
 
         [proxy-server:policy:0]
         write_affinity_node_count = 2 * replicas
+        """
+        do_test(conf_sections, '(default)')
+
+    def test_per_policy_conf_invalid_request_node_count(self):
+        def do_test(conf_sections, label):
+            with self.assertRaises(ValueError) as cm:
+                self._write_conf_and_load_app(conf_sections)
+            self.assertIn('2* replicas', cm.exception.args[0])
+            self.assertIn('Invalid request_node_count value:',
+                          cm.exception.args[0])
+            self.assertIn(label, cm.exception.args[0])
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        request_node_count = 2 * replicas
+
+        [proxy-server:policy:0]
+        request_node_count = 2* replicas
+        """
+        do_test(conf_sections, 'policy 0 (nulo)')
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        request_node_count = 2* replicas
+
+        [proxy-server:policy:0]
+        request_node_count = 2 * replicas
         """
         do_test(conf_sections, '(default)')
 
@@ -6157,13 +6219,13 @@ class TestReplicatedObjectController(
         baseapp = proxy_server.Application({},
                                            container_ring=FakeRing(),
                                            account_ring=FakeRing())
-        self.assertEqual(6, baseapp.request_node_count(3))
+        self.assertEqual(6, baseapp.request_node_count_fn(3))
 
         def do_test(value, replicas, expected):
             baseapp = proxy_server.Application({'request_node_count': value},
                                                container_ring=FakeRing(),
                                                account_ring=FakeRing())
-            self.assertEqual(expected, baseapp.request_node_count(replicas))
+            self.assertEqual(expected, baseapp.request_node_count_fn(replicas))
 
         do_test('3', 4, 3)
         do_test('1 * replicas', 4, 4)
@@ -6194,7 +6256,7 @@ class TestReplicatedObjectController(
                 self.assertEqual(len(collected_nodes), 5)
 
                 object_ring.max_more_nodes = 6
-                self.app.request_node_count = lambda r: 20
+                self.app.request_node_count_fn = lambda r: 20
                 partition, nodes = object_ring.get_nodes('account',
                                                          'container',
                                                          'object')
@@ -6208,7 +6270,7 @@ class TestReplicatedObjectController(
                 # zero error-limited primary nodes -> no handoff warnings
                 self.app.log_handoffs = True
                 self.app.logger.clear()  # clean capture state
-                self.app.request_node_count = lambda r: 7
+                self.app.request_node_count_fn = lambda r: 7
                 object_ring.max_more_nodes = 20
                 partition, nodes = object_ring.get_nodes('account',
                                                          'container',
@@ -6226,7 +6288,7 @@ class TestReplicatedObjectController(
                 # one error-limited primary node -> one handoff warning
                 self.app.log_handoffs = True
                 self.app.logger.clear()  # clean capture state
-                self.app.request_node_count = lambda r: 7
+                self.app.request_node_count_fn = lambda r: 7
                 self.app.error_limiter.stats.clear()  # clear out errors
                 set_node_errors(self.app, object_ring._devs[0], 999,
                                 last_error=(2 ** 63 - 1))
@@ -6247,7 +6309,7 @@ class TestReplicatedObjectController(
                 # two error-limited primary nodes -> two handoff warnings
                 self.app.log_handoffs = True
                 self.app.logger.clear()  # clean capture state
-                self.app.request_node_count = lambda r: 7
+                self.app.request_node_count_fn = lambda r: 7
                 self.app.error_limiter.stats.clear()  # clear out errors
                 for i in range(2):
                     set_node_errors(self.app, object_ring._devs[i], 999,
@@ -6272,7 +6334,7 @@ class TestReplicatedObjectController(
                 # plus a handoff-all metric
                 self.app.log_handoffs = True
                 self.app.logger.clear()  # clean capture state
-                self.app.request_node_count = lambda r: 10
+                self.app.request_node_count_fn = lambda r: 10
                 object_ring.set_replicas(4)  # otherwise we run out of handoffs
                 self.app.error_limiter.stats.clear()  # clear out errors
                 for i in range(4):
@@ -6390,7 +6452,7 @@ class TestReplicatedObjectController(
         expected = [dict(n) for n in node_list]
         with mock.patch.object(self.app, 'sort_nodes',
                                lambda n, *args, **kwargs: n), \
-                mock.patch.object(self.app, 'request_node_count',
+                mock.patch.object(self.app, 'request_node_count_fn',
                                   lambda r: 3):
             got_nodes = list(proxy_base.NodeIter(
                 'object', self.app, object_ring, 0, self.logger,
@@ -6402,7 +6464,7 @@ class TestReplicatedObjectController(
                      for n in range(10)]
         with mock.patch.object(self.app, 'sort_nodes',
                                lambda n, *args, **kwargs: n), \
-                mock.patch.object(self.app, 'request_node_count',
+                mock.patch.object(self.app, 'request_node_count_fn',
                                   lambda r: 1000000):
             got_nodes = list(proxy_base.NodeIter(
                 'object', self.app, object_ring, 0, self.logger, req,
@@ -6418,7 +6480,7 @@ class TestReplicatedObjectController(
             '/v1/a/c', headers={'x-backend-use-replication-network': 'true'})
         with mock.patch.object(self.app, 'sort_nodes',
                                lambda n, *args, **kwargs: n), \
-                mock.patch.object(self.app, 'request_node_count',
+                mock.patch.object(self.app, 'request_node_count_fn',
                                   lambda r: 3):
             got_nodes = list(proxy_base.NodeIter(
                 'object', self.app, object_ring, 0, self.logger, req,
@@ -6430,7 +6492,7 @@ class TestReplicatedObjectController(
         expected = [dict(n, use_replication=False) for n in node_list]
         with mock.patch.object(self.app, 'sort_nodes',
                                lambda n, *args, **kwargs: n), \
-                mock.patch.object(self.app, 'request_node_count',
+                mock.patch.object(self.app, 'request_node_count_fn',
                                   lambda r: 13):
             got_nodes = list(proxy_base.NodeIter(
                 'object', self.app, object_ring, 0, self.logger, req,
