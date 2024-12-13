@@ -1467,7 +1467,9 @@ class TestFuncs(BaseTest):
         self.assertEqual(bytes_to_skip(97, 7873823), 55)
 
 
-@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
+@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing()),
+                 StoragePolicy(1, 'one', False, object_ring=FakeRing()),
+                 StoragePolicy(2, 'two', False, object_ring=FakeRing())])
 class TestNodeIter(BaseTest):
 
     def test_iter_default_fake_ring(self):
@@ -1597,6 +1599,59 @@ class TestNodeIter(BaseTest):
             self.assertIn('use_replication', node)
             self.assertFalse(node['use_replication'])
         self.assertEqual(other_iter, ring.get_part_nodes(0))
+
+    def test_iter_with_request_node_count(self):
+        # default is 2 * replica
+        # And no policy will use the proxy default
+        ring = FakeRing(replicas=8, max_more_nodes=20)
+        node_iter = NodeIter(
+            'container', self.app, ring, 0, self.logger,
+            request=Request.blank(''))
+        # 2 x replica default
+        self.assertEqual(len(list(node_iter)), 16)
+
+        # Let's make a proxy with overrides
+        proxy_conf = {
+            'request_node_count': '1 * replicas',
+            'policy_config':
+            {
+                '1': {'request_node_count': '3 * replicas'},
+                '2': {'request_node_count': '2'}}}
+
+        self.app = proxy_server.Application(proxy_conf,
+                                            logger=self.logger,
+                                            account_ring=self.account_ring,
+                                            container_ring=self.container_ring)
+
+        # no policy test 2, non-default global request_node_count (1 * replica)
+        node_iter = NodeIter(
+            'container', self.app, ring, 0, self.logger,
+            request=Request.blank(''))
+        # 1 x replica default
+        self.assertEqual(len(list(node_iter)), 8)
+
+        # now a policy that isn't overriden should be the same
+        policy = StoragePolicy(0, 'ec', object_ring=ring)
+        node_iter = NodeIter(
+            'object', self.app, policy.object_ring, 0, self.logger,
+            policy=policy, request=Request.blank(''))
+        # 1 x replica default
+        self.assertEqual(len(list(node_iter)), 8)
+
+        # Now let's try policies in which we do have policy overrides
+        policy = StoragePolicy(1, 'ec', object_ring=ring)
+        node_iter = NodeIter(
+            'object', self.app, policy.object_ring, 0, self.logger,
+            policy=policy, request=Request.blank(''))
+        # 3 x replica default
+        self.assertEqual(len(list(node_iter)), 24)
+
+        policy = StoragePolicy(2, 'ec', object_ring=ring)
+        node_iter = NodeIter(
+            'object', self.app, policy.object_ring, 0, self.logger,
+            policy=policy, request=Request.blank(''))
+        # just 2
+        self.assertEqual(len(list(node_iter)), 2)
 
 
 class TestGetterSource(unittest.TestCase):
