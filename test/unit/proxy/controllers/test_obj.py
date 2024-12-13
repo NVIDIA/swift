@@ -273,7 +273,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         # artificially by the proxy max request node count
         object_ring.max_more_nodes = 100000
         # nothing magic about * 2 + 3, just a way to make it bigger
-        self.app.request_node_count = lambda r: r * 2 + 3
+        self.app.request_node_count_fn = lambda r: r * 2 + 3
 
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
@@ -281,7 +281,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             node['use_replication'] = False
 
         # limit to the number we're going to look at in this request
-        nodes_requested = self.app.request_node_count(object_ring.replicas)
+        nodes_requested = self.app.request_node_count_fn(object_ring.replicas)
         all_nodes = all_nodes[:nodes_requested]
 
         # make sure we have enough local nodes (sanity)
@@ -1119,7 +1119,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         req = swob.Request.blank('/v1/a/c/o', method='HEAD',
                                  headers={'X-Newest': 'true'})
         ts = (utils.Timestamp(t) for t in itertools.count(int(time.time())))
-        request_count = self.app.request_node_count(self.obj_ring.replicas)
+        request_count = self.app.request_node_count_fn(self.obj_ring.replicas)
         backend_response_headers = [{
             'x-timestamp': next(ts).normal,
         } for i in range(request_count)]
