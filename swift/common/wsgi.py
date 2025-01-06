@@ -640,6 +640,7 @@ class StrategyBase(object):
                 self.logger.error(
                     'Invalid worker state received; '
                     'error reading old pids: %s', err)
+            self.logger.debug('Received old worker pids: %s', old_pids)
             self.reload_pids.update(old_pids)
 
             def smother(old_pids=old_pids, timeout=self.stale_worker_timeout):
@@ -660,6 +661,8 @@ class StrategyBase(object):
                                               "for stale pid %d: %s", pid, e)
                         continue
                     if ppid == own_pid:
+                        self.logger.notice("Killing long-running stale worker "
+                                           "%d after %ds", pid, int(timeout))
                         try:
                             os.kill(pid, signal.SIGKILL)
                         except OSError as e:
@@ -1180,7 +1183,7 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
                 # See https://www.python.org/dev/peps/pep-0446/
                 os.set_inheritable(write_fd, True)
                 os.set_inheritable(state_rfd, True)
-            os.execv(myself, sys.argv)
+            os.execv(myself, sys.argv)  # nosec B606
             logger.error('Somehow lived past os.execv()?!')
             exit('Somehow lived past os.execv()?!')
         elif child_pid == 0:

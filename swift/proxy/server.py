@@ -139,19 +139,15 @@ class ProxyOverrideOptions(object):
             raise ValueError("Invalid write_affinity value: %r (%s)" %
                              (self.write_affinity, err.args[0]))
         self.write_affinity_node_count = get(
-            'write_affinity_node_count', '2 * replicas').lower()
-        value = self.write_affinity_node_count.split()
-        if len(value) == 1:
-            wanc_value = int(value[0])
-            self.write_affinity_node_count_fn = lambda replicas: wanc_value
-        elif len(value) == 3 and value[1] == '*' and value[2] == 'replicas':
-            wanc_value = int(value[0])
+            'write_affinity_node_count', '2 * replicas')
+        try:
             self.write_affinity_node_count_fn = \
-                lambda replicas: wanc_value * replicas
-        else:
+                config_request_node_count_value(
+                    self.write_affinity_node_count)
+        except ValueError:
             raise ValueError(
                 'Invalid write_affinity_node_count value: %r' %
-                (' '.join(value)))
+                self.write_affinity_node_count)
 
         self.write_affinity_handoff_delete_count = config_auto_int_value(
             get('write_affinity_handoff_delete_count', 'auto'), None
@@ -164,6 +160,9 @@ class ProxyOverrideOptions(object):
             'concurrency_timeout', app.conn_timeout))
         self.concurrent_ec_extra_requests = int(get(
             'concurrent_ec_extra_requests', 0))
+        self.request_node_count = get('request_node_count', '2 * replicas')
+        self.request_node_count_fn = config_request_node_count_value(
+            self.request_node_count)
 
     def __repr__(self):
         return '%s({}, {%s}, app)' % (
@@ -178,6 +177,7 @@ class ProxyOverrideOptions(object):
                     'concurrent_gets',
                     'concurrency_timeout',
                     'concurrent_ec_extra_requests',
+                    'request_node_count',
                 )))
 
     def __eq__(self, other):
@@ -193,6 +193,7 @@ class ProxyOverrideOptions(object):
             'concurrent_gets',
             'concurrency_timeout',
             'concurrent_ec_extra_requests',
+            'request_node_count',
         ))
 
 
@@ -304,8 +305,6 @@ class Application(object):
             conf.get('allow_open_expired', 'f'))
         self.node_timings = {}
         self.timing_expiry = int(conf.get('timing_expiry', 300))
-        value = conf.get('request_node_count', '2 * replicas')
-        self.request_node_count = config_request_node_count_value(value)
         # swift_owner_headers are stripped by the account and container
         # controllers; we should extend header stripping to object controller
         # when a privileged object header is implemented.
@@ -358,6 +357,10 @@ class Application(object):
         self._override_options = self._load_per_policy_config(conf)
         self.sorts_by_timing = any(pc.sorting_method == 'timing'
                                    for pc in self._override_options.values())
+        self.request_node_count = conf.get(
+            'request_node_count', '2 * replicas')
+        self.request_node_count_fn = config_request_node_count_value(
+            self.request_node_count)
 
         register_swift_info(
             version=swift_version,

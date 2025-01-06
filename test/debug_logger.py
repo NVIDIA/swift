@@ -300,20 +300,6 @@ def debug_labeled_statsd_client(conf):
         return statsd_client.get_labeled_statsd_client(conf)
 
 
-def debug_statsd_client(conf):
-    """get a configured statsd client"""
-    with mock.patch('swift.common.statsd_client.StatsdClient',
-                    FakeStatsdClient):
-        return statsd_client.get_statsd_client(conf)
-
-
-def debug_labeled_statsd_client(conf):
-    """get a configured labeled statsd client"""
-    with mock.patch('swift.common.statsd_client.LabeledStatsdClient',
-                    FakeLabeledStatsdClient):
-        return statsd_client.get_labeled_statsd_client(conf)
-
-
 class ForwardingLogHandler(logging.NullHandler):
     """
     Provides a LogHandler implementation that simply forwards filtered records

@@ -2891,30 +2891,8 @@ cluster_dfw1 = http://dfw1.host/v1/
 
             with utils.NotificationServer(os.getpid(), 1) as swift_listener:
                 do_test_real_socket('\0foobar', '@foobar')
-                self.assertEqual(swift_listener.recv_from_pid(1024),
+                self.assertEqual(swift_listener.receive(),
                                  b'READY=1')
-
-    def test_notification_server_recv_from_bad_pid(self):
-        if six.PY2:
-            raise unittest.SkipTest("py2 doesn't know how to check ancdata")
-
-        class TestServer(utils.NotificationServer):
-            def __init__(self):
-                super(TestServer, self).__init__(os.getpid() + 1, 0.1)
-                self.discarded = False
-
-            def discard_handler(self, *args):
-                self.discarded = True
-
-        with TestServer() as swift_listener:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            sock.settimeout(5)
-            sock.connect('\0swift-notifications\0%d' % (os.getpid() + 1))
-            sock.sendall(b'the message')
-            self.assertFalse(swift_listener.discarded)
-            with self.assertRaises(socket.timeout):
-                swift_listener.recv_from_pid(1024)
-            self.assertTrue(swift_listener.discarded)
 
     def test_md5_with_data(self):
         if not self.fips_enabled:

@@ -1863,12 +1863,16 @@ class NodeIter(object):
         self.logger = logger
         self.request = request
 
+        req_node_count_fn = self.app.request_node_count_fn
+        if policy:
+            policy_options = self.app.get_policy_options(policy)
+            req_node_count_fn = policy_options.request_node_count_fn
         part_nodes = ring.get_part_nodes(partition)
         if node_iter is None:
             node_iter = itertools.chain(
                 part_nodes, ring.get_more_nodes(partition))
         self.num_primary_nodes = len(part_nodes)
-        self.nodes_left = self.app.request_node_count(self.num_primary_nodes)
+        self.nodes_left = req_node_count_fn(self.num_primary_nodes)
         self.expected_handoffs = self.nodes_left - self.num_primary_nodes
 
         # Use of list() here forcibly yanks the first N nodes (the primary

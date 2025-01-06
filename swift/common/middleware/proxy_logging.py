@@ -349,22 +349,21 @@ class ProxyLoggingMiddleware(object):
         labels = self.statsd_metric_labels(
             req, method, status_int=status_int,
             acc=acc, cont=cont, policy_index=policy_index)
-        if labels is not None:
-            self.statsd.timing(
-                'swift_proxy_request_timing',
-                (end_time - start_time) * 1000,
-                labels=labels,
-            )
-            self.statsd.update_stats(
-                'swift_proxy_request_body_bytes',
-                bytes_received,
-                labels=labels,
-            )
-            self.statsd.update_stats(
-                'swift_proxy_response_body_bytes',
-                bytes_sent,
-                labels=labels,
-            )
+        self.statsd.timing(
+            'swift_proxy_request_timing',
+            (end_time - start_time) * 1000,
+            labels=labels,
+        )
+        self.statsd.update_stats(
+            'swift_proxy_request_body_bytes',
+            bytes_received,
+            labels=labels,
+        )
+        self.statsd.update_stats(
+            'swift_proxy_response_body_bytes',
+            bytes_sent,
+            labels=labels,
+        )
 
     def get_aco_from_path(self, swift_path):
         try:
@@ -412,8 +411,6 @@ class ProxyLoggingMiddleware(object):
     def statsd_metric_labels(self, req, method, status_int=None,
                              acc=None, cont=None, policy_index=None):
         server_type = self.get_metric_name_type(req)
-        if server_type is None:
-            return None
 
         labels = {
             'type': server_type,
@@ -503,12 +500,11 @@ class ProxyLoggingMiddleware(object):
                     self.access_logger.timing(
                         metric_name_policy + '.first-byte.timing', ttfb * 1000)
 
-                if labels is not None:
-                    self.statsd.timing(
-                        'swift_proxy_request_ttfb',
-                        ttfb * 1000,
-                        labels=labels,
-                    )
+                self.statsd.timing(
+                    'swift_proxy_request_ttfb',
+                    ttfb * 1000,
+                    labels=labels,
+                )
 
             bytes_sent = 0
             try:

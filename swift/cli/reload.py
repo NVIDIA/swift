@@ -104,39 +104,33 @@ def main(args=None):
 
     if args.wait:
         try:
-            notification_server = ReloadNotificationServer(
-                args.pid, args.timeout)
+            with NotificationServer(args.pid, args.timeout) as notifications:
+                if args.verbose:
+                    print("Sending USR1 signal")
+                os.kill(args.pid, signal.SIGUSR1)
+
+                try:
+                    ready = False
+                    while not ready:
+                        data = notifications.receive()
+                        for data in data.split(b"\n"):
+                            if args.verbose:
+                                if data in (b"READY=1", b"RELOADING=1",
+                                            b"STOPPING=1"):
+                                    print("Process is %s" %
+                                          data.decode("ascii")[:-2])
+                                else:
+                                    print("Received notification %r" % data)
+
+                            if data == b"READY=1":
+                                ready = True
+                except socket.timeout:
+                    print("Timed out reloading %s" % script, file=sys.stderr)
+                    exit(EXIT_RELOAD_TIMEOUT)
         except OSError as e:
             print("Could not bind notification socket: %s" % e,
                   file=sys.stderr)
             exit(EXIT_RELOAD_FAILED)
-
-        with notification_server:
-            if args.verbose:
-                print("Sending USR1 signal")
-            os.kill(args.pid, signal.SIGUSR1)
-
-            try:
-                ready = False
-                while not ready:
-                    data = notification_server.recv_from_pid(1024)
-                    for data in data.split(b"\n"):
-                        if args.verbose:
-                            if data in (b"READY=1", b"RELOADING=1",
-                                        b"STOPPING=1"):
-                                print("Process is %s" %
-                                      data.decode("ascii")[:-2])
-                            elif data.startswith(b"STATUS="):
-                                print("Status: %s" %
-                                      data.decode("utf8").partition("=")[-1])
-                            else:
-                                print("Received notification %r" % data)
-
-                        if data == b"READY=1":
-                            ready = True
-            except socket.timeout:
-                print("Timed out reloading %s" % script, file=sys.stderr)
-                exit(EXIT_RELOAD_TIMEOUT)
     else:  # --no-wait
         if args.verbose:
             print("Sending USR1 signal")

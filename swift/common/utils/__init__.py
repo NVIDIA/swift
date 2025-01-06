@@ -3030,7 +3030,7 @@ def friendly_close(resp):
     return drain_and_close(resp, read_limit=DEFAULT_DRAIN_LIMIT)
 
 
-_rfc_token = r'[^()<>@,;:\"/\[\]?={}\x00-\x20\x7f]+'
+_rfc_token = r'[^()<>@,;:\"/\[\]?={}\x00-\x20\x7f]+'  # nosec B105
 _rfc_extension_pattern = re.compile(
     r'(?:\s*;\s*(' + _rfc_token + r")\s*(?:=\s*(" + _rfc_token +
     r'|"(?:[^"\\]|\\.)*"))?)')
@@ -5098,48 +5098,8 @@ class NotificationServer(object):
         self.read_timeout = read_timeout
         self.sock = None
 
-    def discard_handler(self, data, ancdata, flags, addr):
-        '''
-        Extension point for subclasses to handle unexpected ancillary data
-        '''
-        pass
-
-    def recv_from_pid(self, bufsize):
-        start = time.time()
-        while True:
-            if time.time() - start >= self.sock.gettimeout():
-                raise socket.timeout
-            if six.PY2:
-                # socket.recvmsg is only available on py3, so skip the
-                # pid-checking protections
-                return self.sock.recv(self.RECV_SIZE)
-
-            try:
-                data, ancdata, flags, addr = self.sock.recvmsg(
-                    self.RECV_SIZE, socket.CMSG_LEN(struct.calcsize("3i")))
-            except OSError as e:
-                if e.errno == errno.EAGAIN:
-                    time.sleep(0.1)
-                    continue
-                raise
-
-            if len(ancdata) != 1:
-                self.discard_handler(data, ancdata, flags, addr)
-                continue
-
-            cmsg_level, cmsg_type, cmsg_data = ancdata[0]
-            if (cmsg_level, cmsg_type, len(cmsg_data)) != (
-                    socket.SOL_SOCKET, socket.SCM_CREDENTIALS,
-                    struct.calcsize("3i")):
-                self.discard_handler(data, ancdata, flags, addr)
-                continue
-
-            pid, uid, gid = struct.unpack("3i", cmsg_data)
-            if pid != self.pid:
-                self.discard_handler(data, ancdata, flags, addr)
-                continue
-
-            return data
+    def receive(self):
+        return self.sock.recv(self.RECV_SIZE)
 
     def close(self):
         self.sock.close()
@@ -5154,17 +5114,14 @@ class NotificationServer(object):
         try:
             self.sock.bind(get_pid_notify_socket(self.pid))
             self.sock.settimeout(self.read_timeout)
-            if not six.PY2:
-                # Only py3 has recvmsg, so only py3 gets source-pid checking,
-                # so only py3 needs SO_PASSCRED
-                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
             started = True
         finally:
             if not started:
                 self.close()
 
     def __enter__(self):
-        self.start()
+        if self.sock is None:
+            self.start()
         return self
 
     def __exit__(self, *args):
@@ -5190,7 +5147,6 @@ def systemd_notify(logger=None, msg=b"READY=1"):
        READY=1
        RELOADING=1
        STOPPING=1
-       STATUS=<some string>
 
     :param logger: a logger object
     :param msg: the message to send

@@ -124,7 +124,7 @@ class TestMain(unittest.TestCase):
         self.mock_validate = patcher.start()
         self.addCleanup(patcher.stop)
 
-        patcher = mock.patch.object(reload, 'ReloadNotificationServer')
+        patcher = mock.patch.object(reload, 'NotificationServer')
         self.mock_notify_server = patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -140,11 +140,11 @@ class TestMain(unittest.TestCase):
             ],
             'swift-proxy-server',
         )
-        self.mock_notify_server.return_value.recv_from_pid.side_effect = [
+        self.mock_notify_server().__enter__().receive.side_effect = [
             b'RELOADING=1',
             b'READY=1',
         ]
-        self.assertIsNone(reload.main(['123']))
+        self.assertIsNone(reload.main(['123', '-v']))
         self.assertEqual(self.mock_check_call.mock_calls, [mock.call([
             '/usr/bin/swift-proxy-server',
             '/etc/swift/proxy-server.conf',
@@ -164,7 +164,7 @@ class TestMain(unittest.TestCase):
             ],
             'swift-proxy-server',
         )
-        self.mock_notify_server.return_value.recv_from_pid.side_effect = [
+        self.mock_notify_server().__enter__().receive.side_effect = [
             b'RELOADING=1',
             socket.timeout,
         ]
