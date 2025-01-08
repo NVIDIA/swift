@@ -943,6 +943,50 @@ class TestInternalClient(unittest.TestCase):
         self.assertEqual(exp_metadata, metadata)
         self.assertEqual(1, client.make_request_called)
 
+    def test_get_nonascii_metadata(self):
+        class Response(object):
+            def __init__(self, headers):
+                self.headers = headers
+                self.status_int = 200
+
+        class InternalClient(internal_client.InternalClient):
+            def __init__(self, test, path, resp_headers):
+                self.test = test
+                self.path = path
+                self.resp_headers = resp_headers
+                self.make_request_called = 0
+
+            def make_request(
+                    self, method, path, headers, acceptable_statuses,
+                    body_file=None, params=None):
+                self.make_request_called += 1
+                self.test.assertEqual('HEAD', method)
+                self.test.assertEqual(self.path, path)
+                self.test.assertEqual((2,), acceptable_statuses)
+                self.test.assertIsNone(body_file)
+                return Response(self.resp_headers)
+
+        path = 'some_path'
+        metadata_prefix = swob.str_to_wsgi('\N{SNOWMAN}-')
+        resp_headers = {
+            metadata_prefix + swob.str_to_wsgi('\N{SNOWFLAKE}'): '1',
+            metadata_prefix + swob.str_to_wsgi(
+                '\N{LATIN SMALL LETTER E WITH ACUTE}'): '2',
+            '%sThree' % (metadata_prefix): '3',
+            'some_header-four': '4',
+            'Some_header-five': '5',
+        }
+        exp_metadata = {
+            swob.str_to_wsgi('\N{SNOWFLAKE}'): '1',
+            swob.str_to_wsgi('\N{LATIN SMALL LETTER E WITH ACUTE}'): '2',
+            'three': '3',
+        }
+
+        client = InternalClient(self, path, resp_headers)
+        metadata = client._get_metadata(path, metadata_prefix)
+        self.assertEqual(exp_metadata, metadata)
+        self.assertEqual(1, client.make_request_called)
+
     def test_get_metadata_invalid_status(self):
 
         class FakeApp(FakeSwift):
