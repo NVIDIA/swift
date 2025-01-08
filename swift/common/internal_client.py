@@ -291,11 +291,13 @@ class InternalClient(object):
         headers = headers or {}
         resp = self.make_request('HEAD', path, headers, acceptable_statuses,
                                  params=params)
-        metadata_prefix = metadata_prefix.lower()
+        metadata_prefix = metadata_prefix.encode(
+            'latin1').lower().decode('latin1')
         metadata = {}
         for k, v in resp.headers.items():
-            if k.lower().startswith(metadata_prefix):
-                metadata[k[len(metadata_prefix):].lower()] = v
+            lkey = k.encode('latin1').lower().decode('latin1')
+            if lkey.startswith(metadata_prefix):
+                metadata[lkey[len(metadata_prefix):]] = v
         return metadata
 
     def _iter_items(
