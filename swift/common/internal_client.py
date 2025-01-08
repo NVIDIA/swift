@@ -295,7 +295,9 @@ class InternalClient(object):
         metadata = {}
         for k, v in resp.headers.items():
             if k.lower().startswith(metadata_prefix):
-                metadata[k[len(metadata_prefix):].lower()] = v
+                lkey = k[len(metadata_prefix):].encode(
+                    'latin1').lower().decode('latin1')
+                metadata[lkey] = v
         return metadata
 
     def _iter_items(
