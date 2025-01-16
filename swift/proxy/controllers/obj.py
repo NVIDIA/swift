@@ -308,7 +308,6 @@ class BaseObjectController(Controller):
         policy_index = req.headers.get('X-Backend-Storage-Policy-Index',
                                        container_info['storage_policy'])
         policy = POLICIES.get_by_index(policy_index)
-        obj_ring = self.app.get_object_ring(policy_index)
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
         if is_open_expired(self.app, req):
             req.headers['X-Backend-Open-Expired'] = 'true'
@@ -316,13 +315,8 @@ class BaseObjectController(Controller):
             aresp = req.environ['swift.authorize'](req)
             if aresp:
                 return aresp
-        partition = obj_ring.get_part(
-            self.account_name, self.container_name, self.object_name)
-        node_iter = NodeIter(
-            'object', self.app, obj_ring, partition, self.logger, req,
-            policy=policy)
 
-        resp = self._get_or_head_response(req, node_iter, partition, policy)
+        resp = self._get_or_head_response(req, policy)
 
         if ';' in resp.headers.get('content-type', ''):
             resp.content_type = clean_content_type(
@@ -1089,7 +1083,15 @@ class BaseObjectController(Controller):
 @ObjectControllerRouter.register(REPL_POLICY)
 class ReplicatedObjectController(BaseObjectController):
 
-    def _get_or_head_response(self, req, node_iter, partition, policy):
+    def _get_or_head_response(self, req, policy):
+        """
+        Replicated GETorHEAD concurrency/node_iter handling
+        """
+        partition = policy.object_ring.get_part(
+            self.account_name, self.container_name, self.object_name)
+        node_iter = NodeIter(
+            'object', self.app, policy.object_ring, partition, self.logger,
+            req, policy=policy)
         concurrency = self.app.get_object_ring(policy.idx).replica_count \
             if self.app.get_policy_options(policy).concurrent_gets else 1
         resp = self.GETorHEAD_base(
@@ -2956,15 +2958,38 @@ class ECObjectController(BaseObjectController):
                 # got a stop
                 break
 
-    def _get_or_head_response(self, req, node_iter, partition, policy):
+    def _get_or_head_response(self, req, policy):
+        """
+        EC GETorHEAD concurrency/node_iter handling
+        """
+        partition = policy.object_ring.get_part(
+            self.account_name, self.container_name, self.object_name)
         update_etag_is_at_header(req, "X-Object-Sysmeta-Ec-Etag")
 
         if req.method == 'HEAD':
             # no fancy EC decoding here, just one plain old HEAD request to
             # one object server because all fragments hold all metadata
             # information about the object.
+            policy_options = self.app.get_policy_options(policy)
             concurrency = policy.ec_ndata \
-                if self.app.get_policy_options(policy).concurrent_gets else 1
+                if policy_options.concurrent_gets else 1
+
+            # AFAICT this is the best way to build a normal node_iter limited
+            # by the ec_head_node_count
+            part_nodes = policy.object_ring.get_part_nodes(partition)
+            node_chain = itertools.chain(
+                part_nodes, policy.object_ring.get_more_nodes(partition))
+            # policy.object_ring.replica_count is a float, and real rings don't
+            # have a replicas attribute, so we use len(part_nodes) to keep the
+            # node_count_fn from returning a value that will blow-up
+            # itertools.islice
+            node_count = policy_options.ec_head_node_count_fn(len(part_nodes))
+            head_nodes = itertools.islice(node_chain, node_count)
+            # N.B. GetOrHeadHandler will wrap GreenthreadSafeIterator for us
+            node_iter = NodeIter(
+                'object', self.app, policy.object_ring, partition, self.logger,
+                req, policy=policy, node_iter=head_nodes)
+
             resp = self.GETorHEAD_base(
                 req, 'Object', node_iter, partition,
                 req.swift_entity_path, concurrency, policy)
@@ -2972,6 +2997,9 @@ class ECObjectController(BaseObjectController):
             return resp
 
         # GET request
+        node_iter = NodeIter(
+            'object', self.app, policy.object_ring, partition, self.logger,
+            req, policy=policy)
         orig_range = None
         range_specs = []
         if req.range:
