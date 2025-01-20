@@ -35,6 +35,7 @@ from swift.common import exceptions
 from swift.common.ring import RingBuilder, Ring, RingData
 from swift.common.ring.builder import MAX_BALANCE
 from swift.common.ring.composite_builder import CompositeRingBuilder
+from swift.common.ring.io import RingReader
 from swift.common.ring.ring import RING_CODECS, DEFAULT_RING_FORMAT_VERSION
 from swift.common.ring.utils import validate_args, \
     validate_and_normalize_ip, build_dev_from_opts, \
@@ -661,6 +662,32 @@ swift-ring-builder <builder_file>
 
         if ring_empty_error:
             print(ring_empty_error)
+        exit(EXIT_SUCCESS)
+
+    @staticmethod
+    def version():
+        """
+swift-ring-builder <ring_file> version
+        """
+        if len(argv) < 3:
+            print(Commands.create.__doc__.strip())
+            exit(EXIT_ERROR)
+        try:
+            reader = RingReader(open(argv[1], 'br'))
+            serialization_version = reader.version
+            deserialize = (RingData.deserialize_v1
+                           if serialization_version == 1 else
+                           RingData.deserialize_v2)
+            ring = deserialize(reader, metadata_only=True)
+            version = ring['version']
+        except ValueError as e:
+            print(e)
+            exit(EXIT_ERROR)
+        finally:
+            if reader:
+                reader.close()
+        print('%s: Serialization version: %d, build version: %d' %
+              (argv[1], serialization_version, version))
         exit(EXIT_SUCCESS)
 
     @staticmethod
@@ -1691,8 +1718,11 @@ def main(arguments=None):
 
     builder_file, ring_file = parse_builder_ring_filename_args(argv)
     if builder_file != argv[1]:
-        print('Note: using %s instead of %s as builder file' % (
-              builder_file, argv[1]))
+        if len(argv) > 2 and argv[2] in ('write_buider', 'version'):
+            pass
+        else:
+            print('Note: using %s instead of %s as builder file' % (
+                builder_file, argv[1]))
 
     try:
         builder = RingBuilder.load(builder_file)
@@ -1706,7 +1736,8 @@ def main(arguments=None):
         print(msg)
         exit(EXIT_ERROR)
     except (exceptions.FileNotFoundError, exceptions.PermissionError) as e:
-        if len(argv) < 3 or argv[2] not in ('create', 'write_builder'):
+        if len(argv) < 3 or argv[2] not in ('create', 'write_builder',
+                                            'version'):
             print(e)
             exit(EXIT_ERROR)
     except Exception as e:
