@@ -40,6 +40,9 @@ class GzipReader(object):
         self.fp = fileobj
         self.reset_decompressor()
 
+    def close(self):
+        self.fp.close()
+
     def reset_decompressor(self):
         self.pos = self.fp.tell()
         if self.pos == 0:

@@ -2675,6 +2675,63 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         argv = ["", self.tmpfile + '.builder', "rebalance"]
         self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
 
+    def test_version_serialization_default(self):
+        self.create_sample_ring()
+        rb = RingBuilder.load(self.tmpfile)
+        rb.rebalance()
+        rd = rb.get_ring()
+        rd.save(self.tmpfile + ".ring.gz")
+
+        ring_file = os.path.join(os.path.dirname(self.tmpfile),
+                                 os.path.basename(self.tmpfile) + ".ring.gz")
+
+        argv = ["", ring_file, "version"]
+        mock_stdout = io.StringIO()
+        with mock.patch("sys.stdout", mock_stdout):
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        expected = ("%s.ring.gz: Serialization version: 1, "
+                    "build version: 5\n" % self.tmpfile)
+        self.assertEqual(expected, mock_stdout.getvalue())
+
+    def test_version_serialization_1(self):
+        self.create_sample_ring()
+        rb = RingBuilder.load(self.tmpfile)
+        rb.rebalance()
+        rd = rb.get_ring()
+        rd.save(self.tmpfile + ".ring.gz", format_version=1)
+
+        ring_file = os.path.join(os.path.dirname(self.tmpfile),
+                                 os.path.basename(self.tmpfile) + ".ring.gz")
+
+        argv = ["", ring_file, "version"]
+        mock_stdout = io.StringIO()
+        with mock.patch("sys.stdout", mock_stdout):
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        expected = ("%s.ring.gz: Serialization version: 1, "
+                    "build version: 5\n" % self.tmpfile)
+        self.assertEqual(expected, mock_stdout.getvalue())
+
+    def test_version_serialization_2(self):
+        self.create_sample_ring()
+        rb = RingBuilder.load(self.tmpfile)
+        rb.rebalance()
+        rd = rb.get_ring()
+        rd.save(self.tmpfile + ".ring.gz", format_version=2)
+
+        ring_file = os.path.join(os.path.dirname(self.tmpfile),
+                                 os.path.basename(self.tmpfile) + ".ring.gz")
+
+        argv = ["", ring_file, "version"]
+        mock_stdout = io.StringIO()
+        with mock.patch("sys.stdout", mock_stdout):
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        expected = ("%s.ring.gz: Serialization version: 2, "
+                    "build version: 5\n" % self.tmpfile)
+        self.assertEqual(expected, mock_stdout.getvalue())
+
     def test_warn_at_risk(self):
         # check that warning is generated when rebalance does not achieve
         # satisfactory balance
