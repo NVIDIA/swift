@@ -1821,6 +1821,11 @@ class RingBuilder(object):
         if self._id is None:
             id_persisted = False
             self._id = uuid.uuid4().hex
+        # For backwards compatiblity for builders only, store the
+        # _replica2part2dev as 2 bytes minimum. This makes it easier for
+        # pre-v2 swift code to still use small builders (like a SAIO).
+        if self.dev_id_bytes < 2:
+            self.set_dev_id_bytes(2)
         try:
             with open(builder_file, 'wb') as f:
                 pickle.dump(self.to_dict(), f, protocol=2)
