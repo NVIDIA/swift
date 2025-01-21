@@ -2055,12 +2055,22 @@ class TestRingBuilder(unittest.TestCase):
         for d in devs:
             rb.add_dev(d)
         rb.rebalance()
+        # There are so few devs,we'll be currently storing them in 1 byte
+        # dev ids.
+        self.assertEqual(rb.dev_id_bytes, 1)
+        self.assertEqual(rb._replica2part2dev[0].itemsize, 1)
         builder_file = os.path.join(self.testdir, 'test_save.builder')
         rb.save(builder_file)
+        # When we save the rb if the dev_id_bytes is < 2, we write it out to
+        # disk as 2 byte arrays (H) for backwards compatibility
+        self.assertEqual(rb.dev_id_bytes, 2)
+        self.assertEqual(rb._replica2part2dev[0].itemsize, 2)
         loaded_rb = ring.RingBuilder.load(builder_file)
         self.maxDiff = None
         self.assertEqual(loaded_rb.to_dict(), rb.to_dict())
         self.assertEqual(loaded_rb.overload, 3.14159)
+        self.assertEqual(loaded_rb.dev_id_bytes, 2)
+        self.assertEqual(loaded_rb._replica2part2dev[0].itemsize, 2)
 
     @mock.patch('builtins.open', autospec=True)
     @mock.patch('swift.common.ring.builder.pickle.dump', autospec=True)
