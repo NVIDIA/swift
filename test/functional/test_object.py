@@ -23,9 +23,6 @@ import time
 from unittest import SkipTest
 from xml.dom import minidom
 
-import six
-from six.moves import range
-
 from swift.common.header_key_dict import HeaderKeyDict
 from test.functional import check_response, retry, requires_acls, \
     requires_policies, requires_bulk
@@ -111,11 +108,7 @@ class TestObject(unittest.TestCase):
 
         # delete an object
         def delete(url, token, parsed, conn, container, obj):
-            if six.PY2:
-                obj_name = obj['name'].encode('utf8')
-            else:
-                obj_name = obj['name']
-            path = '/'.join([parsed.path, container, obj_name])
+            path = '/'.join([parsed.path, container, obj['name']])
             conn.request('DELETE', path, '', {'X-Auth-Token': token})
             return check_response(conn)
 
@@ -1263,9 +1256,7 @@ class TestObject(unittest.TestCase):
 
         # can list objects
         resp = retry(get_listing, use_account=3)
-        listing = resp.read()
-        if not six.PY2:
-            listing = listing.decode('utf8')
+        listing = resp.read().decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(self.obj, listing.split('\n'))
 
@@ -1288,9 +1279,7 @@ class TestObject(unittest.TestCase):
 
         # sanity with account1
         resp = retry(get_listing, use_account=3)
-        listing = resp.read()
-        if not six.PY2:
-            listing = listing.decode('utf8')
+        listing = resp.read().decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertNotIn(obj_name, listing.split('\n'))
         self.assertIn(self.obj, listing.split('\n'))
@@ -1348,9 +1337,7 @@ class TestObject(unittest.TestCase):
 
         # can list objects
         resp = retry(get_listing, use_account=3)
-        listing = resp.read()
-        if not six.PY2:
-            listing = listing.decode('utf8')
+        listing = resp.read().decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(self.obj, listing.split('\n'))
 
@@ -1373,9 +1360,7 @@ class TestObject(unittest.TestCase):
 
         # sanity with account1
         resp = retry(get_listing, use_account=3)
-        listing = resp.read()
-        if not six.PY2:
-            listing = listing.decode('utf8')
+        listing = resp.read().decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(obj_name, listing.split('\n'))
         self.assertNotIn(self.obj, listing.split('\n'))
@@ -1433,9 +1418,7 @@ class TestObject(unittest.TestCase):
 
         # can list objects
         resp = retry(get_listing, use_account=3)
-        listing = resp.read()
-        if not six.PY2:
-            listing = listing.decode('utf8')
+        listing = resp.read().decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(self.obj, listing.split('\n'))
 
@@ -1458,9 +1441,7 @@ class TestObject(unittest.TestCase):
 
         # sanity with account1
         resp = retry(get_listing, use_account=3)
-        listing = resp.read()
-        if not six.PY2:
-            listing = listing.decode('utf8')
+        listing = resp.read().decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(obj_name, listing.split('\n'))
         self.assertNotIn(self.obj, listing)
@@ -1975,9 +1956,7 @@ class TestObject(unittest.TestCase):
         for c, o, body in validate_requests:
             resp = retry(get_obj, c, o)
             self.assertEqual(resp.status, 200)
-            if not six.PY2:
-                body = body.encode('utf8')
-            self.assertEqual(body, resp.read())
+            self.assertEqual(body.encode('utf8'), resp.read())
 
     @requires_bulk
     def test_bulk_delete(self):

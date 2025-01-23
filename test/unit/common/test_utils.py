@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import itertools
 
+from swift.common.statsd_client import StatsdClient
 from test.debug_logger import debug_logger, FakeStatsdClient
 from test.unit import temptree, make_timestamp_iter, with_tempdir, \
     mock_timestamp_now, FakeIterable
@@ -48,10 +49,6 @@ import math
 import inspect
 import warnings
 
-import six
-from six import StringIO
-from six.moves import range
-
 import tempfile
 import time
 import unittest
@@ -59,12 +56,12 @@ import fcntl
 import shutil
 
 from getpass import getuser
-from io import BytesIO
+from io import BytesIO, StringIO
 from shutil import rmtree
 from functools import partial
 from tempfile import TemporaryFile, NamedTemporaryFile, mkdtemp
 from mock import MagicMock, patch
-from six.moves.configparser import NoSectionError, NoOptionError
+from configparser import NoSectionError, NoOptionError
 from uuid import uuid4
 
 from swift.common.exceptions import Timeout, LockTimeout, \
@@ -686,8 +683,6 @@ class TestUtils(unittest.TestCase):
 
             def __next__(self):
                 return next(self._body)
-
-            next = __next__  # py2
 
             def close(self):
                 self.close_calls.append(True)
@@ -2023,7 +2018,7 @@ cluster_dfw1 = http://dfw1.host/v1/
         def do_test(input_value, expected):
             actual = utils.get_valid_utf8_str(input_value)
             self.assertEqual(expected, actual)
-            self.assertIsInstance(actual, six.binary_type)
+            self.assertIsInstance(actual, bytes)
             actual.decode('utf-8')
 
         do_test(b'abc', b'abc')
@@ -2935,8 +2930,6 @@ cluster_dfw1 = http://dfw1.host/v1/
         digest = test_md5.hexdigest()
         self.assertEqual(digest, self.md5_digest)
 
-    @unittest.skipIf(sys.version_info.major == 2,
-                     "hashlib.md5 does not raise TypeError here in py2")
     def test_string_data_raises_type_error(self):
         if not self.fips_enabled:
             self.assertRaises(TypeError, hashlib.md5, u'foo')
@@ -3914,7 +3907,7 @@ class TestFileLikeIter(unittest.TestCase):
         self.assertEqual(next(iter_file), b'a')
         iter_file.close()
         self.assertTrue(iter_file.closed)
-        self.assertRaises(ValueError, iter_file.next)
+        self.assertRaises(ValueError, next, iter_file)
         self.assertRaises(ValueError, iter_file.read)
         self.assertRaises(ValueError, iter_file.readline)
         self.assertRaises(ValueError, iter_file.readlines)
@@ -3969,7 +3962,7 @@ class UnsafeXrange(object):
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         if self.concurrent_calls > 0:
             self.concurrent_call = True
 
@@ -3984,7 +3977,6 @@ class UnsafeXrange(object):
                 return val
         finally:
             self.concurrent_calls -= 1
-    __next__ = next
 
 
 class TestEventletRateLimiter(unittest.TestCase):
@@ -4802,7 +4794,7 @@ class TestGreenAsyncPile(unittest.TestCase):
                 next(pile)
                 self.assertEqual(i, pile._pending)
             # sanity check - the pile is empty
-            self.assertRaises(StopIteration, pile.next)
+            self.assertRaises(StopIteration, next, pile)
             # pending remains 0
             self.assertEqual(0, pile._pending)
 
@@ -5232,8 +5224,6 @@ This is the body
 """)
         headers = utils.parse_mime_headers(doc_file)
         utf8 = u'\u043a\u043e\u043d\u0442\u0435\u0439\u043d\u0435\u0440'
-        if six.PY2:
-            utf8 = utf8.encode('utf-8')
 
         expected_headers = {
             'Content-Disposition': 'form-data; name="file_size"',
@@ -5705,14 +5695,9 @@ class BaseNamespaceShardRange(object):
     def _check_name_account_container(self, nsr, exp_name):
         # check that the name, account, container properties are consistent
         exp_account, exp_container = exp_name.split('/')
-        if six.PY2:
-            self.assertEqual(exp_name.encode('utf8'), nsr.name)
-            self.assertEqual(exp_account.encode('utf8'), nsr.account)
-            self.assertEqual(exp_container.encode('utf8'), nsr.container)
-        else:
-            self.assertEqual(exp_name, nsr.name)
-            self.assertEqual(exp_account, nsr.account)
-            self.assertEqual(exp_container, nsr.container)
+        self.assertEqual(exp_name, nsr.name)
+        self.assertEqual(exp_account, nsr.account)
+        self.assertEqual(exp_container, nsr.container)
 
 
 class TestNamespace(unittest.TestCase, BaseNamespaceShardRange):
@@ -5739,8 +5724,6 @@ class TestNamespace(unittest.TestCase, BaseNamespaceShardRange):
         do_test(u'y', 'y')
 
         expected = u'\N{SNOWMAN}'
-        if six.PY2:
-            expected = expected.encode('utf-8')
         with warnings.catch_warnings(record=True) as captured_warnings:
             do_test(u'\N{SNOWMAN}', expected)
             do_test(u'\N{SNOWMAN}'.encode('utf-8'), expected)
@@ -5789,8 +5772,6 @@ class TestNamespace(unittest.TestCase, BaseNamespaceShardRange):
         do_test(u'b', 'b')
 
         expected = u'\N{SNOWMAN}'
-        if six.PY2:
-            expected = expected.encode('utf-8')
         with warnings.catch_warnings(record=True) as captured_warnings:
             do_test(u'\N{SNOWMAN}', expected)
             do_test(u'\N{SNOWMAN}'.encode('utf-8'), expected)
@@ -5839,9 +5820,6 @@ class TestNamespace(unittest.TestCase, BaseNamespaceShardRange):
         ns = utils.Namespace('a/%s-%s' % (lower, upper), lower, upper)
         exp_lower = lower
         exp_upper = upper
-        if six.PY2:
-            exp_lower = exp_lower.encode('utf-8')
-            exp_upper = exp_upper.encode('utf-8')
         self.assertEqual(exp_lower, ns.lower)
         self.assertEqual(exp_lower, ns.lower_str)
         self.assertEqual(exp_upper, ns.upper)
@@ -5871,14 +5849,10 @@ class TestNamespace(unittest.TestCase, BaseNamespaceShardRange):
 
     def test_unicode_name(self):
         shard_bounds = ('', 'ham', 'pie', u'\N{SNOWMAN}', u'\U0001F334', '')
-        bounds = [(l, u) for l, u in zip(shard_bounds[:-1], shard_bounds[1:])]
+        exp_bounds = [(l, u)
+                      for l, u in zip(shard_bounds[:-1], shard_bounds[1:])]
         namespaces = [utils.Namespace('.shards_a/c_%s' % upper, lower, upper)
-                      for lower, upper in bounds]
-        if six.PY2:
-            exp_bounds = [(l.encode('utf8'), u.encode('utf8'))
-                          for l, u in bounds]
-        else:
-            exp_bounds = bounds
+                      for lower, upper in exp_bounds]
         for i in range(len(exp_bounds)):
             self.assertEqual(namespaces[i].name,
                              '.shards_a/c_%s' % exp_bounds[i][1])
@@ -6432,8 +6406,8 @@ class TestShardRange(unittest.TestCase, BaseNamespaceShardRange):
             'state': utils.ShardRange.FOUND, 'state_timestamp': ts_3.internal,
             'epoch': ts_4, 'reported': 0, 'tombstones': -1}
         self.assertEqual(expected, sr_dict)
-        self.assertIsInstance(sr_dict['lower'], six.string_types)
-        self.assertIsInstance(sr_dict['upper'], six.string_types)
+        self.assertIsInstance(sr_dict['lower'], str)
+        self.assertIsInstance(sr_dict['upper'], str)
         sr_new = utils.ShardRange.from_dict(sr_dict)
         self.assertEqual(sr, sr_new)
         self.assertEqual(sr_dict, dict(sr_new))
@@ -8302,63 +8276,103 @@ class TestLoggerStatsdClientDelegation(unittest.TestCase):
         client = swift_logger.logger.statsd_client
         self.assertEqual(exp, client.calls)
 
+    def test_get_logger_statsd_client_default_conf(self):
+        logger = utils.get_logger({}, 'some-name', log_route='some-route')
+        # white-box construction validation
+        self.assertIsInstance(logger.logger.statsd_client, StatsdClient)
+        self.assertIsNone(logger.logger.statsd_client._host)
+        self.assertEqual(logger.logger.statsd_client._port, 8125)
+        self.assertEqual(logger.logger.statsd_client._prefix, 'some-name.')
+        self.assertEqual(logger.logger.statsd_client._default_sample_rate, 1)
+
+    def test_get_logger_statsd_client_non_default_conf(self):
+        logger = utils.get_logger({'log_statsd_host': 'some.host.com',
+                                   'log_statsd_port': 1234,
+                                   'log_statsd_default_sample_rate': 1.2,
+                                   'log_statsd_sample_rate_factor': 3.4},
+                                  'some-name', log_route='some-route')
+        # white-box construction validation
+        self.assertIsInstance(logger.logger.statsd_client, StatsdClient)
+        self.assertEqual(logger.logger.statsd_client._host, 'some.host.com')
+        self.assertEqual(logger.logger.statsd_client._port, 1234)
+        self.assertEqual(logger.logger.statsd_client._default_sample_rate, 1.2)
+        self.assertEqual(logger.logger.statsd_client._sample_rate_factor, 3.4)
+        self.assertEqual(logger.logger.statsd_client._prefix, 'some-name.')
+
     def test_get_logger_statsd_client_prefix(self):
-        def call_get_logger(conf, name, statsd_tail_prefix):
-            with mock.patch('swift.common.statsd_client.StatsdClient',
-                            FakeStatsdClient):
-                swift_logger = utils.get_logger(
-                    conf, name=name, statsd_tail_prefix=statsd_tail_prefix)
+        def call_get_logger(conf, name, statsd_tail_prefix, log_route=None):
+            swift_logger = utils.get_logger(
+                conf, name=name,
+                log_route=log_route,
+                statsd_tail_prefix=statsd_tail_prefix)
             self.assertTrue(hasattr(swift_logger.logger, 'statsd_client'))
             self.assertIsInstance(swift_logger.logger.statsd_client,
-                                  FakeStatsdClient)
-            return swift_logger.logger.statsd_client
+                                  StatsdClient)
+            return swift_logger
 
         # tail prefix defaults to swift
-        statsd_client = call_get_logger(None, None, None)
-        self.assertEqual('swift.', statsd_client._prefix)
+        logger = call_get_logger(None, None, None)
+        self.assertEqual('swift.', logger.logger.statsd_client._prefix)
+        self.assertEqual('swift', logger.name)
+        self.assertEqual('swift', logger.server)
+
+        # tail prefix defaults to swift, log_route is ignored for stats
+        logger = call_get_logger(None, None, None, log_route='route')
+        self.assertEqual('swift.', logger.logger.statsd_client._prefix)
+        self.assertEqual('route', logger.name)
+        self.assertEqual('swift', logger.server)
 
         # tail prefix defaults to conf log_name
         conf = {'log_name': 'bar'}
-        statsd_client = call_get_logger(conf, None, None)
-        self.assertEqual('bar.', statsd_client._prefix)
+        logger = call_get_logger(conf, None, None)
+        self.assertEqual('bar.', logger.logger.statsd_client._prefix)
+        self.assertEqual('bar', logger.name)
+        self.assertEqual('bar', logger.server)
+
+        # tail prefix defaults to conf log_name, log_route is ignored for stats
+        conf = {'log_name': 'bar'}
+        logger = call_get_logger(conf, None, None, log_route='route')
+        self.assertEqual('bar.', logger.logger.statsd_client._prefix)
+        self.assertEqual('route', logger.name)
+        self.assertEqual('bar', logger.server)
 
         # tail prefix defaults to name arg which overrides conf log_name
-        statsd_client = call_get_logger(conf, '', None)
-        self.assertEqual('', statsd_client._prefix)
+        logger = call_get_logger(conf, '', None)
+        self.assertEqual('', logger.logger.statsd_client._prefix)
 
         # tail prefix defaults to name arg which overrides conf log_name
-        statsd_client = call_get_logger(conf, 'baz', None)
-        self.assertEqual('baz.', statsd_client._prefix)
+        logger = call_get_logger(conf, 'baz', None)
+        self.assertEqual('baz.', logger.logger.statsd_client._prefix)
 
         # tail prefix set to statsd_tail_prefix arg which overrides name arg
-        statsd_client = call_get_logger(conf, 'baz', '')
-        self.assertEqual('', statsd_client._prefix)
+        logger = call_get_logger(conf, 'baz', '')
+        self.assertEqual('', logger.logger.statsd_client._prefix)
 
         # tail prefix set to statsd_tail_prefix arg which overrides name arg
-        statsd_client = call_get_logger(conf, 'baz', 'boo')
-        self.assertEqual('boo.', statsd_client._prefix)
+        logger = call_get_logger(conf, 'baz', 'boo')
+        self.assertEqual('boo.', logger.logger.statsd_client._prefix)
 
         # base prefix is configured, tail prefix defaults to swift
         conf = {'log_statsd_metric_prefix': 'foo'}
-        statsd_client = call_get_logger(conf, None, None)
-        self.assertEqual('foo.swift.', statsd_client._prefix)
+        logger = call_get_logger(conf, None, None)
+        self.assertEqual('foo.swift.', logger.logger.statsd_client._prefix)
 
         # base prefix is configured, tail prefix defaults to conf log_name
         conf = {'log_statsd_metric_prefix': 'foo', 'log_name': 'bar'}
-        statsd_client = call_get_logger(conf, None, None)
-        self.assertEqual('foo.bar.', statsd_client._prefix)
+        logger = call_get_logger(conf, None, None)
+        self.assertEqual('foo.bar.', logger.logger.statsd_client._prefix)
 
         # base prefix is configured, tail prefix defaults to name arg
-        statsd_client = call_get_logger(conf, 'baz', None)
-        self.assertEqual('foo.baz.', statsd_client._prefix)
+        logger = call_get_logger(conf, 'baz', None)
+        self.assertEqual('foo.baz.', logger.logger.statsd_client._prefix)
 
         # base prefix is configured, tail prefix set to statsd_tail_prefix arg
-        statsd_client = call_get_logger(conf, None, '')
-        self.assertEqual('foo.', statsd_client._prefix)
+        logger = call_get_logger(conf, None, '')
+        self.assertEqual('foo.', logger.logger.statsd_client._prefix)
 
         # base prefix is configured, tail prefix set to statsd_tail_prefix arg
-        statsd_client = call_get_logger(conf, 'baz', 'boo')
-        self.assertEqual('foo.boo.', statsd_client._prefix)
+        logger = call_get_logger(conf, 'baz', 'boo')
+        self.assertEqual('foo.boo.', logger.logger.statsd_client._prefix)
 
     def test_get_logger_replaces_statsd_client(self):
         # Each call to get_logger creates a *new* StatsdClient instance and
@@ -8433,6 +8447,31 @@ class TestLoggerStatsdClientDelegation(unittest.TestCase):
         self.assertEqual(exp, prefixed_logger.logger.statsd_client.calls)
         self.assertEqual(exp, adapted_logger.logger.statsd_client.calls)
 
+    def test_get_prefixed_logger_with_mutilated_statsd_client(self):
+        with mock.patch(
+                'swift.common.statsd_client.StatsdClient', FakeStatsdClient):
+            adapted_logger = utils.get_logger(None, name=self.logger_name)
+        self.assertTrue(hasattr(adapted_logger, 'statsd_client_source'))
+        self.assertIsInstance(
+            adapted_logger.statsd_client_source.statsd_client,
+            FakeStatsdClient)
+        # sanity
+        adapted_logger.increment('foo')
+        fake_statsd_client = adapted_logger.statsd_client_source.statsd_client
+        self.assertEqual(fake_statsd_client.get_increments(), ['foo'])
+
+        # kill and maim!
+        adapted_logger.statsd_client_source.statsd_client = None
+        # bro, what are you DOING!?  you're crazy!?
+        self.assertEqual(adapted_logger.logger.statsd_client, None)
+        # you can't do that, it *breaks* the statsd_client patch methods
+        with self.assertRaises(AttributeError):
+            adapted_logger.increment('bar')
+
+        # you can't get a prefixed logger from a *broken* adapter
+        with self.assertRaises(ValueError):
+            utils.get_prefixed_logger(adapted_logger, 'test')
+
     def test_get_prefixed_logger_no_statsd_client(self):
         # verify get_prefixed_logger can be used to mutate the prefix of a
         # SwiftLogAdapter that does *not* have a StatsdClient interface
@@ -8447,3 +8486,104 @@ class TestLoggerStatsdClientDelegation(unittest.TestCase):
         self.assertFalse(hasattr(prefixed_logger, 'statsd_client_source'))
         self.assertFalse(hasattr(prefixed_logger.logger, 'statsd_client'))
         self.assertFalse(hasattr(prefixed_logger, 'increment'))
+
+    def test_statsd_set_prefix_deprecation(self):
+        conf = {'log_statsd_host': 'another.host.com'}
+
+        with warnings.catch_warnings(record=True) as cm:
+            warnings.resetwarnings()
+            warnings.simplefilter('always', DeprecationWarning)
+            logger = utils.get_logger(
+                conf, 'some-name', log_route='some-route')
+            logger.set_statsd_prefix('some-name.more-specific')
+        msgs = [str(warning.message)
+                for warning in cm
+                if str(warning.message).startswith('set_statsd_prefix')]
+        self.assertEqual(
+            ['set_statsd_prefix() is deprecated; use the '
+             '``statsd_tail_prefix`` argument to ``get_logger`` instead.'],
+            msgs)
+
+
+class TestTimingStatsDecorators(unittest.TestCase):
+    def test_timing_stats(self):
+        class MockController(object):
+            def __init__(mock_self, status):
+                mock_self.status = status
+                mock_self.logger = debug_logger()
+
+            @utils.timing_stats()
+            def METHOD(mock_self):
+                return Response(status=mock_self.status)
+
+        now = time.time()
+        mock_controller = MockController(200)
+        with mock.patch('swift.common.utils.time.time', return_value=now):
+            mock_controller.METHOD()
+        self.assertEqual({'timing_since': [(('METHOD.timing', now), {})]},
+                         mock_controller.logger.statsd_client.calls)
+
+        mock_controller = MockController(400)
+        with mock.patch('swift.common.utils.time.time', return_value=now):
+            mock_controller.METHOD()
+        self.assertEqual({'timing_since': [(('METHOD.timing', now), {})]},
+                         mock_controller.logger.statsd_client.calls)
+
+        mock_controller = MockController(404)
+        with mock.patch('swift.common.utils.time.time', return_value=now):
+            mock_controller.METHOD()
+        self.assertEqual({'timing_since': [(('METHOD.timing', now), {})]},
+                         mock_controller.logger.statsd_client.calls)
+
+        mock_controller = MockController(412)
+        with mock.patch('swift.common.utils.time.time', return_value=now):
+            mock_controller.METHOD()
+        self.assertEqual({'timing_since': [(('METHOD.timing', now), {})]},
+                         mock_controller.logger.statsd_client.calls)
+
+        mock_controller = MockController(416)
+        with mock.patch('swift.common.utils.time.time', return_value=now):
+            mock_controller.METHOD()
+        self.assertEqual({'timing_since': [(('METHOD.timing', now), {})]},
+                         mock_controller.logger.statsd_client.calls)
+
+        mock_controller = MockController(500)
+        with mock.patch('swift.common.utils.time.time', return_value=now):
+            mock_controller.METHOD()
+        self.assertEqual(
+            {'timing_since': [(('METHOD.errors.timing', now), {})]},
+            mock_controller.logger.statsd_client.calls)
+
+        mock_controller = MockController(507)
+        with mock.patch('swift.common.utils.time.time', return_value=now):
+            mock_controller.METHOD()
+        self.assertEqual(
+            {'timing_since': [(('METHOD.errors.timing', now), {})]},
+            mock_controller.logger.statsd_client.calls)
+
+    def test_memcached_timing_stats(self):
+        class MockMemcached(object):
+            def __init__(mock_self):
+                mock_self.logger = debug_logger()
+
+            @utils.memcached_timing_stats()
+            def set(mock_self):
+                pass
+
+            @utils.memcached_timing_stats()
+            def get(mock_self):
+                pass
+
+        mock_cache = MockMemcached()
+        with patch('time.time', return_value=1000.99):
+            mock_cache.set()
+        self.assertEqual(
+            {'timing_since': [(('memcached.set.timing', 1000.99), {})]},
+            mock_cache.logger.statsd_client.calls)
+
+        mock_cache = MockMemcached()
+        with patch('time.time', return_value=2000.99):
+            mock_cache.get()
+        self.assertEqual(
+            {'timing_since': [(('memcached.get.timing', 2000.99), {})]},
+            mock_cache.logger.statsd_client.calls)

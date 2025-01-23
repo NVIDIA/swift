@@ -24,9 +24,7 @@
 #   These shenanigans are to ensure all related objects can be garbage
 # collected. We've seen objects hang around forever otherwise.
 
-import six
-from six.moves.urllib.parse import quote, unquote
-from six.moves import zip
+from urllib.parse import quote, unquote
 
 import collections
 import itertools
@@ -35,7 +33,6 @@ import mimetypes
 import time
 import math
 import random
-import sys
 
 from greenlet import GreenletExit
 from eventlet import GreenPile
@@ -92,6 +89,28 @@ def check_content_type(req):
                 return HTTPBadRequest("Invalid Content-Type, "
                                       "swift_* is not a valid parameter name.")
     return None
+
+
+# Keep the number of expirer-queue deletes to a reasonable number.
+#
+# In the best case, at least one object server writes out an
+# async_pending for an expirer-queue update. In the worst case, no
+# object server does so, and an expirer-queue row remains that
+# refers to an already-deleted object. In this case, upon attempting
+# to delete the object, the object expirer will notice that the
+# object does not exist and then remove the row from the expirer
+# queue.
+#
+# In other words: expirer-queue updates on object DELETE are nice to
+# have, but not strictly necessary for correct operation.
+#
+# Also, each queue update results in an async_pending record, which
+# causes the object updater to talk to all container servers. If we
+# have N async_pendings and Rc container replicas, we cause N * Rc
+# requests from object updaters to container servers (possibly more,
+# depending on retries). Thus, it is helpful to keep this number
+# small.
+NUM_CLEAN_EXPIRER_QUEUE_UPDATES = 2
 
 
 def num_container_updates(container_replicas, container_quorum,
@@ -580,29 +599,10 @@ class BaseObjectController(Controller):
                 set_delete_at_headers(n_outgoing - 1 - index, next(dan_iter))
             existing_updates += 1
 
-        # Keep the number of expirer-queue deletes to a reasonable number.
-        #
-        # In the best case, at least one object server writes out an
-        # async_pending for an expirer-queue update. In the worst case, no
-        # object server does so, and an expirer-queue row remains that
-        # refers to an already-deleted object. In this case, upon attempting
-        # to delete the object, the object expirer will notice that the
-        # object does not exist and then remove the row from the expirer
-        # queue.
-        #
-        # In other words: expirer-queue updates on object DELETE are nice to
-        # have, but not strictly necessary for correct operation.
-        #
-        # Also, each queue update results in an async_pending record, which
-        # causes the object updater to talk to all container servers. If we
-        # have N async_pendings and Rc container replicas, we cause N * Rc
-        # requests from object updaters to container servers (possibly more,
-        # depending on retries). Thus, it is helpful to keep this number
-        # small.
-        n_desired_queue_updates = 2
+        # limit async_pendings for x-delete-at-update
         for i in range(len(headers)):
-            headers[i].setdefault('X-Backend-Clean-Expiring-Object-Queue',
-                                  't' if i < n_desired_queue_updates else 'f')
+            v = 't' if i < NUM_CLEAN_EXPIRER_QUEUE_UPDATES else 'f'
+            headers[i].setdefault('X-Backend-Clean-Expiring-Object-Queue', v)
 
         return headers
 
@@ -1384,8 +1384,6 @@ class ECAppIter(object):
 
     def __next__(self):
         return next(self.stashed_iter)
-
-    next = __next__  # py2
 
     def _real_iter(self, req, resp_headers):
         if not self.range_specs:
@@ -2593,13 +2591,12 @@ class ECFragGetter(GetterBase):
                     buf += chunk
                     if nbytes is not None:
                         nbytes -= len(chunk)
-            except (ChunkReadTimeout, ShortReadError):
-                exc_type, exc_value, exc_traceback = sys.exc_info()
+            except (ChunkReadTimeout, ShortReadError) as e:
                 try:
                     self.fast_forward(self.bytes_used_from_backend)
                 except (HTTPException, ValueError):
                     self.logger.exception('Unable to fast forward')
-                    six.reraise(exc_type, exc_value, exc_traceback)
+                    raise e
                 except RangeAlreadyComplete:
                     break
                 buf = b''
@@ -2612,10 +2609,10 @@ class ECFragGetter(GetterBase):
                         # it's not clear to me how to make
                         # _get_next_response_part raise StopIteration for the
                         # first doc part of a new request
-                        six.reraise(exc_type, exc_value, exc_traceback)
+                        raise e
                     part_file = ByteCountEnforcer(part_file, nbytes)
                 else:
-                    six.reraise(exc_type, exc_value, exc_traceback)
+                    raise e
             else:
                 if buf and self.skip_bytes:
                     if self.skip_bytes < len(buf):

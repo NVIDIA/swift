@@ -22,7 +22,61 @@ from contextlib import closing
 from random import random
 
 from eventlet.green import socket
-import six
+
+from swift.common.utils.config import config_true_value
+
+
+STATSD_CONF_USER_LABEL_PREFIX = 'statsd_user_label_'
+STATSD_USER_LABEL_NAMESPACE = 'user_'
+USER_LABEL_PATTERN = re.compile(r"[^0-9a-zA-Z_]")
+USER_VALUE_PATTERN = re.compile(r"[^0-9a-zA-Z_.]")
+
+
+def _build_line_parts(name, value, type, sample_rate):
+    line = '%s:%s|%s' % (name, value, type)
+    if sample_rate < 1:
+        line += '@%s' % (sample_rate,)
+    return line
+
+
+class LabeledFormats(object):
+    disabled = None
+
+    @staticmethod
+    def librato(name, value, type, sample_rate, labels):
+        # https://www.librato.com/docs/kb/collect/collection_agents/stastd/#stat-level-tags
+        name += '#' + ','.join('%s=%s' % (k, v) for k, v in labels)
+        line = _build_line_parts(name, value, type, sample_rate)
+        return line
+
+    @staticmethod
+    def influxdb(name, value, type, sample_rate, labels):
+        # https://www.influxdata.com/blog/getting-started-with-sending-statsd-metrics-to-telegraf-influxdb/#introducing-influx-statsd
+        name += ''.join(',%s=%s' % (k, v) for k, v in labels)
+        line = _build_line_parts(name, value, type, sample_rate)
+        return line
+
+    @staticmethod
+    def signalfx(name, value, type, sample_rate, labels):
+        # https://web.archive.org/web/20211123040355/https://docs.signalfx.com/en/latest/integrations/agent/monitors/collectd-statsd.html#adding-dimensions-to-statsd-metrics
+        # https://docs.splunk.com/Observability/gdi/statsd/statsd.html#adding-dimensions-to-statsd-metrics
+        name += '[%s]' % ','.join('%s=%s' % (k, v) for k, v in labels)
+        line = _build_line_parts(name, value, type, sample_rate)
+        return line
+
+    @staticmethod
+    def graphite(name, value, type, sample_rate, labels):
+        # https://graphite.readthedocs.io/en/latest/tags.html#carbon
+        name += ''.join(';%s=%s' % (k, v) for k, v in labels)
+        line = _build_line_parts(name, value, type, sample_rate)
+        return line
+
+    @staticmethod
+    def dogstatsd(name, value, type, sample_rate, labels):
+        # https://docs.datadoghq.com/developers/dogstatsd/datagram_shell/?tab=metrics
+        line = _build_line_parts(name, value, type, sample_rate)
+        line += '|#' + ','.join('%s:%s' % (k, v) for k, v in labels)
+        return line
 
 from swift.common.utils.config import config_true_value
 
@@ -253,14 +307,11 @@ class AbstractStatsdClient(object):
         if line is None:
             return
 
-        if not six.PY2:
-            line = line.encode('utf-8')
-
         # Ideally, we'd cache a sending socket in self, but that
         # results in a socket getting shared by multiple green threads.
         with closing(self._open_socket()) as sock:
             try:
-                return sock.sendto(line, self._target)
+                return sock.sendto(line.encode('utf-8'), self._target)
             except IOError as err:
                 if self.logger:
                     self.logger.warning(

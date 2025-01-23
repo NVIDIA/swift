@@ -16,15 +16,14 @@
 
 """Tests for swift.obj.server"""
 
-import six.moves.cPickle as pickle
+import pickle
 import datetime
 import json
 import errno
 import operator
 import os
 import mock
-import six
-from six import StringIO
+from io import StringIO
 import unittest
 import math
 import random
@@ -36,7 +35,7 @@ from contextlib import contextmanager
 from textwrap import dedent
 
 from eventlet import sleep, spawn, wsgi, Timeout, tpool, greenthread
-from eventlet.green import httplib
+from eventlet.green.http import client as http_client
 
 from swift import __version__ as swift_version
 from swift.common.http import is_success
@@ -224,9 +223,8 @@ class TestObjectController(BaseTestCase):
 
     def test_REQUEST_SPECIAL_CHARS(self):
         obj = 'special昆%20/%'
-        if six.PY3:
-            # The path argument of Request.blank() is a WSGI string, somehow
-            obj = obj.encode('utf-8').decode('latin-1')
+        # The path argument of Request.blank() is a WSGI string, somehow
+        obj = obj.encode('utf-8').decode('latin-1')
         self.check_all_api_methods(obj)
 
     def test_device_unavailable(self):
@@ -7827,6 +7825,7 @@ class TestObjectController(BaseTestCase):
 
     def test_DELETE_if_delete_at(self):
         test_time = time() + 10000
+        # Create an object without an an expiration time.
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
             headers={'X-Timestamp': normalize_timestamp(test_time - 99),
@@ -7836,6 +7835,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
+        # Normal delete request will delete it.
         req = Request.blank(
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'DELETE'},
@@ -7843,6 +7843,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 204)
 
+        # Create an object with an an expiration time.
         delete_at_timestamp = int(test_time - 1)
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -7855,6 +7856,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
+        # Delete this object with incorrect 'X-If-Delete-At'.
         req = Request.blank(
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'DELETE'},
@@ -7863,6 +7865,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 412)
 
+        # Normal delete request without 'X-If-Delete-At' will delete it too.
         req = Request.blank(
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'DELETE'},
@@ -7870,6 +7873,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 204)
 
+        # Create an object with an an expiration time.
         delete_at_timestamp = int(test_time - 1)
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -7882,6 +7886,7 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
+        # Delete this object with incorrect 'X-If-Delete-At'.
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'DELETE'},
             headers={'X-Timestamp': normalize_timestamp(test_time - 92),
@@ -7889,6 +7894,15 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 412)
 
+        # Invalid format for 'X-If-Delete-At'.
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'DELETE'},
+            headers={'X-Timestamp': normalize_timestamp(test_time - 92),
+                     'X-If-Delete-At': 'abc'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 400)
+
+        # Delete this object with correct 'X-If-Delete-At'.
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'DELETE'},
             headers={'X-Timestamp': normalize_timestamp(test_time - 92),
@@ -7896,12 +7910,111 @@ class TestObjectController(BaseTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 204)
 
+        # Invalid format for 'X-If-Delete-At' still returns 400.
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'DELETE'},
             headers={'X-Timestamp': normalize_timestamp(test_time - 92),
                      'X-If-Delete-At': 'abc'})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 400)
+
+    def test_DELETE_delete_task_timestamp(self):
+        create_object_ts = next(self.ts)
+        update_object_ts = next(self.ts)
+        orig_delete_at = utils.normalize_delete_at_timestamp(
+            next(self.ts).normal)
+        new_delete_at = utils.normalize_delete_at_timestamp(
+            next(self.ts).normal)
+
+        # Create an object with an an expiration time.
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers=self._update_delete_at_headers({
+                'X-Timestamp': create_object_ts.normal,
+                'X-Delete-At': orig_delete_at,
+                'Content-Length': '4',
+                'Content-Type': 'application/octet-stream'})
+        )
+        req.body = 'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # Before the object expires, update its 'X-Delete-At'.
+        req = Request.blank(
+            '/sda1/p/a/c/o', method='POST',
+            headers={'X-Timestamp': update_object_ts.normal,
+                     'X-Delete-At': new_delete_at}
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 202)
+
+        # an old expirer won't send x-backend-expirer-task-timestamp, we return
+        #  412 so it will try again because we don't know if our metadata is
+        # newer than the task-timestamp
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={'X-Timestamp': Timestamp(orig_delete_at).normal,
+                     'X-If-Delete-At': orig_delete_at})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 412)
+
+        # a new expirer will send x-backend-expirer-task-timestamp, so we can
+        # tell it this x-if-delete-at does not match and never will because we
+        # have newer metadata with a different x-delete-at
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': create_object_ts.normal,
+                'X-If-Delete-At': orig_delete_at
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 409)
+
+        # no expirer should ever mix up the x-if-delete-at with a different
+        # task-timestamp; but even if the task-timestamp matches our
+        # metadata-timestamp we shouldn't delete if x-if-delete-at does not.
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': update_object_ts.normal,
+                'X-If-Delete-At': orig_delete_at
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 412)
+        # ... no matter how much "newer" the expirer thinks its task-timestamp
+        # is, it needs to keep trying until we have a matching x-if-delete-at
+        even_newer_task_ts = next(self.ts)
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': even_newer_task_ts.normal,
+                'X-Backend-Expirer-Task-Timestamp': even_newer_task_ts.normal,
+                'X-If-Delete-At': orig_delete_at
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 412)
+
+        # finally some expirer should pick up the new entry
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(new_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': update_object_ts.normal,
+                'X-If-Delete-At': new_delete_at
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 204)
 
     def test_extra_headers_contain_object_bytes(self):
         timestamp1 = next(self.ts).normal
@@ -9616,10 +9729,7 @@ class TestObjectServer(unittest.TestCase):
         conn.send(b'c\r\n--boundary123\r\n')
 
         # disconnect client
-        if six.PY2:
-            conn.sock.fd._sock.close()
-        else:
-            conn.sock.fd._real_close()
+        conn.sock.fd._real_close()
         for i in range(2):
             sleep(0)
         self.assertFalse(self.logger.get_lines_for_level('error'))
@@ -9729,10 +9839,7 @@ class TestObjectServer(unittest.TestCase):
         with self._check_multiphase_put_commit_handling() as context:
             conn = context['conn']
             # just bail straight out
-            if six.PY2:
-                conn.sock.fd._sock.close()
-            else:
-                conn.sock.fd._real_close()
+            conn.sock.fd._real_close()
         sleep(0)
 
         put_timestamp = context['put_timestamp']
@@ -9773,10 +9880,7 @@ class TestObjectServer(unittest.TestCase):
             conn.send(to_send)
 
             # and then bail out
-            if six.PY2:
-                conn.sock.fd._sock.close()
-            else:
-                conn.sock.fd._real_close()
+            conn.sock.fd._real_close()
         sleep(0)
 
         put_timestamp = context['put_timestamp']
@@ -9903,12 +10007,8 @@ class TestObjectServer(unittest.TestCase):
                          'Content-Type': 'text/plain'}
         for k, v in actual_meta.items():
             # See diskfile.py:_decode_metadata
-            if six.PY2:
-                self.assertIsInstance(k, six.binary_type)
-                self.assertIsInstance(v, six.binary_type)
-            else:
-                self.assertIsInstance(k, six.text_type)
-                self.assertIsInstance(v, six.text_type)
+            self.assertIsInstance(k, str)
+            self.assertIsInstance(v, str)
         self.assertIsNotNone(actual_meta.pop('ETag', None))
         self.assertEqual(expected_meta, actual_meta)
         # but no other files
@@ -9956,10 +10056,7 @@ class TestObjectServer(unittest.TestCase):
             conn.send(to_send)
 
             # and then bail out
-            if six.PY2:
-                conn.sock.fd._sock.close()
-            else:
-                conn.sock.fd._real_close()
+            conn.sock.fd._real_close()
         sleep(0)
 
         # and make sure it demonstrates the client disconnect
@@ -10154,10 +10251,7 @@ class TestObjectServer(unittest.TestCase):
             conn.send(to_send)
 
             # and then bail out
-            if six.PY2:
-                conn.sock.fd._sock.close()
-            else:
-                conn.sock.fd._real_close()
+            conn.sock.fd._real_close()
 
         # the object server needs to recognize the socket is closed
         # or at least timeout, we'll have to wait
@@ -10230,7 +10324,7 @@ class TestZeroCopy(unittest.TestCase):
         self.wsgi_greenlet = spawn(
             wsgi.server, listener, self.object_controller, NullLogger())
 
-        self.http_conn = httplib.HTTPConnection('127.0.0.1', port)
+        self.http_conn = http_client.HTTPConnection('127.0.0.1', port)
         self.http_conn.connect()
 
     def tearDown(self):

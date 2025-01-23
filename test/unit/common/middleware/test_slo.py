@@ -21,10 +21,8 @@ import time
 import unittest
 import string
 
-import mock
-from mock import patch
+from unittest.mock import patch
 
-import six
 from io import BytesIO
 
 from swift.common import swob, registry
@@ -2527,10 +2525,8 @@ class TestSloGetRawManifest(SloGETorHEADTestCase):
              'path': '/gettest/not_checked'},
             {'etag': md5hex(md5hex("fizz") + md5hex("buzz")),
              'size_bytes': '2099',
-             'path': '/gettest/made_up'}], sort_keys=True)
+             'path': '/gettest/made_up'}], sort_keys=True).encode('utf8')
         expected_etag = md5hex(expected_body)
-        if six.PY3:
-            expected_body = expected_body.encode('utf-8')
 
         self.assertEqual(body, expected_body)
         self.assertEqual(status, '200 OK')
@@ -2853,8 +2849,7 @@ class TestSloGetManifests(SloGETorHEADTestCase):
         self.assertEqual(ct, 'multipart/byteranges')
         boundary = params.get('boundary')
         self.assertTrue(boundary is not None)
-        if six.PY3:
-            boundary = boundary.encode('utf-8')
+        boundary = boundary.encode('utf-8')
 
         self.assertEqual(len(body), int(headers['Content-Length']))
         # this is a multi-range resp
@@ -2934,8 +2929,7 @@ class TestSloGetManifests(SloGETorHEADTestCase):
         self.assertEqual(ct, 'multipart/byteranges')
         boundary = params.get('boundary')
         self.assertTrue(boundary is not None)
-        if six.PY3:
-            boundary = boundary.encode('utf-8')
+        boundary = boundary.encode('utf-8')
 
         got_mime_docs = []
         for mime_doc_fh in iter_multipart_mime_documents(
@@ -3110,11 +3104,8 @@ class TestOldSwiftWithRanges(SloGETorHEADTestCase):
         self.assertEqual(headers['X-Manifest-Etag'],
                          self.manifest_big_man_json_md5)
         self.assertEqual(int(headers['Content-Length']), len(body))
-        if six.PY3:
-            count_e = sum(1 if x == 'e' else 0
-                          for x in body.decode('ascii', errors='replace'))
-        else:
-            count_e = sum(1 if x == 'e' else 0 for x in body)
+        count_e = sum(1 if x == 'e' else 0
+                      for x in body.decode('ascii', errors='replace'))
         self.assertEqual(count_e, 100000)
         self.assertEqual(len(body) - count_e, 0)
 
@@ -3448,10 +3439,7 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
     def test_get_segment_with_non_ascii_path(self):
         segment_body = u"a møøse once bit my sister".encode("utf-8")
         segment_etag = md5(segment_body, usedforsecurity=False).hexdigest()
-        if six.PY2:
-            path = u'/v1/AUTH_test/ünicode/öbject-segment'.encode('utf-8')
-        else:
-            path = str_to_wsgi(u'/v1/AUTH_test/ünicode/öbject-segment')
+        path = str_to_wsgi(u'/v1/AUTH_test/ünicode/öbject-segment')
         self.app.register(
             'GET', path,
             swob.HTTPOk, {'Content-Length': str(len(segment_body)),
@@ -3462,10 +3450,7 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
                                      'hash': segment_etag,
                                      'content_type': 'text/plain',
                                      'bytes': len(segment_body)}])
-        if six.PY2:
-            path = u'/v1/AUTH_test/ünicode/manifest'.encode('utf-8')
-        else:
-            path = str_to_wsgi(u'/v1/AUTH_test/ünicode/manifest')
+        path = str_to_wsgi(u'/v1/AUTH_test/ünicode/manifest')
         self.app.register(
             'GET', path,
             swob.HTTPOk, {'Content-Type': 'application/json',
@@ -3770,9 +3755,8 @@ class TestSloErrors(SloGETorHEADTestCase):
             def __iter__(self):
                 return self
 
-            def next(self):
+            def __next__(self):
                 return next(self.inner_iter)
-            __next__ = next
 
             def close(self):
                 leaks[0] -= 1
@@ -4134,20 +4118,12 @@ class TestSloErrors(SloGETorHEADTestCase):
 
         self.assertEqual('200 OK', status)
         self.assertEqual(body, b'aaaaa')
-        lines = self.slo.logger.get_lines_for_level('error')
-        self.assertEqual(lines, [
-            mock.ANY,
+        self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
+            'Unable to load SLO manifest: '
+            'Expecting value: line 1 column 2 (char 1)',
             'while fetching /v1/AUTH_test/gettest/manifest-abcd, '
             'JSON-decoding of submanifest /v1/AUTH_test/gettest/manifest-bc '
             'failed with 500 Internal Error'
-        ])
-        self.assertIn(lines[0], [
-            # py2
-            'Unable to load SLO manifest: '
-            'No JSON object could be decoded',
-            # py3
-            'Unable to load SLO manifest: '
-            'Expecting value: line 1 column 2 (char 1)',
         ])
 
     def test_mismatched_etag(self):
@@ -6651,9 +6627,7 @@ class TestNonSloPassthrough(SloGETorHEADTestCase):
         self.assertEqual(ct, 'multipart/byteranges')
 
         params = dict(params)
-        boundary = params.get('boundary')
-        if six.PY3:
-            boundary = boundary.encode('utf-8')
+        boundary = params.get('boundary').encode('utf-8')
 
         self.assertEqual(len(body), int(headers['Content-Length']))
 
@@ -6693,9 +6667,7 @@ class TestNonSloPassthrough(SloGETorHEADTestCase):
         self.assertEqual(ct, 'multipart/byteranges')
 
         params = dict(params)
-        boundary = params.get('boundary')
-        if six.PY3:
-            boundary = boundary.encode('utf-8')
+        boundary = params.get('boundary').encode('utf-8')
 
         self.assertEqual(len(body), int(headers['Content-Length']))
 
@@ -6746,9 +6718,7 @@ class TestNonSloPassthrough(SloGETorHEADTestCase):
         self.assertEqual(ct, 'multipart/byteranges')
 
         params = dict(params)
-        boundary = params.get('boundary')
-        if six.PY3:
-            boundary = boundary.encode('utf-8')
+        boundary = params.get('boundary').encode('utf-8')
 
         self.assertEqual(len(body), int(headers['Content-Length']))
 

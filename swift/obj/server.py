@@ -15,9 +15,8 @@
 
 """ Object Server for Swift """
 
-import six
-import six.moves.cPickle as pickle
-from six.moves.urllib.parse import unquote
+import pickle  # nosec: B403
+from urllib.parse import unquote
 import json
 import os
 import multiprocessing
@@ -208,8 +207,8 @@ class ObjectController(BaseStorageServer):
         # disk_chunk_size parameter. However, it affects all created sockets
         # using this class so we have chosen to tie it to the
         # network_chunk_size parameter value instead.
-        if six.PY2:
-            socket._fileobject.default_bufsize = self.network_chunk_size
+        # if six.PY2:
+        #    socket._fileobject.default_bufsize = self.network_chunk_size
         # TODO: find a way to enable similar functionality in py3
 
         self.fallocate_reserve, self.fallocate_is_percent = \
@@ -1296,6 +1295,23 @@ class ObjectController(BaseStorageServer):
             pass
         return response
 
+    def _is_delete_task_stale(self, request, orig_metadata):
+        if 'x-backend-expirer-task-timestamp' not in request.headers:
+            # Older version expirer, can't tell.
+            return False
+
+        delete_task_ts_val = request.headers[
+            "x-backend-expirer-task-timestamp"
+        ]
+        delete_task_ts = Timestamp(delete_task_ts_val)
+        metadata_ts = Timestamp(orig_metadata.get('X-Timestamp') or 0)
+        if delete_task_ts < metadata_ts:
+            # this expirer queue entry is older than the time when the newer
+            # x-delete-at got updated, it's stale and not needed.
+            return True
+        else:
+            return False
+
     @public
     @timing_stats()
     def DELETE(self, request):
@@ -1359,6 +1375,8 @@ class ObjectController(BaseStorageServer):
                 # Found a newer object -- return 409 as work item is stale
                 return HTTPConflict()
             if orig_delete_at != req_if_delete_at:
+                if self._is_delete_task_stale(request, orig_metadata):
+                    return HTTPConflict()
                 return HTTPPreconditionFailed(
                     request=request,
                     body='X-If-Delete-At and X-Delete-At do not match')
