@@ -1,0 +1,6 @@
+#-------------------------------------------------------------------------------
+# Openstack swift
+# Note: add this snippet to either /etc/magic or ~/.magic
+0       string  R1NG    Swift Ring
+>5      byte    &0x01   version 1
+>5      byte    &0x02   version 2
