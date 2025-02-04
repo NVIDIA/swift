@@ -196,6 +196,7 @@ class BaseObjectControllerMixin(object):
 
         # default policy and ring references
         self.policy = POLICIES.default
+        self.is_ec = isinstance(self.policy, ECStoragePolicy)
         self.obj_ring = self.policy.object_ring
         self._ts_iter = (utils.Timestamp(t) for t in
                          itertools.count(int(time.time())))
@@ -950,11 +951,16 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         return fake_conn.requests
 
     def test_x_open_expired_default_config(self):
+        if self.is_ec:
+            head_num_reqs = self.obj_ring.replicas
+        else:
+            head_num_reqs = \
+                self.obj_ring.replicas + self.obj_ring.max_more_nodes
         for method, num_reqs in (
                 ('GET',
                  self.obj_ring.replicas + self.obj_ring.max_more_nodes),
                 ('HEAD',
-                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                 head_num_reqs),
                 ('POST', self.obj_ring.replicas)):
             requests = self._test_x_open_expired(method, num_reqs)
             for r in requests:
@@ -974,6 +980,12 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                 self.assertNotIn('X-Backend-Open-Expired', r['headers'])
 
     def test_x_open_expired_custom_config(self):
+        if self.is_ec:
+            head_num_reqs = self.obj_ring.replicas
+        else:
+            head_num_reqs = \
+                self.obj_ring.replicas + self.obj_ring.max_more_nodes
+
         # helper to check that PUT is not supported in all cases
         def test_put_unsupported():
             req = swift.common.swob.Request.blank(
@@ -1008,7 +1020,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                 ('GET',
                  self.obj_ring.replicas + self.obj_ring.max_more_nodes),
                 ('HEAD',
-                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                 head_num_reqs),
                 ('POST', self.obj_ring.replicas)):
             requests = self._test_x_open_expired(
                 method, num_reqs, headers={'X-Open-Expired': 'true'})
@@ -1023,7 +1035,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                 ('GET',
                  self.obj_ring.replicas + self.obj_ring.max_more_nodes),
                 ('HEAD',
-                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                 head_num_reqs),
                 ('POST', self.obj_ring.replicas)):
             requests = self._test_x_open_expired(
                 method, num_reqs, headers={'X-Open-Expired': 'false'})
@@ -1050,7 +1062,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                 ('GET',
                  self.obj_ring.replicas + self.obj_ring.max_more_nodes),
                 ('HEAD',
-                 self.obj_ring.replicas + self.obj_ring.max_more_nodes),
+                 head_num_reqs),
                 ('POST', self.obj_ring.replicas)):
             # This case is different: we never add the 'X-Backend-Open-Expired'
             # header if the proxy server config disables this feature
@@ -1071,9 +1083,13 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         self.assertIn('Accept-Ranges', resp.headers)
 
     def test_HEAD_x_newest(self):
+        if self.is_ec:
+            head_num_reqs = self.replicas()
+        else:
+            head_num_reqs = 2 * self.replicas()
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD',
                                               headers={'X-Newest': 'true'})
-        with set_http_connect(*([200] * 2 * self.replicas())):
+        with set_http_connect(*([200] * head_num_reqs)):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
@@ -1081,7 +1097,10 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         req = swob.Request.blank('/v1/a/c/o', method='HEAD',
                                  headers={'X-Newest': 'true'})
         ts = (utils.Timestamp(t) for t in itertools.count(int(time.time())))
-        num_expected_requests = 2 * self.replicas()
+        if self.is_ec:
+            num_expected_requests = self.replicas()
+        else:
+            num_expected_requests = 2 * self.replicas()
         timestamps = [next(ts) for i in range(num_expected_requests)]
         newest_timestamp = timestamps[-1]
         random.shuffle(timestamps)
@@ -1100,7 +1119,10 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                                  headers={'X-Newest': 'true'})
         ts = (utils.Timestamp.now(offset=offset)
               for offset in itertools.count())
-        num_expected_requests = 2 * self.replicas()
+        if self.is_ec:
+            num_expected_requests = self.replicas()
+        else:
+            num_expected_requests = 2 * self.replicas()
         timestamps = [next(ts) for i in range(num_expected_requests)]
         newest_timestamp = timestamps[-1]
         random.shuffle(timestamps)
@@ -1119,7 +1141,10 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         req = swob.Request.blank('/v1/a/c/o', method='HEAD',
                                  headers={'X-Newest': 'true'})
         ts = (utils.Timestamp(t) for t in itertools.count(int(time.time())))
-        request_count = self.app.request_node_count_fn(self.obj_ring.replicas)
+        if self.is_ec:
+            request_count = self.replicas()
+        else:
+            request_count = self.app.request_node_count(self.obj_ring.replicas)
         backend_response_headers = [{
             'x-timestamp': next(ts).normal,
         } for i in range(request_count)]
@@ -3328,6 +3353,34 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual(sorted(got, key=lambda p: id(p)),
                          sorted(expected, key=lambda p: id(p)))
 
+    def test_HEAD_404_limited_requests_default(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method="HEAD")
+        # We should only default to replica_count requests before we give up
+        head_statuses = [404] * self.policy.object_ring.replicas
+        with set_http_connect(*head_statuses):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+
+    def test_HEAD_404_experimental_ec_head_limit(self):
+        def do_test(head_limit):
+            conf = {'experimental_ec_head_limit': head_limit,
+                    'conn_timeout': 1.0}
+            self.app = PatchedObjControllerApp(
+                conf, account_ring=FakeRing(),
+                container_ring=FakeRing(), logger=self.logger)
+            self.logger.clear()
+            self.app.container_info = dict(self.fake_container_info())
+
+            req = swift.common.swob.Request.blank('/v1/a/c/o', method="HEAD")
+            # We should only make head_limit requests before we give up
+            head_statuses = [404] * head_limit
+            with set_http_connect(*head_statuses):
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 404)
+
+        for head_limit in range(2, self.policy.object_ring.replicas + 1):
+            do_test(head_limit)
+
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         get_statuses = [200] * self.policy.ec_ndata
@@ -3469,8 +3522,12 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
 
         # no match
-        resp = _do_test('"frag_etag"', 412,
-                        2 * self.policy.ec_n_unique_fragments)
+        if method == 'HEAD':
+            num_reqs = self.obj_ring.replicas
+        else:
+            num_reqs = \
+                2 * self.policy.ec_n_unique_fragments
+        resp = _do_test('"frag_etag"', 412, num_reqs)
         self.assertEqual(resp.status_int, 412)
 
         # match wildcard against an alternate etag
@@ -3485,7 +3542,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         # no match against an alternate etag
         resp = _do_test('"data_etag"', 412,
-                        2 * self.policy.ec_n_unique_fragments,
+                        num_reqs,
                         etag_is_at='X-Object-Sysmeta-Alternate-Etag')
         self.assertEqual(resp.status_int, 412)
 
@@ -6442,7 +6499,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.headers['Etag'], 'foo')
 
         # not found HEAD
-        responses = [(404, b'', {})] * self.replicas() * 2
+        responses = [(404, b'', {})] * self.replicas()
         status_codes, body_iter, headers = zip(*responses)
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD')
         with set_http_connect(*status_codes, body_iter=body_iter,
