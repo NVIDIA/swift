@@ -756,7 +756,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         date_header = self.get_date_header()
         req.headers['Date'] = date_header
         with mock.patch('swift.common.middleware.s3api.s3request.'
-                        'S3Request.check_signature') as mock_cs:
+                        'SigChecker.check_signature') as mock_cs:
             status, headers, body = self.call_s3api(req)
             self.assertIn('swift.backend_path', req.environ)
             self.assertEqual(
@@ -787,7 +787,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         date_header = self.get_date_header()
         req.headers['Date'] = date_header
         with mock.patch('swift.common.middleware.s3api.s3request.'
-                        'S3Request.check_signature') as mock_cs:
+                        'SigChecker.check_signature') as mock_cs:
             status, headers, body = self.call_s3api(req)
             self.assertIn('swift.backend_path', req.environ)
             self.assertEqual(
@@ -969,22 +969,99 @@ class TestS3ApiMiddleware(S3ApiTestCase):
     def test_website_redirect_location(self):
         self._test_unsupported_header('x-amz-website-redirect-location')
 
-    def test_aws_chunked(self):
-        self._test_unsupported_header('content-encoding', 'aws-chunked')
-        # https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.html
-        # has a multi-encoding example:
-        #
-        # > Amazon S3 supports multiple content encodings. For example:
-        # >
-        # >     Content-Encoding : aws-chunked,gzip
-        # > That is, you can specify your custom content-encoding when using
-        # > Signature Version 4 streaming API.
-        self._test_unsupported_header('Content-Encoding', 'aws-chunked,gzip')
-        # Some clients skip the content-encoding,
-        # such as minio-go and aws-sdk-java
-        self._test_unsupported_header('x-amz-content-sha256',
-                                      'STREAMING-AWS4-HMAC-SHA256-PAYLOAD')
-        self._test_unsupported_header('x-amz-decoded-content-length')
+    def test_sigv2_content_sha256_ok(self):
+        good_sha_256 = hashlib.sha256(b'body').hexdigest()
+        req = Request.blank('/bucket/object',
+                            method='PUT',
+                            body=b'body',
+                            headers={'content-encoding': 'aws-chunked',
+                                     'x-amz-content-sha256': good_sha_256,
+                                     'Content-Length': '4',
+                                     'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status, '200 OK')
+
+    def test_sigv2_content_sha256_bad_value(self):
+        good_sha_256 = hashlib.sha256(b'body').hexdigest()
+        bad_sha_256 = hashlib.sha256(b'not body').hexdigest()
+        req = Request.blank('/bucket/object',
+                            method='PUT',
+                            body=b'body',
+                            headers={'content-encoding': 'aws-chunked',
+                                     'x-amz-content-sha256':
+                                         bad_sha_256,
+                                     'Content-Length': '4',
+                                     'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status, '400 Bad Request')
+        self.assertIn(f'<ClientComputedContentSHA256>{bad_sha_256}'
+                      '</ClientComputedContentSHA256>',
+                      body.decode('utf8'))
+        self.assertIn(f'<S3ComputedContentSHA256>{good_sha_256}'
+                      '</S3ComputedContentSHA256>',
+                      body.decode('utf8'))
+
+    def test_sigv2_content_encoding_aws_chunked_is_ignored(self):
+        req = Request.blank('/bucket/object',
+                            method='PUT',
+                            headers={'content-encoding': 'aws-chunked',
+                                     'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+
+        status, _, body = self.call_s3api(req)
+        self.assertEqual(status, '200 OK')
+
+    def test_sigv2_content_sha256_streaming_is_bad_request(self):
+        def do_test(sha256):
+            req = Request.blank(
+                '/bucket/object',
+                method='PUT',
+                headers={'content-encoding': 'aws-chunked',
+                         'x-amz-content-sha256': sha256,
+                         'Content-Length': '0',
+                         'x-amz-decoded-content-length': '0',
+                         'Authorization': 'AWS test:tester:hmac',
+                         'Date': self.get_date_header()})
+            status, _, body = self.call_s3api(req)
+            # sig v2 wants that to actually be the SHA!
+            self.assertEqual(status, '400 Bad Request', body)
+            self.assertEqual(self._get_error_code(body),
+                             'XAmzContentSHA256Mismatch')
+            self.assertIn(f'<ClientComputedContentSHA256>{sha256}'
+                          '</ClientComputedContentSHA256>',
+                          body.decode('utf8'))
+
+        do_test('STREAMING-UNSIGNED-PAYLOAD-TRAILER')
+        do_test('STREAMING-AWS4-HMAC-SHA256-PAYLOAD')
+        do_test('STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER')
+        do_test('STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD')
+        do_test('STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER')
+
+    def test_sigv2_content_sha256_streaming_no_decoded_content_length(self):
+        # MissingContentLength trumps XAmzContentSHA256Mismatch
+        def do_test(sha256):
+            req = Request.blank(
+                '/bucket/object',
+                method='PUT',
+                headers={'content-encoding': 'aws-chunked',
+                         'x-amz-content-sha256': sha256,
+                         'Content-Length': '0',
+                         'Authorization': 'AWS test:tester:hmac',
+                         'Date': self.get_date_header()})
+            status, _, body = self.call_s3api(req)
+            self.assertEqual(status, '411 Length Required', body)
+            self.assertEqual(self._get_error_code(body),
+                             'MissingContentLength')
+
+        do_test('STREAMING-UNSIGNED-PAYLOAD-TRAILER')
+        do_test('STREAMING-AWS4-HMAC-SHA256-PAYLOAD')
+        do_test('STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER')
+        do_test('STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD')
+        do_test('STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER')
 
     def test_object_tagging(self):
         self._test_unsupported_header('x-amz-tagging')
@@ -1350,9 +1427,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                     patch.object(swift.common.middleware.s3api.s3request,
                                  'SERVICE', 'host'):
                 req = _get_req(path, environ)
-                hash_in_sts = req._string_to_sign().split(b'\n')[3]
+                hash_in_sts = req.sig_checker._string_to_sign().split(b'\n')[3]
                 self.assertEqual(hash_val, hash_in_sts.decode('ascii'))
-                self.assertTrue(req.check_signature(
+                self.assertTrue(req.sig_checker.check_signature(
                     'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY'))
 
         # all next data got from aws4_testsuite from Amazon
