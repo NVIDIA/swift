@@ -21,7 +21,7 @@ import unittest
 from io import BytesIO
 
 from swift.common import swob
-from swift.common.middleware.s3api import s3response, controllers
+from swift.common.middleware.s3api import s3request, s3response, controllers
 from swift.common.swob import Request, HTTPNoContent
 from swift.common.middleware.s3api.utils import mktime, Config
 from swift.common.middleware.s3api.acl_handlers import get_acl_handler
@@ -30,7 +30,7 @@ from swift.common.middleware.s3api.subresource import ACL, User, Owner, \
 from test.unit.common.middleware.s3api.test_s3api import S3ApiTestCase
 from swift.common.middleware.s3api.s3request import S3Request, \
     S3AclRequest, SigV4Request, SIGV4_X_AMZ_DATE_FORMAT, HashingInput, \
-    S3InputSHA256Mismatch
+    StreamingInput, S3InputSHA256Mismatch
 from swift.common.middleware.s3api.s3response import InvalidArgument, \
     NoSuchBucket, InternalError, ServiceUnavailable, \
     AccessDenied, SignatureDoesNotMatch, RequestTimeTooSkewed, \
@@ -97,6 +97,7 @@ class TestRequest(S3ApiTestCase):
     def setUp(self):
         super(TestRequest, self).setUp()
         self.s3api.conf.s3_acl = True
+        s3request.SIGV4_CHUNK_MIN_SIZE = 2
 
     @patch('swift.common.middleware.s3api.acl_handlers.ACL_MAP', Fake_ACL_MAP)
     @patch('swift.common.middleware.s3api.s3request.S3AclRequest.authenticate',
@@ -791,8 +792,8 @@ class TestRequest(S3ApiTestCase):
             b'Tue, 27 Mar 2007 19:36:42 +0000',
             b'/johnsmith/photos/puppy.jpg',
         ])
-        self.assertEqual(expected_sts, sigv2_req._string_to_sign())
-        self.assertTrue(sigv2_req.check_signature(secret))
+        self.assertEqual(expected_sts, sigv2_req.sig_checker.string_to_sign)
+        self.assertTrue(sigv2_req.sig_checker.check_signature(secret))
 
         req = Request.blank('/photos/puppy.jpg', method='PUT', headers={
             'Content-Type': 'image/jpeg',
@@ -811,8 +812,8 @@ class TestRequest(S3ApiTestCase):
             b'Tue, 27 Mar 2007 21:15:45 +0000',
             b'/johnsmith/photos/puppy.jpg',
         ])
-        self.assertEqual(expected_sts, sigv2_req._string_to_sign())
-        self.assertTrue(sigv2_req.check_signature(secret))
+        self.assertEqual(expected_sts, sigv2_req.sig_checker.string_to_sign)
+        self.assertTrue(sigv2_req.sig_checker.check_signature(secret))
 
         req = Request.blank(
             '/?prefix=photos&max-keys=50&marker=puppy',
@@ -832,12 +833,12 @@ class TestRequest(S3ApiTestCase):
             b'Tue, 27 Mar 2007 19:42:41 +0000',
             b'/johnsmith/',
         ])
-        self.assertEqual(expected_sts, sigv2_req._string_to_sign())
-        self.assertTrue(sigv2_req.check_signature(secret))
+        self.assertEqual(expected_sts, sigv2_req.sig_checker.string_to_sign)
+        self.assertTrue(sigv2_req.sig_checker.check_signature(secret))
 
         with patch('swift.common.middleware.s3api.s3request.streq_const_time',
                    return_value=True) as mock_eq:
-            self.assertTrue(sigv2_req.check_signature(secret))
+            self.assertTrue(sigv2_req.sig_checker.check_signature(secret))
         mock_eq.assert_called_once()
 
     def test_check_signature_sigv2(self):
@@ -861,7 +862,7 @@ class TestRequest(S3ApiTestCase):
             'storage_domains': ['s3.amazonaws.com']}))
         # This is a failure case with utf-8 non-ascii multi-bytes charactor
         # but we expect to return just False instead of exceptions
-        self.assertFalse(sigv2_req.check_signature(
+        self.assertFalse(sigv2_req.sig_checker.check_signature(
             u'\u30c9\u30e9\u30b4\u30f3'))
 
         # Test v4 check_signature with multi bytes invalid secret
@@ -877,12 +878,12 @@ class TestRequest(S3ApiTestCase):
         })
         sigv4_req = SigV4Request(
             req.environ, Config({'storage_domains': ['s3.amazonaws.com']}))
-        self.assertFalse(sigv4_req.check_signature(
+        self.assertFalse(sigv4_req.sig_checker.check_signature(
             u'\u30c9\u30e9\u30b4\u30f3'))
 
         with patch('swift.common.middleware.s3api.s3request.streq_const_time',
                    return_value=False) as mock_eq:
-            self.assertFalse(sigv4_req.check_signature(
+            self.assertFalse(sigv4_req.sig_checker.check_signature(
                 u'\u30c9\u30e9\u30b4\u30f3'))
         mock_eq.assert_called_once()
 
@@ -908,7 +909,7 @@ class TestRequest(S3ApiTestCase):
         sigv4_req = SigV4Request(req.environ)
         self.assertTrue(
             sigv4_req._canonical_request().endswith(b'UNSIGNED-PAYLOAD'))
-        self.assertTrue(sigv4_req.check_signature('secret'))
+        self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
 
     @patch.object(S3Request, '_validate_dates', lambda *a: None)
     def test_check_signature_sigv4_url_encode(self):
@@ -935,7 +936,7 @@ class TestRequest(S3ApiTestCase):
         canonical_req = sigv4_req._canonical_request()
         self.assertIn(b'PUT\n/test/~/file%2C1_1%3A1-1\n', canonical_req)
         self.assertTrue(canonical_req.endswith(b'UNSIGNED-PAYLOAD'))
-        self.assertTrue(sigv4_req.check_signature('secret'))
+        self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
 
     @patch.object(S3Request, '_validate_dates', lambda *a: None)
     def test_check_sigv4_req_zero_content_length_sha256(self):
@@ -979,7 +980,7 @@ class TestRequest(S3ApiTestCase):
         sigv4_req = SigV4Request(req.environ)
         self.assertTrue(
             sigv4_req._canonical_request().endswith(sha256_of_nothing))
-        self.assertTrue(sigv4_req.check_signature('secret'))
+        self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
 
         # uppercase sha256 -- signature changes, but content's valid
         headers = {
@@ -998,7 +999,7 @@ class TestRequest(S3ApiTestCase):
         sigv4_req = SigV4Request(req.environ)
         self.assertTrue(
             sigv4_req._canonical_request().endswith(sha256_of_nothing.upper()))
-        self.assertTrue(sigv4_req.check_signature('secret'))
+        self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
 
     @patch.object(S3Request, '_validate_dates', lambda *a: None)
     def test_v4_req_xmz_content_sha256_mismatch(self):
@@ -1039,7 +1040,7 @@ class TestRequest(S3ApiTestCase):
             caught.exception.body)
 
     @patch.object(S3Request, '_validate_dates', lambda *a: None)
-    def test_v4_req_xmz_content_sha256_missing(self):
+    def test_v4_req_amz_content_sha256_missing(self):
         # Virtual hosted-style
         self.s3api.conf.storage_domains = ['s3.test.com']
         environ = {
@@ -1182,6 +1183,405 @@ class TestRequest(S3ApiTestCase):
                          str(cm.exception))
         self.assertIn(b'Cannot specify both Range header and partNumber query '
                       b'parameter', cm.exception.body)
+
+    def _make_valid_v4_streaming_hmac_sha256_payload_request(self):
+        environ = {
+            'HTTP_HOST': 's3.test.com',
+            'REQUEST_METHOD': 'PUT',
+            'RAW_PATH_INFO': '/test/file'}
+        headers = {
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/20220330/us-east-1/s3/aws4_request,'
+                'SignedHeaders=content-encoding;content-length;host;x-amz-con'
+                'tent-sha256;x-amz-date;x-amz-decoded-content-length,'
+                'Signature=aa1b67fc5bc4503d05a636e6e740dcb757d3aa2352f32e7493f'
+                '261f71acbe1d5',
+            'Content-Encoding': 'aws-chunked',
+            'Content-Length': '369',
+            'Host': 's3.test.com',
+            'X-Amz-Content-SHA256': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+            'X-Amz-Date': '20220330T095351Z',
+            'X-Amz-Decoded-Content-Length': '25'}
+        body = 'a;chunk-signature=4a397f01db2cd700402dc38931b462e789ae49911d' \
+               'c229d93c9f9c46fd3e0b21\r\nabcdefghij\r\n' \
+               'a;chunk-signature=49177768ee3e9b77c6353ab9f3b9747d188adc11d4' \
+               '5b38be94a130616e6d64dc\r\nklmnopqrst\r\n' \
+               '5;chunk-signature=c884ebbca35b923cf864854e2a906aa8f5895a7140' \
+               '6c73cc6d4ee057527a8c23\r\nuvwz\n\r\n' \
+               '0;chunk-signature=50f7c470d6bf6c59126eecc2cb020d532a69c92322' \
+               'ddfbbd21811de45491022c\r\n\r\n'
+
+        req = Request.blank(environ['RAW_PATH_INFO'], environ=environ,
+                            headers=headers, body=body.encode('utf8'))
+        return SigV4Request(req.environ)
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_check_signature_v4_hmac_sha256_payload_chunk_valid(self):
+        s3req = self._make_valid_v4_streaming_hmac_sha256_payload_request()
+        # Verify header signature
+        self.assertTrue(s3req.sig_checker.check_signature('secret'))
+
+        self.assertEqual(b'abcdefghij', s3req.environ['wsgi.input'].read(10))
+        self.assertEqual(b'klmnopqrst', s3req.environ['wsgi.input'].read(10))
+        self.assertEqual(b'uvwz\n', s3req.environ['wsgi.input'].read(10))
+        self.assertEqual(b'', s3req.environ['wsgi.input'].read(10))
+        self.assertTrue(s3req.sig_checker._all_chunk_signatures_valid)
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_check_signature_v4_hmac_sha256_payload_no_secret(self):
+        # verify S3InputError if auth middleware does NOT call check_signature
+        # before the stream is read
+        s3req = self._make_valid_v4_streaming_hmac_sha256_payload_request()
+        with self.assertRaises(s3request.S3InputMissingSecret) as cm:
+            s3req.environ['wsgi.input'].read(10)
+
+        # ...which in context gets translated to a 501 response
+        with self.assertRaises(s3response.S3NotImplemented) as cm, \
+                s3req.translate_read_errors():
+            s3req.environ['wsgi.input'].read(10)
+        self.assertIn(
+            'Transferring payloads in multiple chunks using aws-chunked is '
+            'not supported.', str(cm.exception.body))
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_check_signature_v4_hmac_sha256_payload_chunk_invalid(self):
+        environ = {
+            'HTTP_HOST': 's3.test.com',
+            'REQUEST_METHOD': 'PUT',
+            'RAW_PATH_INFO': '/test/file'}
+        headers = {
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/20220330/us-east-1/s3/aws4_request,'
+                'SignedHeaders=content-encoding;content-length;host;x-amz-con'
+                'tent-sha256;x-amz-date;x-amz-decoded-content-length,'
+                'Signature=aa1b67fc5bc4503d05a636e6e740dcb757d3aa2352f32e7493f'
+                '261f71acbe1d5',
+            'Content-Encoding': 'aws-chunked',
+            'Content-Length': '369',
+            'Host': 's3.test.com',
+            'X-Amz-Content-SHA256': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+            'X-Amz-Date': '20220330T095351Z',
+            'X-Amz-Decoded-Content-Length': '25'}
+        # second chunk signature is incorrect, should be
+        # 49177768ee3e9b77c6353ab9f3b9747d188adc11d45b38be94a130616e6d64dc
+        body = 'a;chunk-signature=4a397f01db2cd700402dc38931b462e789ae49911d' \
+               'c229d93c9f9c46fd3e0b21\r\nabcdefghij\r\n' \
+               'a;chunk-signature=49177768ee3e9b77c6353ab0f3b9747d188adc11d4' \
+               '5b38be94a130616e6d64dc\r\nklmnopqrst\r\n' \
+               '5;chunk-signature=c884ebbca35b923cf864854e2a906aa8f5895a7140' \
+               '6c73cc6d4ee057527a8c23\r\nuvwz\n\r\n' \
+               '0;chunk-signature=50f7c470d6bf6c59126eecc2cb020d532a69c92322' \
+               'ddfbbd21811de45491022c\r\n\r\n'
+
+        req = Request.blank(environ['RAW_PATH_INFO'], environ=environ,
+                            headers=headers, body=body.encode('utf8'))
+        sigv4_req = SigV4Request(req.environ)
+        # Verify header signature
+        self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
+
+        self.assertEqual(b'abcdefghij', req.environ['wsgi.input'].read(10))
+        with self.assertRaises(s3request.S3InputChunkSignatureMismatch):
+            req.environ['wsgi.input'].read(10)
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_check_signature_v4_hmac_sha256_payload_chunk_wrong_size(self):
+        environ = {
+            'HTTP_HOST': 's3.test.com',
+            'REQUEST_METHOD': 'PUT',
+            'RAW_PATH_INFO': '/test/file'}
+        headers = {
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/20220330/us-east-1/s3/aws4_request,'
+                'SignedHeaders=content-encoding;content-length;host;x-amz-con'
+                'tent-sha256;x-amz-date;x-amz-decoded-content-length,'
+                'Signature=aa1b67fc5bc4503d05a636e6e740dcb757d3aa2352f32e7493f'
+                '261f71acbe1d5',
+            'Content-Encoding': 'aws-chunked',
+            'Content-Length': '369',
+            'Host': 's3.test.com',
+            'X-Amz-Content-SHA256': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+            'X-Amz-Date': '20220330T095351Z',
+            'X-Amz-Decoded-Content-Length': '25'}
+        # 2nd chunk contains an incorrect chunk size (9 should be a)...
+        body = 'a;chunk-signature=4a397f01db2cd700402dc38931b462e789ae49911d' \
+               'c229d93c9f9c46fd3e0b21\r\nabcdefghij\r\n' \
+               '9;chunk-signature=49177768ee3e9b77c6353ab9f3b9747d188adc11d4' \
+               '5b38be94a130616e6d64dc\r\nklmnopqrst\r\n' \
+               '5;chunk-signature=c884ebbca35b923cf864854e2a906aa8f5895a7140' \
+               '6c73cc6d4ee057527a8c23\r\nuvwz\n\r\n' \
+               '0;chunk-signature=50f7c470d6bf6c59126eecc2cb020d532a69c92322' \
+               'ddfbbd21811de45491022c\r\n\r\n'
+
+        req = Request.blank(environ['RAW_PATH_INFO'], environ=environ,
+                            headers=headers, body=body.encode('utf8'))
+        sigv4_req = SigV4Request(req.environ)
+        # Verify header signature
+        self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
+
+        self.assertEqual(b'abcdefghij', req.environ['wsgi.input'].read(10))
+        with self.assertRaises(s3request.S3InputChunkSignatureMismatch):
+            req.environ['wsgi.input'].read(10)
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def test_check_signature_v4_hmac_sha256_payload_chunk_no_last_chunk(self):
+        environ = {
+            'HTTP_HOST': 's3.test.com',
+            'REQUEST_METHOD': 'PUT',
+            'RAW_PATH_INFO': '/test/file'}
+        headers = {
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/20220330/us-east-1/s3/aws4_request,'
+                'SignedHeaders=content-encoding;content-length;host;x-amz-con'
+                'tent-sha256;x-amz-date;x-amz-decoded-content-length,'
+                'Signature=99759fb2823febb695950e6b75a7a1396b164742da9d204f71f'
+                'db3a3a52216aa',
+            'Content-Encoding': 'aws-chunked',
+            'Content-Length': '283',
+            'Host': 's3.test.com',
+            'X-Amz-Content-SHA256': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+            'X-Amz-Date': '20220330T095351Z',
+            'X-Amz-Decoded-Content-Length': '25'}
+        body = 'a;chunk-signature=9c35d0203ce923cb7837b5e4a2984f2c107b05ac45' \
+               '80bafce7541c4b142b9712\r\nabcdefghij\r\n' \
+               'a;chunk-signature=f514382beed5f287a5181b8293399fe006fd9398ee' \
+               '4b8aed910238092a4d5ec7\r\nklmnopqrst\r\n' \
+               '5;chunk-signature=ed6a54f035b920e7daa378ab2d255518c082573c98' \
+               '60127c80d43697375324f4\r\nuvwz\n\r\n'
+
+        req = Request.blank(environ['RAW_PATH_INFO'], environ=environ,
+                            headers=headers, body=body.encode('utf8'))
+        sigv4_req = SigV4Request(req.environ)
+        # Verify header signature
+        self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
+        self.assertEqual(b'abcdefghij', req.environ['wsgi.input'].read(10))
+        self.assertEqual(b'klmnopqrst', req.environ['wsgi.input'].read(10))
+        with self.assertRaises(s3request.S3InputIncomplete):
+            req.environ['wsgi.input'].read(5)
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def _test_sig_v4_streaming_aws_hmac_sha256_payload_trailer(
+            self, body):
+        environ = {
+            'HTTP_HOST': 's3.test.com',
+            'REQUEST_METHOD': 'PUT',
+            'RAW_PATH_INFO': '/test/file'}
+        headers = {
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/20220330/us-east-1/s3/aws4_request,'
+                'SignedHeaders=content-encoding;content-length;host;x-amz-con'
+                'tent-sha256;x-amz-date;x-amz-decoded-content-length,'
+                'Signature=bee7ad4f1a4f16c22f3b24155ab749b2aca0773065ccf08bc41'
+                'a1e8e84748311',
+            'Content-Encoding': 'aws-chunked',
+            'Content-Length': '369',
+            'Host': 's3.test.com',
+            'X-Amz-Content-SHA256':
+                'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
+            'X-Amz-Date': '20220330T095351Z',
+            'X-Amz-Decoded-Content-Length': '27',
+            'X-Amz-Trailer': 'x-amz-checksum-sha256',
+        }
+        req = Request.blank(environ['RAW_PATH_INFO'], environ=environ,
+                            headers=headers, body=body.encode('utf8'))
+        sigv4_req = SigV4Request(req.environ)
+        # Verify header signature
+        self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
+        return req
+
+    def test_check_sig_v4_streaming_aws_hmac_sha256_payload_trailer_ok(self):
+        body = 'a;chunk-signature=c9dd07703599d3d0bd51c96193110756d4f7091d5a' \
+               '4408314a53a802e635b1ad\r\nabcdefghij\r\n' \
+               'a;chunk-signature=662dc18fb1a3ddad6abc2ce9ebb0748bedacd219eb' \
+               '223a5e80721c2637d30240\r\nklmnopqrst\r\n' \
+               '7;chunk-signature=b63f141c2012de9ac60b961795ef31ad3202b125aa' \
+               '873b4142cf9d815360abc0\r\nuvwxyz\n\r\n' \
+               '0;chunk-signature=b1ff1f86dccfbe9bcc80011e2b87b72e43e0c7f543' \
+               'bb93612c06f9808ccb772e\r\n' \
+               'x-amz-checksum-sha256:foo\r\n' \
+               'x-amz-trailer-signature:347dd27b77f240eee9904e9aaaa10acb955a' \
+               'd1bd0d6dd2e2c64794195eb5535b\r\n'
+        req = self._test_sig_v4_streaming_aws_hmac_sha256_payload_trailer(body)
+        self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
+                         req.environ['wsgi.input'].read())
+
+    def test_check_sig_v4_streaming_aws_hmac_sha256_missing_trailer_sig(self):
+        body = 'a;chunk-signature=c9dd07703599d3d0bd51c96193110756d4f7091d5a' \
+               '4408314a53a802e635b1ad\r\nabcdefghij\r\n' \
+               'a;chunk-signature=662dc18fb1a3ddad6abc2ce9ebb0748bedacd219eb' \
+               '223a5e80721c2637d30240\r\nklmnopqrst\r\n' \
+               '7;chunk-signature=b63f141c2012de9ac60b961795ef31ad3202b125aa' \
+               '873b4142cf9d815360abc0\r\nuvwxyz\n\r\n' \
+               '0;chunk-signature=b1ff1f86dccfbe9bcc80011e2b87b72e43e0c7f543' \
+               'bb93612c06f9808ccb772e\r\n' \
+               'x-amz-checksum-sha256:foo\r\n'
+        req = self._test_sig_v4_streaming_aws_hmac_sha256_payload_trailer(body)
+        with self.assertRaises(s3request.S3InputIncomplete):
+            req.environ['wsgi.input'].read()
+
+    def test_check_sig_v4_streaming_aws_hmac_sha256_payload_trailer_bad(self):
+        body = 'a;chunk-signature=c9dd07703599d3d0bd51c96193110756d4f7091d5a' \
+               '4408314a53a802e635b1ad\r\nabcdefghij\r\n' \
+               'a;chunk-signature=000000000000000000000000000000000000000000' \
+               '0000000000000000000000\r\nklmnopqrst\r\n' \
+               '7;chunk-signature=b63f141c2012de9ac60b961795ef31ad3202b125aa' \
+               '873b4142cf9d815360abc0\r\nuvwxyz\n\r\n' \
+               '0;chunk-signature=b1ff1f86dccfbe9bcc80011e2b87b72e43e0c7f543' \
+               'bb93612c06f9808ccb772e\r\n' \
+               'x-amz-checksum-sha256:foo\r\n'
+        req = self._test_sig_v4_streaming_aws_hmac_sha256_payload_trailer(body)
+        self.assertEqual(b'abcdefghij', req.environ['wsgi.input'].read(10))
+        with self.assertRaises(s3request.S3InputChunkSignatureMismatch):
+            req.environ['wsgi.input'].read(10)
+
+    @patch.object(S3Request, '_validate_dates', lambda *a: None)
+    def _test_sig_v4_streaming_unsigned_payload_trailer(
+            self, body, x_amz_trailer='x-amz-checksum-sha256'):
+        environ = {
+            'HTTP_HOST': 's3.test.com',
+            'REQUEST_METHOD': 'PUT',
+            'RAW_PATH_INFO': '/test/file'}
+        headers = {
+            'Authorization':
+                'AWS4-HMAC-SHA256 '
+                'Credential=test/20220330/us-east-1/s3/aws4_request,'
+                'SignedHeaders=content-encoding;content-length;host;x-amz-con'
+                'tent-sha256;x-amz-date;x-amz-decoded-content-length,'
+                'Signature=43727fcfa7765e97cd3cbfc112fed5fedc31e2b7930588ddbca'
+                '3feaa1205a7f2',
+            'Content-Encoding': 'aws-chunked',
+            'Content-Length': '369',
+            'Host': 's3.test.com',
+            'X-Amz-Content-SHA256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+            'X-Amz-Date': '20220330T095351Z',
+            'X-Amz-Decoded-Content-Length': '27',
+        }
+        if x_amz_trailer is not None:
+            headers['X-Amz-Trailer'] = x_amz_trailer
+        req = Request.blank(environ['RAW_PATH_INFO'], environ=environ,
+                            headers=headers, body=body.encode('utf8'))
+        sigv4_req = SigV4Request(req.environ)
+        # Verify header signature
+        self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
+        return req
+
+    def test_check_sig_v4_streaming_unsigned_payload_trailer_ok(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n' \
+               'x-amz-checksum-sha256:foo\r\n'
+        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
+                         req.environ['wsgi.input'].read())
+
+    def test_check_sig_v4_streaming_unsigned_payload_trailer_none_ok(self):
+        # verify it's ok to not send any trailer
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n'
+        req = self._test_sig_v4_streaming_unsigned_payload_trailer(
+            body, x_amz_trailer=None)
+        self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
+                         req.environ['wsgi.input'].read())
+
+    def test_check_sig_v4_streaming_unsigned_payload_trailer_undeclared(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n' \
+               'x-amz-checksum-sha256:undeclared\r\n'
+        req = self._test_sig_v4_streaming_unsigned_payload_trailer(
+            body, x_amz_trailer=None)
+        self.assertEqual(b'abcdefghijklmnopqrst',
+                         req.environ['wsgi.input'].read(20))
+        with self.assertRaises(s3request.S3InputIncomplete):
+            req.environ['wsgi.input'].read()
+
+    def test_check_sig_v4_streaming_unsigned_payload_trailer_multiple(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n' \
+               'x-amz-checksum-sha256:undeclared\r\n'
+        with self.assertRaises(s3request.InvalidRequest):
+            self._test_sig_v4_streaming_unsigned_payload_trailer(
+                body,
+                x_amz_trailer='x-amz-checksum-sha256,x-amz-checksum-crc32')
+
+    def test_check_sig_v4_streaming_unsigned_payload_trailer_mismatch(self):
+        # the unexpected footer is detected before the incomplete line
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n' \
+               'x-amz-checksum-not-sha256:foo\r\n' \
+               'x-'
+        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        self.assertEqual(b'abcdefghijklmnopqrst',
+                         req.environ['wsgi.input'].read(20))
+        # trailers are read with penultimate chunk??
+        with self.assertRaises(s3request.S3InputMalformedTrailer):
+            req.environ['wsgi.input'].read()
+
+    def test_check_sig_v4_streaming_unsigned_payload_trailer_missing(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n' \
+               '\r\n'
+        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        self.assertEqual(b'abcdefghijklmnopqrst',
+                         req.environ['wsgi.input'].read(20))
+        # trailers are read with penultimate chunk??
+        with self.assertRaises(s3request.S3InputMalformedTrailer):
+            req.environ['wsgi.input'].read()
+
+    def test_check_sig_v4_streaming_unsigned_payload_trailer_extra(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n' \
+               'x-amz-checksum-crc32:foo\r\n' \
+               'x-amz-checksum-sha32:foo\r\n'
+        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        self.assertEqual(b'abcdefghijklmnopqrst',
+                         req.environ['wsgi.input'].read(20))
+        # trailers are read with penultimate chunk??
+        with self.assertRaises(s3request.S3InputMalformedTrailer):
+            req.environ['wsgi.input'].read()
+
+    def test_check_sig_v4_streaming_unsigned_payload_trailer_duplicate(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n' \
+               'x-amz-checksum-sha256:foo\r\n' \
+               'x-amz-checksum-sha256:bar\r\n'
+        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        self.assertEqual(b'abcdefghijklmnopqrst',
+                         req.environ['wsgi.input'].read(20))
+        # Reading the rest succeeds! AWS would complain about the checksum,
+        # but we aren't looking at it (yet)
+        req.environ['wsgi.input'].read()
+
+    def test_check_sig_v4_streaming_unsigned_payload_trailer_short(self):
+        body = 'a\r\nabcdefghij\r\n' \
+               'a\r\nklmnopqrst\r\n' \
+               '7\r\nuvwxyz\n\r\n' \
+               '0\r\n' \
+               'x-amz-checksum-sha256'
+        req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
+        self.assertEqual(b'abcdefghijklmnopqrst',
+                         req.environ['wsgi.input'].read(20))
+        # trailers are read with penultimate chunk??
+        with self.assertRaises(s3request.S3InputIncomplete):
+            req.environ['wsgi.input'].read()
 
 
 class TestSigV4Request(S3ApiTestCase):
@@ -1549,6 +1949,112 @@ class TestHashingInput(S3ApiTestCase):
         self.assertEqual(b'12345\n', wrapped.readline())
         with self.assertRaises(S3InputSHA256Mismatch):
             self.assertEqual(b'6789', wrapped.readline())
+
+
+class TestStreamingInput(S3ApiTestCase):
+    def setUp(self):
+        super(TestStreamingInput, self).setUp()
+        # Override chunk min size
+        s3request.SIGV4_CHUNK_MIN_SIZE = 2
+
+    def test_good(self):
+        def chunk_validator(chunk, signature):
+            return signature == 'ok'
+
+        raw = '9;chunk-signature=ok\r\n123456789\r\n' \
+              '0;chunk-signature=ok\r\n\r\n'.encode('utf8')
+        wrapped = StreamingInput(BytesIO(raw), 9, set(), chunk_validator, None)
+        self.assertEqual(b'1234', wrapped.read(4))
+        self.assertEqual(b'56', wrapped.read(2))
+        # trying to read past the end gets us whatever's left
+        self.assertEqual(b'789', wrapped.read(4))
+        # can continue trying to read -- but it'll be empty
+        self.assertEqual(b'', wrapped.read(2))
+
+        self.assertFalse(wrapped._input.closed)
+        wrapped.close()
+        self.assertTrue(wrapped._input.closed)
+
+    def test_good_with_trailers(self):
+        def chunk_validator(chunk, signature):
+            return signature == 'ok'
+
+        raw = '9;chunk-signature=ok\r\n123456789\r\n' \
+              '0;chunk-signature=ok\r\n' \
+              'x-amz-checksum-crc32: AAAAAA==\r\n'.encode('utf8')
+        wrapped = StreamingInput(
+            BytesIO(raw), 9, {'x-amz-checksum-crc32'}, chunk_validator, None)
+        self.assertEqual(b'1234', wrapped.read(4))
+        self.assertEqual(b'56', wrapped.read(2))
+        # not at end, trailers haven't been read
+        self.assertEqual({}, wrapped.trailers)
+        # if we get exactly to the end, we go ahead and read the trailers
+        self.assertEqual(b'789', wrapped.read(3))
+        self.assertEqual({'x-amz-checksum-crc32': 'AAAAAA=='},
+                         wrapped.trailers)
+        # can continue trying to read -- but it'll be empty
+        self.assertEqual(b'', wrapped.read(2))
+        self.assertEqual({'x-amz-checksum-crc32': 'AAAAAA=='},
+                         wrapped.trailers)
+
+        self.assertFalse(wrapped._input.closed)
+        wrapped.close()
+        self.assertTrue(wrapped._input.closed)
+
+    def test_wrong_signature_first_chunk(self):
+        def chunk_validator(chunk, signature):
+            return signature == 'ok'
+
+        raw = '9;chunk-signature=ko\r\n123456789\r\n' \
+              '0;chunk-signature=ok\r\n\r\n'.encode('utf8')
+        wrapped = StreamingInput(BytesIO(raw), 9, set(), chunk_validator, None)
+        # Can read while in the chunk...
+        self.assertEqual(b'1234', wrapped.read(4))
+        self.assertEqual(b'5678', wrapped.read(4))
+        # But once we hit the end, bomb out
+        with self.assertRaises(s3request.S3InputChunkSignatureMismatch):
+            wrapped.read(4)
+        self.assertTrue(wrapped._input.closed)
+
+    def test_wrong_signature_middle_chunk(self):
+        def chunk_validator(chunk, signature):
+            return signature == 'ok'
+
+        raw = '2;chunk-signature=ok\r\n12\r\n' \
+              '2;chunk-signature=ok\r\n34\r\n' \
+              '2;chunk-signature=ko\r\n56\r\n' \
+              '2;chunk-signature=ok\r\n78\r\n' \
+              '0;chunk-signature=ok\r\n\r\n'.encode('utf8')
+        wrapped = StreamingInput(BytesIO(raw), 9, set(), chunk_validator, None)
+        self.assertEqual(b'1234', wrapped.read(4))
+        with self.assertRaises(s3request.S3InputChunkSignatureMismatch):
+            wrapped.read(4)
+        self.assertTrue(wrapped._input.closed)
+
+    def test_wrong_signature_last_chunk(self):
+        def chunk_validator(chunk, signature):
+            return signature == 'ok'
+
+        raw = '2;chunk-signature=ok\r\n12\r\n' \
+              '2;chunk-signature=ok\r\n34\r\n' \
+              '2;chunk-signature=ok\r\n56\r\n' \
+              '2;chunk-signature=ok\r\n78\r\n' \
+              '0;chunk-signature=ko\r\n\r\n'.encode('utf8')
+        wrapped = StreamingInput(BytesIO(raw), 9, set(), chunk_validator, None)
+        self.assertEqual(b'12345678', wrapped.read(8))
+        with self.assertRaises(s3request.S3InputChunkSignatureMismatch):
+            wrapped.read(4)
+        self.assertTrue(wrapped._input.closed)
+
+    def test_wrong_chunk_size(self):
+        def chunk_validator(chunk, signature):
+            return signature == 'ok'
+
+        raw = 'a;chunk-signature=ok\r\n123456789\r\n' \
+            '0;chunk-signature=ok\r\n\r\n'.encode('utf8')
+        wrapped = StreamingInput(BytesIO(raw), 9, set(), chunk_validator, None)
+        with self.assertRaises(s3request.S3InputError):
+            wrapped.read(4)
 
 
 if __name__ == '__main__':
