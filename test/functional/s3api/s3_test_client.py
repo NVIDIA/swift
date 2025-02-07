@@ -161,9 +161,12 @@ class Connection(object):
         return url, {}
 
 
-def get_boto3_conn(aws_access_key, aws_secret_key):
+def get_boto3_conn(aws_access_key, aws_secret_key, s3_config=None):
     endpoint_url = tf.config['s3_storage_url']
-    config = boto3.session.Config(s3={'addressing_style': 'path'})
+    config = {'addressing_style': 'path'}
+    if s3_config:
+        config.update(s3_config)
+    config = boto3.session.Config(s3=config)
     return boto3.client(
         's3', aws_access_key_id=aws_access_key,
         aws_secret_access_key=aws_secret_key,
