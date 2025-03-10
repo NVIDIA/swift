@@ -558,7 +558,10 @@ class RingWriter(GzipWriter):
         """
         if self.pos != 0:
             raise IOError("Magic must be written at the start of the file")
+        # switch to uncompressed, so libmagic can know what to expect
+        self._set_compression_level(0)
         self.write(struct.pack("!4sH", b"R1NG", version))
+        self._set_compression_level(9)
 
     def write_size(self, size, fmt="!Q"):
         """
