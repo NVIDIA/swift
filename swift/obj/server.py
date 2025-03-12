@@ -29,9 +29,9 @@ from eventlet import sleep, wsgi, Timeout, tpool
 from eventlet.greenthread import spawn
 
 from swift.common.utils import public, get_logger, \
-    config_true_value, config_percent_value, timing_stats, replication, \
-    normalize_delete_at_timestamp, get_log_line, Timestamp, \
-    parse_mime_headers, \
+    config_true_value, config_percent_value, timing_stats, \
+    labeled_timing_stats, replication, normalize_delete_at_timestamp, \
+    get_log_line, Timestamp, parse_mime_headers, \
     iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads, \
     config_auto_int_value, split_path, get_redirect_data, \
     normalize_timestamp, md5, parse_options, CooperativeIterator
@@ -52,6 +52,7 @@ from swift.common.request_helpers import get_name_and_placement, \
     is_user_meta, is_sys_or_user_meta, is_object_transient_sysmeta, \
     resolve_etag_is_at_header, is_sys_meta, validate_internal_obj, \
     is_backend_open_expired
+from swift.common.statsd_client import get_labeled_statsd_client
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPInternalServerError, HTTPNoContent, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestTimeout, HTTPUnprocessableEntity, \
@@ -64,6 +65,9 @@ from swift.container.backend import SHARDED
 from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter
 from swift.obj.expirer import build_task_obj, embed_expirer_bytes_in_ctype, \
     X_DELETE_TYPE
+
+
+LABELED_METRIC_NAME = 'swift_object_request_timing'
 
 
 def iter_mime_headers_and_bodies(wsgi_input, mime_boundary, read_chunk_size):
@@ -144,6 +148,7 @@ class ObjectController(BaseStorageServer):
         """
         super(ObjectController, self).__init__(conf)
         self.logger = logger or get_logger(conf, log_route='object-server')
+        self.statsd = get_labeled_statsd_client(conf, self.logger.logger)
         self.node_timeout = float(conf.get('node_timeout', 3))
         self.container_update_timeout = float(
             conf.get('container_update_timeout', 1))
@@ -1127,10 +1132,15 @@ class ObjectController(BaseStorageServer):
 
     @public
     @timing_stats()
-    def GET(self, request):
+    @labeled_timing_stats(metric=LABELED_METRIC_NAME)
+    def GET(self, request, timing_stats_labels):
         """Handle HTTP GET requests for the Swift Object Server."""
         device, partition, account, container, obj, policy = \
             get_obj_name_and_placement(request)
+        timing_stats_labels['account'] = account
+        timing_stats_labels['container'] = container
+        timing_stats_labels['policy'] = int(policy)
+
         request.headers.setdefault('X-Timestamp',
                                    normalize_timestamp(time.time()))
         req_timestamp = valid_timestamp(request)
@@ -1391,7 +1401,8 @@ class ObjectController(BaseStorageServer):
     @public
     @replication
     @timing_stats(sample_rate=0.1)
-    def REPLICATE(self, request):
+    @labeled_timing_stats(metric=LABELED_METRIC_NAME, sample_rate=0.1)
+    def REPLICATE(self, request, timing_stats_labels):
         """
         Handle REPLICATE requests for the Swift Object Server.  This is used
         by the object replicator to get hashes for directories.
@@ -1403,10 +1414,14 @@ class ObjectController(BaseStorageServer):
         device, partition, suffix_parts, policy = \
             get_name_and_placement(request, 2, 3, True)
         suffixes = suffix_parts.split('-') if suffix_parts else []
+        skip_rehash = bool(suffixes)
+        timing_stats_labels['policy'] = int(policy)
+        timing_stats_labels['skip_rehash'] = skip_rehash
+
         try:
             hashes = self._diskfile_router[policy].get_hashes(
                 device, partition, suffixes, policy,
-                skip_rehash=bool(suffixes))
+                skip_rehash=skip_rehash)
         except DiskFileDeviceUnavailable:
             resp = HTTPInsufficientStorage(drive=device, request=request)
         else:
