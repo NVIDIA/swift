@@ -41,7 +41,8 @@ from swift import __version__ as swift_version
 from swift.common.http import is_success
 from swift.obj.expirer import ExpirerConfig
 from test import listen_zero, BaseTestCase
-from test.debug_logger import debug_logger
+from test.debug_logger import debug_logger, FakeStatsdClient, \
+    FakeLabeledStatsdClient
 from test.unit import mocked_http_conn, \
     make_timestamp_iter, DEFAULT_TEST_EC_TYPE, skip_if_no_xattrs, \
     connect_tcp, readuntil2crlfs, patch_policies, encode_frag_archive_bodies, \
@@ -55,6 +56,7 @@ from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
     Timestamp, md5
 from swift.common import constraints
 from swift.common.request_helpers import get_reserved_name
+from swift.common.statsd_client import LabeledStatsdClient
 from swift.common.swob import Request, WsgiBytesIO, \
     HTTPRequestedRangeNotSatisfiable
 from swift.common.splice import splice
@@ -194,6 +196,7 @@ class TestObjectController(BaseTestCase):
         app = object_server.ObjectController(conf, logger=self.logger)
         self.assertEqual(app.container_update_timeout, 0.0)
         self.assertEqual(app.auto_create_account_prefix, '.')
+        self.assertIsInstance(app.statsd, LabeledStatsdClient)
         self.assertEqual(self.logger.get_lines_for_level('warning'), [])
 
     def check_all_api_methods(self, obj_name='o', alt_res=None):
@@ -220,6 +223,64 @@ class TestObjectController(BaseTestCase):
             self.assertEqual(resp.status_int, res)
             if out_body and (200 <= res < 300):
                 self.assertEqual(resp.body, out_body)
+
+    def _do_test_timing_stats(self, req, now):
+        conf = {}
+        with mock.patch('swift.common.utils.time.time', return_value=now), \
+                mock.patch('swift.common.statsd_client.StatsdClient',
+                           FakeStatsdClient), \
+                mock.patch('swift.common.statsd_client.LabeledStatsdClient',
+                           FakeLabeledStatsdClient):
+            app = object_server.ObjectController(conf, logger=self.logger)
+            statsd_client = app.logger.logger.statsd_client
+            statsd = app.statsd
+
+            with mock.patch.object(statsd_client, 'random', return_value=0), \
+                    mock.patch.object(statsd, 'random', return_value=0):
+                req.call_application(app)
+
+        self.assertIsInstance(statsd_client, FakeStatsdClient)
+        self.assertIsInstance(statsd, FakeLabeledStatsdClient)
+        return statsd_client, statsd
+
+    def test_legacy_and_labeled_timing_stats_get(self):
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+        now = time()
+        statsd_client, statsd = self._do_test_timing_stats(req, now)
+        self.assertEqual({'timing_since': [(('GET.errors.timing', now), {
+        })]}, statsd_client.calls)
+        self.assertEqual(
+            {'timing_since': [(('swift_object_request_timing', now), {
+                'labels': {
+                    'method': 'GET',
+                    'account': 'a',
+                    'container': 'c',
+                    'policy': 0,
+                    'status': 507
+                },
+            })]},
+            statsd.calls)
+
+    def test_legacy_and_labeled_timing_stats_replicate(self):
+        req = Request.blank(
+            '/sda1/p/', environ={'REQUEST_METHOD': 'REPLICATE'})
+        now = time()
+        statsd_client, statsd = self._do_test_timing_stats(req, now)
+        self.assertEqual({'timing_since': [(('REPLICATE.errors.timing', now), {
+            'sample_rate': 0.1
+        })]}, statsd_client.calls)
+        self.assertEqual(
+            {'timing_since': [(('swift_object_request_timing', now), {
+                'labels': {
+                    'method': 'REPLICATE',
+                    'policy': 0,
+                    'skip_rehash': False,
+                    'status': 507
+                },
+                'sample_rate': 0.1
+            })]},
+            statsd.calls)
 
     def test_REQUEST_SPECIAL_CHARS(self):
         obj = 'special昆%20/%'
@@ -7014,11 +7075,13 @@ class TestObjectController(BaseTestCase):
         self.object_controller.delete_at_update('PUT', delete_at,
                                                 'a', 'c', 'o',
                                                 req, 'sda1', policy)
-        self.assertEqual({'debug': [
-            "Proxy X-Delete-At-Container '%s' does not match expected "
-            "'%s' for current expirer_config." % (unexpected_container,
-                                                  expected_container)
-        ]}, self.logger.all_log_lines())
+        self.assertEqual({
+            'debug': [
+                'Labeled statsd mode: disabled (test-object-controller)',
+                "Proxy X-Delete-At-Container '%s' does not match expected "
+                "'%s' for current expirer_config." % (unexpected_container,
+                                                      expected_container)
+            ]}, self.logger.all_log_lines())
         self.assertEqual(
             given_args, [
                 'PUT', '.expiring_objects', unexpected_container,
@@ -7063,7 +7126,9 @@ class TestObjectController(BaseTestCase):
         self.object_controller.delete_at_update('PUT', delete_at,
                                                 'a', 'c', 'o',
                                                 req, 'sda1', policy)
-        self.assertEqual({}, self.logger.all_log_lines())
+        self.assertEqual({
+            'debug': ['Labeled statsd mode: disabled (test-object-controller)']
+        }, self.logger.all_log_lines())
         self.assertEqual(given_args, [])
 
     def test_delete_at_update_put_with_info_but_empty_host(self):
