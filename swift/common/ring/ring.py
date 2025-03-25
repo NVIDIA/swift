@@ -100,6 +100,7 @@ class RingData(object):
         self._dev_id_bytes = 0
         self._replica_count = 0
         self._num_devs = sum(1 if dev is not None else 0 for dev in self.devs)
+        self.resize_on_serialize = True
 
     @property
     def replica_count(self):
@@ -312,7 +313,8 @@ class RingData(object):
 
     def serialize_v2(self, writer):
         writer.write_magic(version=2)
-        self.set_dev_id_bytes(calc_dev_id_bytes(self.max_dev_id))
+        if self.resize_on_serialize:
+            self.set_dev_id_bytes(calc_dev_id_bytes(self.max_dev_id))
         ring = self.to_dict()
 
         # Only include next_part_power if it is set in the
