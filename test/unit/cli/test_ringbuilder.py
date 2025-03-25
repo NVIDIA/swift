@@ -30,7 +30,7 @@ import time
 from swift.cli import ringbuilder
 from swift.cli.ringbuilder import EXIT_SUCCESS, EXIT_WARNING, EXIT_ERROR
 from swift.common import exceptions
-from swift.common.ring import RingBuilder
+from swift.common.ring import RingBuilder, Ring
 from swift.common.ring.io import RingReader
 from swift.common.ring.composite_builder import CompositeRingBuilder
 
@@ -2575,6 +2575,30 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         out, err = self.run_srb("write_ring", "--format-version", "3",
                                 exp_results=exp_results)
         self.assertIn('invalid choice', err)
+
+        for dev_id_bytes in "2", "4":
+            argv = ["", self.tmpfile, "write_ring", "--format-version",
+                    "2", "--dev-id-bytes", dev_id_bytes]
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+            ring = Ring("%s.ring.gz" % self.tmpfile)
+            self.assertEqual(int(dev_id_bytes), ring.dev_id_bytes)
+
+        # --dev-id-bytes doesn't work on format_version 1. or at least has
+        # no effect
+        argv = ["", self.tmpfile, "write_ring", "--format-version",
+                "1", "--dev-id-bytes", "4"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = Ring("%s.ring.gz" % self.tmpfile)
+        self.assertEqual(2, ring.dev_id_bytes)
+
+        # invalid dev-id-bytes don't work
+        for dev_id_bytes in "1", "8", 'banana':
+            argv = ["", self.tmpfile, "write_ring", "--format-version",
+                    "2", "--dev-id-bytes", dev_id_bytes]
+            out, err = self.run_srb(
+                "write_ring", "--format-version", "2", "--dev-id-bytes",
+                dev_id_bytes, exp_results=exp_results)
+            self.assertIn('invalid choice', err)
 
     def test_write_empty_ring(self):
         ring = RingBuilder(6, 3, 1)

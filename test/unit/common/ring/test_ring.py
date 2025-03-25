@@ -418,6 +418,59 @@ class TestRingData(unittest.TestCase):
                          str(err.exception))
         # re-serialisation is already handled in test_load.
 
+    def test_resize_on_serialize(self):
+        resize_called = [False]
+        ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
+        orig_set_dev_id_bytes = ring.RingData.set_dev_id_bytes
+
+        def mocked_set_dev_id_bytes(*args, **kwargs):
+            resize_called[0] = True
+            orig_set_dev_id_bytes(*args, **kwargs)
+
+        with mock.patch('swift.common.ring.RingData.set_dev_id_bytes',
+                        mocked_set_dev_id_bytes):
+            # inital save will be call resize and end up being 2 byte ids
+            rd = ring.RingData(
+                [array.array('H', [0, 1, 0, 1]),
+                 array.array('H', [0, 1, 0, 1])],
+                [{'id': 0, 'zone': 0, 'ip': '10.1.1.0', 'port': 7000},
+                 {'id': 1, 'zone': 1, 'ip': '10.1.1.1', 'port': 7000}],
+                30)
+
+            self.assertTrue(rd.resize_on_serialize)
+            rd.save(ring_fname, format_version=2)
+            r = ring.Ring(ring_fname)
+            self.assertEqual(r.dev_id_bytes, 2)
+            self.assertTrue(resize_called[0])
+
+            # if we change the dev_id_bytes to something bigger and then
+            # save again, it'll resize as it's serialized.
+            rd.set_dev_id_bytes(4)
+            resize_called[0] = False
+            rd.save(ring_fname, format_version=2)
+            self.assertEqual(rd.dev_id_bytes, 2)
+            r = ring.Ring(ring_fname)
+            self.assertEqual(r.dev_id_bytes, 2)
+            self.assertTrue(resize_called[0])
+
+            # But if we turn off resize_on_serialize it'll stay 4 bytes
+            rd.set_dev_id_bytes(4)
+            rd.resize_on_serialize = False
+            resize_called[0] = False
+            rd.save(ring_fname, format_version=2)
+            self.assertEqual(rd.dev_id_bytes, 4)
+            r = ring.Ring(ring_fname)
+            self.assertEqual(r.dev_id_bytes, 4)
+            self.assertFalse(resize_called[0])
+
+            # all this is ignored on format_version 1 so it'll be resized
+            # to 2 bytes
+            rd.save(ring_fname, format_version=1)
+            self.assertEqual(rd.dev_id_bytes, 2)
+            r = ring.Ring(ring_fname)
+            self.assertEqual(r.dev_id_bytes, 2)
+            self.assertTrue(resize_called[0])
+
 
 class TestRing(TestRingBase):
     FORMAT_VERSION = 1
