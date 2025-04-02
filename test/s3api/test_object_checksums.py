@@ -242,6 +242,24 @@ class TestObjectChecksumCRC32C(ObjectChecksumMixin, BaseS3TestCaseWithBucket):
         super().setUpClass()
 
 
+class TestObjectChecksumCRC64NVME(ObjectChecksumMixin,
+                                  BaseS3TestCaseWithBucket):
+    ALGORITHM = 'CRC64NVME'
+    EXPECTED = 'rosUhgp5mIg='
+    INVALID = 'rosUhgp5mIh='
+    BAD = 'sosUhgp5mIg='
+
+    @classmethod
+    def setUpClass(cls):
+        if [int(x) for x in botocore.__version__.split('.')] < [1, 36]:
+            raise SkipTest('botocore cannot crc64nvme (run '
+                           '`pip install -U boto3 botocore`)')
+        if not botocore.httpchecksum.HAS_CRT:
+            raise SkipTest('botocore cannot crc64nvme (run '
+                           '`pip install awscrt`)')
+        super().setUpClass()
+
+
 class TestObjectChecksumSHA1(ObjectChecksumMixin, BaseS3TestCaseWithBucket):
     ALGORITHM = 'SHA1'
     EXPECTED = '98O8HYCOBHMq32eZZczDTKeuNEE='
