@@ -906,6 +906,44 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                              object_reconstructor.REVERT))
             self.assert_expected_jobs(part_info['partition'], jobs)
 
+    def test_do_listdir(self):
+        part_path = os.path.join(self.testdir, 'node/sda1/objects-1/1')
+        part_info = {
+            'local_dev': self.policy.object_ring.devs[1],
+            'policy': self.policy,
+            'partition': 1,
+            'part_path': part_path,
+        }
+        self.reconstructor._reset_stats()
+        jobs = self.reconstructor.build_reconstruction_jobs(part_info)
+
+        def collect_suffix(jobs):
+            found_suffix = set()
+            for job in jobs:
+                found_suffix.update(job['hashes'].keys())
+            return found_suffix
+        self.assertEqual({'061', '3c1'}, collect_suffix(jobs))
+
+        # make a new suffix dir and put a "tombstone" in it
+        hash_dir = os.path.join(
+            part_path, 'ce1/73eb4933fe8101d2f26fb6f4d0933ce1/')
+        os.makedirs(hash_dir)
+        now = utils.Timestamp(time.time())
+        with open(os.path.join(hash_dir, '%s.ts' % now.internal), 'w'):
+            pass
+
+        # disable do_listdir
+        self.reconstructor.part_listdir_percent = 0
+        jobs = self.reconstructor.build_reconstruction_jobs(part_info)
+        # the new suffix is not found
+        self.assertEqual({'061', '3c1'}, collect_suffix(jobs))
+
+        # force do_listdir
+        self.reconstructor.part_listdir_percent = 100
+        jobs = self.reconstructor.build_reconstruction_jobs(part_info)
+        # the new suffix is  found
+        self.assertEqual({'061', '3c1', 'ce1'}, collect_suffix(jobs))
+
     def test_handoffs_only(self):
         self.reconstructor.handoffs_only = True
 
@@ -2458,6 +2496,48 @@ class TestWorkerReconstructor(unittest.TestCase):
         kwargs = {'devices': 'sdz'}
         do_test(kwargs, ['sdz'], [])
 
+    def test_run_forever_increments_cycle(self):
+        now = time.time()
+        cycles = 5
+
+        def fake_time():
+            nonlocal now
+            while True:
+                yield now
+                now += 300
+
+        class StopForever(Exception):
+            pass
+
+        def fake_sleep():
+            for i in range(cycles):
+                yield None
+            raise StopForever()
+
+        reconstructor = object_reconstructor.ObjectReconstructor({
+            'reconstructor_workers': 2,
+            'recon_cache_path': self.recon_cache_path
+        }, logger=self.logger)
+        reconstructor.get_local_devices = lambda: ['sda', 'sdb', 'sdc', 'sdd']
+        reconstructor.reconstruct = mock.MagicMock()
+        worker_args = list(
+            # include 'devices' kwarg as a sanity check - it should be ignored
+            # in run_forever mode
+            reconstructor.get_worker_args(once=False, devices='sda'))
+
+        self.assertEqual(0, reconstructor.process_cycle)
+        with mock.patch('swift.obj.reconstructor.time.time',
+                        side_effect=fake_time()), \
+                mock.patch('swift.obj.reconstructor.os.getpid',
+                           return_value='pid-1'), \
+                mock.patch('swift.obj.reconstructor.sleep',
+                           side_effect=fake_sleep()), \
+                Timeout(.3), quiet_eventlet_exceptions(), \
+                self.assertRaises(StopForever):
+            gt = spawn(reconstructor.run_forever, **worker_args[0])
+            gt.wait()
+        self.assertEqual(cycles, reconstructor.process_cycle)
+
     def test_run_forever_recon_aggregation(self):
 
         class StopForever(Exception):
@@ -3688,6 +3768,35 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
                 msg = 'expected %r != %r for %r' % (
                     expected_paths, found_paths, kwargs)
                 self.assertEqual(expected_paths, found_paths, msg)
+
+    def test_build_jobs_will_do_listdir(self):
+        part_path = os.path.join(self.devices, self.local_dev['device'],
+                                 diskfile.get_data_dir(self.policy), '0')
+        utils.mkdirs(part_path)
+        part_info = {
+            'local_dev': self.local_dev,
+            'policy': self.policy,
+            'partition': 0,
+            'part_path': part_path,
+        }
+
+        expected = [
+            (10, 10),
+            (1, 100),
+            (.1, 1000),
+        ]
+
+        for pct, cycles in expected:
+            self.reconstructor.part_listdir_percent = pct
+            with mock.patch.object(self.reconstructor._df_router[self.policy],
+                                   '_get_hashes') as mock_get_hashes:
+                mock_get_hashes.return_value = (0, {})
+                for i in range(cycles):
+                    self.reconstructor.build_reconstruction_jobs(part_info)
+                    self.reconstructor.process_cycle += 1
+            self.assertEqual(1, sum(
+                call[1]['do_listdir']
+                for call in mock_get_hashes.call_args_list))
 
     def test_build_jobs_creates_empty_hashes(self):
         part_path = os.path.join(self.devices, self.local_dev['device'],
