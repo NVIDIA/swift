@@ -42,15 +42,11 @@ from swift.common.http import HTTP_OK, HTTP_INSUFFICIENT_STORAGE
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.obj import ssync_sender
 from swift.obj.diskfile import get_data_dir, get_tmp_dir, DiskFileRouter, \
-    invalidate_hash
+    invalidate_hash, should_part_listdir
 from swift.common.storage_policy import POLICIES, REPL_POLICY
 from swift.common.exceptions import PartitionLockTimeout
 
 DEFAULT_RSYNC_TIMEOUT = 900
-
-
-def _do_listdir(partition, replication_cycle):
-    return (((partition + replication_cycle) % 10) == 0)
 
 
 class Stats(object):
@@ -146,7 +142,6 @@ class ObjectReplicator(Daemon):
         self.stats_interval = float(conf.get('stats_interval', '300'))
         self.ring_check_interval = float(conf.get('ring_check_interval', 15))
         self.next_check = time.time() + self.ring_check_interval
-        self.replication_cycle = random.randint(0, 9)
         self.partition_times = []
         self.interval = float(conf.get('interval') or
                               conf.get('run_pause') or 30)
@@ -162,6 +157,9 @@ class ObjectReplicator(Daemon):
                     'Option object-replicator/run_pause is deprecated and '
                     'will be removed in a future version. Update your '
                     'configuration to use option object-replicator/interval.')
+        self.process_cycle = 0
+        self.cycle_seed = random.random()
+        self.part_listdir_percent = float(conf.get('part_listdir_percent', 10))
         self.rsync_timeout = int(conf.get('rsync_timeout',
                                           DEFAULT_RSYNC_TIMEOUT))
         self.rsync_io_timeout = conf.get('rsync_io_timeout', '30')
@@ -680,6 +678,12 @@ class ObjectReplicator(Daemon):
                         suffix_dir)
         return success_paths, error_paths
 
+    def do_listdir(self, partition):
+        return should_part_listdir(self.cycle_seed,
+                                   self.process_cycle,
+                                   partition,
+                                   self.part_listdir_percent)
+
     def update(self, job):
         """
         High-level method that replicates a single partition.
@@ -699,9 +703,7 @@ class ObjectReplicator(Daemon):
             hashed, local_hash = tpool.execute(
                 df_mgr._get_hashes, job['device'],
                 job['partition'], job['policy'],
-                do_listdir=_do_listdir(
-                    int(job['partition']),
-                    self.replication_cycle))
+                do_listdir=self.do_listdir(job['partition']))
             stats.suffix_hash += hashed
             self.logger.update_stats('suffix.hashes', hashed)
             attempts_left = len(job['nodes'])
@@ -992,7 +994,6 @@ class ObjectReplicator(Daemon):
             start_time = time.time()
         self.start = start_time
         self.last_replication_count = 0
-        self.replication_cycle = (self.replication_cycle + 1) % 10
         self.partition_times = []
         self.all_devs_info = set()
         self.handoffs_remaining = 0
@@ -1189,6 +1190,7 @@ class ObjectReplicator(Daemon):
             self.logger.debug('Replication sleeping for %s seconds.',
                               self.interval)
             sleep(self.interval)
+            self.process_cycle += 1
 
     def post_multiprocess_run(self):
         # This method is called after run_once using multiple workers.
