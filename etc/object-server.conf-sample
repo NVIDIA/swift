@@ -360,6 +360,11 @@ use = egg:swift#backend_ratelimit
 # 0 means to log the entire line
 # rsync_error_log_line_length = 0
 #
+# Sanity check a partitions suffixes in hashes.pkl some small percentage of
+# cycles. Lower values are fine for busy or full clusters.  Minimum real value
+# is will floor at .01, but you can disable entirely by setting it to zero.
+# part_listdir_percent = 10
+#
 # handoffs_first and handoff_delete are options for a special case
 # such as disk full in the cluster. These two options SHOULD NOT BE
 # CHANGED, except for such an extreme situations. (e.g. disks filled up
@@ -458,6 +463,11 @@ use = egg:swift#backend_ratelimit
 # reconstructor sync type jobs between primary partitions. A value of 0 (the
 # default) means there is no limit.
 # max_objects_per_revert = 0
+#
+# Sanity check a partitions suffixes in hashes.pkl some small percentage of
+# cycles. Lower values are fine for busy or full clusters.  Minimum real value
+# is will floor at .01, but you can disable entirely by setting it to zero.
+# part_listdir_percent = 10
 #
 # You can set scheduling priority of processes. Niceness values range from -20
 # (most favorable to the process) to 19 (least favorable to the process).
