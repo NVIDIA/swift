@@ -408,27 +408,22 @@ class TestObjectReplicator(unittest.TestCase):
         for node in nodes:
             process_arg_checker.append(
                 (0, '', ['rsync', whole_path_from, rsync_mods]))
-        start = replicator.replication_cycle
-        self.assertGreaterEqual(start, 0)
-        self.assertLessEqual(start, 9)
-        with _mock_process(process_arg_checker):
-            replicator.run_once()
-        self.assertEqual((start + 1) % 10, replicator.replication_cycle)
-        self.assertFalse(process_errors)
-        self.assertFalse(self.logger.get_lines_for_level('error'))
+        # process_cycle is just a 0-indexed counter
+        self.assertEqual(0, replicator.process_cycle)
 
-        # Returns 0 at first, and 60 on all following .next() calls
+        # Returns 0 at start = time(), and 60 on all following calls
         def _infinite_gen():
             yield 0
             while True:
                 yield 60
-
-        for cycle in range(1, 10):
-            with _mock_process(process_arg_checker):
-                with mock.patch('time.time', side_effect=_infinite_gen()):
-                    replicator.run_once()
-                    self.assertEqual((start + 1 + cycle) % 10,
-                                     replicator.replication_cycle)
+        with _mock_process(process_arg_checker), mock.patch(
+                'swift.obj.replicator.time.time',
+                side_effect=_infinite_gen()):
+            replicator.run_once()
+        # run_once doesn't increment the process_cycle (anymore)
+        self.assertEqual(0, replicator.process_cycle)
+        self.assertFalse(process_errors)
+        self.assertFalse(self.logger.get_lines_for_level('error'))
 
         recon_fname = os.path.join(self.recon_cache, RECON_OBJECT_FILE)
         with open(recon_fname) as cachefile:
@@ -1946,7 +1941,7 @@ class TestObjectReplicator(unittest.TestCase):
 
     @mock.patch('swift.obj.replicator.tpool.execute')
     @mock.patch('swift.obj.replicator.http_connect', autospec=True)
-    @mock.patch('swift.obj.replicator._do_listdir')
+    @mock.patch('swift.obj.replicator.should_part_listdir')
     def test_update(self, mock_do_listdir, mock_http, mock_tpool_execute):
 
         def set_default(self):
@@ -1970,8 +1965,10 @@ class TestObjectReplicator(unittest.TestCase):
         # count of attempts and call args
         resp.status = 507
         expected_listdir_calls = [
-            mock.call(int(job['partition']),
-                      self.replicator.replication_cycle)
+            mock.call(self.replicator.cycle_seed,
+                      self.replicator.process_cycle,
+                      job['partition'],
+                      self.replicator.part_listdir_percent)
             for job in jobs]
         do_listdir_results = [False, False, True, False, True, False]
         mock_do_listdir.side_effect = do_listdir_results
@@ -2136,9 +2133,8 @@ class TestObjectReplicator(unittest.TestCase):
 
     @mock.patch('swift.obj.replicator.tpool.execute')
     @mock.patch('swift.obj.replicator.http_connect', autospec=True)
-    @mock.patch('swift.obj.replicator._do_listdir')
     def test_update_local_hash_changes_during_replication(
-            self, mock_do_listdir, mock_http, mock_tpool_execute):
+            self, mock_http, mock_tpool_execute):
         mock_http.return_value = answer = mock.MagicMock()
         answer.getresponse.return_value = resp = mock.MagicMock()
         resp.status = 200
@@ -2370,7 +2366,9 @@ class TestObjectReplicator(unittest.TestCase):
             '192.168.50.30::object/d8/objects/241 (0.100)'])
 
     def test_do_listdir(self):
-        # Test if do_listdir is enabled for every 10th partition to rehash
+        # Original replicator do_listdir expected 10%
+        seed = 0
+        pct = 10
         # First number is the number of partitions in the job, list entries
         # are the expected partition numbers per run
         test_data = {
@@ -2383,7 +2381,8 @@ class TestObjectReplicator(unittest.TestCase):
             for phase in range(10):
                 invalidated = 0
                 for partition in range(partitions):
-                    if object_replicator._do_listdir(partition, phase):
+                    if object_replicator.should_part_listdir(
+                            seed, phase, partition, pct):
                         seen.append(partition)
                         invalidated += 1
                 # Every 10th partition is seen after each phase
@@ -3001,6 +3000,187 @@ class TestMultiProcessReplicator(unittest.TestCase):
             recon_data['replication_last'],
             min(pd['replication_last']
                 for pd in recon_data['object_replication_per_disk'].values()))
+
+    def test_workers_run_forever(self):
+        start = time.time()
+        cycles = 5
+        # this option only effects get_worker_args, which is called by
+        # DaemonStrategy and passed into the worker's run_forever post-fork
+        self.conf['replicator_workers'] = 2
+        parent_replicator = object_replicator.ObjectReplicator(
+            self.conf, logger=self.logger)
+        # but we won't fork...
+        worker_args = parent_replicator.get_worker_args()
+        self.assertEqual(2, len(worker_args))
+
+        def mock_time():
+            now = start
+            for i in range(cycles * 2):
+                yield now
+                now += 120
+            raise RuntimeError("that's all folks!")
+        with mock.patch('swift.obj.replicator.sleep'):
+            # we'll just run each worker in serial
+            for w_args in worker_args:
+                # fake_replicate wants to reference the worker
+                self.replicator = object_replicator.ObjectReplicator(
+                    self.conf, logger=self.logger)
+                # and they'll think they started at the same time
+                with mock.patch.object(self.replicator, 'replicate',
+                                       self.fake_replicate), \
+                        mock.patch('swift.obj.replicator.time.time',
+                                   side_effect=mock_time()), \
+                        self.assertRaises(RuntimeError) as ctx:
+                    self.replicator.run_forever(**w_args)
+                self.assertEqual(str(ctx.exception), "that's all folks!")
+                # each worker completed expected cycles
+                self.assertEqual(cycles, self.replicator.process_cycle)
+        # "without error"
+        self.assertEqual([], self.logger.get_lines_for_level('error'))
+        expected = []
+        for w_args in worker_args:
+            # no fork means every worker hast he same pid!
+            prefix = '[worker %s/2 pid=%s] ' % (
+                w_args['multiprocess_worker_index'] + 1, os.getpid())
+            w_expected = [
+                prefix + 'Starting object replicator in daemon mode.'
+            ] + ([
+                prefix + 'Starting object replication pass.',
+                prefix + 'Object replication complete. (2.00 minutes)',
+            ] * cycles) + [
+                # last cycle never completed.
+                prefix + 'Starting object replication pass.',
+            ]
+            expected.extend(w_expected)
+        self.assertEqual(expected, self.logger.get_lines_for_level('info'))
+        # force aggregate_recon_update
+        parent_replicator.post_multiprocess_run()
+        # every cycle advances the clock 2m twice, except the last one...
+        last_finish = start + (cycles * 120 * 2 - 120)
+        expected = {
+            # I think these are duplicated for backcompat
+            'object_replication_last': last_finish,
+            'replication_last': last_finish,
+            # how dumb is it that this is in minutes!?
+            'object_replication_time': 2.0,
+            'replication_time': 2.0,
+            # this is a sum of the fake per-worker stats
+            'replication_stats': {
+                'attempted': 15,
+                'failure': 1500,
+                'failure_nodes': {
+                    '10.1.1.1': {'d11': 1},
+                    '10.2.2.2': {'d22': 2},
+                    '10.3.3.3': {'d33': 3},
+                    '10.4.4.4': {'d44': 4},
+                    '10.5.5.5': {'d55': 5},
+                },
+                'hashmatch': 15000,
+                'remove': 1500000,
+                'rsync': 150000,
+                'success': 150,
+                'suffix_count': 15000000,
+                'suffix_hash': 150000000,
+                'suffix_sync': 1500000000,
+            },
+            # FWIW I'd be fine if we pop the per_disk stats before we assert,
+            # they're all made up anyway
+            'object_replication_per_disk': {
+                'sda': {
+                    'object_replication_last': last_finish,
+                    'replication_last': last_finish,
+                    'object_replication_time': 2.0,
+                    'replication_time': 2.0,
+                    'replication_stats': {
+                        'attempted': 1,
+                        'failure': 100,
+                        'failure_nodes': {'10.1.1.1': {'d11': 1}},
+                        'hashmatch': 1000,
+                        'remove': 100000,
+                        'rsync': 10000,
+                        'success': 10,
+                        'suffix_count': 1000000,
+                        'suffix_hash': 10000000,
+                        'suffix_sync': 100000000,
+                    },
+                },
+                'sdb': {
+                    'object_replication_last': last_finish,
+                    'replication_last': last_finish,
+                    'object_replication_time': 2.0,
+                    'replication_time': 2.0,
+                    'replication_stats': {
+                        'attempted': 2,
+                        'failure': 200,
+                        'failure_nodes': {'10.2.2.2': {'d22': 2}},
+                        'hashmatch': 2000,
+                        'remove': 200000,
+                        'rsync': 20000,
+                        'success': 20,
+                        'suffix_count': 2000000,
+                        'suffix_hash': 20000000,
+                        'suffix_sync': 200000000,
+                    },
+                },
+                'sdc': {
+                    'object_replication_last': last_finish,
+                    'replication_last': last_finish,
+                    'object_replication_time': 2.0,
+                    'replication_time': 2.0,
+                    'replication_stats': {
+                        'attempted': 3,
+                        'failure': 300,
+                        'failure_nodes': {'10.3.3.3': {'d33': 3}},
+                        'hashmatch': 3000,
+                        'remove': 300000,
+                        'rsync': 30000,
+                        'success': 30,
+                        'suffix_count': 3000000,
+                        'suffix_hash': 30000000,
+                        'suffix_sync': 300000000,
+                    },
+                },
+                'sdd': {
+                    'object_replication_last': last_finish,
+                    'replication_last': last_finish,
+                    'object_replication_time': 2.0,
+                    'replication_time': 2.0,
+                    'replication_stats': {
+                        'attempted': 4,
+                        'failure': 400,
+                        'failure_nodes': {'10.4.4.4': {'d44': 4}},
+                        'hashmatch': 4000,
+                        'remove': 400000,
+                        'rsync': 40000,
+                        'success': 40,
+                        'suffix_count': 4000000,
+                        'suffix_hash': 40000000,
+                        'suffix_sync': 400000000,
+                    },
+                },
+                'sde': {
+                    'object_replication_last': last_finish,
+                    'replication_last': last_finish,
+                    'object_replication_time': 2.0,
+                    'replication_time': 2.0,
+                    'replication_stats': {
+                        'attempted': 5,
+                        'failure': 500,
+                        'failure_nodes': {'10.5.5.5': {'d55': 5}},
+                        'hashmatch': 5000,
+                        'remove': 500000,
+                        'rsync': 50000,
+                        'success': 50,
+                        'suffix_count': 5000000,
+                        'suffix_hash': 50000000,
+                        'suffix_sync': 500000000,
+                    },
+                },
+            },
+        }
+        with open(self.recon_file) as fh:
+            recon_data = json.load(fh)
+        self.assertEqual(expected, recon_data)
 
 
 class TestReplicatorStats(unittest.TestCase):
