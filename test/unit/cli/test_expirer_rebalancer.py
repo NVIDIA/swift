@@ -21,9 +21,9 @@ import random
 import shlex
 import time
 import unittest
-import mock
 import six
 from six.moves import cStringIO as StringIO
+from unittest import mock
 
 from swift.common.direct_client import DirectClientException
 from swift.common.internal_client import InternalClient
@@ -108,85 +108,80 @@ class TestExpirerRebalance(unittest.TestCase):
         args.logger = self.logger
         return args
 
-    def test_move_task_object(self):
+    def _run_move_task_object(self, obj, resp, args_str=''):
         target_task_container = self.expirer_config.get_expirer_container(
-            self.now, 'a', 'c', 'o')
+            self.now, 'a', 'c', obj)
         orig_task_container = self.expirer_config.get_expirer_container(
             self.now, 'a', 'c', 'other-o')
-        # sanity
         self.assertNotEqual(target_task_container, orig_task_container)
-        task_obj_name = expirer.build_task_obj(self.now, 'a', 'c', 'o')
+        task_obj_name = expirer.build_task_obj(self.now, 'a', 'c', obj)
         orig_task_info = {
             'timestamp': self.now,
             'orig_task_obj_name': task_obj_name,
             'content_type': expirer.X_DELETE_TYPE,
             'orig_task_container': orig_task_container,
         }
-        resp = [201] * 3 + [204] * 3
-        args = self._parse_args()
+        args = self._parse_args(args_str)
         worker = expirer_rebalancer.RebalancerWorker(args)
         worker.container_ring = self.container_ring
+
         with mocked_http_conn(*resp) as conn:
             worker.move_task_object(target_task_container, orig_task_info)
+        return worker, conn
+
+    def test_move_task_object(self):
+        resp = [201] * 3 + [204] * 3
+        _, conn = self._run_move_task_object('o', resp)
+        self.assertEqual(['PUT'] * 3 + ['DELETE'] * 3,
+                         [r['method'] for r in conn.requests])
+
+    def test_move_task_object_unicode_names(self):
+        resp = [201] * 3 + [204] * 3
+        _, conn = self._run_move_task_object(u'o1\u2661', resp)
+        self.assertEqual(['PUT'] * 3 + ['DELETE'] * 3,
+                         [r['method'] for r in conn.requests])
+        resp = [201] * 3 + [204] * 3
+        _, conn = self._run_move_task_object(u'o2\xf8', resp)
         self.assertEqual(['PUT'] * 3 + ['DELETE'] * 3,
                          [r['method'] for r in conn.requests])
 
     def test_move_task_object_with_retries(self):
-        target_task_container = self.expirer_config.get_expirer_container(
-            self.now, 'a', 'c', 'o')
-        orig_task_container = self.expirer_config.get_expirer_container(
-            self.now, 'a', 'c', 'other-o')
-        # sanity
-        self.assertNotEqual(target_task_container, orig_task_container)
-        task_obj_name = expirer.build_task_obj(self.now, 'a', 'c', 'o')
-        orig_task_info = {
-            'timestamp': self.now,
-            'orig_task_obj_name': task_obj_name,
-            'content_type': expirer.X_DELETE_TYPE,
-            'orig_task_container': orig_task_container,
-        }
         resp = [201, 201, 503] + [201] * 3 + [204] * 3
-        args = self._parse_args()
-        worker = expirer_rebalancer.RebalancerWorker(args)
-        worker.container_ring = self.container_ring
-        with mocked_http_conn(*resp) as conn, \
-                mock.patch.object(expirer_rebalancer.eventlet, 'sleep'):
-            worker.move_task_object(target_task_container, orig_task_info)
+        _, conn = self._run_move_task_object('o', resp)
         self.assertEqual(['PUT'] * 6 + ['DELETE'] * 3,
                          [r['method'] for r in conn.requests])
 
     def test_move_task_object_timeout_with_retries(self):
-        target_task_container = self.expirer_config.get_expirer_container(
-            self.now, 'a', 'c', 'o')
-        orig_task_container = self.expirer_config.get_expirer_container(
-            self.now, 'a', 'c', 'other-o')
-        # sanity
-        self.assertNotEqual(target_task_container, orig_task_container)
-        task_obj_name = expirer.build_task_obj(self.now, 'a', 'c', 'o')
-        orig_task_info = {
-            'timestamp': self.now,
-            'orig_task_obj_name': task_obj_name,
-            'content_type': expirer.X_DELETE_TYPE,
-            'orig_task_container': orig_task_container,
-        }
         slow_status = FakeStatus(201, response_sleep=1.0)
         resp = [201, 201, slow_status] + [201] * 3 + [204] * 3
-        args = self._parse_args('--timeout 0.1')
-        self.assertEqual(0.1, args.timeout)  # sanity
-        worker = expirer_rebalancer.RebalancerWorker(args)
-        worker.container_ring = self.container_ring
-        with mocked_http_conn(*resp) as conn:
-            worker.move_task_object(target_task_container, orig_task_info)
+        args_str = '--timeout 0.1'
+        self.assertEqual(0.1, self._parse_args(args_str).timeout)
+        worker, conn = self._run_move_task_object('o', resp, args_str=args_str)
         self.assertEqual(['PUT'] * 6 + ['DELETE'] * 3,
                          [r['method'] for r in conn.requests])
         self.assertLess(worker.stats['retry_sleep'], 0.3)
+
+    def test_move_task_object_cleanup_fails(self):
+        resp = [210] * 3 + [204, 204, 503]
+        _, conn = self._run_move_task_object('o', resp)
+        self.assertEqual(['PUT'] * 3 + ['DELETE'] * 3,
+                         [r['method'] for r in conn.requests])
+
+    def test_move_task_object_cleanup_retries_timeout(self):
+        slow_status = FakeStatus(204, response_sleep=1.0)
+        resp = [slow_status] + [201] * 5 + [slow_status] + [204] * 5
+        args_str = '--timeout 0.1'
+        self.assertEqual(0.1, self._parse_args(args_str).timeout)
+        worker, conn = self._run_move_task_object('o', resp, args_str=args_str)
+        self.assertEqual(['PUT'] * 6 + ['DELETE'] * 6,
+                         [r['method'] for r in conn.requests])
+        self.assertLess(worker.stats['retry_sleep'], 0.5)
 
     def test_move_task_object_fails(self):
         target_task_container = self.expirer_config.get_expirer_container(
             self.now, 'a', 'c', 'o')
         orig_task_container = self.expirer_config.get_expirer_container(
             self.now, 'a', 'c', 'other-o')
-        # sanity
         self.assertNotEqual(target_task_container, orig_task_container)
         task_obj_name = expirer.build_task_obj(self.now, 'a', 'c', 'o')
         orig_task_info = {
@@ -201,8 +196,8 @@ class TestExpirerRebalance(unittest.TestCase):
         worker = expirer_rebalancer.RebalancerWorker(args)
         worker.container_ring = self.container_ring
         with mocked_http_conn(*resp) as conn, \
-                mock.patch.object(expirer_rebalancer.eventlet, 'sleep'), \
-                self.assertRaises(Exception) as ctx:
+             mock.patch.object(expirer_rebalancer.eventlet, 'sleep'), \
+             self.assertRaises(Exception) as ctx:
             worker._move_task_object(target_task_container, orig_task_info)
         self.assertEqual(['PUT'] * 6,
                          [r['method'] for r in conn.requests])
@@ -213,61 +208,6 @@ class TestExpirerRebalance(unittest.TestCase):
         self.assertIn(task_obj_name, msg)
         self.assertIn(target_task_container, msg)
         self.assertNotIn(orig_task_container, msg)
-
-    def test_move_task_object_cleanup_fails(self):
-        # N.B. "cleanup" uses the reconciler's direct_delete_container_entry
-        # which uses a GreenPool that won't raise DirectClientException's - so
-        # we don't retry do_cleanup on 503
-        args = self._parse_args()
-        target_task_container = self.expirer_config.get_expirer_container(
-            self.now, 'a', 'c', 'o')
-        orig_task_container = self.expirer_config.get_expirer_container(
-            self.now, 'a', 'c', 'other-o')
-        # sanity
-        self.assertNotEqual(target_task_container, orig_task_container)
-        task_obj_name = expirer.build_task_obj(self.now, 'a', 'c', 'o')
-        orig_task_info = {
-            'timestamp': self.now,
-            'orig_task_obj_name': task_obj_name,
-            'content_type': expirer.X_DELETE_TYPE,
-            'orig_task_container': orig_task_container,
-        }
-        resp = [210] * 3 + [204, 204, 503]
-        args = self._parse_args()
-        worker = expirer_rebalancer.RebalancerWorker(args)
-        worker.container_ring = self.container_ring
-        with mocked_http_conn(*resp) as conn, \
-                mock.patch.object(expirer_rebalancer.eventlet, 'sleep'):
-            worker.move_task_object(target_task_container, orig_task_info)
-        self.assertEqual(['PUT'] * 3 + ['DELETE'] * 3,
-                         [r['method'] for r in conn.requests])
-
-    def test_move_task_object_cleanup_retries_timeout(self):
-        target_task_container = self.expirer_config.get_expirer_container(
-            self.now, 'a', 'c', 'o')
-        orig_task_container = self.expirer_config.get_expirer_container(
-            self.now, 'a', 'c', 'other-o')
-        # sanity
-        self.assertNotEqual(target_task_container, orig_task_container)
-        task_obj_name = expirer.build_task_obj(self.now, 'a', 'c', 'o')
-        orig_task_info = {
-            'timestamp': self.now,
-            'orig_task_obj_name': task_obj_name,
-            'content_type': expirer.X_DELETE_TYPE,
-            'orig_task_container': orig_task_container,
-        }
-        slow_status = FakeStatus(204, response_sleep=1.0)
-        # we'll retry timeouts on either do_migration or do_cleanup
-        resp = [slow_status] + [201] * 5 + [slow_status] + [204] * 5
-        args = self._parse_args('--timeout 0.1')
-        self.assertEqual(0.1, args.timeout)  # sanity
-        worker = expirer_rebalancer.RebalancerWorker(args)
-        worker.container_ring = self.container_ring
-        with mocked_http_conn(*resp) as conn:
-            worker.move_task_object(target_task_container, orig_task_info)
-        self.assertEqual(['PUT'] * 6 + ['DELETE'] * 6,
-                         [r['method'] for r in conn.requests])
-        self.assertLess(worker.stats['retry_sleep'], 0.5)
 
     def test_set_verosity_level(self):
         args_expected = {
@@ -657,7 +597,7 @@ class TestExpirerRebalance(unittest.TestCase):
         }, stats)
 
         self.assertEqual([
-            '%(prefix)s error listing tasks in %(task_container)s: ' % {
+            '%(prefix)s error listing tasks in %(task_container)s' % {
                 'prefix': expirer_rebalancer._get_worker_prefix(),
                 'task_container': stub_task_containers[bad_container_index],
             }
@@ -777,6 +717,31 @@ class TestExpirerRebalance(unittest.TestCase):
                       "config_positive_int_value value: '0'",
                       err.getvalue().splitlines()[-1])
 
+    def test_main_return_on_errors(self):
+        conf_path = os.path.join(self.testdir, 'object-expirer.conf')
+        with open(conf_path, 'w') as fd:
+            fd.write('[object-expirer]')
+
+        with mock.patch('sys.stdout', new=StringIO()) as mock_stdout, \
+            mock.patch.object(expirer_rebalancer.ExpirerRebalancer,
+                              'get_task_containers_to_migrate') as mock_get:
+            mock_get.side_effect = Exception('test error')
+            ret = expirer_rebalancer.main([conf_path])
+
+        self.assertEqual(1, ret)
+        self.assertEqual('done with errors, please check logs.\n',
+                         mock_stdout.getvalue())
+
+        with mock.patch('sys.stdout', new=StringIO()) as mock_stdout, \
+            mock.patch.object(expirer_rebalancer.ExpirerRebalancer,
+                              'run_workers') as mock_run_workers:
+            mock_run_workers.return_value = {'failed_tasks': 1}
+            ret = expirer_rebalancer.main([conf_path])
+
+        self.assertEqual(1, ret)
+        self.assertEqual('done with errors, please check logs.\n',
+                         mock_stdout.getvalue())
+
     def test_main(self):
         # attempting to test main to sanity check config/parser handling might
         # reasonable, but without careful patching to prevent forking and
@@ -809,7 +774,7 @@ class TestExpirerRebalance(unittest.TestCase):
             mock.patch.object(expirer_rebalancer.ExpirerRebalancer,
                               'run_workers') as mock_run_workers:
             mock_run_workers.return_value = {}
-            expirer_rebalancer.main([conf_path])
+            ret = expirer_rebalancer.main([conf_path])
         self.assertEqual(mock_run_workers.call_args_list, [
             mock.call(mock.ANY, [{
                 'count': num_task_per_task_container,
@@ -817,3 +782,4 @@ class TestExpirerRebalance(unittest.TestCase):
                 'rebalance_day_delta': 0,
             } for task_container_name in task_container_names]),
         ])
+        self.assertEqual(0, ret)

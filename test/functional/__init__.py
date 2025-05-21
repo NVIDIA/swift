@@ -13,12 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
 
 import configparser
 import contextlib
 
-import mock
+from unittest import mock
 import os
 from urllib.parse import urlparse, urlsplit, urlunsplit
 import sys
@@ -311,8 +310,7 @@ def _in_process_setup_ring(swift_conf, conf_src_dir, testdir):
                 {'id': 2, 'zone': 2, 'device': 'sdc1', 'ip': '127.0.0.1',
                  'port': obj_sockets[2].getsockname()[1]}]
         ring_data = ring.RingData(replica2part2dev_id, devs, 30)
-        with closing(GzipFile(ring_file_test, 'wb')) as f:
-            pickle.dump(ring_data, f)
+        ring_data.save(ring_file_test, format_version=0)
 
     for dev in ring_data.devs:
         _debug('Ring file dev: %s' % dev)
@@ -824,7 +822,8 @@ def setup_package():
     global web_front_end
     web_front_end = config.get('web_front_end', 'integral')
     global normalized_urls
-    normalized_urls = config.get('normalized_urls', False)
+    normalized_urls = utils.config_true_value(
+        config.get('normalized_urls', False))
 
     global orig_collate
     orig_collate = locale.setlocale(locale.LC_COLLATE)

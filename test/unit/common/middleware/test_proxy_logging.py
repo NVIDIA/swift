@@ -14,8 +14,7 @@
 # limitations under the License.
 import logging
 
-import copy
-import mock
+from unittest import mock
 import time
 import unittest
 from io import BytesIO
@@ -24,16 +23,14 @@ from logging.handlers import SysLogHandler
 from urllib.parse import unquote
 
 from swift.common.utils import get_swift_logger, split_path
-from swift.common.statsd_client import StatsdClient
 from swift.common.middleware import proxy_logging
 from swift.common.registry import register_sensitive_header, \
     register_sensitive_param, get_sensitive_headers
 from swift.common.swob import Request, Response, HTTPServiceUnavailable
-from swift.common import constraints, registry
+from swift.common import constraints, registry, statsd_client
 from swift.common.storage_policy import StoragePolicy
-from test.debug_logger import debug_logger, \
-    FakeStatsdClient, FakeLabeledStatsdClient, \
-    debug_statsd_client, debug_labeled_statsd_client
+from test.debug_logger import debug_logger, FakeStatsdClient, \
+    FakeLabeledStatsdClient, debug_labeled_statsd_client
 from test.unit import patch_policies
 from test.unit.common.middleware.helpers import FakeAppThatExcepts, FakeSwift
 
@@ -127,7 +124,48 @@ class TestProxyLogging(unittest.TestCase):
         # get_logger, ultimately tracing back to our hard-coded
         # statsd_tail_prefix
         self.logger.logger.statsd_client._prefix = 'proxy-server.'
-        self.statsd = debug_labeled_statsd_client({})
+        conf = {
+            'log_statsd_host': 'host',
+            'log_statsd_port': 8125,
+            'statsd_label_mode': 'dogstatsd',
+            'statsd_emit_legacy': True,
+        }
+        self.statsd = debug_labeled_statsd_client(conf)
+        account_labels = {
+            'account': 'a',
+            'resource': 'account',
+        }
+        container_labels = {
+            'account': 'a',
+            'container': 'c',
+            'resource': 'container',
+        }
+        object_labels = {
+            'account': 'a',
+            'container': 'c',
+            'resource': 'object',
+            'policy': '0',
+        }
+        self.path_labels = {
+            '/v1/a': account_labels,
+            '/v1/a/': account_labels,
+            '/v1/a/c': container_labels,
+            '/v1/a/c/': container_labels,
+            '/v1/a/c/o': object_labels,
+            '/v1/a/c/o/': object_labels,
+            '/v1/a/c/o/p': object_labels,
+            '/v1/a/c/o/p/': object_labels,
+            '/v1/a/c/o/p/p2': object_labels,
+            '/v1.0/a': account_labels,
+            '/v1.0/a/': account_labels,
+            '/v1.0/a/c': container_labels,
+            '/v1.0/a/c/': container_labels,
+            '/v1.0/a/c/o': object_labels,
+            '/v1.0/a/c/o/': object_labels,
+            '/v1.0/a/c/o/p': object_labels,
+            '/v1.0/a/c/o/p/': object_labels,
+            '/v1.0/a/c/o/p/p2': object_labels,
+        }
 
     def _clear(self):
         self.logger.clear()
@@ -206,7 +244,24 @@ class TestProxyLogging(unittest.TestCase):
                      ('host', 8125)),
                     app.access_logger.statsd_client.sendto_calls)
 
-    def test_init_statsd_options_log_prefix(self):
+    def assertLabeledTimingStats(self, exp_metrics_values_labels):
+        statsd_calls = self.statsd.calls['timing']
+        exp_calls = []
+        for metric, value, labels in exp_metrics_values_labels:
+            exp_calls.append(((metric, mock.ANY), {'labels': labels}))
+        self.assertEqual(exp_calls, statsd_calls)
+        for i, (metric, value, labels) in enumerate(exp_metrics_values_labels):
+            self.assertAlmostEqual(
+                value, statsd_calls[i][0][1], places=4, msg=i)
+
+    def assertLabeledUpdateStats(self, exp_metrics_values_labels):
+        statsd_calls = self.statsd.calls['update_stats']
+        exp_calls = []
+        for metric, value, labels in exp_metrics_values_labels:
+            exp_calls.append(((metric, value), {'labels': labels}))
+        self.assertEqual(exp_calls, statsd_calls)
+
+    def test_init_logger_and_legacy_statsd_options_log_prefix(self):
         conf = {
             'log_headers': 'no',
             'log_statsd_valid_http_methods': 'GET',
@@ -245,7 +300,7 @@ class TestProxyLogging(unittest.TestCase):
             [(b'foo.proxy-server.baz:1|c|@0.4', ('example.com', 1234))],
             statsd_client.sendto_calls)
 
-    def test_init_statsd_options_access_log_prefix(self):
+    def test_init_logger_and_legacy_statsd_options_access_log_prefix(self):
         # verify that access_log_ prefix has precedence over log_
         conf = {
             'access_log_route': 'my-proxy-access',
@@ -298,6 +353,51 @@ class TestProxyLogging(unittest.TestCase):
             [(b'access_foo.proxy-server.baz:1|c|@0.6', ('access.com', 5678))],
             statsd_client.sendto_calls)
 
+    def test_init_labeled_statsd_options_log_prefix(self):
+        # verify that log_ prefix options are passed to LabeledStatsdClient
+        conf = {
+            'log_statsd_host': 'example.com',
+            'log_statsd_port': '1234',
+            'log_statsd_default_sample_rate': 10,
+            'log_statsd_sample_rate_factor': .04,
+            'statsd_label_mode': 'dogstatsd',
+        }
+        with mock.patch('swift.common.statsd_client.LabeledStatsdClient',
+                        FakeLabeledStatsdClient):
+            app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), conf)
+
+        statsd_client = app.statsd
+        self.assertIsInstance(statsd_client, FakeLabeledStatsdClient)
+        with mock.patch.object(statsd_client, 'random', return_value=0):
+            statsd_client.increment('baz', labels={'test': 'label'})
+        self.assertEqual(
+            [(b'baz:1|c|@0.4|#test:label', ('example.com', 1234))],
+            statsd_client.sendto_calls)
+
+    def test_init_labeled_statsd_options_access_log_prefix(self):
+        # verify that access_log_ prefix has precedence over log_ prefix
+        conf = {
+            'access_log_statsd_host': 'access.com',
+            'access_log_statsd_port': '5678',
+            'access_log_statsd_default_sample_rate': 20,
+            'access_log_statsd_sample_rate_factor': .03,
+            'log_statsd_host': 'example.com',
+            'log_statsd_port': '1234',
+            'log_statsd_default_sample_rate': 10,
+            'log_statsd_sample_rate_factor': .04,
+            'statsd_label_mode': 'dogstatsd',
+        }
+        with mock.patch('swift.common.statsd_client.LabeledStatsdClient',
+                        FakeLabeledStatsdClient):
+            app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), conf)
+        statsd_client = app.statsd
+        self.assertIsInstance(statsd_client, FakeLabeledStatsdClient)
+        with mock.patch.object(statsd_client, 'random', return_value=0):
+            statsd_client.increment('baz', labels={'test': 'label'})
+        self.assertEqual(
+            [(b'baz:1|c|@0.6|#test:label', ('access.com', 5678))],
+            statsd_client.sendto_calls)
+
     def test_init_statsd_options_user_labels(self):
         conf = {
             'log_statsd_host': 'example.com',
@@ -324,7 +424,7 @@ class TestProxyLogging(unittest.TestCase):
             FakeApp(), {'log_statsd_host': 'example.com'})
         self.assertIsNotNone(app.access_logger.logger.statsd_client)
         self.assertIsInstance(app.access_logger.logger.statsd_client,
-                              StatsdClient)
+                              statsd_client.StatsdClient)
         self.assertEqual('proxy-server.',
                          app.access_logger.logger.statsd_client._prefix)
 
@@ -335,98 +435,153 @@ class TestProxyLogging(unittest.TestCase):
                         'log_statsd_host': 'example.com'})
         self.assertIsNotNone(app.access_logger.logger.statsd_client)
         self.assertIsInstance(app.access_logger.logger.statsd_client,
-                              StatsdClient)
+                              statsd_client.StatsdClient)
         self.assertEqual('foo.proxy-server.',
                          app.access_logger.logger.statsd_client._prefix)
 
-    def test_log_request_statsd_invalid_stats_types(self):
+    def test_log_request_stat_type_bad_GET(self):
         app = proxy_logging.ProxyLoggingMiddleware(
-            FakeApp(), {}, logger=self.logger)
-        for url in ['/', '/foo', '/foo/bar', '/v1', '/v1.0']:
-            self.logger.clear()
-            req = Request.blank(url, environ={'REQUEST_METHOD': 'GET'})
+            FakeApp(body=b'7 bytes'), {}, logger=self.logger)
+        app.statsd = self.statsd
+        exp_labels = {'resource': 'UNKNOWN',
+                      'method': 'GET',
+                      'status': 200}
+
+        def do_test(bad_path):
+            self._clear()
+            req = Request.blank(bad_path, environ={'REQUEST_METHOD': 'GET'})
+            with mock.patch('time.time',
+                            side_effect=[18.0, 18.5, 20.71828182846]):
+                resp = app(req.environ, start_response)
+                # get body
+                b''.join(resp)
+            self.assertTiming('UNKNOWN.GET.200.first-byte.timing', app, 500.0)
+            self.assertTiming('UNKNOWN.GET.200.timing', app,
+                              2718.2818284600216)
+            self.assertUpdateStats([('UNKNOWN.GET.200.xfer', 7)], app)
+            self.assertLabeledTimingStats([
+                ('swift_proxy_server_request_ttfb', 0.5 * 1000, exp_labels),
+                ('swift_proxy_server_request_timing', 2.71828182846 * 1000,
+                 exp_labels)
+            ])
+            self.assertLabeledUpdateStats([
+                ('swift_proxy_server_request_body_bytes', 0, exp_labels),
+                ('swift_proxy_server_response_body_bytes', 7, exp_labels),
+            ])
+
+        do_test('')
+        do_test('/')
+        do_test('/bad')
+        do_test('/baddy/mc_badderson')
+        do_test('/v1')
+        do_test('/v1/')
+        do_test('/v1.0')
+        do_test('/v1.0/')
+        do_test('/v1.0//')
+        do_test('/v1.0//c')
+        do_test('/v1.0/a//')
+        do_test('/v1.0/a//o')
+
+    def _do_test_log_request_s3(self, method, path, backend_path):
+        self._clear()
+        fake_app = FakeApp(body=b'7 bytes')
+
+        def app_wrapper(env, start_response):
+            # Fake how s3api would set swift.backend_path. We need to set
+            # PATH_INFO to be the backend_path so that FakeApp does the right
+            # thing w.r.t. the policy index headers, but the original request's
+            # PATH_INFO should be unchanged.
+            env_copy = dict(env)
+            env_copy['PATH_INFO'] = backend_path
+            env['swift.backend_path'] = backend_path
+            return fake_app(env_copy, start_response)
+
+        app = proxy_logging.ProxyLoggingMiddleware(
+            app_wrapper, {}, logger=self.logger)
+        app.statsd = self.statsd
+        req = Request.blank(path, environ={'REQUEST_METHOD': method})
+        with mock.patch('time.time',
+                        side_effect=[18.0, 18.5, 20.71828182846]):
             resp = app(req.environ, start_response)
             # get body
             b''.join(resp)
-            self.assertEqual(
-                [(('UNKNOWN.GET.200.first-byte.timing', mock.ANY), {}),
-                 (('UNKNOWN.GET.200.timing', mock.ANY), {})],
-                app.access_logger.statsd_client.calls['timing'])
-            self.assertEqual(
-                [(('UNKNOWN.GET.200.xfer', mock.ANY), {})],
-                app.access_logger.statsd_client.calls['update_stats'])
+        return app
 
-    def test_log_request_stat_type_bad(self):
-        app = proxy_logging.ProxyLoggingMiddleware(
-            FakeApp(), {}, logger=self.logger)
-        for bad_path in [
-                '',
-                '/',
-                '/bad',
-                '/baddy/mc_badderson',
-                '/v1',
-                '/v1/',
-                '/v1.0',
-                '/v1.0/',
-                '/v1.0//',
-                '/v1.0//c',
-                '/v1.0/a//',
-                '/v1.0/a//o',
-        ]:
-            req = Request.blank(bad_path, environ={'REQUEST_METHOD': 'GET'})
-            now = 10000.0
-            app.log_request(req, 123, 7, 13, now, now + 2.71828182846)
-            self.assertEqual(
-                [(('UNKNOWN.GET.123.timing', 2718.2818284600216), {})],
-                app.access_logger.statsd_client.calls['timing'])
-            self.assertEqual(
-                [(('UNKNOWN.GET.123.xfer', 20), {})],
-                app.access_logger.statsd_client.calls['update_stats'])
-            app.access_logger.clear()
+    def test_log_request_stat_type_good_PUT_s3_container(self):
+        def check_stats(app, exp_labels):
+            self.assertTiming(
+                'container.PUT.200.timing', app, 500)
+            self.assertUpdateStats([('container.PUT.200.xfer', 7)], app)
+            self.assertLabeledTimingStats([
+                ('swift_proxy_server_request_timing', 500, exp_labels)
+            ])
+            self.assertLabeledUpdateStats([
+                ('swift_proxy_server_request_body_bytes', 0, exp_labels),
+                ('swift_proxy_server_response_body_bytes', 7, exp_labels),
+            ])
 
-    def test_log_request_stat_type_good(self):
+        exp_labels = {
+            'method': 'PUT',
+            'status': 200,
+            'resource': 'container',
+            'account': 'AUTH_test',
+            'container': 'bucket'}
+        check_stats(self._do_test_log_request_s3(
+            'PUT', '/bucket', '/v1/AUTH_test/bucket'), exp_labels)
+        # swift.backend_path is authoritative...
+        exp_labels['container'] = 'bucket+segments'
+        check_stats(self._do_test_log_request_s3(
+            'PUT', '/bucket', '/v1/AUTH_test/bucket+segments'), exp_labels)
+
+    def test_log_request_stat_type_good_GET_s3_object(self):
+        def check_stats(app, exp_labels):
+            self.assertTiming(
+                'object.GET.200.first-byte.timing', app, 500.0)
+            self.assertTiming(
+                'object.GET.200.timing', app, 2718.2818284600216)
+            self.assertUpdateStats(
+                [('object.GET.200.xfer', 7),
+                 ('object.policy.0.GET.200.xfer', 7)], app)
+            self.assertLabeledTimingStats([
+                ('swift_proxy_server_request_ttfb', 0.5 * 1000, exp_labels),
+                ('swift_proxy_server_request_timing', 2.71828182846 * 1000,
+                 exp_labels)
+            ])
+            self.assertLabeledUpdateStats([
+                ('swift_proxy_server_request_body_bytes', 0, exp_labels),
+                ('swift_proxy_server_response_body_bytes', 7, exp_labels),
+            ])
+
+        exp_labels = {
+            'method': 'GET',
+            'status': 200,
+            'resource': 'object',
+            'policy': '0',
+            'account': 'AUTH_test',
+            'container': 'bucket'}
+        check_stats(self._do_test_log_request_s3(
+            'GET', '/bucket/obj', '/v1/AUTH_test/bucket/obj'), exp_labels)
+        check_stats(self._do_test_log_request_s3(
+            'GET', '/bucket/obj/blah', '/v1/AUTH_test/bucket/obj/blah'),
+            exp_labels)
+        exp_labels['container'] = 'bucket+segments'
+        check_stats(self._do_test_log_request_s3(
+            'GET', '/bucket/obj', '/v1/AUTH_test/bucket+segments/obj1234'),
+            exp_labels)
+
+    def test_log_request_stat_type_good_GET(self):
         """
         log_request() should send timing and byte-count counters for GET
         requests.  Also, __call__()'s iter_response() function should
         statsd-log time to first byte (calling the passed-in start_response
         function), but only for GET requests.
         """
-        stub_times = []
-
-        def stub_time():
-            return stub_times.pop(0)
-
-        path_types = {
-            '/v1/a': 'account',
-            '/v1/a/': 'account',
-            '/v1/a/c': 'container',
-            '/v1/a/c/': 'container',
-            '/v1/a/c/o': 'object',
-            '/v1/a/c/o/': 'object',
-            '/v1/a/c/o/p': 'object',
-            '/v1/a/c/o/p/': 'object',
-            '/v1/a/c/o/p/p2': 'object',
-            '/v1.0/a': 'account',
-            '/v1.0/a/': 'account',
-            '/v1.0/a/c': 'container',
-            '/v1.0/a/c/': 'container',
-            '/v1.0/a/c/o': 'object',
-            '/v1.0/a/c/o/': 'object',
-            '/v1.0/a/c/o/p': 'object',
-            '/v1.0/a/c/o/p/': 'object',
-            '/v1.0/a/c/o/p/p2': 'object',
-        }
-        conf = {
-            'log_statsd_host': 'host',
-            'log_statsd_port': 8125,
-            'statsd_label_mode': 'signalfx',
-            'statsd_emit_legacy': True,
-        }
-        self.statsd = debug_labeled_statsd_client(conf)
-        with mock.patch("time.time", stub_time):
-            for path, exp_type in path_types.items():
-                # GET
-                self._clear()
+        for path, exp_labels in self.path_labels.items():
+            self._clear()
+            with mock.patch("time.time",
+                            side_effect=[18.0, 18.5, 20.71828182846]):
+                exp_labels = dict(exp_labels)
+                exp_type = exp_labels['resource']
                 app = proxy_logging.ProxyLoggingMiddleware(
                     FakeApp(body=b'7654321', response_str='321 Fubar'),
                     {},
@@ -435,7 +590,6 @@ class TestProxyLogging(unittest.TestCase):
                 req = Request.blank(path, environ={
                     'REQUEST_METHOD': 'GET',
                     'wsgi.input': BytesIO(b'4321')})
-                stub_times = [18.0, 18.5, 20.71828182846]
                 iter_response = app(req.environ, lambda *_: None)
 
                 self.assertEqual(b'7654321', b''.join(iter_response))
@@ -465,48 +619,83 @@ class TestProxyLogging(unittest.TestCase):
                         ('swift_proxy_response_body_bytes', 7, exp_kwargs),
                     ], app)
                 else:
-                    if exp_type == 'container':
-                        exp_kwargs['labels']['container'] = 'c'
-                    self.assertUpdateStats([
-                        ('%s.GET.321.xfer' % exp_type, 4 + 7),
-                        ('swift_proxy_request_body_bytes', 4, exp_kwargs),
-                        ('swift_proxy_response_body_bytes', 7, exp_kwargs),
-                    ], app)
+                    self.assertUpdateStats([('%s.GET.321.xfer' % exp_type,
+                                            4 + 7)],
+                                           app)
+                exp_labels.update({
+                    'method': 'GET',
+                    'status': 321,
+                })
+                self.assertLabeledTimingStats([
+                    ('swift_proxy_server_request_ttfb', 0.5 * 1000,
+                     exp_labels),
+                    ('swift_proxy_server_request_timing', 2.71828182846 * 1000,
+                     exp_labels)
+                ])
+                self.assertLabeledUpdateStats([
+                    ('swift_proxy_server_request_body_bytes', 4, exp_labels),
+                    ('swift_proxy_server_response_body_bytes', 7, exp_labels),
+                ])
 
-                # GET Repeat the test above, but with a non-existent policy
-                # Do this only for object types
-                if exp_type == 'object':
-                    exp_kwargs['labels'].pop('policy')
-                    self._clear()
-                    app = proxy_logging.ProxyLoggingMiddleware(
-                        FakeApp(body=b'7654321', response_str='321 Fubar',
-                                policy_idx='-1'), {}, logger=self.logger)
-                    app.statsd = self.statsd
-                    req = Request.blank(path, environ={
-                        'REQUEST_METHOD': 'GET',
-                        'wsgi.input': BytesIO(b'4321')})
-                    stub_times = [18.0, 18.5, 20.71828182846]
-                    iter_response = app(req.environ, lambda *_: None)
+    def test_log_request_stat_type_good_GET_no_policy(self):
+        # GET Repeat the test above, but with a non-existent policy
+        # Do this only for object types
+        for path, exp_labels in self.path_labels.items():
+            self._clear()
+            with mock.patch("time.time",
+                            side_effect=[18.0, 18.5, 20.71828182846]):
+                exp_labels = dict(exp_labels)
+                exp_type = exp_labels['resource']
+                if exp_type != 'object':
+                    continue
 
-                    self.assertEqual(b'7654321', b''.join(iter_response))
-                    self.assertTiming('%s.GET.321.timing' % exp_type, app,
-                                      exp_timing=2.71828182846 * 1000)
-                    # No results returned for the non-existent policy
-                    self.assertUpdateStats([
-                        ('%s.GET.321.xfer' % exp_type, 4 + 7),
-                        ('swift_proxy_request_body_bytes', 4, exp_kwargs),
-                        ('swift_proxy_response_body_bytes', 7, exp_kwargs),
-                    ], app)
-
-                # GET with swift.proxy_access_log_made already set
                 app = proxy_logging.ProxyLoggingMiddleware(
-                    FakeApp(body=b'7654321', response_str='321 Fubar'), {})
-                app.access_logger = debug_logger()
+                    FakeApp(body=b'7654321', response_str='321 Fubar',
+                            policy_idx='-1'), {}, logger=self.logger)
+                app.statsd = self.statsd
+                req = Request.blank(path, environ={
+                    'REQUEST_METHOD': 'GET',
+                    'wsgi.input': BytesIO(b'4321')})
+                iter_response = app(req.environ, lambda *_: None)
+
+                self.assertEqual(b'7654321', b''.join(iter_response))
+                self.assertTiming('%s.GET.321.timing' % exp_type, app,
+                                  exp_timing=2.71828182846 * 1000)
+                # No results returned for the non-existent policy
+                exp_labels.pop('policy')
+                exp_labels.update({
+                    'method': 'GET',
+                    'status': 321,
+                })
+                self.assertUpdateStats([('%s.GET.321.xfer' % exp_type,
+                                        4 + 7)],
+                                       app)
+                self.assertLabeledTimingStats([
+                    ('swift_proxy_server_request_ttfb', 0.5 * 1000,
+                     exp_labels),
+                    ('swift_proxy_server_request_timing', 2.71828182846 * 1000,
+                     exp_labels)
+                ])
+                self.assertLabeledUpdateStats([
+                    ('swift_proxy_server_request_body_bytes', 4, exp_labels),
+                    ('swift_proxy_server_response_body_bytes', 7, exp_labels),
+                ])
+
+    def test_log_request_stat_type_good_GET_log_made(self):
+        # GET with swift.proxy_access_log_made already set
+        for path, exp_labels in self.path_labels.items():
+            self._clear()
+            with mock.patch("time.time",
+                            side_effect=[18.0, 18.5, 20.71828182846]):
+                app = proxy_logging.ProxyLoggingMiddleware(
+                    FakeApp(body=b'7654321', response_str='321 Fubar'), {},
+                    logger=self.logger
+                )
+                app.statsd = self.statsd
                 req = Request.blank(path, environ={
                     'REQUEST_METHOD': 'GET',
                     'swift.proxy_access_log_made': True,
                     'wsgi.input': BytesIO(b'4321')})
-                stub_times = [18.0, 20.71828182846]
                 iter_response = app(req.environ, lambda *_: None)
                 self.assertEqual(b'7654321', b''.join(iter_response))
                 self.assertEqual(
@@ -515,9 +704,17 @@ class TestProxyLogging(unittest.TestCase):
                     [], app.access_logger.statsd_client.calls['timing_since'])
                 self.assertEqual(
                     [], app.access_logger.statsd_client.calls['update_stats'])
+                self.assertLabeledUpdateStats([])
+                self.assertLabeledTimingStats([])
 
-                # PUT (no first-byte timing!)
-                self._clear()
+    def test_log_request_stat_type_good_PUT(self):
+        # PUT (no first-byte timing!)
+        # (it's not a GET, so time() doesn't have a 2nd call)
+        for path, exp_labels in self.path_labels.items():
+            self._clear()
+            with mock.patch("time.time", side_effect=[58.2, 58.2 + 7.3321]):
+                exp_labels = dict(exp_labels)
+                exp_type = exp_labels['resource']
                 app = proxy_logging.ProxyLoggingMiddleware(
                     FakeApp(body=b'87654321', response_str='314 PiTown'), {},
                     logger=self.logger)
@@ -526,7 +723,6 @@ class TestProxyLogging(unittest.TestCase):
                     'REQUEST_METHOD': 'PUT',
                     'wsgi.input': BytesIO(b'654321')})
                 # (it's not a GET, so time() doesn't have a 2nd call)
-                stub_times = [58.2, 58.2 + 7.3321]
                 iter_response = app(req.environ, lambda *_: None)
                 self.assertEqual(b'87654321', b''.join(iter_response))
                 self.assertTiming('%s.PUT.314.timing' % exp_type, app,
@@ -548,383 +744,72 @@ class TestProxyLogging(unittest.TestCase):
                     self.assertTiming('%s.policy.0.PUT.314.timing' %
                                       exp_type, app,
                                       exp_timing=7.3321 * 1000)
-                    self.assertUpdateStats([
-                        ('object.PUT.314.xfer', 6 + 8),
-                        ('object.policy.0.PUT.314.xfer', 6 + 8),
-                        ('swift_proxy_request_body_bytes', 6, exp_kwargs),
-                        ('swift_proxy_response_body_bytes', 8, exp_kwargs),
-                    ], app)
+                    self.assertUpdateStats(
+                        [('object.PUT.314.xfer', 6 + 8),
+                         ('object.policy.0.PUT.314.xfer', 6 + 8)], app)
+                    exp_labels['policy'] = '0'
                 else:
-                    if exp_type == 'container':
-                        exp_kwargs['labels']['container'] = 'c'
-                    self.assertUpdateStats([
-                        ('%s.PUT.314.xfer' % exp_type, 6 + 8),
-                        ('swift_proxy_request_body_bytes', 6, exp_kwargs),
-                        ('swift_proxy_response_body_bytes', 8, exp_kwargs),
-                    ], app)
+                    self.assertUpdateStats(
+                        [('%s.PUT.314.xfer' % exp_type, 6 + 8)], app)
+                exp_labels.update({
+                    'method': 'PUT',
+                    'status': 314,
+                })
+                self.assertLabeledUpdateStats([
+                    ('swift_proxy_server_request_body_bytes', 6, exp_labels),
+                    ('swift_proxy_server_response_body_bytes', 8, exp_labels),
+                ])
+                self.assertLabeledTimingStats([
+                    ('swift_proxy_server_request_timing', 7.3321 * 1000,
+                     exp_labels)
+                ])
 
-                # PUT Repeat the test above, but with a non-existent policy
-                # Do this only for object types
-                if exp_type == 'object':
-                    exp_kwargs['labels'].pop('policy')
-                    self._clear()
-                    app = proxy_logging.ProxyLoggingMiddleware(
-                        FakeApp(body=b'87654321', response_str='314 PiTown',
-                                policy_idx='-1'), {}, logger=self.logger)
-                    app.statsd = self.statsd
-                    req = Request.blank(path, environ={
-                        'REQUEST_METHOD': 'PUT',
-                        'wsgi.input': BytesIO(b'654321')})
-                    # (it's not a GET, so time() doesn't have a 2nd call)
-                    stub_times = [58.2, 58.2 + 7.3321]
-                    iter_response = app(req.environ, lambda *_: None)
-                    self.assertEqual(b'87654321', b''.join(iter_response))
-                    self.assertTiming('%s.PUT.314.timing' % exp_type, app,
-                                      exp_timing=7.3321 * 1000)
-                    self.assertNotTiming(
-                        '%s.GET.314.first-byte.timing' % exp_type, app)
-                    self.assertNotTiming(
-                        '%s.PUT.314.first-byte.timing' % exp_type, app)
-                    # No results returned for the non-existent policy
-                    self.assertUpdateStats([
-                        ('object.PUT.314.xfer', 6 + 8),
-                        ('swift_proxy_request_body_bytes', 6, exp_kwargs),
-                        ('swift_proxy_response_body_bytes', 8, exp_kwargs),
-                    ], app)
+    def test_log_request_stat_type_good_PUT_no_policy(self):
+        # PUT Repeat the test above, but with a non-existent policy
+        # Do this only for object types
+        for path, exp_labels in self.path_labels.items():
+            self._clear()
+            with mock.patch("time.time", side_effect=[58.2, 58.2 + 7.3321]):
+                exp_labels = dict(exp_labels)
+                exp_type = exp_labels['resource']
+                if exp_type != 'object':
+                    continue
 
-    def test_log_request_labeled_stats_get(self):
-        stub_times = []
-
-        def stub_time():
-            return stub_times.pop(0)
-
-        path_types = {
-            '/v1/a': 'account',
-            '/v1/a/': 'account',
-            '/v1/a/c': 'container',
-            '/v1/a/c/': 'container',
-            '/v1/a/c/o': 'object',
-            '/v1/a/c/o/': 'object',
-            '/v1/a/c/o/p': 'object',
-            '/v1/a/c/o/p/': 'object',
-            '/v1/a/c/o/p/p2': 'object',
-            '/v1.0/a': 'account',
-            '/v1.0/a/': 'account',
-            '/v1.0/a/c': 'container',
-            '/v1.0/a/c/': 'container',
-            '/v1.0/a/c/o': 'object',
-            '/v1.0/a/c/o/': 'object',
-            '/v1.0/a/c/o/p': 'object',
-            '/v1.0/a/c/o/p/': 'object',
-            '/v1.0/a/c/o/p/p2': 'object',
-        }
-        conf = {
-            'log_statsd_host': 'host',
-            'log_statsd_port': 8125,
-            'statsd_label_mode': 'signalfx',
-            'statsd_emit_legacy': False,
-        }
-        self.logger.logger.statsd_client = debug_statsd_client(conf)
-        self.statsd = debug_labeled_statsd_client(conf)
-        with mock.patch("time.time", stub_time):
-            for path, exp_type in path_types.items():
-                # GET
-                self._clear()
                 app = proxy_logging.ProxyLoggingMiddleware(
-                    FakeApp(body=b'7654321', response_str='321 Fubar'),
-                    {},
-                    logger=self.logger)
-                app.statsd = self.statsd
-                req = Request.blank(path, environ={
-                    'REQUEST_METHOD': 'GET',
-                    'wsgi.input': BytesIO(b'4321')})
-                stub_times = [18.0, 18.5, 20.71828182846]
-                iter_response = app(req.environ, lambda *_: None)
-
-                self.assertEqual(b'7654321', b''.join(iter_response))
-                if exp_type == 'account':
-                    label_bytes = b','.join([
-                        b'account=a',
-                        b'method=GET',
-                        b'status=321',
-                        b'type=account',
-                    ])
-                elif exp_type == 'container':
-                    label_bytes = b','.join([
-                        b'account=a',
-                        b'container=c',
-                        b'method=GET',
-                        b'status=321',
-                        b'type=container',
-                    ])
-                else:
-                    label_bytes = b','.join([
-                        b'account=a',
-                        b'container=c',
-                        b'method=GET',
-                        b'policy=0',
-                        b'status=321',
-                        b'type=object',
-                    ])
-                # Note that in a labeled world, object only gets the one stat,
-                # which includes policy info
-                self.assertEqual([
-                    msg for msg, addr in
-                    self.statsd.sendto_calls
-                ], [
-                    b'swift_proxy_request_ttfb[' + label_bytes
-                    + b']:500.0|ms',
-                    b'swift_proxy_request_timing[' + label_bytes
-                    + b']:2718.2818|ms',
-                    b'swift_proxy_request_body_bytes[' + label_bytes
-                    + b']:4|c',
-                    b'swift_proxy_response_body_bytes[' + label_bytes
-                    + b']:7|c',
-                ], path)
-
-    def test_log_request_labeled_stats_get_non_existent_policy(self):
-        stub_times = []
-
-        def stub_time():
-            return stub_times.pop(0)
-
-        path_types = {
-            '/v1/a': 'account',
-            '/v1/a/': 'account',
-            '/v1/a/c': 'container',
-            '/v1/a/c/': 'container',
-            '/v1/a/c/o': 'object',
-            '/v1/a/c/o/': 'object',
-            '/v1/a/c/o/p': 'object',
-            '/v1/a/c/o/p/': 'object',
-            '/v1/a/c/o/p/p2': 'object',
-        }
-        conf = {
-            'log_statsd_host': 'host',
-            'log_statsd_port': 8125,
-            'statsd_label_mode': 'signalfx',
-            'statsd_emit_legacy': False,
-        }
-        self.logger.logger.statsd_client = debug_statsd_client(conf)
-        self.statsd = debug_labeled_statsd_client(conf)
-        with mock.patch("time.time", stub_time):
-            for path, exp_type in path_types.items():
-                # GET Repeat the test above, but with a non-existent policy
-                # Do this only for object types
-                if exp_type == 'object':
-                    self._clear()
-                    app = proxy_logging.ProxyLoggingMiddleware(
-                        FakeApp(body=b'7654321', response_str='321 Fubar',
-                                policy_idx='-1'), {}, logger=self.logger)
-                    app.statsd = self.statsd
-                    req = Request.blank(path, environ={
-                        'REQUEST_METHOD': 'GET',
-                        'wsgi.input': BytesIO(b'4321')})
-                    stub_times = [18.0, 18.5, 20.71828182846]
-                    iter_response = app(req.environ, lambda *_: None)
-
-                    self.assertEqual(b'7654321', b''.join(iter_response))
-                    # No policy_index label at all!
-                    label_bytes = b','.join([
-                        b'account=a',
-                        b'container=c',
-                        b'method=GET',
-                        b'status=321',
-                        b'type=object',
-                    ])
-                    self.assertEqual([
-                        msg for msg, addr in
-                        self.statsd.sendto_calls
-                    ], [
-                        b'swift_proxy_request_ttfb[' + label_bytes
-                        + b']:500.0|ms',
-                        b'swift_proxy_request_timing[' + label_bytes
-                        + b']:2718.2818|ms',
-                        b'swift_proxy_request_body_bytes[' + label_bytes
-                        + b']:4|c',
-                        b'swift_proxy_response_body_bytes[' + label_bytes
-                        + b']:7|c'
-                    ])
-
-    def test_log_request_labeled_stats_get_proxy_access_log_made(self):
-        stub_times = []
-
-        def stub_time():
-            return stub_times.pop(0)
-
-        path_types = {
-            '/v1/a': 'account',
-            '/v1/a/': 'account',
-            '/v1/a/c': 'container',
-            '/v1/a/c/': 'container',
-            '/v1/a/c/o': 'object',
-            '/v1/a/c/o/': 'object',
-            '/v1/a/c/o/p': 'object',
-            '/v1/a/c/o/p/': 'object',
-            '/v1/a/c/o/p/p2': 'object',
-        }
-        conf = {
-            'log_statsd_host': 'host',
-            'log_statsd_port': 8125,
-            'statsd_label_mode': 'signalfx',
-            'statsd_emit_legacy': False,
-        }
-        self.logger.logger.statsd_client = debug_statsd_client(conf)
-        self.statsd = debug_labeled_statsd_client(conf)
-        with mock.patch("time.time", stub_time):
-            for path, exp_type in path_types.items():
-                # GET with swift.proxy_access_log_made already set
-                self._clear()
-                app = proxy_logging.ProxyLoggingMiddleware(
-                    FakeApp(body=b'7654321', response_str='321 Fubar'), {})
-                app.statsd = self.statsd
-                req = Request.blank(path, environ={
-                    'REQUEST_METHOD': 'GET',
-                    'swift.proxy_access_log_made': True,
-                    'wsgi.input': BytesIO(b'4321')})
-                stub_times = [18.0, 20.71828182846]
-                iter_response = app(req.environ, lambda *_: None)
-                self.assertEqual(b'7654321', b''.join(iter_response))
-                self.assertFalse(self.statsd.sendto_calls)
-
-    def test_log_request_labeled_stats_put(self):
-        stub_times = []
-
-        def stub_time():
-            return stub_times.pop(0)
-
-        path_types = {
-            '/v1/a': 'account',
-            '/v1/a/': 'account',
-            '/v1/a/c': 'container',
-            '/v1/a/c/': 'container',
-            '/v1/a/c/o': 'object',
-            '/v1/a/c/o/': 'object',
-            '/v1/a/c/o/p': 'object',
-            '/v1/a/c/o/p/': 'object',
-            '/v1/a/c/o/p/p2': 'object',
-        }
-        conf = {
-            'log_statsd_host': 'host',
-            'log_statsd_port': 8125,
-            'statsd_label_mode': 'signalfx',
-            'statsd_emit_legacy': False,
-        }
-        self.logger.logger.statsd_client = debug_statsd_client(conf)
-        self.statsd = debug_labeled_statsd_client(conf)
-        with mock.patch("time.time", stub_time):
-            for path, exp_type in path_types.items():
-                # PUT (no first-byte timing!)
-                self._clear()
-                app = proxy_logging.ProxyLoggingMiddleware(
-                    FakeApp(body=b'87654321', response_str='314 PiTown'), {},
-                    logger=self.logger)
+                    FakeApp(body=b'87654321', response_str='314 PiTown',
+                            policy_idx='-1'), {}, logger=self.logger)
                 app.statsd = self.statsd
                 req = Request.blank(path, environ={
                     'REQUEST_METHOD': 'PUT',
                     'wsgi.input': BytesIO(b'654321')})
-                # (it's not a GET, so time() doesn't have a 2nd call)
-                stub_times = [58.2, 58.2 + 7.3321]
                 iter_response = app(req.environ, lambda *_: None)
                 self.assertEqual(b'87654321', b''.join(iter_response))
-                if exp_type == 'account':
-                    label_bytes = b','.join([
-                        b'account=a',
-                        b'method=PUT',
-                        b'status=314',
-                        b'type=account',
-                    ])
-                elif exp_type == 'container':
-                    label_bytes = b','.join([
-                        b'account=a',
-                        b'container=c',
-                        b'method=PUT',
-                        b'status=314',
-                        b'type=container',
-                    ])
-                else:
-                    label_bytes = b','.join([
-                        b'account=a',
-                        b'container=c',
-                        b'method=PUT',
-                        b'policy=0',
-                        b'status=314',
-                        b'type=object',
-                    ])
-                # Again, only the one object stat in a labeled world
-                self.assertEqual([
-                    msg for msg, addr in
-                    self.statsd.sendto_calls
-                ], [
-                    b'swift_proxy_request_timing[' + label_bytes
-                    + b']:7332.1|ms',
-                    b'swift_proxy_request_body_bytes[' + label_bytes
-                    + b']:6|c',
-                    b'swift_proxy_response_body_bytes[' + label_bytes
-                    + b']:8|c'
+                self.assertTiming('%s.PUT.314.timing' % exp_type, app,
+                                  exp_timing=7.3321 * 1000)
+                self.assertNotTiming(
+                    '%s.GET.314.first-byte.timing' % exp_type, app)
+                self.assertNotTiming(
+                    '%s.PUT.314.first-byte.timing' % exp_type, app)
+                # No results returned for the non-existent policy
+                exp_labels.pop('policy')
+                exp_labels.update({
+                    'method': 'PUT',
+                    'status': 314,
+                })
+                self.assertUpdateStats(
+                    [('object.PUT.314.xfer', 6 + 8)], app)
+                self.assertLabeledTimingStats([
+                    ('swift_proxy_server_request_timing', 7.3321 * 1000,
+                     exp_labels),
                 ])
-
-    def test_log_request_labeled_stats_put_non_existent_policy(self):
-        stub_times = []
-
-        def stub_time():
-            return stub_times.pop(0)
-
-        path_types = {
-            '/v1/a': 'account',
-            '/v1/a/': 'account',
-            '/v1/a/c': 'container',
-            '/v1/a/c/': 'container',
-            '/v1/a/c/o': 'object',
-            '/v1/a/c/o/': 'object',
-            '/v1/a/c/o/p': 'object',
-            '/v1/a/c/o/p/': 'object',
-            '/v1/a/c/o/p/p2': 'object',
-        }
-        conf = {
-            'log_statsd_host': 'host',
-            'log_statsd_port': 8125,
-            'statsd_label_mode': 'signalfx',
-            'statsd_emit_legacy': False,
-        }
-        self.logger.logger.statsd_client = debug_statsd_client(conf)
-        self.statsd = debug_labeled_statsd_client(conf)
-        with mock.patch("time.time", stub_time):
-            for path, exp_type in path_types.items():
-                # PUT Repeat the test above, but with a non-existent policy
-                # Do this only for object types
-                if exp_type == 'object':
-                    self._clear()
-                    app = proxy_logging.ProxyLoggingMiddleware(
-                        FakeApp(body=b'87654321', response_str='314 PiTown',
-                                policy_idx='-1'), {}, logger=self.logger)
-                    app.statsd = self.statsd
-                    req = Request.blank(path, environ={
-                        'REQUEST_METHOD': 'PUT',
-                        'wsgi.input': BytesIO(b'654321')})
-                    # (it's not a GET, so time() doesn't have a 2nd call)
-                    stub_times = [58.2, 58.2 + 7.3321]
-                    iter_response = app(req.environ, lambda *_: None)
-                    self.assertEqual(b'87654321', b''.join(iter_response))
-                    # No policy_index label at all!
-                    label_bytes = b','.join([
-                        b'account=a',
-                        b'container=c',
-                        b'method=PUT',
-                        b'status=314',
-                        b'type=object',
-                    ])
-                    self.assertEqual([
-                        msg for msg, addr in
-                        self.statsd.sendto_calls
-                    ], [
-                        b'swift_proxy_request_timing[' + label_bytes
-                        + b']:7332.1|ms',
-                        b'swift_proxy_request_body_bytes[' + label_bytes
-                        + b']:6|c',
-                        b'swift_proxy_response_body_bytes[' + label_bytes
-                        + b']:8|c'
-                    ])
+                self.assertLabeledUpdateStats([
+                    ('swift_proxy_server_request_body_bytes', 6, exp_labels),
+                    ('swift_proxy_server_response_body_bytes', 8, exp_labels),
+                ])
+                self.assertLabeledTimingStats([
+                    ('swift_proxy_server_request_timing', 7.3321 * 1000,
+                     exp_labels)
+                ])
 
     def test_log_request_stat_method_filtering_default(self):
         method_map = {
@@ -959,19 +844,20 @@ class TestProxyLogging(unittest.TestCase):
                               exp_timing=1.17 * 1000)
             self.assertUpdateStats([
                 ('account.%s.299.xfer' % exp_method, 11 + 3),
-                ('swift_proxy_request_body_bytes', 11, {
-                    'labels': {
-                        'type': 'account',
-                        'method': mock.ANY,
-                        'status': 299,
-                        'account': 'a'}}),
-                ('swift_proxy_response_body_bytes', 3, {
-                    'labels': {
-                        'type': 'account',
-                        'method': mock.ANY,
-                        'status': 299,
-                        'account': 'a'}})
             ], app)
+            exp_labels = {
+                'resource': 'account',
+                'method': exp_method,
+                'status': 299,
+                'account': 'a'
+            }
+            self.assertLabeledTimingStats([
+                ('swift_proxy_server_request_timing', 1.17 * 1000, exp_labels),
+            ])
+            self.assertLabeledUpdateStats([
+                ('swift_proxy_server_request_body_bytes', 11, exp_labels),
+                ('swift_proxy_server_response_body_bytes', 3, exp_labels)
+            ])
 
     def test_log_request_stat_method_filtering_custom(self):
         method_map = {
@@ -1007,21 +893,22 @@ class TestProxyLogging(unittest.TestCase):
                                   exp_timing=1.01 * 1000)
                 self.assertUpdateStats([
                     ('container.%s.911.xfer' % exp_method, 4 + 43),
-                    ('swift_proxy_request_body_bytes', 4, {
-                        'labels': {
-                            'type': 'container',
-                            'method': mock.ANY,
-                            'status': 911,
-                            'account': 'a',
-                            'container': 'c'}}),
-                    ('swift_proxy_response_body_bytes', 43, {
-                        'labels': {
-                            'type': 'container',
-                            'method': mock.ANY,
-                            'status': 911,
-                            'account': 'a',
-                            'container': 'c'}})
                 ], app)
+                exp_labels = {
+                    'resource': 'container',
+                    'method': exp_method,
+                    'status': 911,
+                    'account': 'a',
+                    'container': 'c'
+                }
+                self.assertLabeledTimingStats([
+                    ('swift_proxy_server_request_timing', 1.01 * 1000,
+                     exp_labels),
+                ])
+                self.assertLabeledUpdateStats([
+                    ('swift_proxy_server_request_body_bytes', 4, exp_labels),
+                    ('swift_proxy_server_response_body_bytes', 43, exp_labels)
+                ])
 
     def test_basic_req(self):
         app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), {})
@@ -1218,23 +1105,23 @@ class TestProxyLogging(unittest.TestCase):
         self.assertUpdateStats([
             ('object.GET.200.xfer', 8),
             ('object.policy.0.GET.200.xfer', 8),
-            ('swift_proxy_request_body_bytes', 0, {
-                'labels': {
-                    'type': 'object',
-                    'method': 'GET',
-                    'status': 200,
-                    'account': 'AUTH_test',
-                    'container': 'bucket',
-                    'policy': mock.ANY}}),
-            ('swift_proxy_response_body_bytes', 8, {
-                'labels': {
-                    'type': 'object',
-                    'method': 'GET',
-                    'status': 200,
-                    'account': 'AUTH_test',
-                    'container': 'bucket',
-                    'policy': mock.ANY}})
         ], app)
+        self.assertLabeledUpdateStats([
+            ('swift_proxy_server_request_body_bytes', 0, {
+                'resource': 'object',
+                'method': 'GET',
+                'status': 200,
+                'account': 'AUTH_test',
+                'container': 'bucket',
+                'policy': '0'}),
+            ('swift_proxy_server_response_body_bytes', 8, {
+                'resource': 'object',
+                'method': 'GET',
+                'status': 200,
+                'account': 'AUTH_test',
+                'container': 'bucket',
+                'policy': '0'})
+        ])
 
     def test_invalid_log_config(self):
         with self.assertRaises(ValueError):
@@ -1272,17 +1159,17 @@ class TestProxyLogging(unittest.TestCase):
         self.assertEqual(log_parts[11], str(len(resp_body)))
         self.assertUpdateStats([
             ('SOS.GET.200.xfer', len(resp_body)),
-            ('swift_proxy_request_body_bytes', 0, {
-                'labels': {
-                    'type': 'SOS',
-                    'method': 'GET',
-                    'status': 200}}),
-            ('swift_proxy_response_body_bytes', 17, {
-                'labels': {
-                    'type': 'SOS',
-                    'method': 'GET',
-                    'status': 200}})
         ], app)
+        self.assertLabeledUpdateStats([
+            ('swift_proxy_server_request_body_bytes', 0, {
+                'resource': 'SOS',
+                'method': 'GET',
+                'status': 200}),
+            ('swift_proxy_server_response_body_bytes', 17, {
+                'resource': 'SOS',
+                'method': 'GET',
+                'status': 200})
+        ])
 
     def test_log_headers(self):
         for conf_key in ['access_log_headers', 'log_headers']:
@@ -1346,23 +1233,23 @@ class TestProxyLogging(unittest.TestCase):
                 len('some stuff') + len('FAKE APP')),
             ('object.policy.0.PUT.200.xfer',
                 len('some stuff') + len('FAKE APP')),
-            ('swift_proxy_request_body_bytes', 10, {
-                'labels': {
-                    'type': 'object',
-                    'method': 'PUT',
-                    'status': 200,
-                    'account': 'a',
-                    'container': 'c',
-                    'policy': mock.ANY}}),
-            ('swift_proxy_response_body_bytes', 8, {
-                'labels': {
-                    'type': 'object',
-                    'method': 'PUT',
-                    'status': 200,
-                    'account': 'a',
-                    'container': 'c',
-                    'policy': mock.ANY}})
         ], app)
+        self.assertLabeledUpdateStats([
+            ('swift_proxy_server_request_body_bytes', 10, {
+                'resource': 'object',
+                'method': 'PUT',
+                'status': 200,
+                'account': 'a',
+                'container': 'c',
+                'policy': '0'}),
+            ('swift_proxy_server_response_body_bytes', 8, {
+                'resource': 'object',
+                'method': 'PUT',
+                'status': 200,
+                'account': 'a',
+                'container': 'c',
+                'policy': '0'})
+        ])
 
         # Using a non-existent policy
         self._clear()
@@ -1383,19 +1270,21 @@ class TestProxyLogging(unittest.TestCase):
         self.assertUpdateStats([
             ('object.PUT.200.xfer',
                 len('some stuff') + len('FAKE APP')),
-            ('swift_proxy_request_body_bytes', 10, {'labels': {
-                'type': 'object',
-                'method': 'PUT',
-                'status': 200,
-                'account': 'a',
-                'container': 'c'}}),
-            ('swift_proxy_response_body_bytes', 8, {'labels': {
-                'type': 'object',
-                'method': 'PUT',
-                'status': 200,
-                'account': 'a',
-                'container': 'c'}})
         ], app)
+        self.assertLabeledUpdateStats([
+            ('swift_proxy_server_request_body_bytes', 10, {
+                'resource': 'object',
+                'method': 'PUT',
+                'status': 200,
+                'account': 'a',
+                'container': 'c'}),
+            ('swift_proxy_server_response_body_bytes', 8, {
+                'resource': 'object',
+                'method': 'PUT',
+                'status': 200,
+                'account': 'a',
+                'container': 'c'})
+        ])
 
     def test_upload_size_no_policy(self):
         conf = {
@@ -1422,21 +1311,21 @@ class TestProxyLogging(unittest.TestCase):
         self.assertUpdateStats([
             ('object.PUT.200.xfer',
                 len('some stuff') + len('FAKE APP')),
-            ('swift_proxy_request_body_bytes', 10, {
-                'labels': {
-                    'type': 'object',
-                    'method': 'PUT',
-                    'status': 200,
-                    'account': 'a',
-                    'container': 'c'}}),
-            ('swift_proxy_response_body_bytes', 8, {
-                'labels': {
-                    'type': 'object',
-                    'method': 'PUT',
-                    'status': 200,
-                    'account': 'a',
-                    'container': 'c'}})
         ], app)
+        self.assertLabeledUpdateStats([
+            ('swift_proxy_server_request_body_bytes', 10, {
+                'resource': 'object',
+                'method': 'PUT',
+                'status': 200,
+                'account': 'a',
+                'container': 'c'}),
+            ('swift_proxy_server_response_body_bytes', 8, {
+                'resource': 'object',
+                'method': 'PUT',
+                'status': 200,
+                'account': 'a',
+                'container': 'c'})
+        ])
 
     def test_upload_line(self):
         conf = {
@@ -1463,21 +1352,21 @@ class TestProxyLogging(unittest.TestCase):
         self.assertUpdateStats([
             ('container.POST.200.xfer',
                 len('some stuff\n') + len('FAKE APP')),
-            ('swift_proxy_request_body_bytes', len('some stuff\n'), {
-                'labels': {
-                    'type': 'container',
-                    'method': 'POST',
-                    'status': 200,
-                    'account': 'a',
-                    'container': 'c'}}),
-            ('swift_proxy_response_body_bytes', len('FAKE APP'), {
-                'labels': {
-                    'type': 'container',
-                    'method': 'POST',
-                    'status': 200,
-                    'account': 'a',
-                    'container': 'c'}})
         ], app)
+        self.assertLabeledUpdateStats([
+            ('swift_proxy_server_request_body_bytes', len('some stuff\n'), {
+                'resource': 'container',
+                'method': 'POST',
+                'status': 200,
+                'account': 'a',
+                'container': 'c'}),
+            ('swift_proxy_server_response_body_bytes', len('FAKE APP'), {
+                'resource': 'container',
+                'method': 'POST',
+                'status': 200,
+                'account': 'a',
+                'container': 'c'})
+        ])
 
     def test_log_query_string(self):
         app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), {})
@@ -1574,13 +1463,22 @@ class TestProxyLogging(unittest.TestCase):
 
     def test_conf_statsd_label_mode(self):
         app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), {})
-        self.assertEqual('disabled',
-                         app.statsd.label_mode)
+        self.assertIsNone(app.statsd.label_formatter)
 
+        app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), {})
+        self.assertIsNone(app.statsd.label_formatter)
+        conf = {'statsd_label_mode': 'dogstatsd'}
+        app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), conf)
+        self.assertEqual(statsd_client.dogstatsd, app.statsd.label_formatter)
         conf = {'statsd_label_mode': 'graphite'}
         app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), conf)
-        self.assertEqual('graphite',
-                         app.statsd.label_mode)
+        self.assertEqual(statsd_client.graphite, app.statsd.label_formatter)
+        conf = {'statsd_label_mode': 'librato'}
+        app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), conf)
+        self.assertEqual(statsd_client.librato, app.statsd.label_formatter)
+        conf = {'statsd_label_mode': 'influxdb'}
+        app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), conf)
+        self.assertEqual(statsd_client.influxdb, app.statsd.label_formatter)
 
     def test_conf_statsd_emit_legacy(self):
         app = proxy_logging.ProxyLoggingMiddleware(FakeApp(), {})

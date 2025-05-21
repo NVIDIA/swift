@@ -203,10 +203,10 @@ class RebalancerWorker(BaseRebalancer):
                         target_task_container,
                         orig_task_info['orig_task_obj_name'], headers=headers)
             except eventlet.Timeout:
-                self.logger.exception('timeout writing %r to %r w/ %r',
-                                      orig_task_info,
-                                      target_task_container,
-                                      headers)
+                self.logger.error('timeout writing %r to %r w/ %r',
+                                  orig_task_info,
+                                  target_task_container,
+                                  headers)
                 raise
         self._retry(do_migration)
 
@@ -219,9 +219,9 @@ class RebalancerWorker(BaseRebalancer):
                         orig_task_info['orig_task_container'],
                         orig_task_info['orig_task_obj_name'])
             except eventlet.Timeout:
-                self.logger.exception('timeout cleaning %r from %r',
-                                      orig_task_info['orig_task_obj_name'],
-                                      orig_task_info['orig_task_container'])
+                self.logger.error('timeout cleaning %r from %r',
+                                  orig_task_info['orig_task_obj_name'],
+                                  orig_task_info['orig_task_container'])
                 raise
         self._retry(do_cleanup)
 
@@ -230,7 +230,7 @@ class RebalancerWorker(BaseRebalancer):
         try:
             self._move_task_object(target_task_container, orig_task_info)
         except Exception:
-            self.logger.exception('unable to move %r to %r' % (
+            self.logger.error('unable to move %r to %r' % (
                 orig_task_info, target_task_container))
             self.stats['failed_tasks'] += 1
         else:
@@ -279,6 +279,7 @@ class RebalancerWorker(BaseRebalancer):
         with super(RebalancerWorker, self).internal_client_ctx() as ic:
             self.container_ring = ic.container_ring
             yield ic
+            self.container_ring = None
 
     def process(self, task_containers):
         with self.internal_client_ctx() as swift:
@@ -289,7 +290,7 @@ class RebalancerWorker(BaseRebalancer):
                     worker_tasks += self.process_task_container(
                         swift, task_container, pool)
                 except UnexpectedResponse:
-                    self.logger.exception(
+                    self.logger.error(
                         'error listing tasks in %s' % task_container)
 
             self.logger.info('listed %s task_containers '
@@ -389,15 +390,26 @@ class ExpirerRebalancer(BaseRebalancer):
 
 def main(args=None):
     args = parser.parse_args(args)
-
     expirer_rebalancer = ExpirerRebalancer(args)
+    err_msg = 'done with errors, please check logs.'
 
-    task_containers = expirer_rebalancer.get_task_containers_to_migrate(
-        args.start_day_offset, args.num_days)
+    try:
+        task_containers = expirer_rebalancer.get_task_containers_to_migrate(
+            args.start_day_offset, args.num_days)
+    except Exception as e:
+        expirer_rebalancer.logger.exception(
+            'Failed to get expirering task containers: %s', e)
+        print(err_msg)
+        return 1
+
     stats = expirer_rebalancer.run_workers(args, task_containers)
     for k, v in stats.items():
         print(k, v)
+    if stats.get('failed_tasks', 0) > 0:
+        print(err_msg)
+        return 1
     print('done')
+    return 0
 
 
 if __name__ == "__main__":

@@ -32,9 +32,7 @@ class SwiftHttpProtocol(wsgi.HttpProtocol):
         # See https://github.com/eventlet/eventlet/pull/590
         self.pre_shutdown_bugfix_eventlet = not getattr(
             websocket.WebSocketWSGI, '_WSGI_APP_ALWAYS_IDLE', None)
-        # Note this is not a new-style class, so super() won't work
-        self.requests_read = 0
-        wsgi.HttpProtocol.__init__(self, *args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def log_request(self, *a):
         """
@@ -236,11 +234,7 @@ class SwiftHttpProtocol(wsgi.HttpProtocol):
             sock.settimeout(old_timeout)
 
     def _read_request_line(self):
-        # eventlet expects keepalive to be True or False, but we can
-        # hijack it to carry our separate timeout
-        with self.updated_timeout(self.server.keepalive):
-            # Note this is not a new-style class, so super() won't work
-            got = wsgi.HttpProtocol._read_request_line(self)
+        got = super()._read_request_line()
         # See https://github.com/eventlet/eventlet/pull/590
         if self.pre_shutdown_bugfix_eventlet:
             self.conn_state[2] = wsgi.STATE_REQUEST
@@ -248,8 +242,7 @@ class SwiftHttpProtocol(wsgi.HttpProtocol):
         return got
 
     def handle_one_request(self):
-        # Note this is not a new-style class, so super() won't work
-        got = wsgi.HttpProtocol.handle_one_request(self)
+        got = super().handle_one_request()
         # See https://github.com/eventlet/eventlet/pull/590
         if self.pre_shutdown_bugfix_eventlet:
             if self.conn_state[2] != wsgi.STATE_CLOSE:

@@ -13,11 +13,10 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import email.message
 import io
 from http.client import parse_headers
 
-import mock
+from unittest import mock
 import unittest
 import socket
 
@@ -237,7 +236,6 @@ class TestBufferedHTTP(unittest.TestCase):
         self.assertEqual('d', resp.headers.get('c'))
         # XXX: AttributeError: 'dict' object has no attribute 'get_all'
         # self.assertEqual(['b'], resp.headers.get_all('a'))
-
 
     def test_headers_setter_with_message(self):
         msg = parse_headers(io.BytesIO(b'a: b\na: bb\nc: d\n\n'))

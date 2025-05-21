@@ -16,7 +16,7 @@
 import base64
 import binascii
 import hashlib
-from mock import patch
+from unittest.mock import patch
 import os
 import time
 import unittest
@@ -1136,6 +1136,16 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             'Content-MD5': base64.b64encode(b'blahblahblahblah').strip()},
             fake_memcache)
 
+    def test_object_multipart_upload_initiate_with_checksum_algorithm(self):
+        fake_memcache = FakeMemcache()
+        fake_memcache.store[get_cache_key(
+            'AUTH_test', 'bucket+segments')] = {'status': 204}
+        fake_memcache.store[get_cache_key(
+            'AUTH_test', 'bucket')] = {'status': 204}
+        self._test_object_multipart_upload_initiate(
+            {'X-Amz-Checksum-Algorithm': 'CRC32',
+             'X-Amz-Checksum-Type': 'COMPOSITE'}, fake_memcache)
+
     def test_object_mpu_initiate_with_segment_bucket_mixed_policy(self):
         fake_memcache = FakeMemcache()
         fake_memcache.store[get_cache_key(
@@ -1508,7 +1518,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             ('DELETE', '/v1/AUTH_test/bucket+segments/%s/X' % wsgi_snowman)
         ])
 
-        self.assertEqual(json.loads(self.swift.req_bodies[-2]), [
+        self.assertEqual(json.loads(self.swift.call_list[-2].body), [
             {"path": u"/bucket+segments/\N{SNOWMAN}/X/1",
              "etag": "0123456789abcdef0123456789abcdef"},
             {"path": u"/bucket+segments/\N{SNOWMAN}/X/2",
@@ -1590,10 +1600,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                                      'Content-MD5': content_md5, },
                             body=XML)
         status, headers, body = self.call_s3api(req)
-        elem = fromstring(body, 'CompleteMultipartUploadResult')
-        self.assertNotIn('Etag', headers)
-        self.assertEqual(elem.find('ETag').text, S3_ETAG)
-        self.assertEqual(status.split()[0], '200')
+        elem = fromstring(body, 'Error')
+        self.assertEqual(elem.find('Code').text, 'NoSuchUpload')
+        self.assertEqual(status.split()[0], '404')
 
         self.assertEqual(self.swift.calls, [
             # Bucket exists
@@ -1603,23 +1612,10 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             ('HEAD', '/v1/AUTH_test/bucket+segments/object/X'),
             # But the object does, and with the same upload ID
             ('HEAD', '/v1/AUTH_test/bucket/object'),
-            # Create the SLO
-            ('PUT', '/v1/AUTH_test/bucket/object'
-                    '?heartbeat=on&multipart-manifest=put'),
-            # Retry deleting the marker for the sake of completeness
-            ('DELETE', '/v1/AUTH_test/bucket+segments/object/X')
+            # And then we bail
         ])
         self.assertEqual(req.environ['swift.backend_path'],
                          '/v1/AUTH_test/bucket+segments/object/X')
-
-        _, _, headers = self.swift.calls_with_headers[-2]
-        self.assertEqual(headers.get('X-Object-Meta-Foo'), 'bar')
-        self.assertEqual(headers.get('Content-Type'), 'baz/quux')
-        # SLO will provide a base value
-        override_etag = '; s3_etag=%s' % S3_ETAG.strip('"')
-        h = 'X-Object-Sysmeta-Container-Update-Override-Etag'
-        self.assertEqual(headers.get(h), override_etag)
-        self.assertEqual(headers.get('X-Object-Sysmeta-S3Api-Upload-Id'), 'X')
 
     def test_object_multipart_upload_retry_complete_upload_id_mismatch(self):
         content_md5 = base64.b64encode(md5(
@@ -1889,8 +1885,11 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         fromstring(body, 'Error')
         self.assertEqual(status.split()[0], '200')
         self.assertEqual(self._get_error_code(body), 'InvalidPart')
-        self.assertIn('One or more of the specified parts could not be found',
-                      self._get_error_message(body))
+        self.assertEqual(
+            "One or more of the specified parts could not be found.  The part "
+            "may not have been uploaded, or the specified entity tag may not "
+            "match the part's entity tag.",
+            self._get_error_message(body))
         self.assertEqual(self.swift.calls, [
             ('HEAD', '/v1/AUTH_test'),
             ('HEAD', '/v1/AUTH_test/bucket'),

@@ -16,12 +16,12 @@
 
 import base64
 import hashlib
+import io
 import unittest
-
-from mock import patch, MagicMock
+from unittest.mock import patch, MagicMock
 import calendar
 from datetime import datetime
-import mock
+from unittest import mock
 import requests
 import json
 from paste.deploy import loadwsgi
@@ -248,9 +248,31 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual('proxy-server', s3api.logger.server)
         self.assertEqual('s3api.', s3api.logger.logger.statsd_client._prefix)
         client = s3api.logger.logger.statsd_client
-        self.assertEqual({'test-metric': 1}, client.get_increment_counts())
+        self.assertEqual({'test-metric': 1}, client.get_stats_counts())
         self.assertEqual([(b's3api.test-metric:1|c', ('1.2.3.4', 8125))],
                          client.sendto_calls)
+
+    def test_init_logs_checksum_implementation(self):
+        with mock.patch('swift.common.middleware.s3api.s3api.get_logger',
+                        return_value=self.logger), \
+                mock.patch('swift.common.utils.checksum.crc32c_isal') \
+                as mock_crc32c, \
+                mock.patch('swift.common.utils.checksum.crc64nvme_isal') \
+                as mock_crc64nvme:
+            mock_crc32c.__name__ = 'crc32c_isal'
+            mock_crc64nvme.__name__ = 'crc64nvme_isal'
+            S3ApiMiddleware(None, {})
+        self.assertEqual(
+            {
+                'debug': [
+                    'Labeled statsd mode: disabled (fake-swift)',
+                ],
+                'info': [
+                    'Using crc32c_isal implementation for CRC32C.',
+                    'Using crc64nvme_isal implementation for CRC64NVME.',
+                ],
+            },
+            self.logger.all_log_lines())
 
     def test_init_statsd_options_user_labels(self):
         conf = {
@@ -286,7 +308,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
         self.assertEqual(
             {'403.AccessDenied.invalid_header_auth': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_header_auth',
                          get_log_info(req.environ))
 
@@ -299,7 +321,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'MethodNotAllowed')
         self.assertEqual(
             {'405.MethodNotAllowed': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:MethodNotAllowed',
                          get_log_info(req.environ))
 
@@ -313,7 +335,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'MethodNotAllowed')
         self.assertEqual(
             {'405.MethodNotAllowed': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:MethodNotAllowed',
                          get_log_info(req.environ))
 
@@ -350,6 +372,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                 'PATH_INFO': path,
                 'QUERY_STRING': query_string,
                 'HTTP_AUTHORIZATION': 'AWS X:Y:Z',
+                'wsgi.input': io.BytesIO(),
             }
             for header, value in headers.items():
                 header = 'HTTP_' + header.replace('-', '_').upper()
@@ -449,7 +472,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
         self.assertEqual(
             {'403.AccessDenied.expired': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.expired',
                          get_log_info(req.environ))
 
@@ -500,7 +523,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
         self.assertEqual(
             {'403.AccessDenied.invalid_expires': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_expires',
                          get_log_info(req.environ))
 
@@ -516,7 +539,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
         self.assertEqual(
             {'403.AccessDenied.invalid_query_auth': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_query_auth',
                          get_log_info(req.environ))
 
@@ -531,7 +554,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
         self.assertEqual(
             {'403.AccessDenied.invalid_query_auth': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_query_auth',
                          get_log_info(req.environ))
 
@@ -582,7 +605,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             self.assertIn(extra, body)
             self.assertEqual(
                 {'400.AuthorizationQueryParametersError': 1},
-                self.s3api.logger.logger.statsd_client.get_increment_counts())
+                self.s3api.logger.logger.statsd_client.get_stats_counts())
             self.assertEqual('s3:err:AuthorizationQueryParametersError',
                              get_log_info(req.environ))
 
@@ -615,7 +638,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
         self.assertEqual(
             {'403.AccessDenied.invalid_date': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_date',
                          get_log_info(req.environ))
 
@@ -635,7 +658,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidArgument')
         self.assertEqual(
             {'400.InvalidArgument': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:InvalidArgument',
                          get_log_info(req.environ))
 
@@ -655,7 +678,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                          'AuthorizationHeaderMalformed')
         self.assertEqual(
             {'400.AuthorizationHeaderMalformed': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AuthorizationHeaderMalformed',
                          get_log_info(req.environ))
 
@@ -674,7 +697,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
         self.assertEqual(
             {'403.AccessDenied.invalid_credential': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_credential',
                          get_log_info(req.environ))
 
@@ -693,7 +716,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
         self.assertEqual(
             {'403.AccessDenied.invalid_query_auth': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_query_auth',
                          get_log_info(req.environ))
 
@@ -711,16 +734,15 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertIn('swift.backend_path', req.environ)
         self.assertEqual('/v1/AUTH_test/bucket',
                          req.environ['swift.backend_path'])
-        self.assertEqual([(('swift_s3_checksum_algo_request', mock.ANY), {})],
+        exp_labels = {'account': 'AUTH_test',
+                      'container': 'bucket',
+                      'method': 'HEAD',
+                      'type': 'container',
+                      'status': 200,
+                      'header_x_amz_content_sha256': 'hash_64'}
+        self.assertEqual([(('swift_s3_checksum_algo_request',),
+                           {'labels': exp_labels})],
                          self.statsd.calls['increment'])
-        labels = self.statsd.calls['increment'][0][0][1]
-        self.assertEqual({'account': 'AUTH_test',
-                          'container': 'bucket',
-                          'method': 'HEAD',
-                          'type': 'container',
-                          'status': 200,
-                          'header_x_amz_content_sha256': 'hash_64'},
-                         labels)
 
     def test_object_virtual_hosted_style(self):
         req = Request.blank(
@@ -736,14 +758,15 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertIn('swift.backend_path', req.environ)
         self.assertEqual('/v1/AUTH_test/bucket/object',
                          req.environ['swift.backend_path'])
-        labels = self.statsd.calls['increment'][0][0][1]
-        self.assertEqual({'account': 'AUTH_test',
-                          'container': 'bucket',
-                          'method': 'HEAD',
-                          'type': 'object',
-                          'status': 200,
-                          'header_x_amz_content_sha256': 'hash_64'},
-                         labels)
+        exp_labels = {'account': 'AUTH_test',
+                      'container': 'bucket',
+                      'method': 'HEAD',
+                      'type': 'object',
+                      'status': 200,
+                      'header_x_amz_content_sha256': 'hash_64'}
+        self.assertEqual([(('swift_s3_checksum_algo_request',),
+                           {'labels': exp_labels})],
+                         self.statsd.calls['increment'])
 
     def test_token_generation(self):
         self.swift.register('HEAD', '/v1/AUTH_test/bucket+segments/'
@@ -759,7 +782,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         date_header = self.get_date_header()
         req.headers['Date'] = date_header
         with mock.patch('swift.common.middleware.s3api.s3request.'
-                        'S3Request.check_signature') as mock_cs:
+                        'SigCheckerV2.check_signature') as mock_cs:
             status, headers, body = self.call_s3api(req)
             self.assertIn('swift.backend_path', req.environ)
             self.assertEqual(
@@ -790,7 +813,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         date_header = self.get_date_header()
         req.headers['Date'] = date_header
         with mock.patch('swift.common.middleware.s3api.s3request.'
-                        'S3Request.check_signature') as mock_cs:
+                        'SigCheckerV2.check_signature') as mock_cs:
             status, headers, body = self.call_s3api(req)
             self.assertIn('swift.backend_path', req.environ)
             self.assertEqual(
@@ -815,7 +838,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidURI')
         self.assertEqual(
             {'400.InvalidURI': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:InvalidURI', get_log_info(req.environ))
 
     def test_object_create_bad_md5_unreadable(self):
@@ -828,7 +851,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
         self.assertEqual(
             {'400.InvalidDigest': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:InvalidDigest', get_log_info(req.environ))
 
     def test_object_create_bad_md5_too_short(self):
@@ -844,7 +867,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
         self.assertEqual(
             {'400.InvalidDigest': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:InvalidDigest', get_log_info(req.environ))
 
     def test_object_create_bad_md5_bad_padding(self):
@@ -861,7 +884,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
         self.assertEqual(
             {'400.InvalidDigest': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:InvalidDigest', get_log_info(req.environ))
 
     def test_object_create_bad_md5_too_long(self):
@@ -878,7 +901,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
         self.assertEqual(
             {'400.InvalidDigest': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:InvalidDigest', get_log_info(req.environ))
 
     def test_invalid_metadata_directive(self):
@@ -892,7 +915,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidArgument')
         self.assertEqual(
             {'400.InvalidArgument': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:InvalidArgument',
                          get_log_info(req.environ))
 
@@ -906,7 +929,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidStorageClass')
         self.assertEqual(
             {'400.InvalidStorageClass': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:InvalidStorageClass',
                          get_log_info(req.environ))
 
@@ -920,7 +943,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidArgument')
         self.assertEqual(
             {'400.InvalidArgument': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:InvalidArgument',
                          get_log_info(req.environ))
 
@@ -937,7 +960,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'NotImplemented')
         self.assertEqual(
             {'501.NotImplemented': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:NotImplemented',
                          get_log_info(req.environ))
 
@@ -972,23 +995,6 @@ class TestS3ApiMiddleware(S3ApiTestCase):
     def test_website_redirect_location(self):
         self._test_unsupported_header('x-amz-website-redirect-location')
 
-    def test_aws_chunked(self):
-        self._test_unsupported_header('content-encoding', 'aws-chunked')
-        # https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.html
-        # has a multi-encoding example:
-        #
-        # > Amazon S3 supports multiple content encodings. For example:
-        # >
-        # >     Content-Encoding : aws-chunked,gzip
-        # > That is, you can specify your custom content-encoding when using
-        # > Signature Version 4 streaming API.
-        self._test_unsupported_header('Content-Encoding', 'aws-chunked,gzip')
-        # Some clients skip the content-encoding,
-        # such as minio-go and aws-sdk-java
-        self._test_unsupported_header('x-amz-content-sha256',
-                                      'STREAMING-AWS4-HMAC-SHA256-PAYLOAD')
-        self._test_unsupported_header('x-amz-decoded-content-length')
-
     def test_object_tagging(self):
         self._test_unsupported_header('x-amz-tagging')
 
@@ -1001,7 +1007,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'NotImplemented')
         self.assertEqual(
             {'501.NotImplemented': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:NotImplemented',
                          get_log_info(req.environ))
 
@@ -1032,7 +1038,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(status.split()[0], '200')
         self.assertEqual(
             {},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
 
         req = Request.blank('/bucket?tagging',
                             environ={'REQUEST_METHOD': 'PUT'},
@@ -1043,7 +1049,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'NotImplemented')
         self.assertEqual(
             {'501.NotImplemented': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:NotImplemented',
                          get_log_info(req.environ))
 
@@ -1056,7 +1062,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'NotImplemented')
         self.assertEqual(
             {'501.NotImplemented': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:NotImplemented',
                          get_log_info(req.environ))
 
@@ -1075,7 +1081,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(elem.find('./ResourceType').text, 'ACL')
         self.assertEqual(
             {'405.MethodNotAllowed': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:MethodNotAllowed',
                          get_log_info(req.environ))
 
@@ -1212,7 +1218,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
         self.assertEqual(
             {'403.AccessDenied.invalid_date': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_date',
                          get_log_info(req.environ))
 
@@ -1236,7 +1242,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             'Missing required header for this request: x-amz-content-sha256')
         self.assertEqual(
             {'400.InvalidRequest': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:InvalidRequest',
                          get_log_info(req.environ))
 
@@ -1258,7 +1264,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             self.assertIn(extra, body)
             self.assertEqual(
                 {metric: 1},
-                self.s3api.logger.logger.statsd_client.get_increment_counts())
+                self.s3api.logger.logger.statsd_client.get_stats_counts())
             self.assertEqual('s3:err:%s' % metric[4:],
                              get_log_info(req.environ))
 
@@ -1332,6 +1338,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                     'Credential=X:Y/20110909/us-east-1/s3/aws4_request, '
                     'SignedHeaders=content-md5;content-type;date, '
                     'Signature=x',
+                'wsgi.input': io.BytesIO(),
             }
             fake_time = calendar.timegm((2011, 9, 9, 23, 36, 0))
             env.update(environ)
@@ -1353,9 +1360,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                     patch.object(swift.common.middleware.s3api.s3request,
                                  'SERVICE', 'host'):
                 req = _get_req(path, environ)
-                hash_in_sts = req._string_to_sign().split(b'\n')[3]
+                hash_in_sts = req.sig_checker._string_to_sign().split(b'\n')[3]
                 self.assertEqual(hash_val, hash_in_sts.decode('ascii'))
-                self.assertTrue(req.check_signature(
+                self.assertTrue(req.sig_checker.check_signature(
                     'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY'))
 
         # all next data got from aws4_testsuite from Amazon
@@ -1524,7 +1531,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(status.split()[0], '403', body)
         self.assertEqual(
             {'403.AccessDenied.invalid_expires': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_expires',
                          get_log_info(req.environ))
 
@@ -1542,7 +1549,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(status.split()[0], '403', body)
         self.assertEqual(
             {'403.AccessDenied.invalid_expires': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_expires',
                          get_log_info(req.environ))
 
@@ -1659,7 +1666,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                 statsd_client = self.s3api.logger.logger.statsd_client
                 self.assertEqual(
                     {'403.SignatureDoesNotMatch': 1},
-                    statsd_client.get_increment_counts())
+                    statsd_client.get_stats_counts())
             self.assertEqual('s3:err:SignatureDoesNotMatch',
                              get_log_info(req.environ))
 
@@ -1713,19 +1720,19 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req, status, _, body = do_test(800)
         self.assertEqual('200 OK', status)
         self.assertFalse(
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
 
         req, status, _, body = do_test(-800)
         self.assertEqual('200 OK', status)
         self.assertFalse(
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
 
         req, status, _, body = do_test(1000)
         self.assertEqual('403 Forbidden', status)
         self.assertEqual(self._get_error_code(body), 'RequestTimeTooSkewed')
         self.assertEqual(
             {'403.RequestTimeTooSkewed': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:RequestTimeTooSkewed',
                          get_log_info(req.environ))
 
@@ -1734,7 +1741,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'RequestTimeTooSkewed')
         self.assertEqual(
             {'403.RequestTimeTooSkewed': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:RequestTimeTooSkewed',
                          get_log_info(req.environ))
 
@@ -1744,7 +1751,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'RequestTimeTooSkewed')
         self.assertEqual(
             {'403.RequestTimeTooSkewed': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:RequestTimeTooSkewed',
                          get_log_info(req.environ))
 
@@ -1769,14 +1776,14 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req = do_test(ErrorResponse(status=403, msg='not good', reason='bad'))
         self.assertEqual(
             {'403.ErrorResponse.bad': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:ErrorResponse.bad',
                          get_log_info(req.environ))
 
         req = do_test(AccessDenied(msg='no entry', reason='invalid_date'))
         self.assertEqual(
             {'403.AccessDenied.invalid_date': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:AccessDenied.invalid_date',
                          get_log_info(req.environ))
 
@@ -1785,7 +1792,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                                      reason='boom boom'))
         self.assertEqual(
             {'400.ka_boom.boom_boom': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            self.s3api.logger.logger.statsd_client.get_stats_counts())
         self.assertEqual('s3:err:ka_boom.boom_boom',
                          get_log_info(req.environ))
 
@@ -1806,8 +1813,8 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         status, headers, body = self.call_app(req, app=app)
 
         self.assertEqual(
-            {'403.AccessDenied.invalid_credential': 1},
-            self.s3api.logger.logger.statsd_client.get_increment_counts())
+            ['403.AccessDenied.invalid_credential'],
+            self.s3api.logger.statsd_client.get_increments())
         self.assertEqual('s3:err:AccessDenied.invalid_credential',
                          get_log_info(req.environ))
         self.assertEqual(
@@ -1827,16 +1834,35 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             'Authorization': authz_header,
             'X-Amz-Date': self.get_v4_amz_date_header(),
             'Content-Type': 'text/plain',
+            'Content-Length': '0',
         }
         headers.update(extra_headers)
         req = Request.blank(path, headers=headers, body='')
         req.method = method
         self.statsd.clear()
-        self.call_s3api(req)
-        self.assertEqual([(('swift_s3_checksum_algo_request', mock.ANY), {})],
+
+        # verify that request headers are sampled before request is handled by
+        # mocking the controller to mutate the request headers
+        orig_get_response = S3Request.get_response
+        captured_envs = []
+
+        def mock_handler(req, *args, **kwargs):
+            # note: only requests that succeed in constructing an S3Request
+            # will reach this handler
+            captured_envs.append(req)
+            resp = orig_get_response(req, *args, **kwargs)
+            for k in extra_headers:
+                req.headers.pop(k, None)
+            return resp
+
+        with mock.patch('swift.common.middleware.s3api.s3request.S3Request.'
+                        'get_response', mock_handler):
+            _, _, body = self.call_s3api(req)
+        self.assertEqual([(('swift_s3_checksum_algo_request',), mock.ANY)],
                          self.statsd.calls['increment'])
-        labels = self.statsd.calls['increment'][0][0][1]
-        return labels
+        kwargs = self.statsd.calls['increment'][0][1]
+        self.assertIn('labels', kwargs)
+        return kwargs['labels']
 
     def test_emit_stats_x_amx_content_sha256_real_hash(self):
         headers = {'X-Amz-Content-SHA256': SHA256_OF_EMPTY_STRING}
@@ -1925,19 +1951,36 @@ class TestS3ApiMiddleware(S3ApiTestCase):
 
         do_test('UNSIGNED-PAYLOAD')
 
-    def test_emit_stats_x_amx_content_sha256_unsupported_aliases(self):
+    def test_emit_stats_x_amx_content_sha256_supported_streaming_aliases(self):
         def do_test(alias):
-            headers = {'X-Amz-Content-SHA256': alias}
+            headers = {'X-Amz-Content-SHA256': alias,
+                       'x-amz-decoded-content-length': '0'}
             labels = self._do_test_emit_header_stats(headers)
-            self.assertEqual({'method': 'PUT',
-                              'type': 'UNKNOWN',
-                              'status': 400,
+            self.assertEqual({'account': 'AUTH_test',
+                              'container': 'bucket',
+                              'method': 'PUT',
+                              'type': 'object',
+                              'status': 400,  # incomplete payload
+                              'header_x_amz_decoded_content_length': True,
                               'header_x_amz_content_sha256': alias},
                              labels)
 
         do_test('STREAMING-UNSIGNED-PAYLOAD-TRAILER')
         do_test('STREAMING-AWS4-HMAC-SHA256-PAYLOAD')
         do_test('STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER')
+
+    def test_emit_stats_x_amx_content_sha256_unsupported_aliases(self):
+        def do_test(alias):
+            headers = {'X-Amz-Content-SHA256': alias,
+                       'x-amz-decoded-content-length': '0'}
+            labels = self._do_test_emit_header_stats(headers)
+            self.assertEqual({'method': 'PUT',
+                              'type': 'UNKNOWN',
+                              'status': 501,
+                              'header_x_amz_decoded_content_length': True,
+                              'header_x_amz_content_sha256': alias},
+                             labels)
+
         do_test('STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD')
         do_test('STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER')
 
@@ -1981,9 +2024,11 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {'Content-Encoding': 'aws-chunked',
                    'X-Amz-Content-SHA256': SHA256_OF_EMPTY_STRING}
         labels = self._do_test_emit_header_stats(headers)
-        self.assertEqual({'method': 'PUT',
-                          'type': 'UNKNOWN',
-                          'status': 501,
+        self.assertEqual({'account': 'AUTH_test',
+                          'container': 'bucket',
+                          'method': 'PUT',
+                          'type': 'object',
+                          'status': 200,
                           'header_content_encoding': 'aws-chunked',
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
@@ -1991,9 +2036,11 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {'Content-Encoding': 'aws-chunked,gzip',
                    'X-Amz-Content-SHA256': SHA256_OF_EMPTY_STRING}
         labels = self._do_test_emit_header_stats(headers)
-        self.assertEqual({'method': 'PUT',
-                          'type': 'UNKNOWN',
-                          'status': 501,
+        self.assertEqual({'account': 'AUTH_test',
+                          'container': 'bucket',
+                          'method': 'PUT',
+                          'type': 'object',
+                          'status': 200,
                           'header_content_encoding': 'aws-chunked',
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
@@ -2003,9 +2050,11 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {'Content-Encoding': 'not-aws-chunked',
                    'X-Amz-Content-SHA256': SHA256_OF_EMPTY_STRING}
         labels = self._do_test_emit_header_stats(headers)
-        self.assertEqual({'method': 'PUT',
-                          'type': 'UNKNOWN',
-                          'status': 501,
+        self.assertEqual({'account': 'AUTH_test',
+                          'container': 'bucket',
+                          'method': 'PUT',
+                          'type': 'object',
+                          'status': 200,
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
 
@@ -2049,9 +2098,11 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {'X-Amz-Decoded-Content-Length': '123',
                    'X-Amz-Content-SHA256': SHA256_OF_EMPTY_STRING}
         labels = self._do_test_emit_header_stats(headers)
-        self.assertEqual({'method': 'PUT',
-                          'type': 'UNKNOWN',
-                          'status': 501,
+        self.assertEqual({'account': 'AUTH_test',
+                          'container': 'bucket',
+                          'method': 'PUT',
+                          'type': 'object',
+                          'status': 200,
                           'header_x_amz_decoded_content_length': True,
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
@@ -2064,7 +2115,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                           'container': 'bucket',
                           'method': 'PUT',
                           'type': 'object',
-                          'status': 200,
+                          'status': 400,  # bad digest
                           'header_x_amz_checksum_crc32': 'b64_8',
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
@@ -2072,11 +2123,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {'X-Amz-Checksum-Crc32': base64.b64encode(b'123'),  # bad
                    'X-Amz-Content-SHA256': SHA256_OF_EMPTY_STRING}
         labels = self._do_test_emit_header_stats(headers)
-        self.assertEqual({'account': 'AUTH_test',
-                          'container': 'bucket',
-                          'method': 'PUT',
-                          'type': 'object',
-                          'status': 200,
+        self.assertEqual({'method': 'PUT',
+                          'type': 'UNKNOWN',
+                          'status': 400,
                           'header_x_amz_checksum_crc32': 'unknown',
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
@@ -2089,7 +2138,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                           'container': 'bucket',
                           'method': 'PUT',
                           'type': 'object',
-                          'status': 200,
+                          'status': 400,  # bad digest
                           'header_x_amz_checksum_crc32c': 'b64_8',
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
@@ -2097,11 +2146,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {'X-Amz-Checksum-Crc32c': base64.b64encode(b'123'),  # bad
                    'X-Amz-Content-SHA256': SHA256_OF_EMPTY_STRING}
         labels = self._do_test_emit_header_stats(headers)
-        self.assertEqual({'account': 'AUTH_test',
-                          'container': 'bucket',
-                          'method': 'PUT',
-                          'type': 'object',
-                          'status': 200,
+        self.assertEqual({'method': 'PUT',
+                          'type': 'UNKNOWN',
+                          'status': 400,
                           'header_x_amz_checksum_crc32c': 'unknown',
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
@@ -2110,11 +2157,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {'X-Amz-Checksum-Crc32c': base64.b64encode(b'12345678'),
                    'X-Amz-Content-SHA256': SHA256_OF_EMPTY_STRING}
         labels = self._do_test_emit_header_stats(headers)
-        self.assertEqual({'account': 'AUTH_test',
-                          'container': 'bucket',
+        self.assertEqual({'type': 'UNKNOWN',
                           'method': 'PUT',
-                          'type': 'object',
-                          'status': 200,
+                          'status': 400,  # bad digest
                           'header_x_amz_checksum_crc32c': 'b64_12',
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
@@ -2127,7 +2172,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                           'container': 'bucket',
                           'method': 'PUT',
                           'type': 'object',
-                          'status': 200,
+                          'status': 400,  # bad digest
                           'header_x_amz_checksum_sha1': 'b64_28',
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
@@ -2135,11 +2180,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {'X-Amz-Checksum-SHA1': base64.b64encode(b'123' * 5),  # bad
                    'X-Amz-Content-SHA256': SHA256_OF_EMPTY_STRING}
         labels = self._do_test_emit_header_stats(headers)
-        self.assertEqual({'account': 'AUTH_test',
-                          'container': 'bucket',
-                          'method': 'PUT',
-                          'type': 'object',
-                          'status': 200,
+        self.assertEqual({'method': 'PUT',
+                          'type': 'UNKNOWN',
+                          'status': 400,  # invalid header value
                           'header_x_amz_checksum_sha1': 'unknown',
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
@@ -2149,29 +2192,63 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                    'X-Amz-Checksum-CRC32': base64.b64encode(b'1234'),
                    'X-Amz-Content-SHA256': SHA256_OF_EMPTY_STRING}
         labels = self._do_test_emit_header_stats(headers)
-        self.assertEqual({'account': 'AUTH_test',
-                          'container': 'bucket',
+        self.assertEqual({'type': 'UNKNOWN',
+                          'status': 400,
                           'method': 'PUT',
-                          'type': 'object',
-                          'status': 200,
                           'header_x_amz_checksum_crc32': 'b64_8',
                           'header_x_amz_checksum_sha1': 'b64_28',
                           'header_x_amz_content_sha256': 'hash_64'},
                          labels)
 
+    def test_emit_stats_x_amz_trailer_unknown(self):
+        def do_test(header_value):
+            headers = {
+                'X-Amz-Trailer': header_value,
+                'X-Amz-Content-SHA256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+                'x-amz-decoded-content-length': '0'
+            }
+            labels = self._do_test_emit_header_stats(headers)
+            self.assertEqual({'method': 'PUT',
+                              'type': 'UNKNOWN',
+                              'status': 400,
+                              'header_x_amz_decoded_content_length': True,
+                              'header_x_amz_trailer': 'unknown',
+                              'header_x_amz_content_sha256':
+                                  'STREAMING-UNSIGNED-PAYLOAD-TRAILER'},
+                             labels)
+
+        do_test('content-md5')
+        do_test('x-amz-checksum-sha2')
+        do_test('content-md5,x-amz-checksum-sha256')
+        do_test('x-amz-checksum-sha256,x-amz-checksum-crc32')
+
     def test_emit_stats_x_amz_trailer(self):
-        headers = {
-            'X-Amz-Trailer': 'content-md5,x-amx-checksum-sha256',
-            'X-Amz-Content-SHA256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-        }
-        labels = self._do_test_emit_header_stats(headers)
-        self.assertEqual({'method': 'PUT',
-                          'type': 'UNKNOWN',
-                          'status': 400,
-                          'header_x_amz_trailer': True,
-                          'header_x_amz_content_sha256':
-                              'STREAMING-UNSIGNED-PAYLOAD-TRAILER'},
-                         labels)
+        def do_test(header_value):
+            headers = {
+                'X-Amz-Trailer': header_value,
+                'X-Amz-Content-SHA256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+                'x-amz-decoded-content-length': '0'
+            }
+            labels = self._do_test_emit_header_stats(headers)
+            self.assertEqual({'account': 'AUTH_test',
+                              'container': 'bucket',
+                              'method': 'PUT',
+                              'type': 'object',
+                              'status': 400,  # IncompleteBody
+                              'header_x_amz_decoded_content_length': True,
+                              'header_x_amz_trailer': header_value,
+                              'header_x_amz_content_sha256':
+                                  'STREAMING-UNSIGNED-PAYLOAD-TRAILER'},
+                             labels)
+
+        do_test('x-amz-checksum-crc32')
+        do_test('x-amz-checksum-crc32c')
+        with mock.patch('swift.common.utils.checksum.crc64nvme_isal') \
+                as mock_crc64nvme:
+            mock_crc64nvme.__name__ = 'crc64nvme_isal'
+            do_test('x-amz-checksum-crc64nvme')
+        do_test('x-amz-checksum-sha1')
+        do_test('x-amz-checksum-sha256')
 
     def test_emit_stats_x_amz_checksum_algorithm(self):
         def do_test(algo):

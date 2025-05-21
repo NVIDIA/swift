@@ -19,12 +19,11 @@ import tempfile
 from textwrap import dedent
 import unittest
 
-import mock
+from unittest import mock
 
 from swift.common.utils import config
 
 from io import StringIO
-from test import annotate_failure
 from test.unit import temptree
 
 
@@ -151,6 +150,33 @@ class TestUtilsConfig(unittest.TestCase):
             else:
                 self.assertEqual(expected, rv)
 
+    def test_config_positive_float_value(self):
+        # Test cases that should pass
+        for value, expected in (
+                (99, 99.0),
+                (99.01, 99.01),
+                ('99', 99.0),
+                ('99.01', 99.01),
+                (1, 1.0),
+                ('0.00001', 0.00001),
+        ):
+            actual = config.config_positive_float_value(value)
+            self.assertEqual(expected, actual)
+
+        # Test cases that should raise ValueError
+        for value in (
+                0, '0', 0.0, '0.0',
+                -99, -99.01,
+                '-99', '-99.01',
+                None, 'not-a-float'
+        ):
+            with self.assertRaises(ValueError) as cm:
+                config.config_positive_float_value(value)
+            expected_msg = (
+                'Config option must be a positive float number, not "%s".' %
+                value)
+            self.assertEqual(expected_msg, str(cm.exception))
+
     def test_config_float_value(self):
         for args, expected in (
                 ((99, None, None), 99.0),
@@ -240,7 +266,7 @@ class TestUtilsConfig(unittest.TestCase):
 
         for bad in ('1.1', 1.1, 'auto', 'bad',
                     '2.5 * replicas', 'two * replicas'):
-            with annotate_failure(bad):
+            with self.subTest(option=bad):
                 with self.assertRaises(ValueError):
                     config.config_request_node_count_value(bad)
 

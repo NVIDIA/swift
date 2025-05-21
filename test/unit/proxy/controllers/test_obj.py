@@ -25,7 +25,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 import json
 
-import mock
+from unittest import mock
 from eventlet import Timeout, sleep
 from eventlet.queue import Empty
 
@@ -8101,9 +8101,11 @@ class TestGetUpdateShard(BaseObjectControllerMixin, unittest.TestCase):
         self.assertFalse(self.app.logger.get_lines_for_level('error'))
 
     def test_get_update_shard_cache_not_available(self):
-        # verify case when memcache is not available
+        # when memcache is not available, object controller will only need to
+        # retrieve a specific shard range from the container server to send the
+        # update request to.
         req = Request.blank('/v1/a/c/o', method='PUT')
-        body, resp_headers = self._create_response_data(self.shard_ranges)
+        body, resp_headers = self._create_response_data([self.shard_ranges[1]])
         with mocked_http_conn(
                 200, 200, body_iter=iter([b'', body]),
                 headers=resp_headers) as fake_conn:
@@ -8118,7 +8120,9 @@ class TestGetUpdateShard(BaseObjectControllerMixin, unittest.TestCase):
         self.assertEqual('a/c', captured[1]['path'][7:])
         params = sorted(captured[1]['qs'].split('&'))
         self.assertEqual(
-            ['format=json', 'states=updating'], params)
+            ['format=json', 'includes=' + quote(self.item), 'states=updating'],
+            params
+        )
         captured_hdrs = captured[1]['headers']
         self.assertEqual('shard', captured_hdrs.get('X-Backend-Record-Type'))
         self.assertEqual('namespace',
@@ -8126,7 +8130,7 @@ class TestGetUpdateShard(BaseObjectControllerMixin, unittest.TestCase):
         self.assertIsNone(self.memcache.get('shard-updating-v2/a/c'))
         exp_ns = Namespace(self.shard_ranges[1].name,
                            self.shard_ranges[1].lower,
-                           self.shard_ranges[2].lower)
+                           self.shard_ranges[1].upper)
         self.assertEqual(exp_ns, actual)
         self.assertFalse(self.app.logger.get_lines_for_level('error'))
 

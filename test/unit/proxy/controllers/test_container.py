@@ -14,7 +14,7 @@
 # limitations under the License.
 import json
 
-import mock
+from unittest import mock
 import socket
 import unittest
 
@@ -29,7 +29,6 @@ from swift.common.utils import ShardRange, Timestamp, Namespace, \
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers.base import headers_to_container_info, \
     Controller, get_container_info, get_cache_key
-from test import annotate_failure
 from test.unit import fake_http_connect, FakeRing, FakeMemcache, \
     make_timestamp_iter
 from swift.common.storage_policy import StoragePolicy
@@ -590,7 +589,7 @@ class TestGetShardedContainer(BaseTestContainerController):
             self.assertEqual(len(expected_requests), len(fake_conn.requests))
         for i, ((exp_path, exp_headers, exp_params), req) in enumerate(
                 zip(expected_requests, fake_conn.requests)):
-            with annotate_failure('Request check at index %d.' % i):
+            with self.subTest(index=i):
                 # strip off /sdx/0/ from path
                 self.assertEqual(exp_path, req['path'][7:])
                 got_params = dict(urllib.parse.parse_qsl(
@@ -3498,7 +3497,7 @@ class TestGetPathNamespaceCaching(BaseTestContainerControllerGetPath):
         self.assertEqual(404, resp.status_int)
         self.assertEqual({'container.info.cache.hit': 1,
                           'container.shard_listing.cache.miss.404': 1},
-                         self.logger.statsd_client.get_increment_counts())
+                         self.logger.statsd_client.get_stats_counts())
 
     def test_GET_namespaces_read_from_cache_error(self):
         info = headers_to_container_info(self.root_resp_hdrs)
@@ -3529,7 +3528,7 @@ class TestGetPathNamespaceCaching(BaseTestContainerControllerGetPath):
         self.assertEqual(404, resp.status_int)
         self.assertEqual({'container.info.cache.hit': 1,
                           'container.shard_listing.cache.error.404': 1},
-                         self.logger.statsd_client.get_increment_counts())
+                         self.logger.statsd_client.get_stats_counts())
 
     def test_GET_namespaces_read_from_cache_empty_list(self):
         info = headers_to_container_info(self.root_resp_hdrs)
@@ -3561,7 +3560,7 @@ class TestGetPathNamespaceCaching(BaseTestContainerControllerGetPath):
         self.assertEqual(404, resp.status_int)
         self.assertEqual({'container.info.cache.hit': 1,
                           'container.shard_listing.cache.miss.404': 1},
-                         self.logger.statsd_client.get_increment_counts())
+                         self.logger.statsd_client.get_stats_counts())
 
     def _do_test_GET_namespaces_read_from_cache(self, params, record_type):
         # pre-warm cache with container metadata and shard ranges and verify
@@ -3584,7 +3583,7 @@ class TestGetPathNamespaceCaching(BaseTestContainerControllerGetPath):
             self.memcache.calls)
         self.assertEqual({'container.info.cache.hit': 1,
                           'container.shard_listing.cache.hit': 1},
-                         self.logger.statsd_client.get_increment_counts())
+                         self.logger.statsd_client.get_stats_counts())
         return resp
 
     def test_GET_namespaces_read_from_cache(self):
@@ -3665,7 +3664,7 @@ class TestGetPathNamespaceCaching(BaseTestContainerControllerGetPath):
                          self.memcache.calls[2][1][1]['sharding_state'])
         self.assertEqual({'container.info.cache.miss': 1,
                           'container.shard_listing.cache.bypass.200': 1},
-                         self.logger.statsd_client.get_increment_counts())
+                         self.logger.statsd_client.get_stats_counts())
         return resp
 
     def test_GET_namespaces_write_to_cache(self):
@@ -3745,7 +3744,7 @@ class TestGetPathNamespaceCaching(BaseTestContainerControllerGetPath):
                          self.memcache.calls[2][1][1]['sharding_state'])
         self.assertEqual({'container.info.cache.miss': 1,
                           'container.shard_listing.cache.force_skip.200': 1},
-                         self.logger.statsd_client.get_increment_counts())
+                         self.logger.statsd_client.get_stats_counts())
 
     def _do_test_GET_namespaces_no_cache_write(self, resp_hdrs):
         # verify that there is a cache lookup to check container info but then
@@ -3951,7 +3950,7 @@ class TestGetPathNamespaceCaching(BaseTestContainerControllerGetPath):
                          self.memcache.calls[1][1][1]['sharding_state'])
         self.assertEqual({'container.info.cache.miss': 1,
                           'container.shard_listing.cache.bypass.200': 1},
-                         self.logger.statsd_client.get_increment_counts())
+                         self.logger.statsd_client.get_stats_counts())
         self.memcache.delete_all()
 
     def test_GET_namespaces_bad_response_body(self):

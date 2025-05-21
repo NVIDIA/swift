@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
 import email.parser
 import logging
 import json
@@ -44,7 +43,7 @@ from collections import defaultdict
 import uuid
 import itertools
 
-import mock
+from unittest import mock
 from eventlet import sleep, spawn, wsgi, Timeout, debug
 from eventlet.green.http import client as http_client
 from io import BytesIO
@@ -1217,7 +1216,7 @@ class TestProxyServer(unittest.TestCase):
                 self.assertTrue(log_kwargs['exc_info'])
                 self.assertIs(caught_exc, log_kwargs['exc_info'][1])
                 incremented_limit_samples.append(
-                    logger.statsd_client.get_increment_counts().get(
+                    logger.statsd_client.get_stats_counts().get(
                         'error_limiter.incremented_limit', 0))
             self.assertEqual([0] * 10 + [1], incremented_limit_samples)
             self.assertEqual(
@@ -1251,7 +1250,7 @@ class TestProxyServer(unittest.TestCase):
                 self.assertIn(expected_msg, line)
                 self.assertIn(node_to_string(node), line)
                 incremented_limit_samples.append(
-                    logger.statsd_client.get_increment_counts().get(
+                    logger.statsd_client.get_stats_counts().get(
                         'error_limiter.incremented_limit', 0))
 
             self.assertEqual([0] * 10 + [1], incremented_limit_samples)
@@ -1268,7 +1267,7 @@ class TestProxyServer(unittest.TestCase):
             self.assertIn(expected_msg, line)
             self.assertIn(node_to_string(node), line)
             self.assertEqual(
-                2, logger.statsd_client.get_increment_counts().get(
+                2, logger.statsd_client.get_stats_counts().get(
                     'error_limiter.incremented_limit', 0))
             self.assertEqual(
                 ('Node will be error limited for 60.00s: %s' %
@@ -3645,7 +3644,7 @@ class TestReplicatedObjectController(
             error_node = object_ring.get_part_nodes(1)[0]
             self.app.error_limit(error_node, 'test')
             self.assertEqual(
-                1, self.logger.statsd_client.get_increment_counts().get(
+                1, self.logger.statsd_client.get_stats_counts().get(
                     'error_limiter.forced_limit', 0))
             line = self.logger.get_lines_for_level('error')[-1]
             self.assertEqual(
@@ -3654,7 +3653,7 @@ class TestReplicatedObjectController(
 
             # no error limited checking yet.
             self.assertEqual(
-                0, self.logger.statsd_client.get_increment_counts().get(
+                0, self.logger.statsd_client.get_stats_counts().get(
                     'error_limiter.is_limited', 0))
             set_http_connect(200, 200,        # account, container
                              201, 201, 201,   # 3 working backends
@@ -3666,7 +3665,7 @@ class TestReplicatedObjectController(
             self.assertTrue(res.status.startswith('201 '))
             # error limited happened during PUT.
             self.assertEqual(
-                1, self.logger.statsd_client.get_increment_counts().get(
+                1, self.logger.statsd_client.get_stats_counts().get(
                     'error_limiter.is_limited', 0))
 
         # this is kind of a hokey test, but in FakeRing, the port is even when
@@ -4382,7 +4381,7 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual(
                 {'account.info.cache.disabled.200': 1,
                  'account.info.infocache.hit': 2,
@@ -4449,6 +4448,7 @@ class TestReplicatedObjectController(
         self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
         self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
         self.app.recheck_updating_shard_ranges = 3600
+        self.app.namespace_cache_tokens_per_session = 0
 
         def do_test(method, sharding_state):
             self.app.logger.clear()  # clean capture state
@@ -4479,13 +4479,13 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual({'account.info.cache.miss.200': 1,
                               'account.info.infocache.hit': 2,
                               'container.info.cache.miss.200': 1,
                               'container.info.infocache.hit': 1,
                               'object.shard_updating.cache.miss.200': 1,
-                              'object.shard_updating.cache.set': 1},
+                              'object.shard_updating.cache.set.200': 1},
                              stats)
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
             info_lines = self.logger.get_lines_for_level('info')
@@ -4597,7 +4597,7 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
 
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual({'account.info.cache.miss.200': 1,
                               'account.info.infocache.hit': 1,
                               'container.info.cache.miss.200': 1,
@@ -4678,10 +4678,13 @@ class TestReplicatedObjectController(
                 utils.ShardRange(
                     '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
             ]
+            cache = FakeMemcache()
             infocache = {
                 'shard-updating-v2/a/c':
                 NamespaceBoundList.parse(shard_ranges)}
-            req = Request.blank('/v1/a/c/o', {'swift.infocache': infocache},
+            req = Request.blank('/v1/a/c/o',
+                                {'swift.cache': cache,
+                                 'swift.infocache': infocache},
                                 method=method, body='',
                                 headers={'Content-Type': 'text/plain'})
 
@@ -4699,10 +4702,10 @@ class TestReplicatedObjectController(
             # verify request hitted infocache.
             self.assertEqual(resp.status_int, 202)
 
-            stats = self.app.logger.statsd_client.get_increment_counts()
-            self.assertEqual({'account.info.cache.disabled.200': 1,
+            stats = self.app.logger.statsd_client.get_stats_counts()
+            self.assertEqual({'account.info.cache.miss.200': 1,
                               'account.info.infocache.hit': 1,
-                              'container.info.cache.disabled.200': 1,
+                              'container.info.cache.miss.200': 1,
                               'container.info.infocache.hit': 1,
                               'object.shard_updating.infocache.hit': 1}, stats)
             # verify statsd prefix is not mutated
@@ -4767,6 +4770,7 @@ class TestReplicatedObjectController(
         self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
         self.app.recheck_updating_shard_ranges = 3600
         self.app.container_updating_shard_ranges_skip_cache = 0.001
+        self.app.namespace_cache_tokens_per_session = 0
 
         def do_test(method, sharding_state):
             self.app.logger.clear()  # clean capture state
@@ -4801,7 +4805,7 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
 
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual({'account.info.cache.miss.200': 1,
                               'account.info.infocache.hit': 1,
                               'container.info.cache.miss.200': 1,
@@ -4847,7 +4851,7 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
 
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual({'account.info.cache.miss.200': 1,
                               'account.info.infocache.hit': 1,
                               'container.info.cache.miss.200': 1,
@@ -4856,7 +4860,7 @@ class TestReplicatedObjectController(
                               'container.info.cache.hit': 1,
                               'account.info.cache.hit': 1,
                               'object.shard_updating.cache.skip.200': 1,
-                              'object.shard_updating.cache.set': 1},
+                              'object.shard_updating.cache.set.200': 1},
                              stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
@@ -4916,7 +4920,7 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual(stats, {
                 'account.info.cache.hit': 2,
                 'account.info.cache.miss.200': 1,
@@ -4927,7 +4931,7 @@ class TestReplicatedObjectController(
                 'object.shard_updating.cache.skip.200': 1,
                 'object.shard_updating.cache.hit': 1,
                 'object.shard_updating.cache.error.200': 1,
-                'object.shard_updating.cache.set': 2
+                'object.shard_updating.cache.set.200': 2
             })
 
         do_test('POST', 'sharding')
@@ -4949,6 +4953,7 @@ class TestReplicatedObjectController(
         self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
         self.app.recheck_updating_shard_ranges = 3600
         self.app.container_updating_shard_ranges_skip_cache = 0.001
+        self.app.namespace_cache_tokens_per_session = 0
 
         def do_test(method, sharding_state):
             self.app.logger.clear()  # clean capture state
@@ -4982,13 +4987,13 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
 
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual({'account.info.cache.miss.200': 1,
                               'account.info.infocache.hit': 2,
                               'container.info.cache.miss.200': 1,
                               'container.info.infocache.hit': 1,
                               'object.shard_updating.cache.skip.200': 1,
-                              'object.shard_updating.cache.set_error': 1},
+                              'object.shard_updating.cache.set_error.200': 1},
                              stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
@@ -5054,7 +5059,7 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual(
                 {'account.info.cache.disabled.200': 1,
                  'account.info.infocache.hit': 2,
@@ -5119,30 +5124,26 @@ class TestReplicatedObjectController(
             logger=self.logger,
             account_ring=FakeRing(),
             container_ring=FakeRing())
-        self.assertEqual(self.app.namespace_cache_use_token, False)
-        self.assertEqual(self.app.namespace_cache_token_retry_interval, 0.1)
+        self.assertEqual(self.app.namespace_avg_backend_fetch_time, 0.3)
         self.assertEqual(self.app.namespace_cache_tokens_per_session, 3)
 
-        conf = {'namespace_cache_use_token': 'True'}
+        conf = {'namespace_cache_tokens_per_session': '0'}
         self.app = proxy_server.Application(
             conf,
             logger=self.logger,
             account_ring=FakeRing(),
             container_ring=FakeRing())
-        self.assertEqual(self.app.namespace_cache_use_token, True)
-        self.assertEqual(self.app.namespace_cache_token_retry_interval, 0.1)
-        self.assertEqual(self.app.namespace_cache_tokens_per_session, 3)
+        self.assertEqual(self.app.namespace_avg_backend_fetch_time, 0.3)
+        self.assertEqual(self.app.namespace_cache_tokens_per_session, 0)
 
-        conf = {'namespace_cache_use_token': 'True',
-                'namespace_cache_token_retry_interval': 0.2,
+        conf = {'namespace_avg_backend_fetch_time': 0.2,
                 'namespace_cache_tokens_per_session': 1}
         self.app = proxy_server.Application(
             conf,
             logger=self.logger,
             account_ring=FakeRing(),
             container_ring=FakeRing())
-        self.assertEqual(self.app.namespace_cache_use_token, True)
-        self.assertEqual(self.app.namespace_cache_token_retry_interval, 0.2)
+        self.assertEqual(self.app.namespace_avg_backend_fetch_time, 0.2)
         self.assertEqual(self.app.namespace_cache_tokens_per_session, 1)
 
     @patch_policies([
@@ -5153,7 +5154,7 @@ class TestReplicatedObjectController(
         # verify that the request to get updating shard from the container
         # backend works with cooperative token acquired.
         # reset the router post patch_policies
-        conf = {'namespace_cache_use_token': 'True'}
+        conf = {}
         self.app = proxy_server.Application(
             conf,
             logger=self.logger,
@@ -5200,7 +5201,7 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual(
                 {
                     "account.info.cache.miss.200": 1,
@@ -5208,7 +5209,7 @@ class TestReplicatedObjectController(
                     "container.info.cache.miss.200": 1,
                     "container.info.infocache.hit": 1,
                     "object.shard_updating.cache.miss.200": 1,
-                    "object.shard_updating.cache.set": 1,
+                    "object.shard_updating.cache.set.200": 1,
                     "token.shard_updating.backend_reqs.with_token.200": 1,
                     "token.shard_updating.done_token_reqs": 1,
                 },
@@ -5286,8 +5287,7 @@ class TestReplicatedObjectController(
         # grabbed all available cooperative tokens and filled the updating
         # shard ranges into the memcache.
         # reset the router post patch_policies
-        conf = {'namespace_cache_use_token': 'True',
-                'namespace_cache_token_retry_interval': 0.005}
+        conf = {'namespace_avg_backend_fetch_time': 0.005}
         self.app = proxy_server.Application(
             conf,
             logger=self.logger,
@@ -5350,7 +5350,7 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual({'account.info.cache.miss.200': 1,
                               'account.info.infocache.hit': 1,
                               'container.info.cache.miss.200': 1,
@@ -5359,12 +5359,6 @@ class TestReplicatedObjectController(
                               'token.shard_updating.cache_served_reqs': 1},
                              stats)
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
-            debug_lines = self.logger.get_lines_for_level('debug')
-            self.assertIn(
-                'Retrieved updating shards (3 shards) from cache instead '
-                'of backend due to request coalescing by cooperative '
-                'token for shard-updating-v2/a/c',
-                debug_lines)
 
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]
@@ -5420,11 +5414,10 @@ class TestReplicatedObjectController(
         # backend will be served out of memcached when other requests have
         # grabbed all available cooperative tokens. Due to simulated busy
         # eventlet scheduler, this request would be underserved and only get
-        # two normal retries during the token sessioin, but eventually get data
+        # two normal retries during the token session, but eventually get data
         # from cache by use of the forced retry.
         # reset the router post patch_policies
-        conf = {'namespace_cache_use_token': 'True',
-                'namespace_cache_token_retry_interval': 0.005}
+        conf = {'namespace_avg_backend_fetch_time': 0.005}
         self.app = proxy_server.Application(
             conf,
             logger=self.logger,
@@ -5489,7 +5482,7 @@ class TestReplicatedObjectController(
                     resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual({'account.info.cache.miss.200': 1,
                               'account.info.infocache.hit': 1,
                               'container.info.cache.miss.200': 1,
@@ -5499,12 +5492,6 @@ class TestReplicatedObjectController(
                               'token.shard_updating.lack_retries': 1},
                              stats)
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
-            debug_lines = self.logger.get_lines_for_level('debug')
-            self.assertIn(
-                'Retrieved updating shards (3 shards) from cache instead '
-                'of backend due to request coalescing by cooperative '
-                'token for shard-updating-v2/a/c',
-                debug_lines)
 
             backend_requests = fake_conn.requests
             account_request = backend_requests[0]
@@ -5558,10 +5545,7 @@ class TestReplicatedObjectController(
     def test_get_backend_updating_shard_with_cooperative_token_timeout(self):
         # verify that the request to get updating shard from the container
         # backend works with cooperative token timeout.
-        conf = {
-            'namespace_cache_use_token': True,
-            'namespace_cache_token_retry_interval': 0.001,
-        }
+        conf = {'namespace_avg_backend_fetch_time': 0.001}
         self.app = proxy_server.Application(
             conf,
             logger=self.logger,
@@ -5615,7 +5599,7 @@ class TestReplicatedObjectController(
                 resp = req.get_response(self.app)
 
             self.assertEqual(resp.status_int, 202)
-            stats = self.app.logger.statsd_client.get_increment_counts()
+            stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual(
                 {
                     'account.info.cache.miss.200': 1,
@@ -5623,7 +5607,7 @@ class TestReplicatedObjectController(
                     'container.info.cache.miss.200': 1,
                     'container.info.infocache.hit': 1,
                     'object.shard_updating.cache.miss.200': 1,
-                    'object.shard_updating.cache.set': 1,
+                    'object.shard_updating.cache.set.200': 1,
                     'token.shard_updating.backend_reqs.no_token.200': 1
                 },
                 stats
@@ -6328,9 +6312,7 @@ class TestReplicatedObjectController(
                         'Handoff requested (5)',
                         'Handoff requested (6)',
                     ])
-                stats = (
-                    self.app.logger.statsd_client.get_increment_counts()
-                )
+                stats = self.app.logger.statsd_client.get_stats_counts()
                 self.assertEqual(2, stats.get('error_limiter.is_limited', 0))
                 self.assertEqual(2, stats.get('object.handoff_count', 0))
 
@@ -6358,9 +6340,7 @@ class TestReplicatedObjectController(
                         'Handoff requested (9)',
                         'Handoff requested (10)',
                     ])
-                stats = (
-                    self.app.logger.statsd_client.get_increment_counts()
-                )
+                stats = self.app.logger.statsd_client.get_stats_counts()
                 self.assertEqual(4, stats.get('error_limiter.is_limited', 0))
                 self.assertEqual(4, stats.get('object.handoff_count', 0))
                 self.assertEqual(1, stats.get('object.handoff_all_count', 0))
@@ -6400,15 +6380,15 @@ class TestReplicatedObjectController(
             self.assertIn(first_nodes[0], second_nodes)
 
             self.assertEqual(
-                0, self.logger.statsd_client.get_increment_counts().get(
+                0, self.logger.statsd_client.get_stats_counts().get(
                     'error_limiter.is_limited', 0))
             self.assertEqual(
-                0, self.logger.statsd_client.get_increment_counts().get(
+                0, self.logger.statsd_client.get_stats_counts().get(
                     'error_limiter.forced_limit', 0))
 
             self.app.error_limit(first_nodes[0], 'test')
             self.assertEqual(
-                1, self.logger.statsd_client.get_increment_counts().get(
+                1, self.logger.statsd_client.get_stats_counts().get(
                     'error_limiter.forced_limit', 0))
             line = self.logger.get_lines_for_level('error')[-1]
             self.assertEqual(
@@ -6420,14 +6400,14 @@ class TestReplicatedObjectController(
                 request=Request.blank('')))
             self.assertNotIn(first_nodes[0], second_nodes)
             self.assertEqual(
-                1, self.logger.statsd_client.get_increment_counts().get(
+                1, self.logger.statsd_client.get_stats_counts().get(
                     'error_limiter.is_limited', 0))
             third_nodes = list(proxy_base.NodeIter(
                 'object', self.app, object_ring, 0, self.logger,
                 request=Request.blank('')))
             self.assertNotIn(first_nodes[0], third_nodes)
             self.assertEqual(
-                2, self.logger.statsd_client.get_increment_counts().get(
+                2, self.logger.statsd_client.get_stats_counts().get(
                     'error_limiter.is_limited', 0))
 
     def test_iter_nodes_gives_extra_if_error_limited_inline(self):

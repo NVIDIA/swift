@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import json
-import mock
+from unittest import mock
 import unittest
 import zlib
 import os
@@ -1204,7 +1204,7 @@ class TestInternalClient(unittest.TestCase):
             'X-Backend-Allow-Reserved-Names': 'true',
             'Host': 'localhost:80',
             'User-Agent': 'test'
-        })], app._calls)
+        })], app.calls_with_headers)
         self.assertEqual(app.backend_user_agent, 'test')
         self.assertEqual({}, app.unread_requests)
         self.assertEqual({}, app.unclosed_requests)
@@ -1312,7 +1312,7 @@ class TestInternalClient(unittest.TestCase):
             'Host': 'localhost:80',
             'X-Account-Meta-Color': 'Blue',
             'User-Agent': 'test'
-        })], app._calls)
+        })], app.calls_with_headers)
         self.assertEqual({}, app.unread_requests)
         self.assertEqual({}, app.unclosed_requests)
         self.assertEqual(app.backend_user_agent, 'test')
@@ -1369,7 +1369,7 @@ class TestInternalClient(unittest.TestCase):
             'X-Backend-Allow-Reserved-Names': 'true',
             'Host': 'localhost:80',
             'User-Agent': 'test'
-        })], app._calls)
+        })], app.calls_with_headers)
         self.assertEqual(app.backend_user_agent, 'test')
         self.assertEqual({}, app.unread_requests)
         self.assertEqual({}, app.unclosed_requests)
@@ -1476,7 +1476,7 @@ class TestInternalClient(unittest.TestCase):
             'Host': 'localhost:80',
             'X-Container-Meta-Color': 'Blue',
             'User-Agent': 'test'
-        })], app._calls)
+        })], app.calls_with_headers)
         self.assertEqual({}, app.unread_requests)
         self.assertEqual({}, app.unclosed_requests)
         self.assertEqual(app.backend_user_agent, 'test')
@@ -1647,7 +1647,7 @@ class TestInternalClient(unittest.TestCase):
             'Host': 'localhost:80',
             'X-Object-Meta-Color': 'Blue',
             'User-Agent': 'test'
-        })], app._calls)
+        })], app.calls_with_headers)
         self.assertEqual({}, app.unread_requests)
         self.assertEqual({}, app.unclosed_requests)
         self.assertEqual(app.backend_user_agent, 'test')
@@ -1676,7 +1676,7 @@ class TestInternalClient(unittest.TestCase):
             'X-Backend-Allow-Reserved-Names': 'true',
             'Host': 'localhost:80',
             'User-Agent': 'test'
-        })], app._calls)
+        })], app.calls_with_headers)
         self.assertEqual({}, app.unread_requests)
         self.assertEqual({}, app.unclosed_requests)
         self.assertEqual(app.backend_user_agent, 'test')

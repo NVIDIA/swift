@@ -32,51 +32,69 @@ USER_LABEL_PATTERN = re.compile(r"[^0-9a-zA-Z_]")
 USER_VALUE_PATTERN = re.compile(r"[^0-9a-zA-Z_.]")
 
 
-def _build_line_parts(name, value, type, sample_rate):
-    line = '%s:%s|%s' % (name, value, type)
+def _build_line_parts(metric, value, metric_type, sample_rate):
+    line = '%s:%s|%s' % (metric, value, metric_type)
     if sample_rate < 1:
-        line += '@%s' % (sample_rate,)
+        line += '|@%s' % (sample_rate,)
     return line
 
 
-class LabeledFormats(object):
-    disabled = None
+def librato(metric, value, metric_type, sample_rate, labels):
+    # https://www.librato.com/docs/kb/collect/collection_agents/stastd/#stat-level-tags
+    if labels:
+        metric += '#' + ','.join('%s=%s' % (k, v) for k, v in labels)
+    line = _build_line_parts(metric, value, metric_type, sample_rate)
+    return line
 
-    @staticmethod
-    def librato(name, value, type, sample_rate, labels):
-        # https://www.librato.com/docs/kb/collect/collection_agents/stastd/#stat-level-tags
-        name += '#' + ','.join('%s=%s' % (k, v) for k, v in labels)
-        line = _build_line_parts(name, value, type, sample_rate)
-        return line
 
-    @staticmethod
-    def influxdb(name, value, type, sample_rate, labels):
-        # https://www.influxdata.com/blog/getting-started-with-sending-statsd-metrics-to-telegraf-influxdb/#introducing-influx-statsd
-        name += ''.join(',%s=%s' % (k, v) for k, v in labels)
-        line = _build_line_parts(name, value, type, sample_rate)
-        return line
+def influxdb(metric, value, metric_type, sample_rate, labels):
+    # https://www.influxdata.com/blog/getting-started-with-sending-statsd-metrics-to-telegraf-influxdb/#introducing-influx-statsd
+    if labels:
+        metric += ''.join(',%s=%s' % (k, v) for k, v in labels)
+    line = _build_line_parts(metric, value, metric_type, sample_rate)
+    return line
 
-    @staticmethod
-    def signalfx(name, value, type, sample_rate, labels):
-        # https://web.archive.org/web/20211123040355/https://docs.signalfx.com/en/latest/integrations/agent/monitors/collectd-statsd.html#adding-dimensions-to-statsd-metrics
-        # https://docs.splunk.com/Observability/gdi/statsd/statsd.html#adding-dimensions-to-statsd-metrics
-        name += '[%s]' % ','.join('%s=%s' % (k, v) for k, v in labels)
-        line = _build_line_parts(name, value, type, sample_rate)
-        return line
 
-    @staticmethod
-    def graphite(name, value, type, sample_rate, labels):
-        # https://graphite.readthedocs.io/en/latest/tags.html#carbon
-        name += ''.join(';%s=%s' % (k, v) for k, v in labels)
-        line = _build_line_parts(name, value, type, sample_rate)
-        return line
+def graphite(metric, value, metric_type, sample_rate, labels):
+    # https://graphite.readthedocs.io/en/latest/tags.html#carbon
+    if labels:
+        metric += ''.join(';%s=%s' % (k, v) for k, v in labels)
+    line = _build_line_parts(metric, value, metric_type, sample_rate)
+    return line
 
-    @staticmethod
-    def dogstatsd(name, value, type, sample_rate, labels):
-        # https://docs.datadoghq.com/developers/dogstatsd/datagram_shell/?tab=metrics
-        line = _build_line_parts(name, value, type, sample_rate)
+
+def dogstatsd(metric, value, metric_type, sample_rate, labels):
+    # https://docs.datadoghq.com/developers/dogstatsd/datagram_shell/?tab=metrics
+    line = _build_line_parts(metric, value, metric_type, sample_rate)
+    if labels:
         line += '|#' + ','.join('%s:%s' % (k, v) for k, v in labels)
-        return line
+    return line
+
+
+LABEL_MODES = {
+    'disabled': None,
+    'librato': librato,
+    'influxdb': influxdb,
+    'graphite': graphite,
+    'dogstatsd': dogstatsd,
+}
+
+
+def _get_labeled_statsd_formatter(label_mode):
+    """
+    Returns a label formatting function for the given ``label_mode``.
+
+    :param label_mode: A label mode.
+    :raises ValueError: if ``label_mode`` is not supported by ``LabelFormats``.
+    :returns: a label formatting function.
+    """
+    try:
+        return LABEL_MODES[label_mode]
+    except KeyError:
+        label_modes = LABEL_MODES.keys()
+        raise ValueError(
+            'unknown statsd_label_mode %r; '
+            'expected one of %r' % (label_mode, label_modes))
 
 
 def get_statsd_client(conf=None, tail_prefix='', logger=None):
@@ -177,10 +195,22 @@ def get_labeled_statsd_client(conf=None, logger=None):
         logger=logger)
 
 
-class AbstractStatsdClient(object):
-    def __init__(self, host, port,
-                 default_sample_rate=1, sample_rate_factor=1,
-                 logger=None):
+class AbstractStatsdClient:
+    """
+    Base class to facilitate sending metrics to a socket. Sub-classes are
+    responsible for formatting metrics lines.
+
+    :param host: Statsd host name. If ``None`` then metrics are not sent.
+    :param port: Statsd host port.
+    :param default_sample_rate: The default rate at which metrics should be
+        sampled if no sample rate is otherwise specified. Should be a float
+        value between 0 and 1.
+    :param sample_rate_factor: A multiplier to apply to the rate at which
+        metrics are sampled. Should be a float value between 0 and 1.
+    :param logger: A stdlib logger instance.
+    """
+    def __init__(self, host, port, default_sample_rate=1,
+                 sample_rate_factor=1, logger=None):
         self._host = host
         self._port = port
         self._default_sample_rate = default_sample_rate
@@ -230,23 +260,42 @@ class AbstractStatsdClient(object):
             self._target = (host, port)
 
     def _is_emitted(self, sample_rate):
+        """
+        Adjust the given ``sample_rate`` by the configured
+        ``sample_rate_factor`` and, based on the adjusted sample rate,
+        determine if a stat should be emitted on this occasion.
+
+        Sub-classes should call this method before sending a metric line with
+        ``_send_line``.
+
+        :param sample_rate: The sample_rate given in the call to emit a stat.
+            If ``None`` then this will default to the configured
+            ``default_sample_rate``.
+        :returns: a tuple ``(<boolean>, <adjusted_sample_rate>)``. The boolean
+            is ``True`` if a stat should be emitted on this occasion, ``False``
+            otherwise.
+        """
         if not self._host:
             # StatsD not configured
             return False, None
 
         if sample_rate is None:
             sample_rate = self._default_sample_rate
-        sample_rate = sample_rate * self._sample_rate_factor
+        adjusted_sample_rate = sample_rate * self._sample_rate_factor
 
-        if sample_rate < 1 and self.random() >= sample_rate:
+        if adjusted_sample_rate < 1 and self.random() >= adjusted_sample_rate:
             return False, None
 
-        return True, sample_rate
+        return True, adjusted_sample_rate
 
     def _send_line(self, line):
         """
-        Send a line of metrics to socket if allowed by sample_rate. If
-        sample_rate < 1, may not actually send a packet.
+        Send a ``line`` of metrics to socket.
+
+        Sub-classes should call ``_is_emitted`` before calling this method.
+
+        :param line: The string to be sent to the socket. If ``None`` then
+            nothing is sent.
         """
 
         if line is None:
@@ -266,28 +315,82 @@ class AbstractStatsdClient(object):
     def _open_socket(self):
         return socket.socket(self._sock_family, socket.SOCK_DGRAM)
 
+    def _update_stats(self, metric, value, **kwargs):
+        # This method was added to disaggregate *crement metrics when testing
+        return self._send(metric, value, 'c', **kwargs)
+
+    def update_stats(self, metric, value, **kwargs):
+        self._update_stats(metric, value, **kwargs)
+
+    def increment(self, metric, **kwargs):
+        return self._update_stats(metric, 1, **kwargs)
+
+    def decrement(self, metric, **kwargs):
+        return self._update_stats(metric, -1, **kwargs)
+
+    def _timing(self, metric, timing_ms, **kwargs):
+        # This method was added to disaggregate timing metrics when testing
+        return self._send(metric, round(timing_ms, 4), 'ms', **kwargs)
+
+    def timing(self, metric, timing_ms, **kwargs):
+        return self._timing(metric, timing_ms, **kwargs)
+
+    def timing_since(self, metric, orig_time, **kwargs):
+        return self._timing(
+            metric, (time.time() - orig_time) * 1000, **kwargs)
+
+    def transfer_rate(self, metric, elapsed_time, byte_xfer, **kwargs):
+        if byte_xfer:
+            return self._timing(
+                metric, elapsed_time * 1000 / byte_xfer * 1000, **kwargs)
+
 
 class StatsdClient(AbstractStatsdClient):
+    """
+    A legacy statsd client.  This client does not support labeled metrics.
+
+    A prefix may be specified using the ``base_prefix`` and ``tail_prefix``
+    arguments. The prefix is added to the name of every metric such that the
+    emitted metric name has the form:
+
+        [<base_prefix>.][tail_prefix.]<metric name>
+
+    :param host: Statsd host name. If ``None`` then metrics are not sent.
+    :param port: Statsd host port.
+    :param base_prefix: (optional) A string that will form the first part of a
+        prefix added to each metric name. The prefix is separated from the
+        metric name by a '.' character.
+    :param tail_prefix: (optional) A string that will form the second part of a
+        prefix added to each metric name. The prefix is separated from the
+        metric name by a '.' character.
+    :param default_sample_rate: The default rate at which metrics should be
+        sampled if no sample rate is otherwise specified. Should be a float
+        value between 0 and 1.
+    :param sample_rate_factor: A multiplier to apply to the rate at which
+        metrics are sampled. Should be a float value between 0 and 1.
+    :param emit_legacy: if ``True`` then the client will emit metrics; if
+        ``False``  then the client will emit no metrics.
+    :param logger: A stdlib logger instance.
+    """
     def __init__(self, host, port,
                  base_prefix='', tail_prefix='',
                  default_sample_rate=1, sample_rate_factor=1,
                  emit_legacy=True,
                  logger=None):
-        AbstractStatsdClient.__init__(
-            self, host, port, default_sample_rate, sample_rate_factor, logger)
+        super().__init__(
+            host, port, default_sample_rate, sample_rate_factor, logger)
         self._base_prefix = base_prefix
 
         self.emit_legacy = emit_legacy
 
         self._set_prefix(tail_prefix)
 
-    def _send(self, m_name, m_value, m_type, sample_rate):
-        is_emitted, sample_rate = self._is_emitted(sample_rate)
+    def _send(self, metric, value, metric_type, sample_rate=None):
+        is_emitted, adjusted_sample_rate = self._is_emitted(sample_rate)
         if self.emit_legacy and is_emitted:
-            parts = ['%s%s:%s' % (self._prefix, m_name, m_value), m_type]
-            if sample_rate < 1:
-                parts.append('@%s' % (sample_rate,))
-            line = '|'.join(parts)
+            metric = self._prefix + metric
+            line = _build_line_parts(
+                metric, value, metric_type, adjusted_sample_rate)
             return self._send_line(line)
 
     def _set_prefix(self, tail_prefix):
@@ -329,94 +432,218 @@ class StatsdClient(AbstractStatsdClient):
         )
         self._set_prefix(tail_prefix)
 
-    def update_stats(self, m_name, m_value, sample_rate=None):
-        return self._send(m_name, m_value, 'c', sample_rate)
+    # for backwards compat StatsdClient supports sample_rate as positional arg
+    def update_stats(self, metric, value, sample_rate=None):
+        """
+        Update a counter, aggregated metric changed by value.
+
+        :param metric: name of the metric
+        :param value: int, the counter delta
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().update_stats(metric, value,
+                                    sample_rate=sample_rate)
 
     def increment(self, metric, sample_rate=None):
-        return self.update_stats(metric, 1, sample_rate)
+        """
+        Increment a counter, aggregated metric increased by one.
+
+        :param metric: name of the metric
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().increment(metric, sample_rate=sample_rate)
 
     def decrement(self, metric, sample_rate=None):
-        return self.update_stats(metric, -1, sample_rate)
+        """
+        Decrement a counter, aggregated metric decreased by one.
 
-    def _timing(self, metric, timing_ms, sample_rate):
-        # This method was added to disagregate timing metrics when testing
-        return self._send(metric, round(timing_ms, 4), 'ms', sample_rate)
+        :param metric: name of the metric
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().decrement(metric, sample_rate=sample_rate)
 
     def timing(self, metric, timing_ms, sample_rate=None):
-        return self._timing(metric, timing_ms, sample_rate)
+        """
+        Update a timing metric, aggregated percentiles recalculated.
+
+        :param metric: name of the metric
+        :param timing_ms: float, total timing of operation
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().timing(metric, timing_ms, sample_rate=sample_rate)
 
     def timing_since(self, metric, orig_time, sample_rate=None):
-        return self._timing(
-            metric, (time.time() - orig_time) * 1000, sample_rate)
+        """
+        Update a timing metric, aggregated percentiles recalculated.
 
-    def transfer_rate(self, metric, elapsed_time, byte_xfer, sample_rate=None):
-        if byte_xfer:
-            return self.timing(
-                metric, elapsed_time * 1000 / byte_xfer * 1000, sample_rate)
+        This is an alternative spelling of timing which calculates
+        timing_ms=(time.time() - orig_time) for you.
+
+        :param metric: name of the metric
+        :param orig_time: float, time.time() from start of operation
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().timing_since(metric, orig_time,
+                                    sample_rate=sample_rate)
+
+    def transfer_rate(self, metric, elapsed_time, byte_xfer,
+                      sample_rate=None):
+        """
+        Update a timing metric, aggregated percentiles recalculated.
+
+        This is a timing metric, but adjusts the timing data per kB transferred
+        (ms/kB) for each non-zero-byte update.  Allegedly this could be used to
+        monitor problematic devices, where higher is bad.
+
+        :param metric: name of the metric
+        :param elapsed_time: float, total timing of operation
+        :param byte_xfer: int, number of bytes
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().transfer_rate(metric, elapsed_time, byte_xfer,
+                                     sample_rate=sample_rate)
 
 
 class LabeledStatsdClient(AbstractStatsdClient):
+    """
+    A statsd client that supports annotating metrics with labels.
+
+    Labeled metrics can be emitted in the style of Graphite, Librato, InfluxDB,
+    or DogStatsD, by specifying the corresponding ``label_mode`` when
+    constructing a client. If ``label_mode`` is ``disabled`` then no metrics
+    are emitted by the client.
+
+    Label keys should contain only ASCII letters ('a-z', 'A-Z'), digits
+    ('0-9') and the underscore character ('_'). Label values may also contain
+    the period ('.') character.
+
+    Callers should avoid using labels that have a high cardinality of values
+    since this may result in an unreasonable number of distinct time series for
+    collectors to maintain. For example, labels should NOT be used for object
+    names or transaction ids.
+
+    :param host: Statsd host name. If ``None`` then metrics are not sent.
+    :param port: Statsd host port.
+    :param default_sample_rate: The default rate at which metrics should be
+        sampled if no sample rate is otherwise specified. Should be a float
+        value between 0 and 1.
+    :param sample_rate_factor: A multiplier to apply to the rate at which
+        metrics are sampled. Should be a float value between 0 and 1.
+    :param label_mode: one of 'graphite', 'dogstatsd', 'librato', 'influxdb'
+        or 'disabled'.
+    :param default_labels: a dictionary of labels that will be added to every
+        metric emitted by the client.
+    :param logger: A stdlib logger instance.
+    """
     def __init__(self, host, port,
                  default_sample_rate=1, sample_rate_factor=1,
                  label_mode='disabled', default_labels=None,
                  logger=None):
-        AbstractStatsdClient.__init__(
-            self, host, port, default_sample_rate, sample_rate_factor, logger)
-        self.label_mode = label_mode
+        super().__init__(
+            host, port, default_sample_rate, sample_rate_factor, logger)
         self.default_labels = default_labels or {}
+        self.label_formatter = _get_labeled_statsd_formatter(label_mode)
+        if self.logger:
+            self.logger.debug('Labeled statsd mode: %s (%s)',
+                              label_mode, self.logger.name)
 
-        try:
-            self._label_line_f = getattr(LabeledFormats, label_mode)
-        except AttributeError:
-            label_modes = [
-                f for f in LabeledFormats.__dict__ if
-                not f.startswith('__')]
-            raise ValueError(
-                'unknown statsd_label_mode %r; '
-                'expected one of %r' % (label_mode, label_modes))
+    def _send(self, metric, value, metric_type, labels=None, sample_rate=None):
+        if not self.label_formatter:
+            return
 
-    def _send(self, m_name, m_value, m_type, sample_rate, labels):
-        is_emitted, sample_rate = self._is_emitted(sample_rate)
+        is_emitted, adjusted_sample_rate = self._is_emitted(sample_rate)
         if is_emitted:
             return self._send_line(self._build_line(
-                m_name, m_value, m_type, sample_rate, labels))
+                metric, value, metric_type, labels, adjusted_sample_rate))
 
-    def _build_line(self, m_name, m_value, m_type, sample_rate, labels):
-        if not self._label_line_f:
-            return
-        labels = dict(self.default_labels, **labels)
-        return self._label_line_f(
-            m_name,
-            m_value,
-            m_type,
+    def _build_line(self, metric, value, metric_type, labels, sample_rate):
+        all_labels = dict(self.default_labels)
+        if labels:
+            all_labels.update(labels)
+        return self.label_formatter(
+            metric,
+            value,
+            metric_type,
             sample_rate,
-            sorted(labels.items()))
+            sorted(all_labels.items()))
 
-    def update_stats(self, m_name, m_value, labels, sample_rate=None):
-        return self._send(m_name, m_value, 'c', sample_rate, labels=labels)
+    def update_stats(self, metric, value, *, labels=None, sample_rate=None):
+        """
+        Update a counter, aggregated metric changed by value.
 
-    def increment(self, metric, labels, sample_rate=None):
-        return self.update_stats(metric, 1, labels, sample_rate)
+        :param metric: name of the metric
+        :param value: int, the counter delta
+        :param labels: dict, metric labels
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().update_stats(metric, value, labels=labels,
+                                    sample_rate=sample_rate)
 
-    def decrement(self, metric, labels, sample_rate=None):
-        return self.update_stats(metric, -1, labels, sample_rate)
+    def increment(self, metric, *, labels=None, sample_rate=None):
+        """
+        Increment a counter, aggregated metric increased by one.
 
-    def _timing(self, metric, timing_ms, labels, sample_rate):
-        # This method was added to disagregate timing metrics when testing
-        return self._send(metric, round(timing_ms, 4), 'ms',
-                          sample_rate, labels=labels)
+        :param metric: name of the metric
+        :param labels: dict, metric labels
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().increment(metric, labels=labels,
+                                 sample_rate=sample_rate)
 
-    def timing(self, metric, timing_ms, labels, sample_rate=None):
-        return self._timing(metric, timing_ms, labels, sample_rate)
+    def decrement(self, metric, *, labels=None, sample_rate=None):
+        """
+        Decrement a counter, aggregated metric decreased by one.
 
-    def timing_since(self, metric, orig_time, labels, sample_rate=None):
-        return self._timing(
-            metric, (time.time() - orig_time) * 1000,
-            labels, sample_rate)
+        :param metric: name of the metric
+        :param labels: dict, metric labels
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().decrement(metric, labels=labels,
+                                 sample_rate=sample_rate)
 
-    def transfer_rate(self, metric, elapsed_time, byte_xfer,
-                      labels, sample_rate=None):
-        if byte_xfer:
-            return self.timing(
-                metric, elapsed_time * 1000 / byte_xfer * 1000,
-                labels, sample_rate)
+    def timing(self, metric, timing_ms, *, labels=None, sample_rate=None):
+        """
+        Update a timing metric, aggregated percentiles recalculated.
+
+        :param metric: name of the metric
+        :param timing_ms: float, total timing of operation
+        :param labels: dict, metric labels
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().timing(metric, timing_ms, labels=labels,
+                              sample_rate=sample_rate)
+
+    def timing_since(self, metric, orig_time, *,
+                     labels=None, sample_rate=None):
+        """
+        Update a timing metric, aggregated percentiles recalculated.
+
+        This is an alternative spelling of timing which calculates
+        timing_ms=(time.time() - orig_time) for you.
+
+        :param metric: name of the metric
+        :param orig_time: float, time.time() from start of operation
+        :param labels: dict, metric labels
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().timing_since(metric, orig_time, labels=labels,
+                                    sample_rate=sample_rate)
+
+    def transfer_rate(self, metric, elapsed_time, byte_xfer, *,
+                      labels=None, sample_rate=None):
+        """
+        Update a timing metric, aggregated percentiles recalculated.
+
+        This is a timing metric, but adjusts the timing data per kB transferred
+        (ms/kB) for each non-zero-byte update.  Allegedly this could be used to
+        monitor problematic devices, where higher is bad.
+
+        :param metric: name of the metric
+        :param elapsed_time: float, total timing of operation
+        :param byte_xfer: int, number of bytes
+        :param labels: dict, metric labels
+        :param sample_rate: float, override default sample_rate
+        """
+        return super().transfer_rate(metric, elapsed_time, byte_xfer,
+                                     labels=labels,
+                                     sample_rate=sample_rate)

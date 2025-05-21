@@ -339,7 +339,6 @@ metadata which can be used for stats and billing purposes.
 """
 
 import base64
-from cgi import parse_header
 from collections import defaultdict
 from datetime import datetime
 import json
@@ -362,18 +361,17 @@ from swift.common.utils import get_logger, config_true_value, \
     override_bytes_from_content_type, split_path, \
     RateLimitedIterator, quote, closing_if_possible, \
     LRUCache, StreamingPile, strict_b64decode, Timestamp, friendly_close, \
-    md5
+    md5, parse_header
 from swift.common.registry import register_swift_info
 from swift.common.request_helpers import SegmentedIterable, \
     get_sys_meta_prefix, update_etag_is_at_header, resolve_etag_is_at_header, \
     get_container_update_override_key, update_ignore_range_header, \
-    get_param, get_valid_part_num
+    get_param, get_valid_part_num, get_heartbeat_response_body
 from swift.common.constraints import check_utf8
 from swift.common.http import HTTP_NOT_FOUND, HTTP_UNAUTHORIZED
 from swift.common.wsgi import WSGIContext, make_subrequest, make_env, \
     make_pre_authed_request
-from swift.common.middleware.bulk import get_response_body, \
-    ACCEPTABLE_FORMATS, Bulk
+from swift.common.middleware.bulk import ACCEPTABLE_FORMATS, Bulk
 from swift.obj import expirer
 from swift.proxy.controllers.base import get_container_info
 
@@ -1561,7 +1559,7 @@ class StaticLargeObject(object):
                     start_response(err.status,
                                    [(h, v) for h, v in err.headers.items()
                                     if h.lower() != 'content-length'])
-                yield separator + get_response_body(
+                yield separator + get_heartbeat_response_body(
                     out_content_type, resp_dict, problem_segments, 'upload')
                 return
 
@@ -1588,7 +1586,7 @@ class StaticLargeObject(object):
                         err_body = err_body.decode('utf-8', errors='replace')
                     resp_dict['Response Body'] = err_body or '\n'.join(
                         RESPONSE_REASONS.get(err.status_int, ['']))
-                    yield separator + get_response_body(
+                    yield separator + get_heartbeat_response_body(
                         out_content_type, resp_dict, problem_segments,
                         'upload')
                 else:
@@ -1634,7 +1632,7 @@ class StaticLargeObject(object):
                 if isinstance(resp_body, bytes):
                     resp_body = resp_body.decode('utf-8')
                 resp_dict['Response Body'] = resp_body
-                yield separator + get_response_body(
+                yield separator + get_heartbeat_response_body(
                     out_content_type, resp_dict, [], 'upload')
             else:
                 for chunk in resp(req.environ, start_response):

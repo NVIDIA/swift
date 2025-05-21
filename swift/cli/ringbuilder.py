@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
 import logging
 
 from collections import defaultdict
@@ -23,7 +22,7 @@ from operator import itemgetter
 from os import mkdir
 from os.path import basename, abspath, dirname, exists, join as pathjoin
 import sys
-from sys import argv as sys_argv, exit, stderr, stdout
+from sys import argv as sys_argv, exit, stdout
 from textwrap import wrap
 from time import time
 import traceback
@@ -35,11 +34,13 @@ from swift.common import exceptions
 from swift.common.ring import RingBuilder, Ring, RingData
 from swift.common.ring.builder import MAX_BALANCE
 from swift.common.ring.composite_builder import CompositeRingBuilder
+from swift.common.ring.io import RingReader
+from swift.common.ring.ring import RING_CODECS, DEFAULT_RING_FORMAT_VERSION
 from swift.common.ring.utils import validate_args, \
     validate_and_normalize_ip, build_dev_from_opts, \
     parse_builder_ring_filename_args, parse_search_value, \
     parse_search_values_from_opts, parse_change_values_from_opts, \
-    dispersion_report, parse_add_value
+    dispersion_report, parse_add_value, BYTES_TO_TYPE_CODE
 from swift.common.utils import lock_parent_directory, is_valid_ipv6
 
 MAJOR_VERSION = 1
@@ -47,6 +48,9 @@ MINOR_VERSION = 3
 EXIT_SUCCESS = 0
 EXIT_WARNING = 1
 EXIT_ERROR = 2
+
+FORMAT_CHOICES = [str(v) for v in RING_CODECS]
+DEV_ID_SIZE_CHOICES = [str(i) for i in BYTES_TO_TYPE_CODE]
 
 global argv, backup_dir, builder, builder_file, ring_file
 argv = backup_dir = builder = builder_file = ring_file = None
@@ -160,8 +164,8 @@ def _parse_add_values(argvish):
             dev_dict = parse_add_value(devstr)
 
             if dev_dict['region'] is None:
-                stderr.write('WARNING: No region specified for %s. '
-                             'Defaulting to region 1.\n' % devstr)
+                print('WARNING: No region specified for %s. '
+                      'Defaulting to region 1.\n' % devstr, file=sys.stderr)
                 dev_dict['region'] = 1
 
             if dev_dict['replication_ip'] is None:
@@ -595,9 +599,9 @@ swift-ring-builder <builder_file>
         dispersion_trailer = '' if builder.dispersion is None else (
             ', %.02f dispersion' % (builder.dispersion))
         print('%d partitions, %.6f replicas, %d regions, %d zones, '
-              '%d devices, %.02f balance%s' % (
+              '%d devices, %d-byte IDs, %.02f balance%s' % (
                   builder.parts, builder.replicas, regions, zones, dev_count,
-                  balance, dispersion_trailer))
+                  builder.dev_id_bytes, balance, dispersion_trailer))
         print('The minimum number of hours before a partition can be '
               'reassigned is %s (%s remaining)' % (
                   builder.min_part_hours,
@@ -618,6 +622,9 @@ swift-ring-builder <builder_file>
             except Exception as exc:
                 print('Ring file %s is invalid: %r' % (ring_file, exc))
             else:
+                # mostly just an implementation detail
+                builder_dict.pop('dev_id_bytes', None)
+                ring_dict.pop('dev_id_bytes', None)
                 if builder_dict == ring_dict:
                     print('Ring file %s is up-to-date' % ring_file)
                 else:
@@ -655,6 +662,34 @@ swift-ring-builder <builder_file>
 
         if ring_empty_error:
             print(ring_empty_error)
+        exit(EXIT_SUCCESS)
+
+    @staticmethod
+    def version():
+        """
+swift-ring-builder <ring_file> version
+        """
+        if len(argv) < 3:
+            print(Commands.create.__doc__.strip())
+            exit(EXIT_ERROR)
+        try:
+            reader = RingReader(open(argv[1], 'br'))
+            serialization_version = reader.version
+            deserialize = (RingData.deserialize_v1
+                           if serialization_version == 1 else
+                           RingData.deserialize_v2)
+            ring = deserialize(reader, metadata_only=True)
+            version = ring['version']
+            dev_id_bytes = ring['dev_id_bytes']
+        except ValueError as e:
+            print(e)
+            exit(EXIT_ERROR)
+        finally:
+            if reader:
+                reader.close()
+        print('%s: Serialization version: %d (%d-byte IDs), '
+              'build version: %d' %
+              (argv[1], serialization_version, dev_id_bytes, version))
         exit(EXIT_SUCCESS)
 
     @staticmethod
@@ -1052,7 +1087,19 @@ swift-ring-builder <builder_file> rebalance [options]
         parser.add_option('-s', '--seed', help="seed to use for rebalance")
         parser.add_option('-d', '--debug', action='store_true',
                           help="print debug information")
+        parser.add_option('--format-version',
+                          choices=FORMAT_CHOICES, default=None,
+                          help="specify ring format version")
         options, args = parser.parse_args(argv)
+        if options.format_version is None:
+            print("Defaulting to --format-version=1. This ensures the ring\n"
+                  "written will be readable by older versions of Swift.\n"
+                  "In a future release, the default will change to\n"
+                  "--format-version=2\n")
+            options.format_version = DEFAULT_RING_FORMAT_VERSION
+        else:
+            # N.B. choices doesn't work with type=int
+            options.format_version = int(options.format_version)
 
         def get_seed(index):
             if options.seed:
@@ -1167,9 +1214,11 @@ swift-ring-builder <builder_file> rebalance [options]
             status = EXIT_WARNING
         ts = time()
         builder.get_ring().save(
-            pathjoin(backup_dir, '%d.' % ts + basename(ring_file)))
+            pathjoin(backup_dir, '%d.' % ts + basename(ring_file)),
+            format_version=options.format_version)
         builder.save(pathjoin(backup_dir, '%d.' % ts + basename(builder_file)))
-        builder.get_ring().save(ring_file)
+        builder.get_ring().save(
+            ring_file, format_version=options.format_version)
         builder.save(builder_file)
         exit(status)
 
@@ -1294,19 +1343,42 @@ swift-ring-builder <builder_file> write_ring
     'set_info' calls when no rebalance is needed but you want to send out the
     new device information.
         """
+        usage = Commands.write_ring.__doc__.strip()
+        parser = optparse.OptionParser(usage)
+        parser.add_option('--format-version',
+                          choices=FORMAT_CHOICES, default=None,
+                          help="specify ring format version")
+        parser.add_option('--dev-id-bytes',
+                          choices=DEV_ID_SIZE_CHOICES, default=None,
+                          help="specify the dev-id bytes size (v2 only)")
+        options, args = parser.parse_args(argv)
+        if options.format_version is None:
+            print("Defaulting to --format-version=1. This ensures the ring\n"
+                  "written will be readable by older versions of Swift.\n"
+                  "In a future release, the default will change to\n"
+                  "--format-version=2\n")
+            options.format_version = DEFAULT_RING_FORMAT_VERSION
+        else:
+            # N.B. choices doesn't work with type=int
+            options.format_version = int(options.format_version)
+
         if not builder.devs:
             print('Unable to write empty ring.')
             exit(EXIT_ERROR)
 
+        if options.dev_id_bytes:
+            builder.set_dev_id_bytes(int(options.dev_id_bytes))
+
         ring_data = builder.get_ring()
         if not ring_data._replica2part2dev_id:
             if ring_data.devs:
-                print('Warning: Writing a ring with no partition '
+                print('WARNING: Writing a ring with no partition '
                       'assignments but with devices; did you forget to run '
-                      '"rebalance"?')
+                      '"rebalance"?', file=sys.stderr)
         ring_data.save(
-            pathjoin(backup_dir, '%d.' % time() + basename(ring_file)))
-        ring_data.save(ring_file)
+            pathjoin(backup_dir, '%d.' % time() + basename(ring_file)),
+            format_version=options.format_version)
+        ring_data.save(ring_file, format_version=options.format_version)
         exit(EXIT_SUCCESS)
 
     @staticmethod
@@ -1325,8 +1397,8 @@ swift-ring-builder <ring_file> write_builder [min_part_hours]
         if len(argv) > 3:
             min_part_hours = int(argv[3])
         else:
-            stderr.write("WARNING: default min_part_hours may not match "
-                         "the value in the lost builder.\n")
+            print("WARNING: default min_part_hours may not match "
+                  "the value in the lost builder.\n", file=sys.stderr)
             min_part_hours = 24
         ring = Ring(ring_file)
         for dev in ring.devs:
@@ -1654,8 +1726,11 @@ def main(arguments=None):
 
     builder_file, ring_file = parse_builder_ring_filename_args(argv)
     if builder_file != argv[1]:
-        print('Note: using %s instead of %s as builder file' % (
-              builder_file, argv[1]))
+        if len(argv) > 2 and argv[2] in ('write_builder', 'version'):
+            pass
+        else:
+            print('Note: using %s instead of %s as builder file' % (
+                builder_file, argv[1]))
 
     try:
         builder = RingBuilder.load(builder_file)
@@ -1669,7 +1744,8 @@ def main(arguments=None):
         print(msg)
         exit(EXIT_ERROR)
     except (exceptions.FileNotFoundError, exceptions.PermissionError) as e:
-        if len(argv) < 3 or argv[2] not in ('create', 'write_builder'):
+        if len(argv) < 3 or argv[2] not in ('create', 'write_builder',
+                                            'version'):
             print(e)
             exit(EXIT_ERROR)
     except Exception as e:

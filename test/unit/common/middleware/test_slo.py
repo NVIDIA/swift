@@ -1636,12 +1636,12 @@ class TestSloDeleteManifest(SloTestCase):
             ('X-Backend-Storage-Policy-Index', '0'),
             ('X-Backend-Allow-Private-Methods', 'True'),
         ):
-            self.assertIn(header, self.app.calls_with_headers[1].headers)
-            value = self.app.calls_with_headers[1].headers[header]
+            self.assertIn(header, self.app.call_list[1].headers)
+            value = self.app.call_list[1].headers[header]
             msg = 'Expected %s header to be %r, not %r'
             self.assertEqual(value, expected, msg % (header, expected, value))
 
-        self.assertEqual(json.loads(self.app.req_bodies[1]), [
+        self.assertEqual(json.loads(self.app.call_list[1].body), [
             {'content_type': 'application/async-deleted',
              'created_at': now.internal,
              'deleted': 0,
@@ -1710,12 +1710,12 @@ class TestSloDeleteManifest(SloTestCase):
             ('X-Backend-Storage-Policy-Index', '0'),
             ('X-Backend-Allow-Private-Methods', 'True'),
         ):
-            self.assertIn(header, self.app.calls_with_headers[-2].headers)
-            value = self.app.calls_with_headers[-2].headers[header]
+            self.assertIn(header, self.app.call_list[-2].headers)
+            value = self.app.call_list[-2].headers[header]
             msg = 'Expected %s header to be %r, not %r'
             self.assertEqual(value, expected, msg % (header, expected, value))
 
-        self.assertEqual(json.loads(self.app.req_bodies[-2]), [
+        self.assertEqual(json.loads(self.app.call_list[-2].body), [
             {'content_type': 'application/async-deleted',
              'created_at': now.internal,
              'deleted': 0,
@@ -1780,12 +1780,12 @@ class TestSloDeleteManifest(SloTestCase):
             ('X-Backend-Storage-Policy-Index', '0'),
             ('X-Backend-Allow-Private-Methods', 'True'),
         ):
-            self.assertIn(header, self.app.calls_with_headers[-2].headers)
-            value = self.app.calls_with_headers[-2].headers[header]
+            self.assertIn(header, self.app.call_list[-2].headers)
+            value = self.app.call_list[-2].headers[header]
             msg = 'Expected %s header to be %r, not %r'
             self.assertEqual(value, expected, msg % (header, expected, value))
 
-        self.assertEqual(json.loads(self.app.req_bodies[-2]), [
+        self.assertEqual(json.loads(self.app.call_list[-2].body), [
             {'content_type': 'application/async-deleted',
              'created_at': now.internal,
              'deleted': 0,
@@ -1803,6 +1803,9 @@ class TestSloDeleteManifest(SloTestCase):
         ])
 
     def test_handle_async_delete_alternative_expirer_config(self):
+        # Test that SLO async delete operation will send UPDATE requests to the
+        # alternative expirer container when using a non-default account name
+        # and container divisor.
         slo_conf = {
             'expiring_objects_account_name': 'exp',
             'expiring_objects_container_divisor': '5400',
@@ -6011,7 +6014,7 @@ class TestPartNumber(SloGETorHEADTestCase):
         # since the our requested part-number is range-segment we expect Range
         # header on b_10 segment subrequest
         self.assertEqual('bytes=4-7',
-                         self.app.calls_with_headers[1].headers['Range'])
+                         self.app.call_list[1].headers['Range'])
 
     def test_part_number_sub_ranges_manifest(self):
         req = Request.blank(

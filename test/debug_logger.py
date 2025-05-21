@@ -15,7 +15,7 @@
 import collections
 import contextlib
 import logging
-import mock
+from unittest import mock
 import sys
 
 from collections import defaultdict
@@ -44,7 +44,7 @@ class RecordingSocket(object):
         pass
 
 
-class BaseFakeStatsdClient(object):
+class BaseFakeStatsdClient:
     def __init__(self):
         self.clear()
 
@@ -75,33 +75,43 @@ class BaseFakeStatsdClient(object):
     def clear(self):
         self.calls = defaultdict(list)
         self.recording_socket = RecordingSocket()
+        self.counters = defaultdict(int)
 
     @property
     def sendto_calls(self):
         return self.recording_socket.sendto_calls
 
     def get_increments(self):
+        """
+        Helper to avoid spelling a tricky list comprehension
+
+        :returns: a list of the "metric" arg for all calls to increment
+        """
         return [call[0][0] for call in self.calls['increment']]
 
-    def get_increment_counts(self):
-        # note: this method reports the sum of stats sent via the increment
-        # method only; consider using get_stats_counts instead to get the sum
-        # of stats sent via both the increment and update_stats methods
-        counts = defaultdict(int)
-        for metric in self.get_increments():
-            counts[metric] += 1
-        # convert to normal dict for better failure messages
-        return dict(counts)
+    def _update_stats(self, metric, value, *args, **kwargs):
+        """
+        Hook into base class primitive to track all "counter" metrics
+        """
+        self.counters[metric] += value
+        return super()._update_stats(metric, value, *args, **kwargs)
 
-    def get_update_stats(self):
-        return [call[0][:2] for call in self.calls['update_stats']]
-
+    # getter for backwards compat
     def get_stats_counts(self):
-        counts = defaultdict(int)
-        for metric, step in self.get_update_stats():
-            counts[metric] += step
-        # convert to normal dict for better failure messages
-        return dict(counts)
+        return self.counters
+
+
+class FakeStatsdClient(BaseFakeStatsdClient, statsd_client.StatsdClient):
+    def __init__(self, *args, **kwargs):
+        super(FakeStatsdClient, self).__init__()
+        super(BaseFakeStatsdClient, self).__init__(*args, **kwargs)
+
+
+class FakeLabeledStatsdClient(BaseFakeStatsdClient,
+                              statsd_client.LabeledStatsdClient):
+    def __init__(self, *args, **kwargs):
+        super(FakeLabeledStatsdClient, self).__init__()
+        super(BaseFakeStatsdClient, self).__init__(*args, **kwargs)
 
 
 class FakeStatsdClient(BaseFakeStatsdClient, statsd_client.StatsdClient):
@@ -164,7 +174,7 @@ class FakeLogger(logging.Logger, CaptureLog):
 
     def __init__(self, *args, **kwargs):
         self._clear()
-        self.name = 'swift.unit.fake_logger'
+        self.name = kwargs.get('name') or 'swift.unit.fake_logger'
         self.level = logging.NOTSET
         if 'facility' in kwargs:
             self.facility = kwargs['facility']
@@ -279,9 +289,10 @@ class DebugLogAdapter(utils.logs.SwiftLogAdapter):
             return getattr(self.__dict__['logger'], name)
 
 
-def debug_logger(name='test'):
+def debug_logger(name='test', log_route=None):
     """get a named adapted debug logger"""
-    adapted_logger = DebugLogAdapter(DebugLogger(), name)
+    log_route = log_route or name
+    adapted_logger = DebugLogAdapter(DebugLogger(name=log_route), name)
     utils._patch_statsd_methods(adapted_logger, adapted_logger.logger)
     return adapted_logger
 

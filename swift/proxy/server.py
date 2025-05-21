@@ -37,7 +37,7 @@ from swift.common.utils import Watchdog, get_logger, \
     affinity_key_function, affinity_locality_predicate, list_from_csv, \
     parse_prefixed_conf, config_auto_int_value, node_to_string, \
     config_request_node_count_value, config_percent_value, cap_length, \
-    parse_options
+    parse_options, non_negative_int, config_positive_float_value
 from swift.common.registry import register_swift_info
 from swift.common.constraints import check_utf8, valid_api_version
 from swift.proxy.controllers import AccountController, ContainerController, \
@@ -53,8 +53,7 @@ from swift.common.exceptions import APIVersionError
 from swift.common.wsgi import run_wsgi
 from swift.obj import expirer
 
-DEFAULT_NAMESPACE_CACHE_USE_TOKEN = False
-DEFAULT_NAMESPACE_CACHE_TOKEN_RETRY_INTERVAL = 0.1  # seconds
+DEFAULT_NAMESPACE_AVG_BACKEND_FETCH_TIME = 0.3  # seconds
 DEFAULT_NAMESPACE_CACHE_TOKENS_PER_SESSION = 3  # 3 tokens per session
 
 
@@ -253,15 +252,20 @@ class Application(object):
                 'container_listing_shard_ranges_skip_cache_pct', 0))
         self.account_existence_skip_cache = config_percent_value(
             conf.get('account_existence_skip_cache_pct', 0))
-        self.namespace_cache_use_token = \
-            config_true_value(conf.get('namespace_cache_use_token',
-                                       DEFAULT_NAMESPACE_CACHE_USE_TOKEN))
-        self.namespace_cache_token_retry_interval = \
-            float(conf.get('namespace_cache_token_retry_interval',
-                  DEFAULT_NAMESPACE_CACHE_TOKEN_RETRY_INTERVAL))
+        self.namespace_avg_backend_fetch_time = \
+            config_positive_float_value(
+                conf.get(
+                    'namespace_avg_backend_fetch_time',
+                    DEFAULT_NAMESPACE_AVG_BACKEND_FETCH_TIME
+                )
+            )
         self.namespace_cache_tokens_per_session = \
-            float(conf.get('namespace_cache_tokens_per_session',
-                  DEFAULT_NAMESPACE_CACHE_TOKENS_PER_SESSION))
+            non_negative_int(
+                conf.get(
+                    'namespace_cache_tokens_per_session',
+                    DEFAULT_NAMESPACE_CACHE_TOKENS_PER_SESSION
+                )
+            )
         self.allow_account_management = \
             config_true_value(conf.get('allow_account_management', 'no'))
         self.container_ring = container_ring or Ring(swift_dir,

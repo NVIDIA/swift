@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
 import sys
-from contextlib import contextmanager
 
 import os
 
@@ -36,10 +34,6 @@ warnings.filterwarnings('ignore', message=(
     'and will be removed in a future release.'))
 
 import unittest
-
-if sys.version_info < (3, 2):
-    unittest.TestCase.assertRaisesRegex = unittest.TestCase.assertRaisesRegexp
-    unittest.TestCase.assertRegex = unittest.TestCase.assertRegexpMatches
 
 from eventlet.green import socket
 
@@ -90,29 +84,6 @@ def listen_zero():
     sock.bind(("127.0.0.1", 0))
     sock.listen(50)
     return sock
-
-
-@contextmanager
-def annotate_failure(msg):
-    """
-    Catch AssertionError and annotate it with a message. Useful when making
-    assertions in a loop where the message can indicate the loop index or
-    richer context about the failure.
-
-    :param msg: A message to be prefixed to the AssertionError message.
-    """
-    try:
-        yield
-    except AssertionError as err:
-        if err.args:
-            msg = '%s Failed with %s' % (msg, err.args[0])
-            err.args = (msg, ) + err.args[1:]
-            raise err
-        else:
-            # workaround for some IDE's raising custom AssertionErrors
-            raise AssertionError(
-                '%s Failed with %s' % (msg, err)
-            ).with_traceback(err.__traceback__) from err.__cause__
 
 
 class BaseTestCase(unittest.TestCase):

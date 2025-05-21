@@ -76,43 +76,49 @@ bind_port = 8080
 # log_statsd_metric_prefix =
 #
 # Statsd metrics may include labeling information in a variety of formats.
-# Available options: disabled, dogstatsd, graphite, influxdb, librato, signalfx
-# See also: https://github.com/prometheus/statsd_exporter#tagging-extensions
-# Note that enabling labels will likely increase the number of time series
-# stored, as more labeled metrics may be exposed than may have been previously
-# extracted from the dotted non-labeled legacy metric format.
+# Available options:
+#     disabled, dogstatsd, graphite, influxdb, librato.
+# Defaults to disabled; enable statsd_label_mode by setting another option.
+# See also: https://github.com/prometheus/statsd_exporter#tagging-extensions.
+# Note that enabling statsd_label_mode will likely increase the number of time
+# series stored, as more labeled metrics may be exposed than may have been
+# previously extracted from the dotted non-labeled legacy metric format.
 # statsd_label_mode = disabled
 #
 # Historically, statsd metrics were emitted with implied labels as part of
-# metric name in a dotted "legacy" format. Once that swift is fully
-# instrumented with labeled metrics, if you have statsd_label_mode enabled you
-# may want to turn off legacy metrics; to do that set this option to False.
-# Defaults to True.
+# metric name in a dotted "legacy" format. Once swift is fully instrumented
+# with labeled metrics, and you have statsd_label_mode enabled, you may want to
+# turn off legacy metrics; to do that set this option to False. Defaults to
+# True.
 # statsd_emit_legacy = True
 #
 # Statsd metrics emitted with labels also support user defined labels
-# configured by options. The format is:
+# configured by options. The format for each option is:
 #     statsd_user_label_<name> = <value>
 # where <name> and <value> are restricted to a subset of non-whitespace ASCII
-# characters, both can include letters (upper and lower), numbers and
-# underscores. Value may also contain a period (.).
+# characters, including letters (upper and lower), numbers and underscores.
+# <value> may also contain the period character (.). Each option will add a
+# label with name user_<name> and value <value> to labeled metrics.
+# User defined labels may be configured in this [DEFAULT] section, in which
+# case they will be included with every labeled metric, or they may be
+# configured in individual [filter:<middleware>] sections, in which case they
+# will only be included with labeled metrics emitted by that <middleware>.
 # For example, a proxy-server configuration could use the following to
-# delineate labeled metrics emitted by instances of proxy-logging middleware
-# in the pipeline:
+# delineate labeled metrics emitted by different instances of proxy-logging
+# middleware in the pipeline:
 #     [filter:subrequest-logging]
 #     use = egg:swift#proxy_logging
 #     statsd_user_label_reqctx = subrequest
-# which adds a label with name 'user_reqctx' in specific namespace and value
-# 'subrequest' to any labeled metrics emitted by this proxy-logging instance.
-# This would achieve similar effect as the following proxy-server configuration
-# for non-labeled metrics:
+# which adds a label with name 'user_reqctx' and value 'subrequest' to every
+# labeled metrics emitted by this proxy-logging instance. This would achieve
+# similar effect as the following proxy-server configuration for legacy
+# non-labeled metrics:
 #     [filter:subrequest-logging]
 #     use = egg:swift#proxy_logging
 #     access_log_statsd_metric_prefix = subrequest
-# Note that non-labeled option 'log_statsd_metric_prefix' does not apply to
-# labeled metrics.
-
-# Defaults to None.
+# Note that the legacy metrics option 'access_log_statsd_metric_prefix' does
+# not apply to labeled metrics.
+# By default there are no user defined labels.
 #
 # List of origin hosts that are allowed for CORS requests in addition to what
 # the container has set.
@@ -207,21 +213,18 @@ use = egg:swift#proxy
 # container_listing_shard_ranges_skip_cache_pct = 0.0
 # account_existence_skip_cache_pct = 0.0
 #
-# Whether to use cooperative token on updating namespace cache to coalesce the
-# requests which fetch updating namespaces from the backend and set them in
-# memcached.
-# namespace_cache_use_token = False
-#
-# For cooperative token enabled on updating namespace cache, when requests
-# which didn't acquired a token and are waiting for other requests to fill in
-# the cache, they will use the below config value (in seconds) as the first
-# interval to sleep and retry getting data from cache, suggest to be set as the
-# average time spent on getting updating namespaces from the backend. And the
-# cooperative token session will be 10 times of this interval config value.
-# namespace_cache_token_retry_interval = 0.1
-#
-# Number of cooperative tokens per each token session.
+# Use cooperative token on updating namespace cache to coalesce the requests
+# which fetch updating namespaces from the backend and set them in memcached.
+# Number of cooperative tokens per each token session, 0 means to disable the
+# usage of cooperative token and directly talk to the backend and memcache.
 # namespace_cache_tokens_per_session = 3
+#
+# The average time spent on getting updating namespaces from the container
+# servers, this will be used as basic unit for cooperative token to figure out
+# intervals for the retries when requests didn't acquired a token and are
+# waiting for other requests to fill in the cache; and a cooperative token
+# session (`token_ttl`) will be 10 times of this value.
+# namespace_avg_backend_fetch_time = 0.3
 #
 # object_chunk_size = 65536
 # client_chunk_size = 65536
@@ -476,6 +479,19 @@ use = egg:swift#tempauth
 # http, https, or default (chooses based on what the server is running as)
 # This can be useful with an SSL load balancer in front of a non-SSL server.
 # storage_url_scheme = default
+#
+# Fernet keys may be used for storage, rather than relying on memcached.
+# Multiple keys may be configured using options named 'fernet_key_<key_id>'
+# where 'key_id' is a unique identifier. The value should be 32 url-safe
+# base64-encoded bytes, such as may be generated using
+# `openssl rand -base64 32 | tr '+/' '-_'`
+# Any of these keys may be used for decryption. Only one key may be used
+# for encryption by a proxy at any given time; configure it with the
+# 'active_fernet_key_id' option. All proxies in the cluster should know
+# about a key before it is activated. If blank (the default),
+# memcached-backed tokens will be issued.
+# fernet_key_myid = <32 url-safe base64-encoded bytes>
+# active_fernet_key_id = myid
 #
 # Lastly, you need to list all the accounts/users you want here. The format is:
 #   user_<account>_<user> = <key> [group] [group] [...] [storage_url]

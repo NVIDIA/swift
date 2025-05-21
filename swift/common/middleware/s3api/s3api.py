@@ -141,7 +141,6 @@ https://github.com/swiftstack/s3compat in detail.
 
 """
 
-from cgi import parse_header
 import json
 from paste.deploy import loadwsgi
 from urllib.parse import parse_qs
@@ -161,7 +160,8 @@ from swift.common.middleware.s3api.s3request import get_request_class
 from swift.common.middleware.s3api.s3response import ErrorResponse, \
     InternalError, MethodNotAllowed, S3ResponseBase, S3NotImplemented
 from swift.common.utils import get_logger, config_true_value, \
-    config_positive_int_value, split_path, closing_if_possible, list_from_csv
+    config_positive_int_value, split_path, closing_if_possible, \
+    list_from_csv, parse_header, checksum
 from swift.common.middleware.s3api.utils import Config, \
     classify_checksum_header_value, make_header_label
 from swift.common.middleware.s3api.acl_handlers import get_acl_handler
@@ -193,6 +193,13 @@ WELL_KNOWN_CHECKSUM_ALGORITHMS = (
     'CRC32C',
     'SHA1',
     'SHA256'
+)
+WELL_KNOWN_CHECKSUM_HEADERS = (
+    'x-amz-checksum-crc32',
+    'x-amz-checksum-crc32c',
+    'x-amz-checksum-sha1',
+    'x-amz-checksum-sha256',
+    'x-amz-checksum-crc64nvme'
 )
 
 
@@ -336,6 +343,7 @@ class S3ApiMiddleware(object):
         self.statsd = get_labeled_statsd_client(wsgi_conf, self.logger)
 
         self.check_pipeline(wsgi_conf)
+        checksum.log_selected_implementation(self.logger)
 
         if self.conf.use_async_delete and (self.conf.s3_acl or
                                            self.conf.allow_multipart_uploads):
@@ -360,7 +368,7 @@ class S3ApiMiddleware(object):
         # Not S3, apparently
         return False
 
-    def _emit_response_header_stats(self, env, resp):
+    def _make_req_header_labels(self, env):
         req_headers = swob.HeaderEnvironProxy(env)
         labels = {}
         for hdr_key, hdr_val in req_headers.items():
@@ -375,20 +383,20 @@ class S3ApiMiddleware(object):
                     label_val = 'chunked'
             elif hdr_key == 'x-amz-decoded-content-length':
                 label_val = True
-            elif hdr_key in ('x-amz-checksum-sha256',
-                             'x-amz-content-sha256'):
+            elif hdr_key == 'x-amz-content-sha256':
                 if hdr_val in WELL_KNOWN_SPECIFIC_SHA256_VALUES:
                     label_val = hdr_val
                 else:
                     label_val = classify_checksum_header_value(hdr_val)
-            elif hdr_key in ('content-md5',
-                             'x-amz-checksum-crc32',
-                             'x-amz-checksum-crc32c',
-                             'x-amz-checksum-sha1',
-                             'x-amz-checksum-crc64nvme'):
+            elif hdr_key == 'content-md5':
+                label_val = classify_checksum_header_value(hdr_val)
+            elif hdr_key in WELL_KNOWN_CHECKSUM_HEADERS:
                 label_val = classify_checksum_header_value(hdr_val)
             elif hdr_key == 'x-amz-trailer':
-                label_val = True
+                if hdr_val.lower() in WELL_KNOWN_CHECKSUM_HEADERS:
+                    label_val = hdr_val.lower()
+                else:
+                    label_val = 'unknown'
             elif hdr_key in ('x-amz-checksum-algorithm',
                              'x-amz-sdk-checksum-algorithm'):
                 if hdr_val.upper() in WELL_KNOWN_CHECKSUM_ALGORITHMS:
@@ -399,6 +407,9 @@ class S3ApiMiddleware(object):
             if label_val is not None:
                 labels[label_key] = label_val
 
+        return labels
+
+    def _emit_response_header_stats(self, env, resp, labels):
         if not labels:
             return
 
@@ -423,9 +434,11 @@ class S3ApiMiddleware(object):
         else:
             labels['type'] = 'UNKNOWN'
 
-        self.statsd.increment("swift_s3_checksum_algo_request", labels)
+        self.statsd.increment("swift_s3_checksum_algo_request", labels=labels)
 
     def __call__(self, env, start_response):
+        # get metrics header labels before any mutation of the headers
+        req_header_labels = self._make_req_header_labels(env)
         origin = env.get('HTTP_ORIGIN')
         if self.conf.cors_preflight_allow_origin and \
                 self.is_s3_cors_preflight(env):
@@ -482,7 +495,8 @@ class S3ApiMiddleware(object):
         if 's3api.backend_path' in env and 'swift.backend_path' not in env:
             env['swift.backend_path'] = env['s3api.backend_path']
 
-        self._emit_response_header_stats(env, resp)
+        # emit metric with header labels now path and status may be available
+        self._emit_response_header_stats(env, resp, req_header_labels)
 
         return resp(env, start_response)
 

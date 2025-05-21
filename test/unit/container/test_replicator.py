@@ -18,7 +18,7 @@ import time
 import shutil
 import itertools
 import unittest
-import mock
+from unittest import mock
 import random
 import sqlite3
 
@@ -32,7 +32,6 @@ from swift.container.reconciler import (
 from swift.common.utils import Timestamp, encode_timestamps, ShardRange, \
     get_db_files, make_db_file_path, MD5_OF_EMPTY_STRING
 from swift.common.storage_policy import POLICIES
-from test import annotate_failure
 
 from test.debug_logger import debug_logger
 from test.unit.common import test_db_replicator
@@ -884,12 +883,13 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         daemon = self._run_once(node)
         # push to remote, and third node was missing (also maybe reconciler)
         self.assertTrue(2 < daemon.stats['rsync'] <= 3, daemon.stats['rsync'])
-        self.assertEqual(
-            1, self.logger.statsd_client.get_stats_counts().get(
-                'reconciler_db_created'))
-        self.assertFalse(
-            self.logger.statsd_client.get_stats_counts().get(
-                'reconciler_db_exists'))
+        self.assertEqual({
+            'attempts': 2,
+            'diffs': 1,
+            'successes': 4,
+            'rsyncs': 3,
+            'reconciler_db_created': 1,
+        }, self.logger.statsd_client.counters)
 
         # grab the rsynced instance of remote_broker
         remote_broker = self._get_broker('a', 'c', node_index=1)
@@ -911,12 +911,9 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         # since we forced the object timestamps to be in the same hour.
         self.logger.clear()
         reconciler = daemon.get_reconciler_broker(misplaced[0]['created_at'])
-        self.assertFalse(
-            self.logger.statsd_client.get_stats_counts().get(
-                'reconciler_db_created'))
-        self.assertEqual(
-            1, self.logger.statsd_client.get_stats_counts().get(
-                'reconciler_db_exists'))
+        self.assertEqual({
+            'reconciler_db_exists': 1,
+        }, self.logger.statsd_client.counters)
         # but it may not be on the same node as us anymore though...
         reconciler = self._get_broker(reconciler.account,
                                       reconciler.container, node_index=0)
@@ -1554,7 +1551,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
             (default_osr_newer, osr_with_epoch, False, False, True),
         )
         for i, params in enumerate(tests):
-            with annotate_failure((i, params)):
+            with self.subTest(i=i, params=params):
                 do_test(*params)
 
     def test_sync_shard_ranges(self):
@@ -1611,7 +1608,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertEqual(0, daemon.stats['rsync'])
         self.assertEqual(1, daemon.stats['diff'])
         self.assertEqual({'diffs': 1},
-                         daemon.logger.statsd_client.get_increment_counts())
+                         daemon.logger.statsd_client.get_stats_counts())
 
         # update one shard range
         shard_ranges[1].update_meta(50, 50)
@@ -1623,7 +1620,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertEqual(0, daemon.stats['rsync'])
         self.assertEqual(0, daemon.stats['diff'])
         self.assertEqual({'no_changes': 1},
-                         daemon.logger.statsd_client.get_increment_counts())
+                         daemon.logger.statsd_client.get_stats_counts())
 
         # now enable local broker for sharding
         own_sr = broker.enable_sharding(Timestamp.now())
@@ -1745,7 +1742,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertFalse(error_lines[1:])
         self.assertEqual(1, daemon.stats['diff'])
         self.assertEqual(
-            1, daemon.logger.statsd_client.get_increment_counts()['diffs'])
+            1, daemon.logger.statsd_client.get_stats_counts()['diffs'])
 
     def test_sync_shard_ranges_timeout_in_fetch(self):
         # verify that replication is not considered successful if
@@ -1784,10 +1781,10 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertFalse(error_lines[1:])
         self.assertEqual(0, daemon.stats['diff'])
         self.assertNotIn(
-            'diffs', daemon.logger.statsd_client.get_increment_counts())
+            'diffs', daemon.logger.statsd_client.get_stats_counts())
         self.assertEqual(1, daemon.stats['failure'])
         self.assertEqual(
-            1, daemon.logger.statsd_client.get_increment_counts()['failures'])
+            1, daemon.logger.statsd_client.get_stats_counts()['failures'])
 
     def test_sync_shard_ranges_none_to_sync(self):
         # verify that merge_shard_ranges is not sent if there are no shard

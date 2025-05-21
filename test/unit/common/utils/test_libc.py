@@ -22,7 +22,7 @@ import platform
 import tempfile
 import unittest
 
-import mock
+from unittest import mock
 
 from swift.common.utils import libc
 

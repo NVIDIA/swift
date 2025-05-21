@@ -147,7 +147,6 @@ import itertools
 import json
 import time
 
-from cgi import parse_header
 from urllib.parse import unquote
 
 from swift.common.constraints import MAX_FILE_SIZE, \
@@ -166,11 +165,11 @@ from swift.common.swob import HTTPPreconditionFailed, HTTPServiceUnavailable, \
     HTTPBadRequest, str_to_wsgi, bytes_to_wsgi, wsgi_quote, \
     wsgi_to_str, wsgi_unquote, Request, HTTPNotFound, HTTPException, \
     HTTPRequestEntityTooLarge, HTTPInternalServerError, HTTPNotAcceptable, \
-    HTTPConflict
+    HTTPConflict, HTTPLengthRequired
 from swift.common.storage_policy import POLICIES
 from swift.common.utils import get_logger, Timestamp, drain_and_close, \
     config_true_value, close_if_possible, closing_if_possible, \
-    FileLikeIter, split_path, parse_content_type, RESERVED_STR
+    FileLikeIter, split_path, parse_content_type, parse_header, RESERVED_STR
 from swift.common.wsgi import WSGIContext, make_pre_authed_request
 from swift.proxy.controllers.base import get_container_info
 
@@ -731,8 +730,10 @@ class ObjectContext(ObjectVersioningContext):
         Handle a PUT?version-id request and create/update the is_latest link to
         point to the specific version.
         """
-        if req.content_length is None:
+        if req.is_chunked:
             has_body = (req.body_file.read(1) != b'')
+        elif req.content_length is None:
+            raise HTTPLengthRequired(request=req)
         else:
             has_body = (req.content_length != 0)
         if has_body:

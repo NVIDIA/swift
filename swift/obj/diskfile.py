@@ -406,6 +406,15 @@ def read_hashes(partition_dir):
     return hashes
 
 
+def should_part_listdir(seed, cycle, part, pct):
+    if pct <= 0:
+        # bold choice, but ok
+        return False
+    index = int(seed * 10_000 + cycle + int(part)) % 10_000
+    steps = max(1, int(1 / pct * 100))
+    return index % steps == 0
+
+
 def write_hashes(partition_dir, hashes):
     """
     Write hashes to hashes.pkl
@@ -1290,6 +1299,13 @@ class BaseDiskFileManager(object):
         raise NotImplementedError
 
     def _get_hashes(self, *args, **kwargs):
+        """
+        Base entry-point to non-tpool'd __get_hashes
+
+        See __get_hashes for params
+
+        :returns: (int, dict) tuple, i.e. (num_hashed, sanitized_suffix_hashes)
+        """
         hashed, hashes = self.__get_hashes(*args, **kwargs)
         hashes.pop('updated', None)
         hashes.pop('valid', None)

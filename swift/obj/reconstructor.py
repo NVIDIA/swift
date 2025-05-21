@@ -43,7 +43,7 @@ from swift.obj.ssync_sender import Sender as ssync_sender
 from swift.common.http import HTTP_OK, HTTP_NOT_FOUND, \
     HTTP_INSUFFICIENT_STORAGE
 from swift.obj.diskfile import DiskFileRouter, get_data_dir, \
-    get_tmp_dir, DEFAULT_RECLAIM_AGE
+    get_tmp_dir, DEFAULT_RECLAIM_AGE, should_part_listdir
 from swift.common.storage_policy import POLICIES, EC_POLICY
 from swift.common.exceptions import ConnectionTimeout, DiskFileError, \
     SuffixSyncError, PartitionLockTimeout, DiskFileNotExist
@@ -195,6 +195,9 @@ class ObjectReconstructor(Daemon):
                     'and will be removed in a future version. '
                     'Update your configuration to use option '
                     'object-reconstructor/interval.')
+        self.process_cycle = 0
+        self.cycle_seed = random.random()
+        self.part_listdir_percent = float(conf.get('part_listdir_percent', 10))
         self.http_timeout = int(conf.get('http_timeout', 60))
         self.lockup_timeout = int(conf.get('lockup_timeout', 1800))
         self.recon_cache_path = conf.get('recon_cache_path',
@@ -828,12 +831,19 @@ class ObjectReconstructor(Daemon):
                 self.kill_coros()
             self.last_reconstruction_count = self.reconstruction_count
 
+    def do_listdir(self, partition):
+        return should_part_listdir(self.cycle_seed,
+                                   self.process_cycle,
+                                   partition,
+                                   self.part_listdir_percent)
+
     def _get_hashes(self, device, partition, policy, recalculate=None,
                     do_listdir=False):
         df_mgr = self._df_router[policy]
         hashed, suffix_hashes = tpool.execute(
             df_mgr._get_hashes, device, partition, policy,
             recalculate=recalculate, do_listdir=do_listdir)
+        # hashed is always an int, we count it in stats but don't return it
         self.logger.update_stats('suffix.hashes', hashed)
         return suffix_hashes
 
@@ -1151,7 +1161,7 @@ class ObjectReconstructor(Daemon):
         # find all the fi's in the part, and which suffixes have them
         try:
             hashes = self._get_hashes(local_dev['device'], partition, policy,
-                                      do_listdir=True)
+                                      do_listdir=self.do_listdir(partition))
         except OSError as e:
             if e.errno != errno.ENOTDIR:
                 raise
@@ -1563,6 +1573,7 @@ class ObjectReconstructor(Daemon):
             self.logger.debug('reconstruction sleeping for %s seconds.',
                               self.interval)
             sleep(self.interval)
+            self.process_cycle += 1
 
 
 def main():

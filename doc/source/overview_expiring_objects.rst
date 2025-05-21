@@ -136,9 +136,10 @@ Scaling Expiring Objects Queue
 As expiring objects are added to the system, the object servers will record the
 expirations in a hidden ``.expiring_objects`` account for the
 ``swift-object-expirer`` to handle later.  The records inserted into the
-"task_containers" of the ``.expiring_objects`` account are not natively
-sharded; instead each day's worth of delete tasks are hashed into a
-configurable number of "task_containers" (100 by default).
+"task_containers" of the ``.expiring_objects`` account are not automatically
+distributed across multiple containers; instead each day's worth of delete
+tasks are hashed into a configurable number of "task_containers" (100 by
+default).
 
 When the number of expiration tasks per day grows larger than 100 times the
 native sharding threshold for containers (1M by default, i.e. more than 100M
@@ -151,14 +152,14 @@ the pre-existing enqueued expiration tasks will be in the "wrong
 task_container".  While these expirations will continue to be processed as
 normal, if any referenced object has its ``x-delete-at`` timestamp updated the
 "stale task cleanup" will target the wrong "task_container" which will leave
-the mishomed stale tasks in the queue.
+the misplaced stale tasks in the queue.
 
 You can avoid this inefficiency by using the ``swift-expirer-rebalancer`` CLI
 tool.  It can be run on any single node  with access to rings, configs and
-container-servers in order to create a copy of the mishomed tasks in the
-"correct task_container" and then delete the mishomed tasks.
+container-servers in order to create a copy of the misplaced tasks in the
+"correct task_container" and then delete the misplaced tasks.
 
-By default the tool runs on only the "next days" worth of task_containers, this
+By default the tool runs on only the "next days" worth of task_containers. This
 works well to help ops estimate the runtime to process the entire queue. You'll
 need to run the ``swift-expirer-rebalancer`` multiple times with increasing
 values for ``--num-days`` in order to process the entire expirer queue. You can

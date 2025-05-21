@@ -20,7 +20,7 @@ import binascii
 import os
 import errno
 import itertools
-import mock
+from unittest import mock
 import unittest
 import email
 import tempfile
@@ -30,7 +30,7 @@ import xattr
 import re
 import sys
 from collections import defaultdict
-from random import shuffle, randint
+from random import shuffle, randint, random
 from shutil import rmtree
 from time import time
 from tempfile import mkdtemp
@@ -39,7 +39,8 @@ from gzip import GzipFile
 import pyeclib.ec_iface
 
 from eventlet import hubs, timeout, tpool
-from swift.obj.diskfile import update_auditor_status, EUCLEAN, read_hashes
+from swift.obj.diskfile import update_auditor_status, EUCLEAN, \
+    should_part_listdir
 from test import BaseTestCase
 from test.debug_logger import debug_logger
 from test.unit import (mock as unit_mock, temptree, mock_check_drive,
@@ -851,6 +852,130 @@ class TestDiskFileModuleMethods(unittest.TestCase):
         with open(path, 'wb') as fd:
             diskfile.write_metadata(fd, metadata)
         check_metadata(as_native, str)
+
+    def test_should_part_listdir_types(self):
+        self.assertTrue(should_part_listdir(0.1, 0, '1', 100))
+        # zero pct is always false
+        self.assertFalse(should_part_listdir(None, float, 'asdf', 0))
+        # 200% is the same as 100%
+        self.assertTrue(should_part_listdir(43, 78.9, 4567, 200))
+        # int seed unexpected, and struggles with no cycle or part
+        self.assertTrue(should_part_listdir(894, 0.0, 0, 1e-300))
+        # but random seed does ok
+        self.assertFalse(should_part_listdir(random(), 0.0, 0, 1e-300))
+
+    def test_should_part_listdir_seed_helps_restarts(self):
+        # for this test it doesn't matter that these are random so much as
+        # different looking floats
+        seeds = [random() for i in range(10000)]
+
+        pct = 10
+        # across 10K seeds with pct=10 we expect ~1000
+        expected = int(len(seeds) * (pct / 100))
+        found = []
+        for part in (123, 4567, 8901234, 2 ** 31 + 5):
+            part_across_seeds = sum(
+                should_part_listdir(seed, 0, part, pct)
+                for seed in seeds)
+            found.append(part_across_seeds)
+        for part_across_seeds in found:
+            err = abs(part_across_seeds - expected) / expected
+            # ... but get 890-1110
+            self.assertLess(err, 0.11, found)
+
+        pct = 50
+        expected = int(len(seeds) * (pct / 100))
+        found = []
+        for part in (3, 42, 9743, 2 ** 16 + 123):
+            part_across_seeds = sum(
+                should_part_listdir(seed, 0, part, pct)
+                for seed in seeds)
+            found.append(part_across_seeds)
+        for part_across_seeds in found:
+            err = abs(part_across_seeds - expected) / expected
+            # coin flip is more accurate than d10?
+            self.assertLess(err, 0.05, found)
+
+        pct = 1
+        expected = int(len(seeds) * (pct / 100))
+        found = []
+        for part in (5, 1243, 2 ** 18 - 10, 2 ** 30 + 8765):
+            part_across_seeds = sum(
+                should_part_listdir(seed, 0, part, pct)
+                for seed in seeds)
+            found.append(part_across_seeds)
+        for part_across_seeds in found:
+            err = abs(part_across_seeds - expected) / expected
+            # 65-135?  This is how many times out of 10K that 1% will land *on
+            # the first cycle*
+            self.assertLess(err, 0.35, found)
+
+    def test_should_part_listdir_cycle_helps_guarantee(self):
+        # given a static seed across enough cycles (10K) you're going to hit
+        # your expected percentage - EXACTLY
+        results = []
+        pct = 10
+        seed = random()
+        for part in (3, 42, 9743, 2 ** 16 + 123):
+            results.append(sum(should_part_listdir(seed, cycle, part, pct)
+                               for cycle in range(10000)))
+        for r in results:
+            self.assertEqual(r, 1000)
+
+        results = []
+        pct = 50
+        seed = 0
+        for part in (123, 4567, 8901234, 2 ** 31 + 5):
+            results.append(sum(should_part_listdir(seed, cycle, part, pct)
+                               for cycle in range(10000)))
+        for r in results:
+            self.assertEqual(r, 5000)
+
+        results = []
+        pct = 1
+        seed = random()
+        for part in (5, 1243, 2 ** 18 - 10, 2 ** 30 + 8765):
+            results.append(sum(should_part_listdir(seed, cycle, part, pct)
+                               for cycle in range(100)))
+        for r in results:
+            # N.B. it will *always* happen 1/100 cycles consistently (if you
+            # can run that long).
+            self.assertEqual(r, 1)
+
+    def test_should_part_listdir_looks_random(self):
+        # if we listdir a given part one cycle, we probably don't want to
+        # listdir the same part the very next cycle (at least not often)
+        seed = random()
+        part = 2 ** 12 - 3
+        results = [should_part_listdir(seed, cycle, part, 10)
+                   for cycle in range(10000)]
+        self.assertEqual(sum(results), 1000)
+        pairs = list(zip(results, results[1:]))
+        # FWIW in the current implemenation it so happens these Trues are
+        # *perfectly* distributed; but I wouldn't even know how to spell that
+        # assertion for a random seed and all I really want is close enough.
+        self.assertEqual(0, pairs.count((True, True)))
+
+    def test_should_part_listdir_works_with_small_pct(self):
+        seeds = [random() for i in range(100)]
+        part = 2 ** 16 // 2 + 42
+        pct = 0.01
+        results = []
+        for seed in seeds:
+            results.append(sum(should_part_listdir(seed, cycle, part, pct)
+                               for cycle in range(10000)))
+        for result in results:
+            self.assertEqual(result, 1)
+
+    def test_should_part_listdir_too_small_pct(self):
+        seed = 0.7674047700730445
+        part = 2 ** 8 + 192
+        # pct = 0.01 is really the lowest you can go
+        pct = 0.00001
+        number_of_listdir = sum(
+            should_part_listdir(seed, cycle, part, pct)
+            for cycle in range(10000))
+        self.assertEqual(number_of_listdir, 1)
 
     def test_read_file_metadata(self):
         path = os.path.join(self.testdir, str(uuid.uuid4()))

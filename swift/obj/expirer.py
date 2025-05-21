@@ -99,7 +99,7 @@ class ExpirerConfig(object):
         if self.task_container_per_day >= self.expirer_divisor:
             msg = 'expiring_objects_task_container_per_day (%s) MUST be ' \
                   'less than %d' \
-                  % (self.task_container_per_day, EXPIRER_CONTAINER_DIVISOR)
+                  % (self.task_container_per_day, self.expirer_divisor)
             if self.expirer_divisor != 86400:
                 msg += '; expiring_objects_container_divisor (%s) SHOULD be ' \
                        'default value of %d' \
@@ -546,9 +546,9 @@ class ObjectExpirer(Daemon):
 
         if unexpected_task_containers['count']:
             self.logger.info(
-                'processing %s unexpected task containers (e.g. %s) '
-                'if you have recently changed your expirer config '
-                'you can run swift-expirer-rebalancer.',
+                'Processing %s unexpected task containers (e.g. %s). '
+                'If you have recently changed your expirer config '
+                'you can run swift-expirer-rebalancer to move tasks.',
                 unexpected_task_containers['count'],
                 ' '.join(unexpected_task_containers['examples']))
 

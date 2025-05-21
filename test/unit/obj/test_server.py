@@ -22,7 +22,7 @@ import json
 import errno
 import operator
 import os
-import mock
+from unittest import mock
 from io import StringIO
 import unittest
 import math
@@ -41,7 +41,8 @@ from swift import __version__ as swift_version
 from swift.common.http import is_success
 from swift.obj.expirer import ExpirerConfig
 from test import listen_zero, BaseTestCase
-from test.debug_logger import debug_logger
+from test.debug_logger import debug_logger, FakeStatsdClient, \
+    FakeLabeledStatsdClient
 from test.unit import mocked_http_conn, \
     make_timestamp_iter, DEFAULT_TEST_EC_TYPE, skip_if_no_xattrs, \
     connect_tcp, readuntil2crlfs, patch_policies, encode_frag_archive_bodies, \
@@ -55,6 +56,7 @@ from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
     Timestamp, md5, lock_path
 from swift.common import constraints
 from swift.common.request_helpers import get_reserved_name
+from swift.common.statsd_client import LabeledStatsdClient
 from swift.common.swob import Request, WsgiBytesIO, \
     HTTPRequestedRangeNotSatisfiable
 from swift.common.splice import splice
@@ -191,10 +193,15 @@ class TestObjectController(BaseTestCase):
             'mount_check': 'false',
             'container_update_timeout': 0.0,
         }
+        self.logger.clear()
         app = object_server.ObjectController(conf, logger=self.logger)
         self.assertEqual(app.container_update_timeout, 0.0)
         self.assertEqual(app.auto_create_account_prefix, '.')
-        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+        self.assertIsInstance(app.statsd, LabeledStatsdClient)
+        self.assertEqual({
+            'debug': [
+                'Labeled statsd mode: disabled (test-object-controller)'
+            ]}, self.logger.all_log_lines())
 
     def check_all_api_methods(self, obj_name='o', alt_res=None):
         path = '/sda1/p/a/c/%s' % obj_name
@@ -220,6 +227,196 @@ class TestObjectController(BaseTestCase):
             self.assertEqual(resp.status_int, res)
             if out_body and (200 <= res < 300):
                 self.assertEqual(resp.body, out_body)
+
+    def _do_test_timing_stats(self, conf, req, now):
+        with mock.patch('swift.common.utils.time.time', return_value=now), \
+                mock.patch('swift.common.statsd_client.StatsdClient',
+                           FakeStatsdClient), \
+                mock.patch('swift.common.statsd_client.LabeledStatsdClient',
+                           FakeLabeledStatsdClient):
+            app = object_server.ObjectController(conf, logger=self.logger)
+            statsd_client = app.logger.logger.statsd_client
+            statsd = app.statsd
+
+            with mock.patch.object(statsd_client, 'random', return_value=0), \
+                    mock.patch.object(statsd, 'random', return_value=0):
+                req.call_application(app)
+
+        self.assertIsInstance(statsd_client, FakeStatsdClient)
+        self.assertIsInstance(statsd, FakeLabeledStatsdClient)
+        return statsd_client, statsd
+
+    def test_legacy_and_labeled_timing_stats_replicate(self):
+        req = Request.blank(
+            '/sda1/p/', environ={'REQUEST_METHOD': 'REPLICATE'})
+        now = time()
+        statsd_client, statsd = self._do_test_timing_stats(self.conf, req, now)
+        self.assertEqual({'timing_since': [(('REPLICATE.timing', now), {
+            'sample_rate': 0.1
+        })]}, statsd_client.calls)
+        self.assertEqual(
+            {'timing_since': [(('swift_object_server_request_timing', now), {
+                'labels': {
+                    'method': 'REPLICATE',
+                    'policy': 0,
+                    'skip_rehash': False,
+                    'status': 200
+                },
+                'sample_rate': 0.1
+            })]},
+            statsd.calls)
+
+    def test_legacy_and_labeled_timing_stats_replicate_skip_rehash(self):
+        # suffixes in request path
+        req = Request.blank(
+            '/sda1/p/123-abc', environ={'REQUEST_METHOD': 'REPLICATE'})
+        now = time()
+        statsd_client, statsd = self._do_test_timing_stats(self.conf, req, now)
+        self.assertEqual({'timing_since': [(('REPLICATE.timing', now), {
+            'sample_rate': 0.1
+        })]}, statsd_client.calls)
+        self.assertEqual(
+            {'timing_since': [(('swift_object_server_request_timing', now), {
+                'labels': {
+                    'method': 'REPLICATE',
+                    'policy': 0,
+                    'skip_rehash': True,
+                    'status': 200
+                },
+                'sample_rate': 0.1
+            })]},
+            statsd.calls)
+
+    def test_legacy_and_labeled_timing_stats_replicate_policy(self):
+        # non-default policy
+        req = Request.blank(
+            '/sda1/p/', environ={'REQUEST_METHOD': 'REPLICATE'},
+            headers={'X-Backend-Storage-Policy-Index': '1'}
+        )
+        now = time()
+        statsd_client, statsd = self._do_test_timing_stats(self.conf, req, now)
+        self.assertEqual({'timing_since': [(('REPLICATE.timing', now), {
+            'sample_rate': 0.1
+        })]}, statsd_client.calls)
+        self.assertEqual(
+            {'timing_since': [(('swift_object_server_request_timing', now), {
+                'labels': {
+                    'method': 'REPLICATE',
+                    'policy': 1,
+                    'skip_rehash': False,
+                    'status': 200
+                },
+                'sample_rate': 0.1
+            })]},
+            statsd.calls)
+
+    def test_legacy_and_labeled_timing_stats_replicate_507(self):
+        req = Request.blank(
+            '/sda1/p/', environ={'REQUEST_METHOD': 'REPLICATE'})
+        now = time()
+        # mount_check will provoke a 507
+        conf = dict(self.conf, mount_check='true')
+        statsd_client, statsd = self._do_test_timing_stats(conf, req, now)
+        self.assertEqual({'timing_since': [(('REPLICATE.errors.timing', now), {
+            'sample_rate': 0.1
+        })]}, statsd_client.calls)
+        self.assertEqual(
+            {'timing_since': [(('swift_object_server_request_timing', now), {
+                'labels': {
+                    'method': 'REPLICATE',
+                    'policy': 0,
+                    'skip_rehash': False,
+                    'status': 507
+                },
+                'sample_rate': 0.1
+            })]},
+            statsd.calls)
+
+    def test_legacy_and_labeled_timing_stats_replicate_bad_policy(self):
+        # non-existent policy
+        req = Request.blank(
+            '/sda1/p/', environ={'REQUEST_METHOD': 'REPLICATE'},
+            headers={'X-Backend-Storage-Policy-Index': '99'}
+        )
+        now = time()
+        statsd_client, statsd = self._do_test_timing_stats(
+            self.conf, req, now)
+        self.assertEqual({'timing_since': [(('REPLICATE.errors.timing', now), {
+            'sample_rate': 0.1
+        })]}, statsd_client.calls)
+        self.assertEqual(
+            {'timing_since': [(('swift_object_server_request_timing', now), {
+                'labels': {
+                    'method': 'REPLICATE',
+                    'status': 503
+                },
+                'sample_rate': 0.1
+            })]},
+            statsd.calls)
+
+    def _do_test_legacy_timing_stats_error(self, req, sample_rate=None):
+        now = time()
+        # mount_check will provoke a 507
+        conf = dict(self.conf, mount_check='true')
+        statsd_client, statsd = self._do_test_timing_stats(conf, req, now)
+        kwargs = {} if sample_rate is None else {'sample_rate': sample_rate}
+        self.assertEqual({
+            'timing_since': [((req.method + '.errors.timing', now), kwargs)]
+        }, statsd_client.calls)
+
+    def test_legacy_timing_stats_get_error(self):
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+        self._do_test_legacy_timing_stats_error(req)
+
+    def test_legacy_timing_stats_post_error(self):
+        timestamp = normalize_timestamp(time())
+        headers = {'X-Timestamp': timestamp,
+                   'X-Object-Meta-1': 'One',
+                   'Content-Type': 'text/plain'}
+
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'POST'},
+                            headers=headers)
+        self._do_test_legacy_timing_stats_error(req)
+
+    def test_legacy_timing_stats_head_error(self):
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'HEAD'})
+        self._do_test_legacy_timing_stats_error(req, sample_rate=0.8)
+
+    def test_legacy_timing_stats_delete_error(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'DELETE'},
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'application/x-test'})
+        self._do_test_legacy_timing_stats_error(req)
+
+    def test_legacy_timing_stats_ssync_error(self):
+        # non-existent policy
+        req = Request.blank(
+            '/sda1/0',
+            environ={'REQUEST_METHOD': 'SSYNC'},
+            headers={'X-Backend-Storage-Policy-Index': '99'}
+        )
+        now = time()
+        statsd_client, statsd = self._do_test_timing_stats(
+            self.conf, req, now)
+        self.assertEqual({'timing_since': [(('SSYNC.errors.timing', now), {
+            'sample_rate': 0.1
+        })]}, statsd_client.calls)
+
+    def test_legacy_timing_stats_put_error(self):
+        timestamp = normalize_timestamp(time())
+        headers = {'X-Timestamp': timestamp,
+                   'X-Object-Meta-1': 'One',
+                   'Content-Type': 'text/plain'}
+
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers=headers)
+        req.body = b'VERIFY'
+        self._do_test_legacy_timing_stats_error(req)
 
     def test_REQUEST_SPECIAL_CHARS(self):
         obj = 'special昆%20/%'
@@ -2734,7 +2931,7 @@ class TestObjectController(BaseTestCase):
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
-        self.assertEqual(self.logger.statsd_client.get_increment_counts(),
+        self.assertEqual(self.logger.statsd_client.get_stats_counts(),
                          {'sync_update.success.201': 1})
         timestamp = normalize_timestamp(time())
         req = Request.blank(
@@ -2753,7 +2950,7 @@ class TestObjectController(BaseTestCase):
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
-        self.assertEqual(self.logger.statsd_client.get_increment_counts(),
+        self.assertEqual(self.logger.statsd_client.get_stats_counts(),
                          {'sync_update.error.500': 1, 'async_pendings': 1})
         timestamp = normalize_timestamp(time())
         req = Request.blank(
@@ -2773,7 +2970,7 @@ class TestObjectController(BaseTestCase):
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
-        self.assertEqual(self.logger.statsd_client.get_increment_counts(),
+        self.assertEqual(self.logger.statsd_client.get_stats_counts(),
                          {'sync_update.error.exception': 1,
                           'async_pendings': 1})
 
@@ -6457,7 +6654,7 @@ class TestObjectController(BaseTestCase):
                 'x-trans-id': '123',
                 'referer': 'PUT http://localhost/sda1/0/a/c/o',
                 'x-foo': 'bar'}))
-            self.assertEqual(self.logger.statsd_client.get_increment_counts(),
+            self.assertEqual(self.logger.statsd_client.get_stats_counts(),
                              {'sync_update.success.200': 1})
 
         # EC policy override headers
@@ -6526,7 +6723,7 @@ class TestObjectController(BaseTestCase):
                 with fake_spawn():
                     resp = req.get_response(self.object_controller)
                 self.assertEqual(
-                    self.logger.statsd_client.get_increment_counts(),
+                    self.logger.statsd_client.get_stats_counts(),
                     {'sync_update.skip': 1})
                 self.assertEqual(len(container_updates), 0)
             else:
@@ -6537,7 +6734,7 @@ class TestObjectController(BaseTestCase):
                 with self.assertRaises(StopIteration):
                     next(fake_conn.code_iter)
                 self.assertEqual(
-                    self.logger.statsd_client.get_increment_counts(),
+                    self.logger.statsd_client.get_stats_counts(),
                     {'sync_update.error.500': 1})
                 self.assertEqual(len(container_updates), 1)
                 # verify expected path used in update request
@@ -6992,7 +7189,7 @@ class TestObjectController(BaseTestCase):
             given_args.extend(args)
 
         self.object_controller.async_update = fake_async_update
-        self.object_controller.logger = self.logger
+        self.logger.clear()
         delete_at = time()
         req_headers = {
             'X-Timestamp': 1,
@@ -7046,7 +7243,7 @@ class TestObjectController(BaseTestCase):
             given_args.extend(args)
 
         self.object_controller.async_update = fake_async_update
-        self.object_controller.logger = self.logger
+        self.logger.clear()
         delete_at = time()
         req_headers = {
             'X-Timestamp': 1,
@@ -8015,6 +8212,178 @@ class TestObjectController(BaseTestCase):
         )
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 204)
+
+    def test_invalid_delete_task_timestamp(self):
+        create_object_ts = next(self.ts)
+        orig_delete_at = utils.normalize_delete_at_timestamp(
+            next(self.ts).normal)
+        wrong_delete_at = utils.normalize_delete_at_timestamp(
+            next(self.ts).normal)
+
+        # Create an object with an expiration time.
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers=self._update_delete_at_headers({
+                'X-Timestamp': create_object_ts.normal,
+                'X-Delete-At': orig_delete_at,
+                'Content-Length': '4',
+                'Content-Type': 'application/octet-stream'})
+        )
+        req.body = 'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # if the expirer ever sent an invalid x-if-delete-at it'd get a 400
+        # until we fix the bug (good!)
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-If-Delete-At': 'some-nonsense',
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 400)
+        self.assertEqual(b'Bad X-If-Delete-At header value', resp.body)
+
+        # if you send an *non-matching* x-if-delete-at AND some invalid
+        # task-timestamps we blow up until we fix the bug (also fine)
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': 'some-nonsense',
+                'X-If-Delete-At': wrong_delete_at,
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 412)
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(
+            "Exception reading 'x-backend-expirer-task-timestamp': could not "
+            "convert string to float: 'some-nonsense': ",
+            error_lines[-1]
+        )
+
+        # if you send the *correct* x-delete-at the invalid task timestamp
+        # doesn't even matter! (fair enough)
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': 'some-nonsense',
+                'X-If-Delete-At': orig_delete_at,
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 204)
+
+    def test_stale_delete_task_timestamp_404(self):
+        task_timestamp_ts = create_object_ts = next(self.ts)
+        user_deleted_at = next(self.ts)
+        orig_delete_at = utils.normalize_delete_at_timestamp(
+            next(self.ts).normal)
+
+        # we'll use this helper to peak into updates that go to async
+        def gather_async_pendings():
+            async_pendings = []
+            async_pending_dir = os.path.join(
+                self.testdir, 'sda1',
+                diskfile.get_async_dir(POLICIES.default))
+            for dirpath, _, filenames in os.walk(async_pending_dir):
+                for filename in filenames:
+                    with open(os.path.join(dirpath, filename), 'rb') as fh:
+                        async_update = pickle.load(fh)
+                    async_pendings.append(async_update)
+            return async_pendings
+
+        # First, create an object with an an expiration time.
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers=self._update_delete_at_headers({
+                'X-Timestamp': create_object_ts.normal,
+                'X-Delete-At': orig_delete_at,
+                'Content-Length': '4',
+                'Content-Type': 'application/octet-stream'})
+        )
+        req.body = 'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # it seems that since this test has no container-servers running the
+        # assigned X-Delete-At-Host in the PUT request goes to async
+        # N.B.  there's no async-pending for the user namespace container
+        # update because we didn't assign those headers to our stub request!
+        async_pendings = gather_async_pendings()
+        self.assertEqual(
+            [('PUT', '.expiring_objects', task_timestamp_ts)],
+            [(u['op'], u['account'], Timestamp(
+                u['headers']['X-Timestamp']))
+             for u in async_pendings])
+
+        # before the expirer gets a chance to do anything DELETE it!
+        req = Request.blank('/sda1/p/a/c/o', method='DELETE',
+                            headers={
+                                'X-Timestamp': user_deleted_at.normal,
+                            })
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 204)
+
+        # N.B. no x-delete-at host, an overwrite/update of an object with
+        # x-delete-at will "always" generate cleanup task asyncs
+        async_pendings = gather_async_pendings()
+        self.assertEqual(2, len(async_pendings))
+        self.assertEqual({
+            ('PUT', '.expiring_objects', task_timestamp_ts),
+            ('DELETE', '.expiring_objects', user_deleted_at),
+        }, {
+            (u['op'], u['account'], Timestamp(
+                u['headers']['X-Timestamp']))
+            for u in async_pendings
+        })
+
+        # ... but the object *is* a tombstone
+        req = Request.blank('/sda1/p/a/c/o', method='HEAD')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(user_deleted_at,
+                         Timestamp(resp.headers['X-Backend-Timestamp']))
+        # this should be sufficient to say that the task is stale
+        self.assertGreater(Timestamp(resp.headers['X-Backend-Timestamp']),
+                           task_timestamp_ts)
+
+        # when the exprier processes the task-timestamp; it should be "stale"
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            method='DELETE',
+            headers={
+                'X-Timestamp': Timestamp(orig_delete_at).normal,
+                'X-Backend-Expirer-Task-Timestamp': task_timestamp_ts.normal,
+                'X-If-Delete-At': orig_delete_at,
+            }
+        )
+        resp = req.get_response(self.object_controller)
+        # Returns 412 instead of 409 here because deleted object only has
+        # tombstone file left, and won't return 'X-Delete-At' header anymore
+        # when openning the data file;
+        #
+        # NOTE: ``disk_file.read_metadata`` returns ``DiskFileDeleted`` during
+        # object server DELETE handling, but ``HTTPNotFound`` will be ignored
+        # during the following ``x-delete-at`` handling, this probably should
+        # be fixed and ideally object server DELETE should return 404.
+        self.assertEqual(resp.status_int, 412)
+        # this is unfortunate
+        self.assertNotIn('X-Backend-Timestamp', resp.headers)
+
+        # at least we don't create any new asyncs
+        async_pendings = gather_async_pendings()
+        self.assertEqual(2, len(async_pendings))
+        # ... and the expirer will "only" keep trying until the async_pending
+        # for the DELETE into the .expiring objects account gets processed to
+        # wipe out the stale task.
 
     def test_extra_headers_contain_object_bytes(self):
         timestamp1 = next(self.ts).normal

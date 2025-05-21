@@ -11,22 +11,7 @@
     vars:
       tox_environment:
         TMPDIR: '{{ ansible_env.HOME }}/xfstmp'
-
-- job:
-    name: swift-tox-py36
-    parent: swift-tox-base
-    nodeset: ubuntu-bionic
-    description: |
-      Run unit-tests for swift under cPython version 3.6.
-
-      Uses tox with the ``py36`` environment.
-      It sets TMPDIR to an XFS mount point created via
-      tools/test-setup.sh.
-    vars:
-      tox_envlist: py36
-      bindep_profile: test py36
-      python_version: 3.6
-    post-run: tools/playbooks/common/cover-post.yaml
+        COLUMNS: 240
 
 - job:
     name: swift-tox-py37
@@ -142,6 +127,22 @@
       python_version: '3.12'
 
 - job:
+    name: swift-tox-py313
+    parent: swift-tox-base
+    nodeset: ubuntu-noble
+    description: |
+      Run unit-tests for swift under cPython version 3.13.
+
+      Uses tox with the ``py313`` environment.
+      It sets TMPDIR to an XFS mount point created via
+      tools/test-setup.sh.
+    vars:
+      tox_envlist: py313
+      bindep_profile: test py313
+      python_use_pyenv: True
+      python_version: '3.13'
+
+- job:
     name: swift-tox-func-py312
     parent: swift-tox-base
     nodeset: ubuntu-noble
@@ -237,6 +238,8 @@
       - opendev.org/openstack/keystone
     timeout: 5400
     vars:
+      tox_environment:
+        COLUMNS: 240
       tox_constraints_file: '{{ ansible_user_dir }}/src/opendev.org/openstack/requirements/upper-constraints.txt'
       # This tox env get run twice; once for Keystone and once for tempauth
       tox_envlist: func
@@ -266,7 +269,7 @@
         SERVICE_HOST: ""
 
 - job:
-    name: swift-tox-func-s3api-ceph-s3tests-tempauth
+    name: swift-tox-func-ceph-s3tests-tempauth
     parent: unittests
     voting: false
     nodeset: centos-9-stream
@@ -274,6 +277,8 @@
       Setup a SAIO dev environment and run ceph-s3tests
     timeout: 5400
     vars:
+      tox_environment:
+        COLUMNS: 240
       s3_acl: yes
       s3_inventory_enabled: yes
       bindep_profile: test py39
@@ -289,13 +294,15 @@
       - tools/playbooks/ceph-s3tests/post.yaml
 
 - job:
-    name: swift-tox-func-s3api-tests-tempauth
+    name: swift-tox-func-s3api-compat-tests-tempauth
     parent: unittests
     nodeset: centos-9-stream
     description: |
       Setup a SAIO dev environment and run our s3api test suite
     timeout: 1800
     vars:
+      tox_environment:
+        COLUMNS: 240
       s3_acl: yes
       s3_inventory_enabled: yes
       bindep_profile: test py39
@@ -318,6 +325,8 @@
       under Python 3.
     timeout: 7200
     vars:
+      tox_environment:
+        COLUMNS: 240
       s3_acl: no
       bindep_profile: test py39
       s3_inventory_enabled: no
@@ -403,6 +412,7 @@
       Build a 4 node swift cluster and run functional tests
     timeout: 5400
     vars:
+      tox_envlist: func
       bindep_profile: test py39
     pre-run:
       - tools/playbooks/multinode_setup/pre.yaml
@@ -418,48 +428,62 @@
     parent: swift-multinode-rolling-upgrade
     vars:
       previous_swift_version: wallaby-eom
+      tox_envlist: func-py3
 
 - job:
     name: swift-multinode-rolling-upgrade-xena
     parent: swift-multinode-rolling-upgrade
     vars:
       previous_swift_version: xena-eom
+      tox_envlist: func-py3
 
 - job:
     name: swift-multinode-rolling-upgrade-yoga
     parent: swift-multinode-rolling-upgrade
     vars:
       previous_swift_version: yoga-eom
+      tox_envlist: func-py3
 
 - job:
     name: swift-multinode-rolling-upgrade-zed
     parent: swift-multinode-rolling-upgrade
     vars:
       previous_swift_version: zed-eom
+      tox_envlist: func-py3
 
 - job:
     name: swift-multinode-rolling-upgrade-antelope
     parent: swift-multinode-rolling-upgrade
     vars:
       previous_swift_version: 2023.1-eom
+      tox_envlist: func-py3
 
 - job:
     name: swift-multinode-rolling-upgrade-bobcat
     parent: swift-multinode-rolling-upgrade
     vars:
-      previous_swift_version: origin/stable/2023.2
+      previous_swift_version: 2023.2-eol
+      tox_envlist: func-py3
 
 - job:
     name: swift-multinode-rolling-upgrade-caracal
     parent: swift-multinode-rolling-upgrade
     vars:
       previous_swift_version: origin/stable/2024.1
+      tox_envlist: func-py3
 
 - job:
     name: swift-multinode-rolling-upgrade-dalmatian
     parent: swift-multinode-rolling-upgrade
     vars:
       previous_swift_version: origin/stable/2024.2
+      tox_envlist: func-py3
+
+- job:
+    name: swift-multinode-rolling-upgrade-epoxy
+    parent: swift-multinode-rolling-upgrade
+    vars:
+      previous_swift_version: origin/stable/2025.1
 
 - job:
     name: swift-multinode-rolling-upgrade-master
@@ -473,8 +497,8 @@
     # This seems defensible for a l-c job
     nodeset: ubuntu-bionic
     vars:
-      bindep_profile: test py36
-      python_version: 3.6
+      bindep_profile: test py37
+      python_version: 3.7
       tox_environment:
         TMPDIR: '{{ ansible_env.HOME }}/xfstmp'
 
@@ -611,13 +635,15 @@
             irrelevant-files: *docker-irrelevant-files
 
         # Unit tests
-        - swift-tox-py36:
+        - swift-tox-py37:
             irrelevant-files: &unittest-irrelevant-files
               - ^(api-ref|doc|releasenotes)/.*$
               - ^test/(cors|functional|probe|s3api)/.*$
         - swift-tox-py39:
             irrelevant-files: *unittest-irrelevant-files
         - swift-tox-py312:
+            irrelevant-files: *unittest-irrelevant-files
+        - swift-tox-py313:
             irrelevant-files: *unittest-irrelevant-files
 
         # Functional tests
@@ -636,7 +662,7 @@
               - ^doc/(requirements.txt|(manpages|s3api|source)/.*)$
               - ^test/(unit|functional|probe|s3api)/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG)$
-        - swift-tox-func-s3api-ceph-s3tests-tempauth:
+        - swift-tox-func-ceph-s3tests-tempauth:
             irrelevant-files:
               - ^(api-ref|releasenotes)/.*$
               # Keep doc/saio -- we use those sample configs in the saio playbooks
@@ -644,7 +670,7 @@
               - ^doc/(requirements.txt|(manpages|source)/.*)$
               - ^test/.*$
               - ^(.gitreview|.mailmap|AUTHORS|CHANGELOG|.*\.rst)$
-        - swift-tox-func-s3api-tests-tempauth:
+        - swift-tox-func-s3api-compat-tests-tempauth:
             irrelevant-files:
               - ^(api-ref|releasenotes)/.*$
               # Keep doc/saio -- we use those sample configs in the saio playbooks
@@ -696,14 +722,14 @@
             irrelevant-files: *docker-irrelevant-files
         - swift-upload-image-py3:
             irrelevant-files: *docker-irrelevant-files
-        - swift-tox-py36
+        - swift-tox-py37
         - swift-tox-py39
         - swift-tox-py312
         - swift-tox-func-py312
         - swift-tox-func-encryption-py312
         - swift-tox-func-ec-py312
         - swift-func-cors
-        - swift-tox-func-s3api-tests-tempauth
+        - swift-tox-func-s3api-compat-tests-tempauth
         - swift-probetests-centos-9-stream:
             irrelevant-files: *probetest-irrelevant-files
         - swift-dsvm-functional:
@@ -730,7 +756,6 @@
             irrelevant-files: *tempest-irrelevant-files
     experimental:
       jobs:
-        - swift-tox-py37
         - swift-tox-py38
         - swift-tox-py310
         - swift-tox-py311
@@ -745,6 +770,7 @@
         - swift-multinode-rolling-upgrade-bobcat
         - swift-multinode-rolling-upgrade-caracal
         - swift-multinode-rolling-upgrade-dalmatian
+        - swift-multinode-rolling-upgrade-epoxy
         - swift-multinode-rolling-upgrade-master:
             branches: master
 

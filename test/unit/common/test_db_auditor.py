@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import unittest
-import mock
+from unittest import mock
 import time
 import os
 import random
@@ -168,7 +168,7 @@ class TestAuditor(unittest.TestCase):
             self.assertEqual(
                 {'passes': 3,
                  'failures': 2},
-                test_auditor.logger.statsd_client.get_increment_counts())
+                test_auditor.logger.statsd_client.get_stats_counts())
 
         do_test({})
         do_test({'vacuum_threshold_size': 0})
@@ -204,7 +204,7 @@ class TestAuditor(unittest.TestCase):
             self.assertEqual(test_auditor.passes, 3)
             self.assertEqual(
                 expected_inc_stats,
-                test_auditor.logger.statsd_client.get_increment_counts())
+                test_auditor.logger.statsd_client.get_stats_counts())
             warn_lines = self.logger.get_lines_for_level('warning')
             self.assertIn("Vacuum failed on ", warn_lines[0])
             self.assertIn("Vacuum failed!", warn_lines[0])

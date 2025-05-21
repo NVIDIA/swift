@@ -945,8 +945,6 @@ def get_namespaces_from_cache(req, cache_key, skip_chance):
 
     # then try get them from memcache
     memcache = cache_from_env(req.environ, True)
-    if not memcache:
-        return None, 'disabled'
     if skip_chance and random.random() < skip_chance:
         return None, 'skip'
     try:
@@ -968,14 +966,15 @@ def set_namespaces_in_cache(req, cache_key, ns_bound_list, time):
 
     :param req: a :class:`swift.common.swob.Request` object.
     :param cache_key: the cache key for both infocache and memcache.
-    :param ns_bound_list: a :class:`swift.common.utils.NamespaceBoundList`.
+    :param ns_bound_list: a :class:`swift.common.utils.NamespaceBoundList`;
+                          must be not None or empty.
     :param time: how long the namespaces should remain in memcache.
     :return: the cache_state.
     """
     infocache = req.environ.setdefault('swift.infocache', {})
     infocache[cache_key] = ns_bound_list
     memcache = cache_from_env(req.environ, True)
-    if memcache and ns_bound_list:
+    if memcache:
         bounds = namespace_list_to_bounds(ns_bound_list)
         try:
             memcache.set(cache_key, bounds, time=time, raise_on_error=True)

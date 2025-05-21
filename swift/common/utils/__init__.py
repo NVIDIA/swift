@@ -15,7 +15,6 @@
 
 """Miscellaneous utility functions for use with Swift."""
 
-from __future__ import print_function
 
 import base64
 import binascii
@@ -70,7 +69,6 @@ from urllib.parse import unquote, urlparse
 from collections import UserList
 
 import swift.common.exceptions
-from swift.common.http import is_server_error
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.linkat import linkat
 
@@ -108,6 +106,7 @@ from swift.common.utils.config import ( # noqa
     non_negative_float,
     non_negative_int,
     config_positive_int_value,
+    config_positive_float_value,
     config_float_value,
     config_auto_int_value,
     config_percent_value,
@@ -482,7 +481,9 @@ class FileLikeIter(object):
 
     def __next__(self):
         """
-        next(x) -> the next value, or raise StopIteration
+        :raise StopIteration: if there are no more values to iterate.
+        :raise ValueError: if the close() method has been called.
+        :return: the next value.
         """
         if self.closed:
             raise ValueError('I/O operation on closed file')
@@ -495,12 +496,14 @@ class FileLikeIter(object):
 
     def read(self, size=-1):
         """
-        read([size]) -> read at most size bytes, returned as a bytes string.
-
-        If the size argument is negative or omitted, read until EOF is reached.
-        Notice that when in non-blocking mode, less data than what was
-        requested may be returned, even if no size parameter was given.
+        :param size: (optional) the maximum number of bytes to read. The
+        default value of ``-1`` means 'unlimited' i.e. read until the wrapped
+        iterable is exhausted.
+        :raise ValueError: if the close() method has been called.
+        :return: a bytes literal; if the wrapped iterable has been exhausted
+            then a zero-length bytes literal is returned.
         """
+        size = -1 if size is None else size
         if self.closed:
             raise ValueError('I/O operation on closed file')
         if size < 0:
@@ -522,12 +525,17 @@ class FileLikeIter(object):
 
     def readline(self, size=-1):
         """
-        readline([size]) -> next line from the file, as a bytes string.
+        Read the next line.
 
-        Retain newline.  A non-negative size argument limits the maximum
-        number of bytes to return (an incomplete line may be returned then).
-        Return an empty string at EOF.
+        :param size: (optional) the maximum number of bytes of the next line to
+            read. The default value of ``-1`` means 'unlimited' i.e. read to
+            the end of the line or until the wrapped iterable is exhausted,
+            whichever is first.
+        :raise ValueError: if the close() method has been called.
+        :return: a bytes literal; if the wrapped iterable has been exhausted
+            then a zero-length bytes literal is returned.
         """
+        size = -1 if size is None else size
         if self.closed:
             raise ValueError('I/O operation on closed file')
         data = b''
@@ -550,12 +558,16 @@ class FileLikeIter(object):
 
     def readlines(self, sizehint=-1):
         """
-        readlines([size]) -> list of bytes strings, each a line from the file.
-
         Call readline() repeatedly and return a list of the lines so read.
-        The optional size argument, if given, is an approximate bound on the
-        total number of bytes in the lines returned.
+
+        :param sizehint: (optional) an approximate bound on the total number of
+            bytes in the lines returned. Lines are read until ``sizehint`` has
+            been exceeded but complete lines are always returned, so the total
+            bytes read may exceed ``sizehint``.
+        :raise ValueError: if the close() method has been called.
+        :return: a list of bytes literals, each a line from the file.
         """
+        sizehint = -1 if sizehint is None else sizehint
         if self.closed:
             raise ValueError('I/O operation on closed file')
         lines = []
@@ -572,12 +584,10 @@ class FileLikeIter(object):
 
     def close(self):
         """
-        close() -> None or (perhaps) an integer.  Close the file.
+        Close the iter.
 
-        Sets data attribute .closed to True.  A closed file cannot be used for
-        further I/O operations.  close() may be called more than once without
-        error.  Some kinds of file objects (for example, opened by popen())
-        may return an exit status upon closing.
+        Once close() has been called the iter cannot be used for further I/O
+        operations. close() may be called more than once without error.
         """
         self.iterator = None
         self.closed = True
@@ -836,12 +846,16 @@ def link_fd_to_path(fd, target_path, dirs_created=0, retries=2, fsync=True):
                   the newly created directories.
     """
     dirpath = os.path.dirname(target_path)
-    for _junk in range(0, retries):
+    attempts = 0
+    while True:
+        attempts += 1
         try:
             linkat(linkat.AT_FDCWD, "/proc/self/fd/%d" % (fd),
                    linkat.AT_FDCWD, target_path, linkat.AT_SYMLINK_FOLLOW)
             break
         except IOError as err:
+            if attempts > retries:
+                raise
             if err.errno == errno.ENOENT:
                 dirs_created = makedirs_count(dirpath)
             elif err.errno == errno.EEXIST:
@@ -929,40 +943,6 @@ class GreenthreadSafeIterator(object):
     def __next__(self):
         with self.semaphore:
             return next(self.unsafe_iter)
-
-
-def timing_stats(**dec_kwargs):
-    """
-    Returns a decorator that logs timing events or errors for public methods in
-    swift's wsgi server controllers, based on response code.
-    """
-    def decorating_func(func):
-        method = func.__name__
-
-        @functools.wraps(func)
-        def _timing_stats(ctrl, *args, **kwargs):
-            start_time = time.time()
-            if getattr(ctrl, 'sleep_in_call', False):
-                sleep()
-            resp = func(ctrl, *args, **kwargs)
-            # .timing is for successful responses *or* error codes that are
-            # not Swift's fault. For example, 500 is definitely the server's
-            # fault, but 412 is an error code (4xx are all errors) that is
-            # due to a header the client sent.
-            #
-            # .errors.timing is for failures that *are* Swift's fault.
-            # Examples include 507 for an unmounted drive or 500 for an
-            # unhandled exception.
-            if not is_server_error(resp.status_int):
-                ctrl.logger.timing_since(method + '.timing',
-                                         start_time, **dec_kwargs)
-            else:
-                ctrl.logger.timing_since(method + '.errors.timing',
-                                         start_time, **dec_kwargs)
-            return resp
-
-        return _timing_stats
-    return decorating_func
 
 
 def memcached_timing_stats(**dec_kwargs):
@@ -1459,6 +1439,32 @@ def cache_from_env(env, allow_none=False):
     return item_from_env(env, 'swift.cache', allow_none)
 
 
+def load_multikey_opts(conf, prefix, allow_none_key=False):
+    """
+    Read multi-key options of the form "<prefix>_<key> = <value>"
+
+    :param conf: a config dict
+    :param prefix: the prefix for which to search
+    :param allow_none_key: if True, also parse "<prefix> = <value>" and
+                           include it in the result as ``(None, value)``
+    :returns: a sorted list of (<key>, <value>) tuples
+    :raises ValueError: if an option starts with prefix but cannot be parsed
+    """
+    result = []
+    for k, v in conf.items():
+        if not k.startswith(prefix):
+            continue
+        suffix = k[len(prefix):]
+        if not suffix and allow_none_key:
+            result.append((k, None, v))
+            continue
+        if len(suffix) >= 2 and suffix[0] == '_':
+            result.append((k, suffix[1:], v))
+            continue
+        raise ValueError('Malformed multi-key option name %s' % k)
+    return sorted(result)
+
+
 class CooperativeCachePopulator(object):
     """
     Cooperative token is used to avoid the thundering herd problem when caching
@@ -1472,10 +1478,12 @@ class CooperativeCachePopulator(object):
     without a token should wait for cache filling to finish, instead of all
     querying the backend servers at the same time. After those requests with
     token are done, they will release the token by deleting the internal cache
-    key and finish this usage session.
+    key and finish this usage session. As such, one token session starts from
+    the first request with token after cache misses and ends when all requests
+    with token are done.
 
-    Cooperative cache populator uses ``num_tokens`` to define the minimum limit
-    of tokens during one usage session, default to be 3. This is used to
+    Cooperative cache populator uses ``num_tokens`` to define the maximum
+    number of tokens during one usage session, default to be 3. This is used to
     increase fault tolerance in the distributed environment, when one request
     with token hangs or exits, any other requests with token still can set new
     fetched data into memcache and finish the whole usage session. In the rare
@@ -1491,69 +1499,90 @@ class CooperativeCachePopulator(object):
     after ``token_ttl``, requests which see cache miss will start a new round
     of cooperation token session.
 
+    :param logger: the metrics logger.
+    :param op_type: name of the operation type, will be used as the metrics
+        label.
     :param infocache: the infocache instance.
-    :param memcache: the memcache instance.
+    :param memcache: the memcache instance, must be a valid MemcacheRing.
     :param cache_key: the cache key.
     :param cache_ttl: time-to-live of the data fetched from backend to set into
         memcached.
-    :param do_fetch_backend: a callable object to be called to fetch data from
-        the backend; it needs to return a tuple of (data, response).
-    :param retry_interval: the basic interval to retry getting data from cache
-        when waiting for other requests to populate the cache, suggest to be
-        set as the average time spent on ``do_fetch_backend``.
-    :param cache_encoder: an optional callable object to convert the data
-        retrieved from the backend to a different format to store in memcache.
-    :param cache_decoder: an optional callable object to convert the data
-        retrieved from memcache to the same format as returned from backend.
+    :param avg_backend_fetch_time: The average time in seconds expected for the
+        backend fetch operation ``do_fetch_backend`` to complete. This duration
+        serves as a base unit for calculating exponential backoff delays when
+        awaiting cache population by other requests, and for determining the
+        cooperative token's time-to-live (which is set to 10x this value); Must
+        be greater than 0.
     :param num_tokens: the minimum limit of tokens per each usage sesssion,
         also the the minimum limit of in-flight requests allowed to fetch data
         from backend; default to be 3, which give redundancy when any request
         with token fails to fetch data from the backend or fails to set new
-        data into memcached.
+        data into memcached; 0 means no cooperative token is used.
     """
 
-    def __init__(self, infocache, memcache,
-                 cache_key, cache_ttl, do_fetch_backend, retry_interval,
-                 cache_encoder=None, cache_decoder=None, num_tokens=3):
+    def __init__(self, logger, op_type, infocache, memcache,
+                 cache_key, cache_ttl, avg_backend_fetch_time, num_tokens=3):
+        self._logger = logger
+        self._op_type = op_type
         self._infocache = infocache
         self._memcache = memcache
         self._cache_key = cache_key
         self._cache_ttl = cache_ttl
         self._token_key = '_cache_token/%s' % cache_key
-        self._retry_interval = retry_interval
-        # Time-to-live of the cooperative token when set in memcached, default
-        # to be 10 times of the average time spent on ``do_fetch_backend``.
-        self._token_ttl = retry_interval * 10
+        self._avg_backend_fetch_time = avg_backend_fetch_time
+        # Time-to-live of the cooperative token when set in memcached, this
+        # defines the typical worse time that a token request would need to
+        # fetch the data from the backend when it's busy, default to be 10
+        # times of the average time spent on ``do_fetch_backend`` which is
+        # the ``avg_backend_fetch_time``.
+        self._token_ttl = avg_backend_fetch_time * 10
         self._num_tokens = num_tokens
-        self._do_fetch_backend = do_fetch_backend
-        self._cache_encoder = cache_encoder if cache_encoder else (lambda x: x)
-        self._cache_decoder = cache_decoder if cache_decoder else (lambda x: x)
-        # The status of cache set operations used internally.
+        # The status of cache operation which sets backend data into Memcached.
         self.set_cache_state = None
         # Indicates if this request has acquired one token.
         self.token_acquired = False
-        # Indicates if this request is served out of Memcached.
-        self.req_served_from_cache = False
-        # The HttpResponse object returned by ``do_fetch_backend``.
-        self.backend_response = None
-        # Indicates if a request who doesn't have token and doesn't get enough
-        # retries due to busy eventlet scheduler.
-        self.req_lacks_enough_retries = False
+        # The HttpResponse object returned by ``do_fetch_backend`` if called.
+        self.backend_resp = None
 
-    def query_backend_and_set_cache(self):
+    def do_fetch_backend(self):
         """
-        Fetch data from the backedn and set the value in the Memcached.
+        To fetch data from the backend, needs to be implemented by sub-class.
+
+        :returns: a tuple of (data, response).
+        """
+        raise NotImplementedError
+
+    def cache_encoder(self, data):
+        """
+        To encode data to be stored in Memcached, default to return the data
+        as is.
+
+        :returns: encoded data.
+        """
+        return data
+
+    def cache_decoder(self, data):
+        """
+        To decode data from Memcached, default to return the data as is.
+
+        :returns: decoded data.
+        """
+        return data
+
+    def _query_backend_and_set_cache(self):
+        """
+        Fetch data from the backend and set the value in the Memcached.
 
         :returns: value of the data fetched from backend; None if not exist.
         """
-        data, self.backend_response = self._do_fetch_backend()
+        data, self.backend_resp = self.do_fetch_backend()
         if not data:
             return None
 
         if self._infocache is not None:
             self._infocache[self._cache_key] = data
         try:
-            encoded_data = self._cache_encoder(data)
+            encoded_data = self.cache_encoder(data)
             self._memcache.set(
                 self._cache_key, encoded_data,
                 time=self._cache_ttl, raise_on_error=True)
@@ -1566,38 +1595,41 @@ class CooperativeCachePopulator(object):
     def _sleep_and_retry_memcache(self):
         """
         Wait for cache value to be set by other requests with intermittent and
-        limited number of sleeps. when ``token_ttl`` is 10 times of
-        ``retry_interval`` and the exponential backoff doubles the retry
-        interval after each retry, normally this function will only sleep and
-        retry 3 times.
+        limited number of sleeps. With ``token_ttl`` set as 10 times of
+        ``avg_backend_fetch_time`` and the exponential backoff doubling the
+        retry interval after each retry, this function will normally sleep and
+        retry 3 times maximum.
+        The first retry is 1.5 times of the ``avg_backend_fetch_time``, the
+        second is 3 times, and the third is 6 times of it, so total is 10.5
+        times of the ``avg_backend_fetch_time``. This roughly equals to the
+        ``token_ttl`` which is 10 times of the ``avg_backend_fetch_time``.
 
         :returns: value of the data fetched from Memcached; None if not exist.
         """
         cur_time = time.time()
         cutoff_time = cur_time + self._token_ttl
-        retry_interval = self._retry_interval * 1.5
+        retry_interval = self._avg_backend_fetch_time * 1.5
         num_waits = 0
         while cur_time < cutoff_time or num_waits < 3:
             if cur_time < cutoff_time:
                 eventlet.sleep(retry_interval)
                 num_waits += 1
             else:
+                # Request has no token and doesn't get enough retries.
+                self._logger.increment('token.%s.lack_retries' % self._op_type)
                 # To have one last check, when eventlet scheduling didn't give
                 # this greenthread enough cpu cycles and it didn't have enough
                 # times of retries.
-                self.req_lacks_enough_retries = True
                 num_waits = 3
             cache_data = self._memcache.get(
                 self._cache_key, raise_on_error=False)
             if cache_data:
                 # cache hit.
-                self.req_served_from_cache = True
-                decoded_data = self._cache_decoder(cache_data)
+                decoded_data = self.cache_decoder(cache_data)
                 return decoded_data
             # cache miss, retry again with exponential backoff
             retry_interval *= 2
             cur_time = time.time()
-            continue
         return None
 
     def fetch_data(self):
@@ -1608,14 +1640,10 @@ class CooperativeCachePopulator(object):
         :returns: value of the data fetched from backend or memcache; None if
             not exist.
         """
-        data = None
-        if not self._memcache:
-            data, self.backend_response = self._do_fetch_backend()
-            if self._infocache is not None and data:
-                self._infocache[self._cache_key] = data
-            return data
+        if not self._num_tokens:
+            # Cooperative token disabled, fetch from backend.
+            return self._query_backend_and_set_cache()
 
-        # Try to get a cooperative token by using memcache increments.
         total_requests = 0
         try:
             total_requests = self._memcache.incr(
@@ -1623,14 +1651,19 @@ class CooperativeCachePopulator(object):
         except swift.common.exceptions.MemcacheConnectionError:
             self.set_cache_state = 'inc_error'
 
+        req_served_from_cache = False
         if not total_requests:
             # Couldn't connect to the memcache to increment the token key
-            data = self.query_backend_and_set_cache()
+            data = self._query_backend_and_set_cache()
         elif total_requests <= self._num_tokens:
             # Acquired a cooperative token, go fetching data from backend and
             # set the data in memcache.
             self.token_acquired = True
-            data = self.query_backend_and_set_cache()
+            data = self._query_backend_and_set_cache()
+            self._logger.increment(
+                'token.%s.backend_reqs.with_token.%d' %
+                (self._op_type, self.backend_resp.status_int)
+            )
             if self.set_cache_state == 'set':
                 # Since the successful finish of one whole cooperative token
                 # session only depends on a single successful request. So when
@@ -1638,29 +1671,30 @@ class CooperativeCachePopulator(object):
                 # memcache set successful, it can remove all cooperative tokens
                 #  of this token session.
                 self._memcache.delete(self._token_key)
+                self._logger.increment(
+                    'token.%s.done_token_reqs' % self._op_type
+                )
         else:
             # No token acquired, it means that there are requests in-flight
             # which will fetch data form the backend servers and update them in
-            # cache, let's wait for them to finish with limited retires.
+            # cache, let's wait for them to finish with limited retries.
             data = self._sleep_and_retry_memcache()
-            if not data:
+            if data is not None:
+                req_served_from_cache = True
+                self._logger.increment(
+                    'token.%s.cache_served_reqs' % self._op_type)
+            else:
                 # Still no cache data fetched.
-                data = self.query_backend_and_set_cache()
+                data = self._query_backend_and_set_cache()
 
+        if not self.token_acquired and not req_served_from_cache:
+            # Total number of requests equals to 'cache_served_reqs' plus
+            # 'backend_reqs.with_token' and 'backend_reqs.no_token'.
+            self._logger.increment(
+                'token.%s.backend_reqs.no_token.%d' %
+                (self._op_type, self.backend_resp.status_int)
+            )
         return data
-
-    def is_token_request_done(self):
-        """
-        Indicates if this request has acquired one token and finished all
-        operations, both backend and memcache, successfully.
-
-        :returns: a boolean value.
-        """
-        return (
-            self.token_acquired
-            and self.set_cache_state is not None
-            and self.set_cache_state == "set"
-        )
 
 
 def write_pickle(obj, dest, tmp=None, pickle_protocol=0):
@@ -2691,44 +2725,81 @@ class InputProxy(object):
     """
     File-like object that counts bytes read.
     To be swapped in for wsgi.input for accounting purposes.
+
+    :param wsgi_input: file-like object to be wrapped
     """
 
-    def __init__(self, wsgi_input, env=None):
-        """
-        :param wsgi_input: file-like object to wrap the functionality of
-        """
+    def __init__(self, wsgi_input):
         self.wsgi_input = wsgi_input
-        self.env = {} if env is None else env
+        #: total number of bytes read from the wrapped input
         self.bytes_received = 0
+        #: ``True`` if an exception is raised by ``read()`` or ``readline()``,
+        #: ``False`` otherwise
         self.client_disconnect = False
 
-    def read(self, *args, **kwargs):
+    def chunk_update(self, chunk, eof, *args, **kwargs):
+        """
+        Called each time a chunk of bytes is read from the wrapped input.
+
+        :param chunk: the chunk of bytes that has been read.
+        :param eof: ``True`` if there are no more bytes to read from the
+            wrapped input, ``False`` otherwise. If ``read()`` has been called
+            this will be ``True`` when the size of ``chunk`` is less than the
+            requested size or the requested size is None. If ``readline`` has
+            been called this will be ``True`` when an incomplete line is read
+            (i.e. not ending with ``b'\\n'``) whose length is less than the
+            requested size or the requested size is None. If ``read()`` or
+            ``readline()`` are called with a requested size that exactly
+            matches the number of bytes remaining in the wrapped input then
+            ``eof`` will be ``False``. A subsequent call to ``read()`` or
+            ``readline()`` with non-zero ``size`` would result in ``eof`` being
+            ``True``. Alternatively, the end of the input could be inferred
+            by comparing ``bytes_received`` with the expected length of the
+            input.
+        """
+        # subclasses may override this method; either the given chunk or an
+        # alternative chunk value should be returned
+        return chunk
+
+    def read(self, size=None, *args, **kwargs):
         """
         Pass read request to the underlying file-like object and
         add bytes read to total.
+
+        :param size: (optional) maximum number of bytes to read; the default
+            ``None`` means unlimited.
         """
         try:
-            chunk = self.wsgi_input.read(*args, **kwargs)
+            chunk = self.wsgi_input.read(size, *args, **kwargs)
         except Exception:
             self.env['swift.proxy_logging_status'] = 499
             self.client_disconnect = True
             raise
         self.bytes_received += len(chunk)
-        return chunk
+        eof = size is None or size < 0 or len(chunk) < size
+        return self.chunk_update(chunk, eof)
 
-    def readline(self, *args, **kwargs):
+    def readline(self, size=None, *args, **kwargs):
         """
         Pass readline request to the underlying file-like object and
         add bytes read to total.
+
+        :param size: (optional) maximum number of bytes to read from the
+            current line; the default ``None`` means unlimited.
         """
         try:
-            line = self.wsgi_input.readline(*args, **kwargs)
+            line = self.wsgi_input.readline(size, *args, **kwargs)
         except Exception:
             self.env['swift.proxy_logging_status'] = 499
             self.client_disconnect = True
             raise
         self.bytes_received += len(line)
-        return line
+        eof = ((size is None or size < 0 or len(line) < size)
+               and (line[-1:] != b'\n'))
+        return self.chunk_update(line, eof)
+
+    def close(self):
+        close_if_possible(self.wsgi_input)
 
 
 class LRUCache(object):
@@ -3019,6 +3090,11 @@ _rfc_extension_pattern = re.compile(
     r'(?:\s*;\s*(' + _rfc_token + r")\s*(?:=\s*(" + _rfc_token +
     r'|"(?:[^"\\]|\\.)*"))?)')
 
+_loose_token = r'[^()<>@,;:\"\[\]?={}\x00-\x20\x7f]+'  # nosec B105
+_loose_extension_pattern = re.compile(
+    r'(?:\s*;\s*(' + _loose_token + r")\s*(?:=\s*(" + _loose_token +
+    r'|"(?:[^"\\]|\\.)*"))?)')
+
 _content_range_pattern = re.compile(r'^bytes (\d+)-(\d+)/(\d+)$')
 
 
@@ -3040,7 +3116,7 @@ def parse_content_range(content_range):
     return tuple(int(x) for x in found.groups())
 
 
-def parse_content_type(content_type):
+def parse_content_type(content_type, strict=True):
     """
     Parse a content-type and its parameters into values.
     RFC 2616 sec 14.17 and 3.7 are pertinent.
@@ -3052,17 +3128,46 @@ def parse_content_type(content_type):
             ('text/plain', [('charset, 'UTF-8'), ('level', '1')])
 
     :param content_type: content_type to parse
+    :param strict: ignore ``/`` and any following characters in parameter
+        tokens. If ``strict`` is True a parameter such as ``x=a/b`` will be
+        parsed as ``x=a``. If ``strict`` is False a parameter such as ``x=a/b``
+        will be parsed as ``x=a/b``. The default is True.
     :returns: a tuple containing (content type, list of k, v parameter tuples)
     """
     parm_list = []
     if ';' in content_type:
         content_type, parms = content_type.split(';', 1)
         parms = ';' + parms
-        for m in _rfc_extension_pattern.findall(parms):
+        pat = _rfc_extension_pattern if strict else _loose_extension_pattern
+        for m in pat.findall(parms):
             key = m[0].strip()
             value = m[1].strip()
             parm_list.append((key, value))
     return content_type, parm_list
+
+
+def parse_header(value):
+    """
+    Parse a header value to extract the first part and a dict of any
+    following parameters.
+
+    The ``value`` to parse should be of the form:
+
+        ``<first part>[;<key>=<value>][; <key>=<value>]...``
+
+    ``<first part>`` should be of the form ``<token>[/<token>]``, ``<key>``
+    should be a ``token``, and ``<value>`` should be either a ``token`` or
+    ``quoted-string``, where ``token`` and ``quoted-string`` are defined by RFC
+    2616 section 2.2.
+
+    :param value: the header value to parse.
+    :return: a tuple (first part, dict(params)).
+    """
+    # note: this does not behave *exactly* like cgi.parse_header (which this
+    # replaces) w.r.t. parsing non-token characters in param values (e.g. the
+    # null character) , but it's sufficient for our use cases.
+    token, params = parse_content_type(value, strict=False)
+    return token, dict(params)
 
 
 def extract_swift_bytes(content_type):
@@ -4726,7 +4831,7 @@ def safe_json_loads(value):
     return None
 
 
-def strict_b64decode(value, allow_line_breaks=False):
+def strict_b64decode(value, allow_line_breaks=False, exact_size=None):
     '''
     Validate and decode Base64-encoded data.
 
@@ -4735,6 +4840,8 @@ def strict_b64decode(value, allow_line_breaks=False):
 
     :param value: some base64-encoded data
     :param allow_line_breaks: if True, ignore carriage returns and newlines
+    :param exact_size: if provided, the exact size of the decoded bytes
+        expected; also enforces round-trip checks
     :returns: the decoded data
     :raises ValueError: if ``value`` is not a string, contains invalid
                         characters, or has insufficient padding
@@ -4755,7 +4862,17 @@ def strict_b64decode(value, allow_line_breaks=False):
         strip_chars += '\r\n'
     if any(c not in valid_chars for c in value.strip(strip_chars)):
         raise ValueError
-    return base64.b64decode(value)
+    ret_val = base64.b64decode(value)
+    if exact_size is not None:
+        if len(ret_val) != exact_size:
+            raise ValueError
+        if base64_str(ret_val) != value:
+            raise ValueError
+    return ret_val
+
+
+def base64_str(value):
+    return base64.b64encode(value).decode('ascii')
 
 
 def cap_length(value, max_length):
@@ -5336,5 +5453,7 @@ def get_ppid(pid):
         return int(stats[3])
     except IOError as e:
         if e.errno == errno.ENOENT:
+            if not os.path.exists('/proc/'):
+                raise RuntimeError('get_ppid can only be used on Linux')
             raise OSError(errno.ESRCH, 'No such process')
         raise

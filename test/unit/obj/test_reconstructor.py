@@ -16,7 +16,7 @@ import itertools
 import json
 import unittest
 import os
-import mock
+from unittest import mock
 import pickle
 import tempfile
 import time
@@ -41,7 +41,6 @@ from swift.common import ring
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          POLICIES, EC_POLICY)
 from swift.obj.reconstructor import SYNC, REVERT
-from test import annotate_failure
 
 from test.debug_logger import debug_logger
 from test.unit import (patch_policies, mocked_http_conn, FabricatedRing,
@@ -906,6 +905,44 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                             (object_reconstructor.SYNC,
                              object_reconstructor.REVERT))
             self.assert_expected_jobs(part_info['partition'], jobs)
+
+    def test_do_listdir(self):
+        part_path = os.path.join(self.testdir, 'node/sda1/objects-1/1')
+        part_info = {
+            'local_dev': self.policy.object_ring.devs[1],
+            'policy': self.policy,
+            'partition': 1,
+            'part_path': part_path,
+        }
+        self.reconstructor._reset_stats()
+        jobs = self.reconstructor.build_reconstruction_jobs(part_info)
+
+        def collect_suffix(jobs):
+            found_suffix = set()
+            for job in jobs:
+                found_suffix.update(job['hashes'].keys())
+            return found_suffix
+        self.assertEqual({'061', '3c1'}, collect_suffix(jobs))
+
+        # make a new suffix dir and put a "tombstone" in it
+        hash_dir = os.path.join(
+            part_path, 'ce1/73eb4933fe8101d2f26fb6f4d0933ce1/')
+        os.makedirs(hash_dir)
+        now = utils.Timestamp(time.time())
+        with open(os.path.join(hash_dir, '%s.ts' % now.internal), 'w'):
+            pass
+
+        # disable do_listdir
+        self.reconstructor.part_listdir_percent = 0
+        jobs = self.reconstructor.build_reconstruction_jobs(part_info)
+        # the new suffix is not found
+        self.assertEqual({'061', '3c1'}, collect_suffix(jobs))
+
+        # force do_listdir
+        self.reconstructor.part_listdir_percent = 100
+        jobs = self.reconstructor.build_reconstruction_jobs(part_info)
+        # the new suffix is  found
+        self.assertEqual({'061', '3c1', 'ce1'}, collect_suffix(jobs))
 
     def test_handoffs_only(self):
         self.reconstructor.handoffs_only = True
@@ -2459,6 +2496,48 @@ class TestWorkerReconstructor(unittest.TestCase):
         kwargs = {'devices': 'sdz'}
         do_test(kwargs, ['sdz'], [])
 
+    def test_run_forever_increments_cycle(self):
+        now = time.time()
+        cycles = 5
+
+        def fake_time():
+            nonlocal now
+            while True:
+                yield now
+                now += 300
+
+        class StopForever(Exception):
+            pass
+
+        def fake_sleep():
+            for i in range(cycles):
+                yield None
+            raise StopForever()
+
+        reconstructor = object_reconstructor.ObjectReconstructor({
+            'reconstructor_workers': 2,
+            'recon_cache_path': self.recon_cache_path
+        }, logger=self.logger)
+        reconstructor.get_local_devices = lambda: ['sda', 'sdb', 'sdc', 'sdd']
+        reconstructor.reconstruct = mock.MagicMock()
+        worker_args = list(
+            # include 'devices' kwarg as a sanity check - it should be ignored
+            # in run_forever mode
+            reconstructor.get_worker_args(once=False, devices='sda'))
+
+        self.assertEqual(0, reconstructor.process_cycle)
+        with mock.patch('swift.obj.reconstructor.time.time',
+                        side_effect=fake_time()), \
+                mock.patch('swift.obj.reconstructor.os.getpid',
+                           return_value='pid-1'), \
+                mock.patch('swift.obj.reconstructor.sleep',
+                           side_effect=fake_sleep()), \
+                Timeout(.3), quiet_eventlet_exceptions(), \
+                self.assertRaises(StopForever):
+            gt = spawn(reconstructor.run_forever, **worker_args[0])
+            gt.wait()
+        self.assertEqual(cycles, reconstructor.process_cycle)
+
     def test_run_forever_recon_aggregation(self):
 
         class StopForever(Exception):
@@ -3690,6 +3769,35 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
                     expected_paths, found_paths, kwargs)
                 self.assertEqual(expected_paths, found_paths, msg)
 
+    def test_build_jobs_will_do_listdir(self):
+        part_path = os.path.join(self.devices, self.local_dev['device'],
+                                 diskfile.get_data_dir(self.policy), '0')
+        utils.mkdirs(part_path)
+        part_info = {
+            'local_dev': self.local_dev,
+            'policy': self.policy,
+            'partition': 0,
+            'part_path': part_path,
+        }
+
+        expected = [
+            (10, 10),
+            (1, 100),
+            (.1, 1000),
+        ]
+
+        for pct, cycles in expected:
+            self.reconstructor.part_listdir_percent = pct
+            with mock.patch.object(self.reconstructor._df_router[self.policy],
+                                   '_get_hashes') as mock_get_hashes:
+                mock_get_hashes.return_value = (0, {})
+                for i in range(cycles):
+                    self.reconstructor.build_reconstruction_jobs(part_info)
+                    self.reconstructor.process_cycle += 1
+            self.assertEqual(1, sum(
+                call[1]['do_listdir']
+                for call in mock_get_hashes.call_args_list))
+
     def test_build_jobs_creates_empty_hashes(self):
         part_path = os.path.join(self.devices, self.local_dev['device'],
                                  diskfile.get_data_dir(self.policy), '0')
@@ -3731,7 +3839,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         }
         stub_hashes = {}
         with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                        return_value=(None, stub_hashes)):
+                        return_value=(0, stub_hashes)):
             jobs = self.reconstructor.build_reconstruction_jobs(part_info)
         self.assertEqual(1, len(jobs))
         job = jobs[0]
@@ -3774,7 +3882,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             'abc': {frag_index: 'hash', None: 'hash'},
         }
         with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                        return_value=(None, stub_hashes)):
+                        return_value=(0, stub_hashes)):
             jobs = self.reconstructor.build_reconstruction_jobs(part_info)
         self.assertEqual(1, len(jobs))
         job = jobs[0]
@@ -3819,7 +3927,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             'abc': {None: 'hash'},
         }
         with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                        return_value=(None, stub_hashes)):
+                        return_value=(0, stub_hashes)):
             jobs = self.reconstructor.build_reconstruction_jobs(part_info)
         self.assertEqual(1, len(jobs), 'Expected only one job, got %r' % jobs)
         job = jobs[0]
@@ -3876,7 +3984,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             'abc': {None: 'hash'},
         }
         with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                        return_value=(None, stub_hashes)):
+                        return_value=(0, stub_hashes)):
             jobs = self.reconstructor.build_reconstruction_jobs(part_info)
         self.assertEqual(2, len(jobs))
         sync_jobs, revert_jobs = [], []
@@ -3933,7 +4041,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             'abc': {None: 'hash'},
         }
         with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                        return_value=(None, stub_hashes)):
+                        return_value=(0, stub_hashes)):
             jobs = self.reconstructor.build_reconstruction_jobs(part_info)
         self.assertEqual(len(jobs), 1, 'Expected only one job, got %r' % jobs)
         job = jobs[0]
@@ -4015,7 +4123,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         }
         remote_response = pickle.dumps(remote_hashes)
         with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                        return_value=(None, local_hashes)), \
+                        return_value=(0, local_hashes)), \
                 mocked_http_conn(200, body=remote_response) as request_log:
             suffixes, new_node = self.reconstructor._get_suffixes_to_sync(
                 job, node)
@@ -4112,7 +4220,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
         with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes)), \
+                           return_value=(0, stub_hashes)), \
                 mocked_http_conn(*codes, body_iter=body_iter) as request_log:
             self.reconstructor.process_job(job)
 
@@ -4166,7 +4274,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         ssync_calls = []
         with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes)), \
+                           return_value=(0, stub_hashes)), \
                 mocked_http_conn(*codes, body_iter=body_iter) as request_log:
             self.reconstructor.process_job(job)
 
@@ -4266,7 +4374,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         with mock.patch('swift.obj.ssync_sender.SsyncBufferedHTTPConnection',
                         return_value=ssync_conn), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes)), \
+                           return_value=(0, stub_hashes)), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager.yield_hashes',
                            return_value=iter([])), \
                 mocked_http_conn(*codes, body_iter=body_iter):
@@ -4335,7 +4443,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         ssync_calls = []
         with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes)), \
+                           return_value=(0, stub_hashes)), \
                 mocked_http_conn(*codes, body_iter=body_iter) as request_log:
             self.reconstructor.process_job(job)
 
@@ -4407,7 +4515,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
         with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes)), \
+                           return_value=(0, stub_hashes)), \
                 mocked_http_conn(*codes, body_iter=body_iter) as request_log:
             self.reconstructor.process_job(job)
 
@@ -4477,7 +4585,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         with mock_ssync_sender(ssync_calls,
                                response_callback=ssync_response_callback), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes)), \
+                           return_value=(0, stub_hashes)), \
                 mocked_http_conn(*[200] * len(expected_suffix_calls),
                                  body=pickle.dumps({})) as request_log:
             self.reconstructor.process_job(job)
@@ -4538,7 +4646,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         ssync_calls = []
         with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes)), \
+                           return_value=(0, stub_hashes)), \
                 mocked_http_conn(*codes) as request_log:
             self.reconstructor.process_job(job)
 
@@ -4598,7 +4706,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         ssync_calls = []
         with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes)), \
+                           return_value=(0, stub_hashes)), \
                 mocked_http_conn(*codes, body_iter=body_iter) as request_log:
             self.reconstructor.process_job(job)
         # increment frag_index since we're rebuilding to our right
@@ -4656,7 +4764,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         ssync_calls = []
         with mock_ssync_sender(ssync_calls), \
                 mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
-                           return_value=(None, stub_hashes)):
+                           return_value=(0, stub_hashes)):
             self.reconstructor.process_job(job)
 
         self.assertEqual(
@@ -5488,7 +5596,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                                    2 * ring.replicas,
                                    3 * ring.replicas,
                                    99 * ring.replicas):
-            with annotate_failure(request_node_count):
+            with self.subTest(request_node_count=request_node_count):
                 self.logger.clear()
                 self.reconstructor.request_node_count = \
                     lambda replicas: request_node_count
@@ -5957,7 +6065,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         self.assertEqual(2, reconstructor.quarantine_threshold)
 
         for bad in ('1.1', '-1', -1, 'auto', 'bad'):
-            with annotate_failure(bad):
+            with self.subTest(option=bad):
                 with self.assertRaises(ValueError):
                     object_reconstructor.ObjectReconstructor(
                         {'quarantine_threshold': bad})
@@ -5988,7 +6096,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         self.assertEqual(2, reconstructor.quarantine_age)
 
         for bad in ('1.1', 'auto', 'bad'):
-            with annotate_failure(bad):
+            with self.subTest(option=bad):
                 with self.assertRaises(ValueError):
                     object_reconstructor.ObjectReconstructor(
                         {'quarantine_age': bad})
@@ -6015,7 +6123,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
 
         for bad in ('1.1', 1.1, 'auto', 'bad',
                     '2.5 * replicas', 'two * replicas'):
-            with annotate_failure(bad):
+            with self.subTest(option=bad):
                 with self.assertRaises(ValueError):
                     object_reconstructor.ObjectReconstructor(
                         {'request_node_count': bad})
@@ -6261,8 +6369,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                                    - num_frags - 1)
                 other_responses = [(404, None, None)] * (num_other_resps - 1)
                 other_responses.append((bad_status, None, None))
-                with annotate_failure(
-                        'request_node_count=%d' % request_node_count):
+                with self.subTest(request_node_count=request_node_count):
                     exc = self._do_test_reconstruct_insufficient_frags(
                         {'quarantine_threshold': 1,
                          'reclaim_age': 0,
