@@ -407,12 +407,29 @@ def read_hashes(partition_dir):
 
 
 def should_part_listdir(seed, cycle, part, pct):
+    """
+    Helper used by replicator/reconstructor to perform intermittent part
+    listdir sanity checks to update suffixes in the hashes pickle.  Every cycle
+    we want to listdir on some configured pct of parts and given enough cycles
+    we want to listdir every part.
+
+    :param seed: float, random.random() will do fine
+    :param cycle: int, counter of how many times you've looped in run_forever
+    :param part: the partition number (often from listdir, so it might be digit as a str)
+    :param pct: float, zero or positive value; larger values more likely to
+                return True
+
+    :returns: boolean, should part do_listdir?
+    """
     if pct <= 0:
         # bold choice, but ok
         return False
-    index = int(seed * 10_000 + cycle + int(part)) % 10_000
-    steps = max(1, int(1 / pct * 100))
-    return index % steps == 0
+    elif pct >= 100:
+        return True
+    else:
+        index = int(seed * 10_000 + cycle + int(part)) % 10_000
+        steps = int(1 / pct * 100)
+        return index % steps == 0
 
 
 def write_hashes(partition_dir, hashes):

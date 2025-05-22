@@ -237,12 +237,11 @@ class TestProxyLogging(unittest.TestCase):
         self.assertEqual(sorted(got_metrics_values_and_kwargs),
                          sorted(exp_metrics_values_and_kwargs))
         self.assertIs(self.logger, app.access_logger)
-        for metric, value, kwargs in exp_metrics_values_and_kwargs:
-            if not metric.startswith('swift_'):
-                self.assertIn(
-                    (('proxy-server.%s:%s|c' % (metric, value)).encode(),
-                     ('host', 8125)),
-                    app.access_logger.statsd_client.sendto_calls)
+        for metric, value in exp_metrics_and_values:
+            self.assertIn(
+                (('proxy-server.%s:%s|c' % (metric, value)).encode(),
+                 ('host', 8125)),
+                app.access_logger.statsd_client.sendto_calls)
 
     def assertLabeledTimingStats(self, exp_metrics_values_labels):
         statsd_calls = self.statsd.calls['timing']

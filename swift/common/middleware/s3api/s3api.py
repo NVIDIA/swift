@@ -345,15 +345,6 @@ class S3ApiMiddleware(object):
         self.check_pipeline(wsgi_conf)
         checksum.log_selected_implementation(self.logger)
 
-        if self.conf.use_async_delete and (self.conf.s3_acl or
-                                           self.conf.allow_multipart_uploads):
-            self.conf.use_async_delete = False
-            self.logger.warning(
-                'use_async_delete is not compatible with s3_acl or '
-                'allow_multipart_uploads; it has been disabled')
-            # Alternatively, have the proxy refuse to start.
-            # We default the async to false; operator opted into it...
-
     def is_s3_cors_preflight(self, env):
         if env['REQUEST_METHOD'] != 'OPTIONS' or not env.get('HTTP_ORIGIN'):
             # Not a CORS preflight

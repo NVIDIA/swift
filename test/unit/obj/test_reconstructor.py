@@ -3795,7 +3795,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
                     self.reconstructor.build_reconstruction_jobs(part_info)
                     self.reconstructor.process_cycle += 1
             self.assertEqual(1, sum(
-                call[1]['do_listdir']
+                call.kwargs['do_listdir']
                 for call in mock_get_hashes.call_args_list))
 
     def test_build_jobs_creates_empty_hashes(self):
