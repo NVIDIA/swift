@@ -1642,7 +1642,12 @@ class CooperativeCachePopulator(object):
         """
         if not self._num_tokens:
             # Cooperative token disabled, fetch from backend.
-            return self._query_backend_and_set_cache()
+            data = self._query_backend_and_set_cache()
+            self._logger.increment(
+                'token.%s.backend_reqs.token_disabled.%d' %
+                (self._op_type, self.backend_resp.status_int)
+            )
+            return data
 
         total_requests = 0
         try:

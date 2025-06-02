@@ -15,6 +15,7 @@
 
 import array
 import collections
+import dataclasses
 import io
 import json
 import os.path
@@ -170,9 +171,8 @@ class TestRoundTrip(unittest.TestCase):
         self.assertEqual(list(reader.index), [
             'foo', 'bar', 'baz', 'quux', 'swift/index'])
         self.assertEqual({
-            k: (uncomp_start, uncomp_end, algo)
-            for k, (_, uncomp_start, _, uncomp_end, algo, _)
-            in reader.index.items()
+            k: (v.uncompressed_start, v.uncompressed_end, v.checksum_method)
+            for k, v in reader.index.items()
         }, {
             'foo': (6, 40974, 'sha256'),
             'bar': (40974, 81942, 'sha256'),
@@ -242,8 +242,10 @@ class TestRoundTrip(unittest.TestCase):
             'c51d6703d54cd7cf57b4d4b7ecfcca60'
             '56dbd41ebf1c1e83c0e8e48baeff629a',
             reader.index['foo'].checksum_value)
-        reader.index['foo'] = IndexEntry(*(
-            reader.index['foo'][:-1] + ('not-the-sha',)))
+        reader.index['foo'] = dataclasses.replace(
+            writer.index['foo'],
+            checksum_value='not-the-sha',
+        )
         read_bytes = b''
         with self.assertRaises(ValueError) as caught:
             with reader.open_section('foo') as s:
@@ -258,8 +260,11 @@ class TestRoundTrip(unittest.TestCase):
             writer.write_magic(2)
             with writer.section('foo'):
                 writer.write_blob(b'\xde\xad\xbe\xef')
-            writer.index['foo'] = IndexEntry(*(
-                writer.index['foo'][:-2] + ('not_a_digest', 'do not care')))
+            writer.index['foo'] = dataclasses.replace(
+                writer.index['foo'],
+                checksum_method='not_a_digest',
+                checksum_value='do not care',
+            )
 
         buf.seek(0)
         reader = RingReader(buf)

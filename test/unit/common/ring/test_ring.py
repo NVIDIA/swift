@@ -31,6 +31,7 @@ import copy
 from unittest import mock
 import zlib
 
+from swift.common.exceptions import DevIdBytesTooSmall
 from swift.common import ring, utils
 from swift.common.ring import io, utils as ring_utils
 from swift.common.ring.ring import RING_CODECS
@@ -475,6 +476,22 @@ class TestRingData(unittest.TestCase):
         self.assertEqual("format_version must be one of (0, 1, 2)",
                          str(err.exception))
         # re-serialisation is already handled in test_load.
+
+    def test_save_bad_dev_id_bytes(self):
+        ring_fname = os.path.join(self.testdir, 'foo.ring.gz')
+        rd = ring.RingData(
+            [array.array('I', [0, 1, 0, 1]), array.array('I', [0, 1, 0, 1])],
+            [{'id': 0, 'zone': 0, 'ip': '10.1.1.0', 'port': 7000},
+             {'id': 1, 'zone': 1, 'ip': '10.1.1.1', 'port': 7000}],
+            30)
+
+        # v2 ring can handle wide devices fine
+        rd.save(ring_fname, format_version=2)
+        # for that matter, so can v0 (!)
+        rd.save(ring_fname, format_version=0)
+        # but not v1! Only 2-byte dev ids there!
+        with self.assertRaises(DevIdBytesTooSmall):
+            rd.save(ring_fname, format_version=1)
 
 
 class TestRing(TestRingBase):

@@ -15,6 +15,7 @@
 
 import collections
 import contextlib
+import dataclasses
 import gzip
 import hashlib
 import json
@@ -23,6 +24,7 @@ import os
 import string
 import struct
 import tempfile
+from typing import Optional
 import zlib
 
 from swift.common.ring.utils import BYTES_TO_TYPE_CODE, network_order_array, \
@@ -232,16 +234,17 @@ class SectionReader(object):
         self.close()
 
 
-class IndexEntry(collections.namedtuple('IndexEntry', [
-    'compressed_start',
-    'uncompressed_start',
-    'compressed_end',
-    'uncompressed_end',
-    'checksum_method',
-    'checksum_value',
-])):
+@dataclasses.dataclass(frozen=True)
+class IndexEntry:
+    compressed_start: int
+    uncompressed_start: int
+    compressed_end: Optional[int] = None
+    uncompressed_end: Optional[int] = None
+    checksum_method: Optional[str] = None
+    checksum_value: Optional[str] = None
+
     @property
-    def uncompressed_length(self):
+    def uncompressed_length(self) -> Optional[int]:
         if self.uncompressed_end is None:
             return None
         return self.uncompressed_end - self.uncompressed_start
@@ -300,7 +303,7 @@ class RingReader(GzipReader):
         self.index = collections.OrderedDict(sorted(
             ((section, IndexEntry(*entry))
              for section, entry in json.loads(self.read_blob()).items()),
-            key=lambda x: x[1]))
+            key=lambda x: x[1].compressed_start))
 
     def __contains__(self, section):
         if self.version != 2:
@@ -523,17 +526,18 @@ class RingWriter(GzipWriter):
             raise ValueError('Cannot write duplicate section: %s' % name)
         self.flush()
         self.current_section = name
-        self.index[name] = IndexEntry(
-            self.tell(), self.pos, None, None, None, None)
+        self.index[name] = IndexEntry(self.tell(), self.pos)
         self.checksum = getattr(hashlib, self.checksum_method)()
         try:
             yield self
             self.flush()
-            self.index[name] = IndexEntry(
-                self.index[name].compressed_start,
-                self.index[name].uncompressed_start,
-                self.tell(), self.pos,
-                self.checksum_method, self.checksum.hexdigest())
+            self.index[name] = dataclasses.replace(
+                self.index[name],
+                compressed_end=self.tell(),
+                uncompressed_end=self.pos,
+                checksum_method=self.checksum_method,
+                checksum_value=self.checksum.hexdigest(),
+            )
         finally:
             self.flush()
             self.checksum = None
@@ -617,9 +621,12 @@ class RingWriter(GzipWriter):
         automatically when using the writer as a context manager.
         """
         with self.section('swift/index'):
-            self.write_json(self.index)
+            self.write_json({
+                k: dataclasses.astuple(v)
+                for k, v in self.index.items()
+            })
         # switch to uncompressed
         self._set_compression_level(0)
         # ... which allows us to know that this will be exactly 18 bytes
-        self.write_size(self.index['swift/index'][0])
+        self.write_size(self.index['swift/index'].compressed_start)
         self.flush()

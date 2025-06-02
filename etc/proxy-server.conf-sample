@@ -221,7 +221,7 @@ use = egg:swift#proxy
 #
 # The average time spent on getting updating namespaces from the container
 # servers, this will be used as basic unit for cooperative token to figure out
-# intervals for the retries when requests didn't acquired a token and are
+# intervals for the retries when requests didn't acquire a token and are
 # waiting for other requests to fill in the cache; and a cooperative token
 # session (`token_ttl`) will be 10 times of this value.
 # namespace_avg_backend_fetch_time = 0.3

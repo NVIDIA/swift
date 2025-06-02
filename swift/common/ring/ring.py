@@ -25,7 +25,7 @@ import os
 from itertools import chain, count
 import sys
 
-from swift.common.exceptions import RingLoadError
+from swift.common.exceptions import RingLoadError, DevIdBytesTooSmall
 from swift.common.utils import hash_path, validate_configuration, md5
 from swift.common.ring.io import RingReader, RingWriter
 from swift.common.ring.utils import tiers_for_dev
@@ -244,6 +244,8 @@ class RingData(object):
         return ring
 
     def serialize_v1(self, writer):
+        if self.dev_id_bytes != 2:
+            raise DevIdBytesTooSmall('Ring v1 only supports 2-byte dev IDs')
         # Write out new-style serialization magic and version:
         writer.write_magic(version=1)
         ring = self.to_dict()

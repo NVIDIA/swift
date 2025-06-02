@@ -30,7 +30,7 @@ import time
 from swift.cli import ringbuilder
 from swift.cli.ringbuilder import EXIT_SUCCESS, EXIT_WARNING, EXIT_ERROR
 from swift.common import exceptions
-from swift.common.ring import RingBuilder, Ring
+from swift.common.ring import RingBuilder, Ring, RingData
 from swift.common.ring.io import RingReader
 from swift.common.ring.composite_builder import CompositeRingBuilder
 
@@ -2583,13 +2583,23 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
             ring = Ring("%s.ring.gz" % self.tmpfile)
             self.assertEqual(int(dev_id_bytes), ring.dev_id_bytes)
 
-        # --dev-id-bytes doesn't work on format_version 1. or at least has
-        # no effect
+        # --dev-id-bytes 2 is default on format_version 1
+        argv = ["", self.tmpfile, "write_ring", "--format-version",
+                "1", "--dev-id-bytes", "2"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        rd = RingData.load("%s.ring.gz" % self.tmpfile)
+        self.assertEqual(1, rd.format_version)
+        self.assertEqual(2, rd.dev_id_bytes)
+        self.assertEqual(5, rd.version)
+        # --dev-id-bytes 4 doesn't work on format_version 1
         argv = ["", self.tmpfile, "write_ring", "--format-version",
                 "1", "--dev-id-bytes", "4"]
-        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
-        ring = Ring("%s.ring.gz" % self.tmpfile)
-        self.assertEqual(2, ring.dev_id_bytes)
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+        # ... and has no effect
+        rd = RingData.load("%s.ring.gz" % self.tmpfile)
+        self.assertEqual(1, rd.format_version)
+        self.assertEqual(2, rd.dev_id_bytes)
+        self.assertEqual(5, rd.version)
 
         # invalid dev-id-bytes don't work
         for dev_id_bytes in "1", "8", 'banana':

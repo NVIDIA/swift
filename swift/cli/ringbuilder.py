@@ -34,7 +34,6 @@ from swift.common import exceptions
 from swift.common.ring import RingBuilder, Ring, RingData
 from swift.common.ring.builder import MAX_BALANCE
 from swift.common.ring.composite_builder import CompositeRingBuilder
-from swift.common.ring.io import RingReader
 from swift.common.ring.ring import RING_CODECS, DEFAULT_RING_FORMAT_VERSION
 from swift.common.ring.utils import validate_args, \
     validate_and_normalize_ip, build_dev_from_opts, \
@@ -673,23 +672,13 @@ swift-ring-builder <ring_file> version
             print(Commands.create.__doc__.strip())
             exit(EXIT_ERROR)
         try:
-            reader = RingReader(open(argv[1], 'br'))
-            serialization_version = reader.version
-            deserialize = (RingData.deserialize_v1
-                           if serialization_version == 1 else
-                           RingData.deserialize_v2)
-            ring = deserialize(reader, metadata_only=True)
-            version = ring['version']
-            dev_id_bytes = ring['dev_id_bytes']
+            rd = RingData.load(argv[1], metadata_only=True)
         except ValueError as e:
             print(e)
             exit(EXIT_ERROR)
-        finally:
-            if reader:
-                reader.close()
         print('%s: Serialization version: %d (%d-byte IDs), '
               'build version: %d' %
-              (argv[1], serialization_version, dev_id_bytes, version))
+              (argv[1], rd.format_version, rd.dev_id_bytes, rd.version))
         exit(EXIT_SUCCESS)
 
     @staticmethod
@@ -1366,20 +1355,25 @@ swift-ring-builder <builder_file> write_ring
             print('Unable to write empty ring.')
             exit(EXIT_ERROR)
 
-        if options.dev_id_bytes:
-            builder.set_dev_id_bytes(int(options.dev_id_bytes))
+        try:
+            if options.dev_id_bytes:
+                builder.set_dev_id_bytes(int(options.dev_id_bytes))
 
-        ring_data = builder.get_ring()
-        if not ring_data._replica2part2dev_id:
-            if ring_data.devs:
-                print('WARNING: Writing a ring with no partition '
-                      'assignments but with devices; did you forget to run '
-                      '"rebalance"?', file=sys.stderr)
-        ring_data.save(
-            pathjoin(backup_dir, '%d.' % time() + basename(ring_file)),
-            format_version=options.format_version)
-        ring_data.save(ring_file, format_version=options.format_version)
-        exit(EXIT_SUCCESS)
+            ring_data = builder.get_ring()
+            if not ring_data._replica2part2dev_id:
+                if ring_data.devs:
+                    print('WARNING: Writing a ring with no partition '
+                          'assignments but with devices; did you forget '
+                          'to run "rebalance"?', file=sys.stderr)
+            ring_data.save(
+                pathjoin(backup_dir, '%d.' % time() + basename(ring_file)),
+                format_version=options.format_version)
+            ring_data.save(ring_file, format_version=options.format_version)
+        except ValueError as e:
+            print(e)
+            exit(EXIT_ERROR)
+        else:
+            exit(EXIT_SUCCESS)
 
     @staticmethod
     def write_builder():

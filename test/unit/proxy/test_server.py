@@ -4480,13 +4480,15 @@ class TestReplicatedObjectController(
 
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.statsd_client.get_stats_counts()
-            self.assertEqual({'account.info.cache.miss.200': 1,
-                              'account.info.infocache.hit': 2,
-                              'container.info.cache.miss.200': 1,
-                              'container.info.infocache.hit': 1,
-                              'object.shard_updating.cache.miss.200': 1,
-                              'object.shard_updating.cache.set.200': 1},
-                             stats)
+            self.assertEqual(stats, {
+                'account.info.cache.miss.200': 1,
+                'account.info.infocache.hit': 2,
+                'container.info.cache.miss.200': 1,
+                'container.info.infocache.hit': 1,
+                'token.shard_updating.backend_reqs.token_disabled.200': 1,
+                'object.shard_updating.cache.miss.200': 1,
+                'object.shard_updating.cache.set.200': 1
+            })
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
             info_lines = self.logger.get_lines_for_level('info')
             self.assertIn(
@@ -4852,16 +4854,18 @@ class TestReplicatedObjectController(
             self.assertEqual(resp.status_int, 202)
 
             stats = self.app.logger.statsd_client.get_stats_counts()
-            self.assertEqual({'account.info.cache.miss.200': 1,
-                              'account.info.infocache.hit': 1,
-                              'container.info.cache.miss.200': 1,
-                              'container.info.infocache.hit': 2,
-                              'object.shard_updating.cache.hit': 1,
-                              'container.info.cache.hit': 1,
-                              'account.info.cache.hit': 1,
-                              'object.shard_updating.cache.skip.200': 1,
-                              'object.shard_updating.cache.set.200': 1},
-                             stats)
+            self.assertEqual(stats, {
+                'account.info.cache.miss.200': 1,
+                'account.info.infocache.hit': 1,
+                'container.info.cache.miss.200': 1,
+                'container.info.infocache.hit': 2,
+                'object.shard_updating.cache.hit': 1,
+                'container.info.cache.hit': 1,
+                'account.info.cache.hit': 1,
+                'token.shard_updating.backend_reqs.token_disabled.200': 1,
+                'object.shard_updating.cache.skip.200': 1,
+                'object.shard_updating.cache.set.200': 1
+            })
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
@@ -4928,6 +4932,7 @@ class TestReplicatedObjectController(
                 'container.info.cache.hit': 2,
                 'container.info.cache.miss.200': 1,
                 'container.info.infocache.hit': 3,
+                'token.shard_updating.backend_reqs.token_disabled.200': 2,
                 'object.shard_updating.cache.skip.200': 1,
                 'object.shard_updating.cache.hit': 1,
                 'object.shard_updating.cache.error.200': 1,
@@ -4988,13 +4993,15 @@ class TestReplicatedObjectController(
             self.assertEqual(resp.status_int, 202)
 
             stats = self.app.logger.statsd_client.get_stats_counts()
-            self.assertEqual({'account.info.cache.miss.200': 1,
-                              'account.info.infocache.hit': 2,
-                              'container.info.cache.miss.200': 1,
-                              'container.info.infocache.hit': 1,
-                              'object.shard_updating.cache.skip.200': 1,
-                              'object.shard_updating.cache.set_error.200': 1},
-                             stats)
+            self.assertEqual(stats, {
+                'account.info.cache.miss.200': 1,
+                'account.info.infocache.hit': 2,
+                'container.info.cache.miss.200': 1,
+                'container.info.infocache.hit': 1,
+                'token.shard_updating.backend_reqs.token_disabled.200': 1,
+                'object.shard_updating.cache.skip.200': 1,
+                'object.shard_updating.cache.set_error.200': 1
+            })
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
             # sanity check: namespaces not in cache
@@ -5300,15 +5307,16 @@ class TestReplicatedObjectController(
         token_key = "_cache_token/%s" % cache_key
 
         def do_test(method, sharding_state):
-            retries = [0]
+            retries = 0
 
             class CustomizedFakeCache(FakeMemcache):
                 def get(self, key, raise_on_error=False):
+                    nonlocal retries
                     if key != cache_key:
                         return super(CustomizedFakeCache, self).get(key)
 
-                    retries[0] += 1
-                    if retries[0] <= 2:
+                    retries += 1
+                    if retries <= 2:
                         return super(CustomizedFakeCache, self).get(
                             "NOT_EXISTED_YET")
                     else:
@@ -5349,6 +5357,7 @@ class TestReplicatedObjectController(
                                   body=body) as fake_conn:
                 resp = req.get_response(self.app)
 
+            self.assertEqual(3, retries)
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual({'account.info.cache.miss.200': 1,
@@ -5430,15 +5439,16 @@ class TestReplicatedObjectController(
         token_key = "_cache_token/%s" % cache_key
 
         def do_test(method, sharding_state):
-            retries = [0]
+            retries = 0
 
             class CustomizedFakeCache(FakeMemcache):
                 def get(self, key, raise_on_error=False):
+                    nonlocal retries
                     if key != cache_key:
                         return super(CustomizedFakeCache, self).get(key)
 
-                    retries[0] += 1
-                    if retries[0] <= 2:
+                    retries += 1
+                    if retries <= 2:
                         return super(CustomizedFakeCache, self).get(
                             "NOT_EXISTED_YET")
                     else:
@@ -5477,10 +5487,12 @@ class TestReplicatedObjectController(
 
             with mocked_http_conn(*status_codes, headers=resp_headers,
                                   body=body) as fake_conn:
-                with mock.patch('time.time', ) as mock_time:
+                with mock.patch('swift.proxy.controllers.obj.time.time', ) \
+                        as mock_time:
                     mock_time.side_effect = itertools.count(4000.99, 1.0)
                     resp = req.get_response(self.app)
 
+            self.assertEqual(3, retries)    # 2 normal and 1 forced.
             self.assertEqual(resp.status_int, 202)
             stats = self.app.logger.statsd_client.get_stats_counts()
             self.assertEqual({'account.info.cache.miss.200': 1,
@@ -5545,7 +5557,7 @@ class TestReplicatedObjectController(
     def test_get_backend_updating_shard_with_cooperative_token_timeout(self):
         # verify that the request to get updating shard from the container
         # backend works with cooperative token timeout.
-        conf = {'namespace_avg_backend_fetch_time': 0.001}
+        conf = {'namespace_avg_backend_fetch_time': 0.01}
         self.app = proxy_server.Application(
             conf,
             logger=self.logger,

@@ -3168,6 +3168,11 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             [(self.cache_key, "backend data", self.cache_ttl)]
         )
         self.assertEqual(self.memcache.del_calls, [])
+        stats = self.logger.statsd_client.get_stats_counts()
+        self.assertEqual(
+            {'token.updating_shard.backend_reqs.token_disabled.200': 1},
+            stats
+        )
 
     def test_first_request_with_token(self):
         # Test the first request will acquire the token, fetch data from
@@ -3403,7 +3408,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             self.memcache.set_calls,
             [(self.cache_key, "backend data", self.cache_ttl)]
         )
-        self.assertGreater(retries, 1)
+        self.assertEqual(retries, 3)
         self.assertEqual(
             self.memcache.get_calls, [('NOT_EXISTED_YET')] * retries)
         self.assertEqual(self.memcache.del_calls, [])
@@ -3457,9 +3462,9 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             self.memcache.set_calls,
             [(self.cache_key, "backend data", self.cache_ttl)]
         )
-        self.assertGreater(retries, 1)
+        self.assertEqual(retries, 2)
         self.assertEqual(
-            self.memcache.get_calls, [('NOT_EXISTED_YET')] * retries)
+            self.memcache.get_calls, [('NOT_EXISTED_YET')] * 2)
         self.assertEqual(self.memcache.del_calls, [])
         stats = self.logger.statsd_client.get_stats_counts()
         self.assertEqual({'token.test.lack_retries': 1,
