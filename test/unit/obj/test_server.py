@@ -63,7 +63,7 @@ from swift.common.splice import splice
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          POLICIES, EC_POLICY)
 from swift.common.exceptions import DiskFileDeviceUnavailable, \
-    DiskFileNoSpace, DiskFileQuarantined
+    DiskFileNoSpace, DiskFileQuarantined, DiskFileStateChanged
 from swift.common.wsgi import init_request_processor
 
 
@@ -5721,6 +5721,110 @@ class TestObjectController(BaseTestCase):
                                 headers={'X-Timestamp': t_delete.internal})
             resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 507)
+
+    def test_DELETE_fast_request_no_log(self):
+        # Test with a normal-speed DELETE. It shouldn't log a warning.
+        req = Request.blank('/sda1/p/a/c/o_fast',
+                            environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': '999',
+                                     'Content-Type': 'text/plain'},
+                            body=b'foo')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        req = Request.blank('/sda1/p/a/c/o_fast',
+                            environ={'REQUEST_METHOD': 'DELETE'},
+                            headers={'X-Timestamp': '1000'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 204)
+        error_lines = self.object_controller.logger.get_lines_for_level(
+            'warning')
+        self.assertEqual(len(error_lines), 0)
+
+        # Test with a slower DELETE but still fast enough to not log.
+        req = Request.blank('/sda1/p/a/c/o_slow',
+                            environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': '1001',
+                                     'Content-Type': 'text/plain'},
+                            body=b'bar')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        self.assertEqual(self.object_controller.slow_delete_log_threshold, 120)
+        now = time()
+        with mock.patch('time.time', side_effect=[now] * 5 +
+                        [now + 40.0] + [now + 50.0] + [now + 100.0] +
+                        [now + 110.0] + [now + 115.0] + [now + 119.9] * 6):
+            req = Request.blank('/sda1/p/a/c/o_slow',
+                                environ={'REQUEST_METHOD': 'DELETE'},
+                                headers={'X-Timestamp': '1002'})
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 204)
+        error_lines = self.object_controller.logger.get_lines_for_level(
+            'warning')
+        self.assertEqual(len(error_lines), 0)
+
+    def test_DELETE_slow_request_log(self):
+        # Test with a slow DELETE
+        req = Request.blank('/sda1/p/a/c/o_slow',
+                            environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': '1001',
+                                     'Content-Type': 'text/plain'},
+                            body=b'bar')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        now = time()
+        with mock.patch('time.time', side_effect=[now] * 5 +
+                        [now + 40.0] + [now + 50.0] + [now + 100.0] +
+                        [now + 110.0] + [now + 115.0] + [now + 120.1] * 6):
+            req = Request.blank('/sda1/p/a/c/o_slow',
+                                environ={'REQUEST_METHOD': 'DELETE'},
+                                headers={'X-Timestamp': '1002'})
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 204)
+        error_lines = self.object_controller.logger.get_lines_for_level(
+            'warning')
+        self.assertEqual(1, len(error_lines))
+        self.assertEqual('Slow DELETE (120.100s) for /sda1/p/a/c/o_slow, '
+                         'status 204, diskfile_acquisition=40.000s, '
+                         'metadata_read=10.000s, delete_at_update=50.000s, '
+                         'tombstone_write=15.000s, container_update=5.100s',
+                         error_lines[0])
+
+    def test_DELETE_log_slow_503(self):
+
+        def mock_read_metadata(self, current_time):
+            raise DiskFileStateChanged()
+
+        t_put = utils.Timestamp.now()
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'X-Timestamp': t_put.internal,
+                                     'Content-Length': 0,
+                                     'Content-Type': 'plain/text'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        self.assertEqual(self.object_controller.slow_delete_log_threshold, 120)
+        now = time()
+        with mock.patch('time.time', side_effect=[now] * 5 +
+                        [now + 10.0] + [now + 50.0] + [now + 120.1] * 6):
+            with mock.patch('swift.obj.diskfile.BaseDiskFile.read_metadata',
+                            mock_read_metadata):
+                t_delete = utils.Timestamp.now()
+                req = Request.blank('/sda1/p/a/c/o',
+                                    environ={'REQUEST_METHOD': 'DELETE'},
+                                    headers={'X-Timestamp': t_delete.internal})
+                resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 503)
+        error_lines = self.object_controller.logger.get_lines_for_level(
+            'warning')
+        self.assertEqual(1, len(error_lines))
+        self.assertEqual('Slow DELETE (120.100s) for /sda1/p/a/c/o, '
+                         'status 503, diskfile_acquisition=40.000s, '
+                         'metadata_read=70.100s',
+                         error_lines[0])
 
     def test_object_update_with_offset(self):
         container_updates = []
