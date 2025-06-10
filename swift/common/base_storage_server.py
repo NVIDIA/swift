@@ -17,6 +17,7 @@ import inspect
 import time
 import functools
 
+from collections import defaultdict
 from swift import __version__ as swift_version
 from swift.common.utils import public, config_true_value, \
     LOG_LINE_DEFAULT_FORMAT
@@ -24,11 +25,76 @@ from swift.common.http import is_server_error
 from swift.common.swob import Response, HTTPException
 
 
+DEFAULT_SLOW_REQUEST_THRESHOLD = 60.0
+
+
+def slow_request_logging(threshold_attr=None):
+    """
+    Returns a decorator that logs slow operations with timing breakdown. The
+    function must accept the 'timing_breakdown' parameter.
+
+    :param threshold_attr: The attribute name of the controller class that
+        contains the slow threshold for the operation; if not provided,
+        the default threshold DEFAULT_SLOW_REQUEST_THRESHOLD is used.
+    """
+    def decorating_func(func):
+        @functools.wraps(func)
+        def _slow_request_logging(ctrl, req, *args, **kwargs):
+            timing_breakdown = defaultdict(float)
+            start_time = time.time()
+
+            try:
+                resp = func(
+                    ctrl, req, *args,
+                    timing_breakdown=timing_breakdown, **kwargs
+                )
+            except HTTPException as e:
+                resp = e
+
+            total_time = time.time() - start_time
+            threshold = (getattr(ctrl, threshold_attr,
+                                 DEFAULT_SLOW_REQUEST_THRESHOLD)
+                         if threshold_attr
+                         else DEFAULT_SLOW_REQUEST_THRESHOLD)
+            if total_time > threshold:
+                timing_parts = []
+                for operation, duration in timing_breakdown.items():
+                    timing_parts.append(
+                        '%s=%.3fs' % (operation, duration))
+                ctrl.logger.warning(
+                    'Slow %s (%.3fs) for %s, status %d, %s',
+                    req.method, total_time, req.path, resp.status_int,
+                    ', '.join(timing_parts)
+                )
+
+            return resp
+        return _slow_request_logging
+    return decorating_func
+
+
+def record_slow_timing(timing_breakdown, key, timing_start):
+    """
+    Records a timing event if timing_breakdown is enabled.
+
+    :param timing_breakdown: A dictionary to store timing information, or None.
+    :param key: The key under which to store the timing information.
+    :param timing_start: The start time of the event.
+    :returns: The current time, to be used as the next timing_start.
+    """
+    if timing_breakdown is not None and \
+            isinstance(timing_breakdown, defaultdict):
+        now = time.time()
+        # Add the duration to the existing value for this key
+        timing_breakdown[key] += now - timing_start
+        return now
+    return timing_start
+
+
 def labeled_timing_stats(metric, **dec_kwargs):
     """
     Returns a decorator that emits labeled metrics timing events or errors
     for public methods in swift's wsgi server controllers, based on response
-    code.
+    code. The function must accept the 'timing_stats_labels' parameter.
 
     The controller methods are not allowed to override the following labels:
     'method', 'status'.
