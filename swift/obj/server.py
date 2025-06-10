@@ -47,7 +47,8 @@ from swift.common.request_helpers import resolve_ignore_range_header, \
 from swift.obj import ssync_receiver, expirer
 from swift.common.http import is_success, HTTP_MOVED_PERMANENTLY
 from swift.common.base_storage_server import BaseStorageServer, \
-    timing_stats, labeled_timing_stats
+    timing_stats, labeled_timing_stats, slow_request_logging, \
+    record_slow_timing
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.request_helpers import get_name_and_placement, \
     is_user_meta, is_sys_or_user_meta, is_object_transient_sysmeta, \
@@ -167,6 +168,8 @@ class ObjectController(BaseStorageServer):
         self.cooperative_period = int(conf.get("cooperative_period", 0))
         self.etag_validate_frac = config_percent_value(
             conf.get("etag_validate_pct", 100))
+        self.slow_delete_log_threshold = float(
+            conf.get('slow_delete_log_threshold_seconds', 120))
 
         default_allowed_headers = '''
             content-disposition,
@@ -1321,7 +1324,8 @@ class ObjectController(BaseStorageServer):
     @public
     @timing_stats()
     @labeled_timing_stats(metric=LABELED_METRIC_NAME)
-    def DELETE(self, request, timing_stats_labels):
+    @slow_request_logging(threshold_attr='slow_delete_log_threshold')
+    def DELETE(self, request, timing_stats_labels, timing_breakdown):
         """Handle HTTP DELETE requests for the Swift Object Server."""
         device, partition, account, container, obj, policy = \
             get_obj_name_and_placement(request)
@@ -1331,12 +1335,19 @@ class ObjectController(BaseStorageServer):
 
         req_timestamp = valid_timestamp(request)
         next_part_power = request.headers.get('X-Backend-Next-Part-Power')
+
+        timing_start = time.time()
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
                 policy=policy, next_part_power=next_part_power)
         except DiskFileDeviceUnavailable:
+            record_slow_timing(
+                timing_breakdown, 'diskfile_acquisition', timing_start)
             return HTTPInsufficientStorage(drive=device, request=request)
+        timing_start = record_slow_timing(
+            timing_breakdown, 'diskfile_acquisition', timing_start)
+
         try:
             orig_metadata = disk_file.read_metadata(current_time=req_timestamp)
         except DiskFileXattrNotSupported:
@@ -1365,6 +1376,10 @@ class ObjectController(BaseStorageServer):
                 response_class = HTTPNoContent
             else:
                 response_class = HTTPConflict
+        finally:
+            timing_start = record_slow_timing(
+                timing_breakdown, 'metadata_read', timing_start)
+
         response_timestamp = max(orig_timestamp, req_timestamp)
         orig_delete_at = Timestamp(orig_metadata.get('X-Delete-At') or 0)
         try:
@@ -1394,19 +1409,30 @@ class ObjectController(BaseStorageServer):
             else:
                 # differentiate success from no object at all
                 response_class = HTTPNoContent
+
         self._conditional_delete_at_update(
             request, device, account, container, obj, policy, {},
             orig_delete_at, 0
         )
+        timing_start = record_slow_timing(
+            timing_breakdown, 'delete_at_update', timing_start)
+
         if orig_timestamp < req_timestamp:
             try:
                 disk_file.delete(req_timestamp)
             except DiskFileNoSpace:
                 return HTTPInsufficientStorage(drive=device, request=request)
+            finally:
+                timing_start = record_slow_timing(
+                    timing_breakdown, 'tombstone_write', timing_start)
+
             self.container_update(
                 'DELETE', account, container, obj, request,
                 HeaderKeyDict({'x-timestamp': req_timestamp.internal}),
                 device, policy)
+            record_slow_timing(
+                timing_breakdown, 'container_update', timing_start)
+
         response = response_class(
             request=request,
             headers={'X-Backend-Timestamp': response_timestamp.internal,
