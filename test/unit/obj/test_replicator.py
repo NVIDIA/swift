@@ -28,8 +28,9 @@ from collections import defaultdict
 from errno import ENOENT, ENOTEMPTY, ENOTDIR
 
 from eventlet.green import subprocess
-from eventlet import Timeout, sleep
+from eventlet import Timeout, sleep, tpool
 
+from swift.obj.diskfile import LogTraceContext
 from test.debug_logger import debug_logger
 from test.unit import (patch_policies, make_timestamp_iter, mocked_http_conn,
                        mock_check_drive, skip_if_no_xattrs)
@@ -381,6 +382,7 @@ class TestObjectReplicator(unittest.TestCase):
         conf = dict(swift_dir=self.testdir, devices=self.devices,
                     bind_ip=_ips()[0], recon_cache_path=self.recon_cache,
                     mount_check='false', timeout='300', stats_interval='1')
+        tpool.set_num_threads(1)
         replicator = object_replicator.ObjectReplicator(conf,
                                                         logger=self.logger)
         was_connector = object_replicator.http_connect
@@ -422,12 +424,26 @@ class TestObjectReplicator(unittest.TestCase):
             while True:
                 yield 60
 
+        trace_spans = []
+
+        def capture_trace():
+            msgs = LogTraceContext.get_trace('test', self.logger).messages
+            for msg in msgs:
+                span, took, ms = msg.partition('took')
+                trace_spans.append(span.strip())
+
+        tpool.execute(capture_trace)
+        self.assertLessEqual(len(trace_spans), 44)
+
         for cycle in range(1, 10):
+            trace_spans = []
             with _mock_process(process_arg_checker):
                 with mock.patch('time.time', side_effect=_infinite_gen()):
                     replicator.run_once()
                     self.assertEqual((start + 1 + cycle) % 10,
                                      replicator.replication_cycle)
+            tpool.execute(capture_trace)
+            self.assertLessEqual(len(trace_spans), 44)
 
         recon_fname = os.path.join(self.recon_cache, RECON_OBJECT_FILE)
         with open(recon_fname) as cachefile:
@@ -1979,7 +1995,7 @@ class TestObjectReplicator(unittest.TestCase):
         expected_tpool_calls = [
             mock.call(self.replicator._df_router[job['policy']]._get_hashes,
                       job['device'], job['partition'], job['policy'],
-                      do_listdir=do_listdir)
+                      do_listdir=do_listdir, trace=mock.ANY)
             for job, do_listdir in zip(jobs, do_listdir_results)
         ]
         for job in jobs:
