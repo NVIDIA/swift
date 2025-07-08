@@ -41,6 +41,7 @@ import re
 import time
 import uuid
 import logging
+import math
 import traceback
 import xattr
 from os.path import basename, dirname, exists, join, splitext
@@ -703,6 +704,151 @@ class DiskFileRouter(object):
         return self.policy_to_manager[int(policy)]
 
 
+class LogTraceContext:
+
+    MAX_MESSAGES_PER_CHUNK = 100
+
+    def __init__(self, name, logger=None):
+        self.name = name
+        self.start = time.time()
+        self.spans = []
+        self.messages = []
+        # Generate a unique transaction ID for this trace
+        self.txid = str(uuid.uuid4())[:8]  # Use first 8 chars for brevity
+
+    @classmethod
+    @contextmanager
+    def start_context(cls, start, logger, trace=None):
+        """
+        Since you can't (shouldn't reasonably?) persist a green.threading.local
+        across tpool.execute some callers will pass in a trace instance from
+        their kwargs.
+
+        This ensures a tpool worker won't leak a stale thread local from our
+        caller into it's next job.
+        """
+        try:
+            logger._cls_thread_local.trace = trace
+            trace = cls.get_trace(start, logger)
+            with trace.open_span(start):
+                yield trace
+        finally:
+            logger._cls_thread_local.trace = None
+
+    @classmethod
+    def get_trace(cls, name, logger):
+        """
+        This is for message passing between methods; we use the logger's
+        green.threading.local because dfm instances are shared across
+        greenthreads and thread pools.
+
+        If no LogTraceContext is available, this method will create one to
+        prevent a bunch of "if not trace" checks.
+        """
+        if getattr(logger._cls_thread_local, 'trace', None):
+            return logger._cls_thread_local.trace
+        else:
+            return LogTraceContext(name, logger)
+
+    def open_span(self, span_name, summary_key=None):
+        self.spans.append({
+            'name': span_name,
+            'start_time': time.time(),
+            'end_time': None,
+            'duration': None
+        })
+        return self
+
+    def _context_name(self):
+        return '.'.join(s['name'] for s in self.spans)
+
+    def message(self, msg):
+        self.messages.append(f"{self._context_name()} {msg}")
+
+    def close_span(self):
+        context_name = self._context_name()
+        span = self.spans.pop()
+        span['end_time'] = time.time()
+        span['duration'] = span['end_time'] - span['start_time']
+        duration_ms = span['duration'] * 1000
+        msg = f"{context_name} took {duration_ms:.2f} ms"
+        self.messages.append(msg)
+
+    def __enter__(self):
+        if not self.spans:
+            raise RuntimeError("No span context to enter")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close_span()
+
+    def is_valid(self):
+        """
+        Normally a call to get_trace will be w/i start_context, so either the
+        trace is the passed in explicitly OR it's reset to None.
+
+        However, if you manage to get into an instrumented context behind
+        start_context (e.g. _finalize_put) *AND* your tpool worker previously
+        explicitly set it's thread_local to a trace object that has since been
+        logged from the parent, we can validate the state of this context.
+        """
+        return self.messages is not None
+
+    def log(self, logger):
+        """
+        This will output all captured span messages from the trace to the
+        logger using a chunked template to comply with syslog length limits.
+
+        N.B. I would not recommend a bunch of logging from inside a tpool, that
+        be the way to deadlocks and grimlins.
+        """
+        # this trace is done
+        duration = time.time() - self.start
+        # we want to prevent accidental reuse
+        logger._cls_thread_local.trace = None
+        messages, self.messages = self.messages, None
+
+        # Calculate optimal chunk size for even distribution
+        total_messages = len(messages)
+        num_chunks = math.ceil(total_messages / self.MAX_MESSAGES_PER_CHUNK)
+        num_msg_per_chunk = math.ceil(total_messages / max(1, num_chunks))
+
+        # group messages in batches not larger than num_msg_per_chunk
+        message_chunks = []
+        current_chunk = []
+
+        for msg in messages:
+            current_chunk.append(msg)
+
+            if len(current_chunk) >= num_msg_per_chunk:
+                message_chunks.append(current_chunk)
+                current_chunk = []
+
+        # we need message_chunks to always have at least one (possibly empty)
+        # chunk so that we always get a message_summary (not that messages
+        # should ever actually *be* empty)
+        if current_chunk or not message_chunks:
+            message_chunks.append(current_chunk)
+
+        # Initialize context for prefix in format_message
+        duration_ms = duration * 1000
+        message_summary = f"{self.name} took {duration_ms:.2f} ms"
+        total_chunks = len(message_chunks)
+        chunk_num = 1
+
+        def format_message(msg):
+            nonlocal chunk_num
+            formatted = (f"[{message_summary} txid-{self.txid} "
+                         f"chunk {chunk_num}/{total_chunks}] {msg}")
+            chunk_num += 1
+            return formatted
+
+        # Output each chunk
+        for chunk in message_chunks:
+            chunk_content = '\n'.join(chunk)
+            logger.debug(format_message(chunk_content))
+
+
 class BaseDiskFileManager(object):
     """
     Management class for devices, providing common place for shared parameters
@@ -1116,11 +1262,14 @@ class BaseDiskFileManager(object):
                   key 'obsolete'; a list of files remaining in the directory,
                   reverse sorted, stored under the key 'files'.
         """
+        trace = LogTraceContext.get_trace('cleanup_ondisk_files', self.logger)
+
         def is_reclaimable(timestamp):
             return (time.time() - float(timestamp)) > self.reclaim_age
 
         try:
-            files = os.listdir(hsh_path)
+            with trace.open_span('list_hsh_path'):
+                files = os.listdir(hsh_path)
         except OSError as err:
             if err.errno == errno.ENOENT:
                 results = self.get_ondisk_files(
@@ -1135,7 +1284,8 @@ class BaseDiskFileManager(object):
             files, hsh_path, verify=False, **kwargs)
         if 'ts_info' in results and is_reclaimable(
                 results['ts_info']['timestamp']):
-            remove_file(join(hsh_path, results['ts_info']['filename']))
+            with trace.open_span('remove_ts_file'):
+                remove_file(join(hsh_path, results['ts_info']['filename']))
             files.remove(results.pop('ts_info')['filename'])
         for file_info in results.get('possible_reclaim', []):
             # stray files are not deleted until reclaim-age; non-durable data
@@ -1148,12 +1298,14 @@ class BaseDiskFileManager(object):
                      is_file_older(filepath, self.commit_window))):
                 results.setdefault('obsolete', []).append(file_info)
         for file_info in results.get('obsolete', []):
-            remove_file(join(hsh_path, file_info['filename']))
+            with trace.open_span(f'remove_obsolete_{file_info["filename"]}'):
+                remove_file(join(hsh_path, file_info['filename']))
             files.remove(file_info['filename'])
         results['files'] = files
         if not files:  # everything got unlinked
             try:
-                os.rmdir(hsh_path)
+                with trace.open_span('rmdir'):
+                    os.rmdir(hsh_path)
             except OSError as err:
                 if err.errno not in (errno.ENOENT, errno.ENOTEMPTY):
                     self.logger.debug(
@@ -1192,17 +1344,22 @@ class BaseDiskFileManager(object):
             def hexdigest(self):
                 return self.md5.hexdigest()
         hashes = defaultdict(shim)
-        try:
-            path_contents = sorted(os.listdir(path))
-        except OSError as err:
-            if err.errno in (errno.ENOTDIR, errno.ENOENT):
-                raise PathNotDir()
-            raise
+        trace = LogTraceContext.get_trace('_hash_suffix_dir', self.logger)
+        with trace.open_span('list_suffix_dir'):
+            try:
+                path_contents = sorted(os.listdir(path))
+            except OSError as err:
+                if err.errno in (errno.ENOTDIR, errno.ENOENT):
+                    raise PathNotDir()
+                raise
+        trace.message(f"num_hsh_paths: {len(path_contents)}")
         for hsh in path_contents:
             hsh_path = join(path, hsh)
             try:
+                cleanup_span = trace.open_span('cleanup_ondisk_files')
                 ondisk_info = self.cleanup_ondisk_files(
                     hsh_path, policy=policy)
+                cleanup_span.close_span()
             except OSError as err:
                 partition_path = dirname(path)
                 objects_path = dirname(partition_path)
@@ -1258,7 +1415,8 @@ class BaseDiskFileManager(object):
                 hashes[None].update(info['timestamp'].internal + info['ext'])
 
             # delegate to subclass for data file related updates...
-            self._update_suffix_hashes(hashes, ondisk_info)
+            with trace.open_span('update_suffix_hashes'):
+                self._update_suffix_hashes(hashes, ondisk_info)
 
             if 'ctype_info' in ondisk_info:
                 # We have a distinct content-type timestamp so update the
@@ -1271,7 +1429,8 @@ class BaseDiskFileManager(object):
                                     + '_ctype')
 
         try:
-            os.rmdir(path)
+            with trace.open_span('rmdir'):
+                os.rmdir(path)
         except OSError as e:
             if e.errno == errno.ENOENT:
                 raise PathNotDir()
@@ -1300,9 +1459,11 @@ class BaseDiskFileManager(object):
 
         :returns: (int, dict) tuple, i.e. (num_hashed, sanitized_suffix_hashes)
         """
-        hashed, hashes = self.__get_hashes(*args, **kwargs)
-        hashes.pop('updated', None)
-        hashes.pop('valid', None)
+        with LogTraceContext.start_context('_get_hashes', self.logger,
+                                           trace=kwargs.pop('trace', None)):
+            hashed, hashes = self.__get_hashes(*args, **kwargs)
+            hashes.pop('updated', None)
+            hashes.pop('valid', None)
         return hashed, hashes
 
     def __get_hashes(self, device, partition, policy, recalculate=None,
@@ -1322,6 +1483,7 @@ class BaseDiskFileManager(object):
 
         :returns: tuple of (number of suffix dirs hashed, dictionary of hashes)
         """
+        trace = LogTraceContext.get_trace('__get_hashes', self.logger)
         hashed = 0
         dev_path = self.get_dev_path(device)
         partition_path = get_part_path(dev_path, policy, partition)
@@ -1332,11 +1494,12 @@ class BaseDiskFileManager(object):
         if recalculate is None:
             recalculate = []
 
-        try:
-            orig_hashes = self.consolidate_hashes(partition_path)
-        except Exception:
-            self.logger.warning('Unable to read %r', hashes_file,
-                                exc_info=True)
+        with trace.open_span('consolidate_hashes'):
+            try:
+                orig_hashes = self.consolidate_hashes(partition_path)
+            except Exception:
+                self.logger.warning('Unable to read %r', hashes_file,
+                                    exc_info=True)
 
         if not orig_hashes['valid']:
             # This is the only path to a valid hashes from invalid read (e.g.
@@ -1354,39 +1517,54 @@ class BaseDiskFileManager(object):
             # conditions - so try not to get overly caught up trying to
             # optimize it out unless you manage to convince yourself there's a
             # bad behavior.
-            orig_hashes = read_hashes(partition_path)
+            with trace.open_span('invalid_read_hashes'):
+                orig_hashes = read_hashes(partition_path)
         else:
             hashes = copy.deepcopy(orig_hashes)
 
         if do_listdir:
-            for suff in os.listdir(partition_path):
+            with trace.open_span('do_listdir'):
+                suffix_listing = os.listdir(partition_path)
+            for suff in suffix_listing:
                 if len(suff) == 3:
                     hashes.setdefault(suff, None)
             modified = True
             self.logger.debug('Run listdir on %s', partition_path)
         hashes.update((suffix, None) for suffix in recalculate)
+        rehash_span = trace.open_span('rehash')
         for suffix, hash_ in list(hashes.items()):
             if suffix in ('valid', 'updated'):
                 continue
             if not hash_:
                 suffix_dir = join(partition_path, suffix)
                 try:
+                    suffix_span = trace.open_span(f'hash_{suffix}')
                     hashes[suffix] = self._hash_suffix(
                         suffix_dir, policy=policy)
+                    suffix_span.close_span()
                     hashed += 1
                 except PathNotDir:
                     del hashes[suffix]
                 except OSError:
                     logging.exception('Error hashing suffix')
                 modified = True
+        rehash_span.close_span()
+        trace.message(f"hashed: {hashed}")
         if modified:
+            lock_span = trace.open_span('lock')
             with lock_path(partition_path):
+                lock_span.close_span()
+                reread_span = trace.open_span('reread_hashes')
                 if read_hashes(partition_path) == orig_hashes:
+                    reread_span.close_span()
+                    write_span = trace.open_span('write_hashes')
                     write_hashes(partition_path, hashes)
+                    write_span.close_span()
                     return hashed, hashes
-            return self.__get_hashes(device, partition, policy,
-                                     recalculate=recalculate,
-                                     do_listdir=do_listdir)
+            with trace.open_span('rehash_again'):
+                return self.__get_hashes(device, partition, policy,
+                                         recalculate=recalculate,
+                                         do_listdir=do_listdir)
         else:
             return hashed, hashes
 
@@ -1661,9 +1839,12 @@ class BaseDiskFileManager(object):
         elif not os.path.exists(partition_path):
             hashes = {}
         else:
+            # don't pass logger, we'll log at the end outside of the tpool
+            trace = LogTraceContext('get_hashes')
             _junk, hashes = tpool.execute(
                 self._get_hashes, device, partition, policy,
-                recalculate=suffixes)
+                recalculate=suffixes, trace=trace)
+            trace.log(self.logger)
         return hashes
 
     def _listdir(self, path):
