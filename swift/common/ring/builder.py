@@ -159,7 +159,8 @@ class RingBuilder(object):
     @property
     def dev_id_bytes(self):
         if not self._replica2part2dev:
-            return calc_dev_id_bytes(len(self.devs))
+            max_dev_id = len(self.devs) - 1 if self.devs else 0
+            return calc_dev_id_bytes(max_dev_id)
         return self._replica2part2dev[0].itemsize
 
     def set_dev_id_bytes(self, new_dev_id_bytes):
@@ -587,10 +588,11 @@ class RingBuilder(object):
             # gather parts from replica count adjustment
             self._adjust_replica2part2dev_size(assign_parts)
             # gather parts from failed devices
-            removed_devs = self._gather_parts_from_failed_devices(assign_parts)
+            self._gather_parts_from_failed_devices(assign_parts)
             # gather parts for dispersion (N.B. this only picks up parts that
             # *must* disperse according to the replica plan)
             self._gather_parts_for_dispersion(assign_parts, replica_plan)
+            removed_devs = self._remove_failed_devices()
 
             # we'll gather a few times, or until we archive the plan
             for gather_count in range(MAX_BALANCE_GATHER_COUNT):
@@ -775,7 +777,8 @@ class RingBuilder(object):
                             ))
                     break
                 dev_id = self._replica2part2dev[replica][part]
-                if dev_id >= dev_len or not self.devs[dev_id]:
+                if dev_id == self.none_dev_id or dev_id >= dev_len or \
+                        self.devs[dev_id] is None:
                     raise exceptions.RingValidationError(
                         "Partition %d, replica %d was not allocated "
                         "to a device." %
@@ -1015,6 +1018,7 @@ class RingBuilder(object):
         # reassign these partitions. However, we mark them as moved so later
         # choices will skip other replicas of the same partition if possible.
 
+        gathered_parts = 0
         if self._remove_devs:
             dev_ids = [d['id'] for d in self._remove_devs if d['parts']]
             if dev_ids:
@@ -1025,9 +1029,13 @@ class RingBuilder(object):
                             self.none_dev_id
                         self._set_part_moved(part)
                         assign_parts[part].append(replica)
+                        gathered_parts += 1
                         self.logger.debug(
                             "Gathered %d/%d from dev %d [dev removed]",
                             part, replica, dev_id)
+        return gathered_parts
+
+    def _remove_failed_devices(self):
         removed_devs = 0
         while self._remove_devs:
             remove_dev_id = self._remove_devs.pop()['id']

@@ -28,7 +28,7 @@ import sys
 from swift.common.exceptions import RingLoadError, DevIdBytesTooSmall
 from swift.common.utils import hash_path, validate_configuration, md5
 from swift.common.ring.io import RingReader, RingWriter
-from swift.common.ring.utils import tiers_for_dev
+from swift.common.ring.utils import tiers_for_dev, BYTES_TO_TYPE_CODE
 
 
 DEFAULT_RELOAD_TIME = 15
@@ -37,18 +37,19 @@ RING_CODECS = {
         "serialize": lambda ring_data, writer: pickle.dump(
             ring_data.to_dict(), writer, protocol=2),
         # NB: Old-style pickled ring can't respect metadata_only
-        "deserialize": lambda cls, reader, metadata_only:
+        "deserialize": lambda cls, reader, _metadata_only, _include_devices:
             pickle.load(reader),  # nosec: B301
     },
     1: {
         "serialize": lambda ring_data, writer: ring_data.serialize_v1(writer),
-        "deserialize": lambda cls, reader, metadata_only: cls.deserialize_v1(
-            reader, metadata_only=metadata_only),
+        "deserialize": lambda cls, reader, metadata_only, _include_devices:
+            cls.deserialize_v1(reader, metadata_only=metadata_only),
     },
     2: {
         "serialize": lambda ring_data, writer: ring_data.serialize_v2(writer),
-        "deserialize": lambda cls, reader, metadata_only: cls.deserialize_v2(
-            reader, metadata_only=metadata_only),
+        "deserialize": lambda cls, reader, metadata_only, include_devices:
+            cls.deserialize_v2(reader, metadata_only=metadata_only,
+                               include_devices=include_devices),
     },
 }
 DEFAULT_RING_FORMAT_VERSION = 1
@@ -96,7 +97,7 @@ class RingData(object):
         self.format_version = None
         self.size = self.raw_size = None
         # Next two are used when replica2part2dev is empty
-        self._dev_id_bytes = 0
+        self._dev_id_bytes = 2
         self._replica_count = 0
         self._num_devs = sum(1 if dev is not None else 0 for dev in self.devs)
 
@@ -132,8 +133,10 @@ class RingData(object):
         `replica2part2dev_id` is not loaded and that key in the returned
         dictionary just has the value `[]`.
 
-        :param file reader: An opened file-like object which has already
-                            consumed the 6 bytes of magic and version.
+        :param RingReader reader: An opened RingReader which has already
+                            loaded the index at the end, gone back to the
+                            front, and consumed the 6 bytes of magic and
+                            version.
         :param bool metadata_only: If True, only load `devs` and `part_shift`
         :returns: A dict containing `devs`, `part_shift`, and
                   `replica2part2dev_id`
@@ -152,9 +155,10 @@ class RingData(object):
 
         byteswap = (ring_dict.get('byteorder', sys.byteorder) != sys.byteorder)
 
+        type_code = BYTES_TO_TYPE_CODE[ring_dict['dev_id_bytes']]
         partition_count = 1 << (32 - ring_dict['part_shift'])
         for x in range(ring_dict['replica_count']):
-            part2dev = array.array('H', reader.read(2 * partition_count))
+            part2dev = array.array(type_code, reader.read(2 * partition_count))
             if byteswap:
                 part2dev.byteswap()
             ring_dict['replica2part2dev_id'].append(part2dev)
@@ -205,7 +209,7 @@ class RingData(object):
         return ring_dict
 
     @classmethod
-    def load(cls, filename, metadata_only=False):
+    def load(cls, filename, metadata_only=False, include_devices=True):
         """
         Load ring data from a file.
 
@@ -218,7 +222,7 @@ class RingData(object):
                 raise Exception('Unknown ring format version %d' %
                                 reader.version)
             ring_data = RING_CODECS[reader.version]['deserialize'](
-                cls, reader, metadata_only)
+                cls, reader, metadata_only, include_devices)
 
         if hasattr(ring_data, 'devs'):
             # pickled RingData; make sure we've got region/replication info
@@ -239,7 +243,7 @@ class RingData(object):
         # For loading with metadata_only=True
         if 'replica_count' in ring_data:
             ring._replica_count = ring_data['replica_count']
-        # dev_id_bytes only included in v2 and above
+        # dev_id_bytes only written down in v2 and above
         ring._dev_id_bytes = ring_data.get('dev_id_bytes', 2)
         return ring
 

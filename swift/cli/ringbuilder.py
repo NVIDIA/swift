@@ -672,13 +672,13 @@ swift-ring-builder <ring_file> version
             print(Commands.create.__doc__.strip())
             exit(EXIT_ERROR)
         try:
-            rd = RingData.load(argv[1], metadata_only=True)
+            rd = RingData.load(ring_file, metadata_only=True)
         except ValueError as e:
             print(e)
             exit(EXIT_ERROR)
         print('%s: Serialization version: %d (%d-byte IDs), '
               'build version: %d' %
-              (argv[1], rd.format_version, rd.dev_id_bytes, rd.version))
+              (ring_file, rd.format_version, rd.dev_id_bytes, rd.version))
         exit(EXIT_SUCCESS)
 
     @staticmethod

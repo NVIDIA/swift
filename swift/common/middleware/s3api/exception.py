@@ -100,7 +100,7 @@ class S3InputChecksumMismatch(S3InputError):
     """
 
 
-class S3InputChecksumInvalid(S3InputError):
+class S3InputChecksumTrailerInvalid(S3InputError):
     """
     Client provided a X-Amz-Checksum-* trailer, but it is not a valid format.
 

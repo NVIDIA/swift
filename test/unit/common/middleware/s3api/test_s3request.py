@@ -33,7 +33,7 @@ from swift.common.middleware.s3api.subresource import ACL, User, Owner, \
 from swift.common.middleware.s3api.s3request import S3Request, \
     S3AclRequest, SigV4Request, SIGV4_X_AMZ_DATE_FORMAT, HashingInput, \
     ChunkReader, StreamingInput, S3InputSHA256Mismatch, \
-    S3InputChunkSignatureMismatch
+    S3InputChunkSignatureMismatch, _get_checksum_hasher
 from swift.common.middleware.s3api.s3response import InvalidArgument, \
     NoSuchBucket, InternalError, ServiceUnavailable, \
     AccessDenied, SignatureDoesNotMatch, RequestTimeTooSkewed, \
@@ -1884,7 +1884,7 @@ class TestRequest(S3ApiTestCase):
         s3req = self._test_sig_v4_streaming_unsigned_payload_trailer(body)
         self.assertEqual(b'abcdefghijklmnopqrst',
                          s3req.environ['wsgi.input'].read(20))
-        with self.assertRaises(s3request.S3InputChecksumInvalid):
+        with self.assertRaises(s3request.S3InputChecksumTrailerInvalid):
             s3req.environ['wsgi.input'].read()
 
         # ...which in context gets translated to a 400 response
@@ -2882,6 +2882,35 @@ class TestStreamingInput(S3ApiTestCase):
         # note: underscore not hyphen...
         do_test('chunk_signature=ok', s3request.S3InputChunkSignatureMismatch)
         do_test('skunk-cignature=ok', s3request.S3InputChunkSignatureMismatch)
+
+
+class TestModuleFunctions(unittest.TestCase):
+    def test_get_checksum_hasher(self):
+        def do_test(crc):
+            hasher = _get_checksum_hasher('x-amz-checksum-%s' % crc)
+            self.assertEqual(crc, hasher.name)
+
+        do_test('crc32')
+        do_test('crc32c')
+        do_test('sha1')
+        do_test('sha256')
+        try:
+            checksum._select_crc64nvme_impl()
+        except NotImplementedError:
+            pass
+        else:
+            do_test('crc64nvme')
+
+    def test_get_checksum_hasher_invalid(self):
+        def do_test(crc):
+            with self.assertRaises(s3response.S3NotImplemented):
+                _get_checksum_hasher('x-amz-checksum-%s' % crc)
+
+        with mock.patch.object(checksum, '_select_crc64nvme_impl',
+                               side_effect=NotImplementedError):
+            do_test('crc64nvme')
+        do_test('nonsense')
+        do_test('')
 
 
 if __name__ == '__main__':

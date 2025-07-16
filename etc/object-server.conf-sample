@@ -170,6 +170,9 @@ use = egg:swift#object
 # instead rely on the object-auditor to detect and quarantine corrupted objects.
 # etag_validate_pct = 100
 #
+# The threshold to print out logs of breakdown timings for any slow delete request.
+# slow_delete_log_threshold_seconds = 120
+#
 # on PUTs, sync data every n MB
 # mb_per_sync = 512
 #

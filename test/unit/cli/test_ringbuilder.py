@@ -2766,6 +2766,76 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
                     "build version: 5\n" % self.tmpfile)
         self.assertEqual(expected, mock_stdout.getvalue())
 
+    def test_version_from_builder_file(self):
+        self.create_sample_ring()
+        rb = RingBuilder.load(self.tmpfile)
+        rb.rebalance()
+        rd = rb.get_ring()
+        rd.save(self.tmpfile + ".ring.gz", format_version=2)
+
+        # read version from ring when builder file given as argument
+        argv = ["", self.tmpfile, "version"]
+        mock_stdout = io.StringIO()
+        with mock.patch("sys.stdout", mock_stdout):
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        # output still reports ring file
+        expected = ("%s.ring.gz: Serialization version: 2 (2-byte IDs), "
+                    "build version: 5\n" % self.tmpfile)
+        self.assertEqual(expected, mock_stdout.getvalue())
+
+    def test_version_with_builder_file_missing(self):
+        self.create_sample_ring()
+        rb = RingBuilder.load(self.tmpfile)
+        rb.rebalance()
+        rd = rb.get_ring()
+        rd.save(self.tmpfile + ".ring.gz", format_version=2)
+
+        # remove the builder to hit some interesting except blocks in main
+        os.unlink(self.tmpfile)
+
+        test_args = [
+            # explicit ring file version of course works when builder missing
+            self.tmpfile + ".ring.gz",
+            # even when builder file is missing you can still implicitly
+            # identify the ring file and read the version
+            self.tmpfile,
+        ]
+
+        for path in test_args:
+            argv = ["", path, "version"]
+            mock_stdout = io.StringIO()
+            with mock.patch("sys.stdout", mock_stdout):
+                self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+            expected = ("%s.ring.gz: Serialization version: 2 (2-byte IDs), "
+                        "build version: 5\n" % self.tmpfile)
+            self.assertEqual(expected, mock_stdout.getvalue())
+
+        # but of course if the path is nonsensical we get an error
+        argv = ["", self.tmpfile + ".nonsense", "version"]
+        with self.assertRaises(FileNotFoundError):
+            ringbuilder.main(argv)
+
+    def test_version_from_builder_file_with_ring_missing(self):
+        self.create_sample_ring()
+        rb = RingBuilder.load(self.tmpfile)
+        rb.rebalance()
+        # Don't even bother to write the ring
+
+        test_args = [
+            self.tmpfile + ".ring.gz",
+            # If provided with the (existing) builder, we can infer the
+            # (nonexisting) ring
+            self.tmpfile,
+        ]
+
+        for path in test_args:
+            argv = ["", path, "version"]
+            # Gotta have a ring to get the version info
+            with self.assertRaises(FileNotFoundError):
+                ringbuilder.main(argv)
+
     def test_warn_at_risk(self):
         # check that warning is generated when rebalance does not achieve
         # satisfactory balance

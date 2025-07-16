@@ -43,7 +43,7 @@ from swift.obj.ssync_sender import Sender as ssync_sender
 from swift.common.http import HTTP_OK, HTTP_NOT_FOUND, \
     HTTP_INSUFFICIENT_STORAGE
 from swift.obj.diskfile import DiskFileRouter, get_data_dir, \
-    get_tmp_dir, DEFAULT_RECLAIM_AGE, should_part_listdir
+    get_tmp_dir, DEFAULT_RECLAIM_AGE, LogTraceContext
 from swift.common.storage_policy import POLICIES, EC_POLICY
 from swift.common.exceptions import ConnectionTimeout, DiskFileError, \
     SuffixSyncError, PartitionLockTimeout, DiskFileNotExist
@@ -840,9 +840,12 @@ class ObjectReconstructor(Daemon):
     def _get_hashes(self, device, partition, policy, recalculate=None,
                     do_listdir=False):
         df_mgr = self._df_router[policy]
+        # don't pass logger, we'll log at the end outside of the tpool
+        trace = LogTraceContext('reconstructor._get_hashes')
         hashed, suffix_hashes = tpool.execute(
             df_mgr._get_hashes, device, partition, policy,
-            recalculate=recalculate, do_listdir=do_listdir)
+            recalculate=recalculate, do_listdir=do_listdir, trace=trace)
+        trace.log(self.logger)
         # hashed is always an int, we count it in stats but don't return it
         self.logger.update_stats('suffix.hashes', hashed)
         return suffix_hashes

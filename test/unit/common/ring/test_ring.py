@@ -54,9 +54,7 @@ class TestRingBase(unittest.TestCase):
 class TestRingData(unittest.TestCase):
 
     def setUp(self):
-        self.testdir = os.path.join(os.path.dirname(__file__), 'ring_data')
-        rmtree(self.testdir, ignore_errors=1)
-        os.mkdir(self.testdir)
+        self.testdir = mkdtemp()
 
     def tearDown(self):
         rmtree(self.testdir, ignore_errors=1)
@@ -820,9 +818,6 @@ class TestRing(TestRingBase):
         self.ring.devs.append(new_dev)
         self.ring._rebuild_tier_data()
 
-    @unittest.skipIf(sys.version_info < (3,),
-                     "Seed-specific tests don't work well between python "
-                     "versions. This test is now PY3 only")
     def test_get_more_nodes(self):
         # Yes, these tests are deliberately very fragile. We want to make sure
         # that if someone changes the results the ring produces, they know it.
@@ -1306,7 +1301,7 @@ class TestRingV2(TestRing):
             meta = json.dumps({
                 "dev_id_bytes": 4,
                 "part_shift": 29,
-                "replica_count": 3,
+                "replica_count": 1.5,
             }).encode('ascii')
             fp.write(struct.pack('!Q', len(meta)) + meta)
             fp.flush(zlib.Z_FULL_FLUSH)
@@ -1357,30 +1352,32 @@ class TestRingV0(TestRing):
     FORMAT_VERSION = 0
 
 
-class ExtendedRing(ring.RingData):
+class ExtendedRingData(ring.RingData):
     extra = b'some super-specific data'
 
     def to_dict(self):
-        ring_data = super(ExtendedRing, self).to_dict()
+        ring_data = super().to_dict()
         ring_data.setdefault('extra', self.extra)
         return ring_data
 
     def serialize_v2(self, writer):
-        super(ExtendedRing, self).serialize_v2(writer)
+        super().serialize_v2(writer)
         with writer.section('my-custom-section') as s:
             s.write_blob(self.extra)
 
     @classmethod
     def deserialize_v2(cls, reader, *args, **kwargs):
-        ring_data = super(ExtendedRing, cls).deserialize_v2(
-            reader, *args, **kwargs)
-        with reader.open_section('my-custom-section') as s:
-            ring_data['extra'] = s.read()
+        ring_data = super().deserialize_v2(reader, *args, **kwargs)
+        # If you're adding custom data to your rings, you probably want an
+        # upgrade story that includes that data not being present
+        if 'my-custom-section' in reader.index:
+            with reader.open_section('my-custom-section') as s:
+                ring_data['extra'] = s.read()
         return ring_data
 
     @classmethod
     def from_dict(cls, ring_data):
-        obj = super(ExtendedRing, cls).from_dict(ring_data)
+        obj = super().from_dict(ring_data)
         obj.extra = ring_data.get('extra')
         return obj
 
@@ -1391,7 +1388,7 @@ class TestRingExtensibility(unittest.TestCase):
         d = [{'id': 0, 'zone': 0, 'region': 0, 'ip': '10.1.1.0', 'port': 7000},
              {'id': 1, 'zone': 1, 'region': 1, 'ip': '10.1.1.1', 'port': 7000}]
         s = 30
-        rd = ExtendedRing(r2p2d, d, s)
+        rd = ExtendedRingData(r2p2d, d, s)
         self.assertEqual(rd._replica2part2dev_id, r2p2d)
         self.assertEqual(rd.devs, d)
         self.assertEqual(rd._part_shift, s)
@@ -1404,7 +1401,9 @@ class TestRingExtensibility(unittest.TestCase):
             ring_fname = os.path.join(testdir, 'foo.ring.gz')
             rd.save(ring_fname, format_version=2)
             bytes_written = os.path.getsize(ring_fname)
-            rd2 = ExtendedRing.load(ring_fname)
+            rd2 = ExtendedRingData.load(ring_fname)
+            # Vanilla Swift can also read the custom ring
+            vanilla_ringdata = ring.RingData.load(ring_fname)
         finally:
             rmtree(testdir, ignore_errors=1)
 
@@ -1412,6 +1411,40 @@ class TestRingExtensibility(unittest.TestCase):
         self.assertEqual(rd2.devs, d)
         self.assertEqual(rd2._part_shift, s)
         self.assertEqual(rd2.extra, b'some other value')
+        self.assertEqual(rd2.size, bytes_written)
+
+        self.assertEqual(vanilla_ringdata._replica2part2dev_id, r2p2d)
+        self.assertEqual(vanilla_ringdata.devs, d)
+        self.assertEqual(vanilla_ringdata._part_shift, s)
+        self.assertFalse(hasattr(vanilla_ringdata, 'extra'))
+        self.assertEqual(vanilla_ringdata.size, bytes_written)
+
+    def test_missing_custom_data(self):
+        r2p2d = [[0, 1, 0, 1], [0, 1, 0, 1]]
+        d = [{'id': 0, 'zone': 0, 'region': 0, 'ip': '10.1.1.0', 'port': 7000},
+             {'id': 1, 'zone': 1, 'region': 1, 'ip': '10.1.1.1', 'port': 7000}]
+        s = 30
+        rd = ring.RingData(r2p2d, d, s)
+        self.assertEqual(rd._replica2part2dev_id, r2p2d)
+        self.assertEqual(rd.devs, d)
+        self.assertEqual(rd._part_shift, s)
+        self.assertFalse(hasattr(rd, 'extra'))
+
+        # Can load a vanilla ring and get some default behavior based on the
+        # overridden from_dict
+        testdir = mkdtemp()
+        try:
+            ring_fname = os.path.join(testdir, 'foo.ring.gz')
+            rd.save(ring_fname, format_version=2)
+            bytes_written = os.path.getsize(ring_fname)
+            rd2 = ExtendedRingData.load(ring_fname)
+        finally:
+            rmtree(testdir, ignore_errors=1)
+
+        self.assertEqual(rd2._replica2part2dev_id, r2p2d)
+        self.assertEqual(rd2.devs, d)
+        self.assertEqual(rd2._part_shift, s)
+        self.assertIsNone(rd2.extra)
         self.assertEqual(rd2.size, bytes_written)
 
 

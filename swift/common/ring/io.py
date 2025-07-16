@@ -33,6 +33,9 @@ from swift.common.ring.utils import BYTES_TO_TYPE_CODE, network_order_array, \
 ZLIB_FLUSH_MARKER = b"\x00\x00\xff\xff"
 # we could pull from io.DEFAULT_BUFFER_SIZE, but... 8k seems small
 DEFAULT_BUFFER_SIZE = 2 ** 16
+# v2 rings have sizes written with each section, as well as offsets at the end
+# We *hope* we never need to go past 2**32-1 for those, but just in case...
+V2_SIZE_FORMAT = "!Q"
 
 
 class GzipReader(object):
@@ -45,13 +48,26 @@ class GzipReader(object):
     def close(self):
         self.fp.close()
 
+    def read_sizes(self):
+        """
+        Read the uncompressed and compressed sizes of the whole file.
+
+        Gzip writes the uncompressed length (mod 2**32) write at the end.
+        Then we just need to ``tell()`` to get the compressed length.
+        """
+        self.fp.seek(-4, os.SEEK_END)
+        uncompressed_size, = struct.unpack("<L", self.fp.read(4))
+        # between the seek(-4, SEEK_END) and the read(4), we're at the end
+        compressed_size = self.fp.tell()
+        return uncompressed_size, compressed_size
+
     def reset_decompressor(self):
         self.pos = self.fp.tell()
         if self.pos == 0:
             # Expect gzip header
             wbits = 16 + zlib.MAX_WBITS
         else:
-            # Raw stream
+            # Bare deflate stream
             wbits = -zlib.MAX_WBITS
         self.decompressor = zlib.decompressobj(wbits)
         self.buffer = self.compressed_buffer = b""
@@ -249,6 +265,18 @@ class IndexEntry:
             return None
         return self.uncompressed_end - self.uncompressed_start
 
+    @property
+    def compressed_length(self) -> Optional[int]:
+        if self.compressed_end is None:
+            return None
+        return self.compressed_end - self.compressed_start
+
+    @property
+    def compression_ratio(self) -> Optional[float]:
+        if self.uncompressed_end is None:
+            return None
+        return 1 - self.compressed_length / self.uncompressed_length
+
 
 class RingReader(GzipReader):
     """
@@ -270,10 +298,9 @@ class RingReader(GzipReader):
             if self.version not in (1, 2):
                 raise ValueError("Unsupported ring version: %d" % self.version)
 
-        # get some size info from the end of the gzip
-        self.fp.seek(-4, os.SEEK_END)
-        self.raw_size, = struct.unpack("<L", self.fp.read(4))
-        self.size = self.fp.tell()
+        # NB: In a lot of places, "raw" implies "file on disk", i.e., the
+        # compressed stream -- but here it's actually the uncompressed stream.
+        self.raw_size, self.size = self.read_sizes()
 
         self.load_index()
 
@@ -293,7 +320,7 @@ class RingReader(GzipReader):
         # where this 31 (= 18 + 13) came from.
         self.seek(-31, os.SEEK_END)
         try:
-            index_start, = struct.unpack("!Q", self.read(8))
+            index_start, = struct.unpack(V2_SIZE_FORMAT, self.read(8))
         except zlib.error:
             # TODO: we can still fix this if we're willing to read everything
             raise IOError("Could not read index offset "
@@ -310,9 +337,11 @@ class RingReader(GzipReader):
             return False
         return section in self.index
 
-    def read_blob(self, fmt="!Q"):
+    def read_blob(self, fmt=V2_SIZE_FORMAT):
         """
         Read a length-value encoded BLOB
+
+        Note that the RingReader needs to already be positioned correctly.
 
         :param fmt: the format code used to write the length of the BLOB.
                     All v2 BLOBs use ``!Q``, but v1 may require ``!I``
@@ -324,7 +353,7 @@ class RingReader(GzipReader):
 
     def read_section(self, section):
         """
-        Read an entire section's data
+        Seek to a section and read all its data
         """
         with self.open_section(section) as reader:
             return reader.read()
@@ -345,11 +374,11 @@ class RingReader(GzipReader):
             raise ValueError("No index loaded")
         entry = self.index[section]
         self.seek(entry.compressed_start)
-
-        prefix = self.read(8)
-        blob_length, = struct.unpack("!Q", prefix)
+        size_len = struct.calcsize(V2_SIZE_FORMAT)
+        prefix = self.read(size_len)
+        blob_length, = struct.unpack(V2_SIZE_FORMAT, prefix)
         if entry.compressed_end is not None and \
-                blob_length + 8 != entry.uncompressed_length:
+                size_len + blob_length != entry.uncompressed_length:
             raise IOError("Inconsistent section size")
 
         if entry.checksum_method in ('md5', 'sha1', 'sha256', 'sha512'):
@@ -465,7 +494,7 @@ class GzipWriter(object):
         return self.raw_fp.tell()
 
     def _set_compression_level(self, lvl):
-        # two valid deflate streams may be concentated to produce another
+        # two valid deflate streams may be concatenated to produce another
         # valid deflate stream, so finish the one stream...
         self.flush()
         # ... so we can start up another with whatever level we want
@@ -527,7 +556,8 @@ class RingWriter(GzipWriter):
         self.flush()
         self.current_section = name
         self.index[name] = IndexEntry(self.tell(), self.pos)
-        self.checksum = getattr(hashlib, self.checksum_method)()
+        checksum_class = getattr(hashlib, self.checksum_method)
+        self.checksum = checksum_class()
         try:
             yield self
             self.flush()
@@ -567,9 +597,9 @@ class RingWriter(GzipWriter):
         self.write(struct.pack("!4sH", b"R1NG", version))
         self._set_compression_level(9)
 
-    def write_size(self, size, fmt="!Q"):
+    def write_size(self, size, fmt=V2_SIZE_FORMAT):
         """
-        Write a BLOB-length.
+        Write a size (often a BLOB-length, but sometimes a file offset).
 
         :param data: the size to write
         :param fmt: the struct format to use when writing the length.
@@ -577,7 +607,7 @@ class RingWriter(GzipWriter):
         """
         self.write(struct.pack(fmt, size))
 
-    def write_blob(self, data, fmt="!Q"):
+    def write_blob(self, data, fmt=V2_SIZE_FORMAT):
         """
         Write a length-value encoded BLOB.
 
@@ -588,7 +618,7 @@ class RingWriter(GzipWriter):
         self.write_size(len(data), fmt)
         self.write(data)
 
-    def write_json(self, data, fmt="!Q"):
+    def write_json(self, data, fmt=V2_SIZE_FORMAT):
         """
         Write a length-value encoded JSON BLOB.
 
@@ -627,6 +657,12 @@ class RingWriter(GzipWriter):
             })
         # switch to uncompressed
         self._set_compression_level(0)
-        # ... which allows us to know that this will be exactly 18 bytes
+        # ... which allows us to know that each of these write_size/flush pairs
+        # will write exactly 18 bytes to disk
+        self.write_size(self.index['swift/index'].uncompressed_start)
+        self.flush()
+        # This is the one we really care about in Swift code, but sometimes
+        # ops write their own tools and sometimes those just buffer all the
+        # decoded content
         self.write_size(self.index['swift/index'].compressed_start)
         self.flush()

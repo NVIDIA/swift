@@ -41,6 +41,14 @@ class TestObjectVersioning(BaseS3TestCase):
 
     maxDiff = None
 
+    def _sanitize_obj_listing(self, obj):
+        # there's some object listing parameters that are not deterministic
+        obj.pop('LastModified')
+        obj.pop('Owner', None)
+        # there's some object listing parameters that Swift doesn't return,
+        obj.pop('ChecksumAlgorithm', None)
+        obj.pop('ChecksumType', None)
+
     def setUp(self):
         self.client = self.get_s3_client(1)
         self.bucket_name = self.create_name('versioning')
@@ -132,7 +140,7 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_objects_v2(Bucket=self.bucket_name)
         objs = resp.get('Contents', [])
         for obj in objs:
-            obj.pop('LastModified')
+            self._sanitize_obj_listing(obj)
         self.assertEqual([{
             'ETag': '"%s"' % obj_etag,
             'Key': obj_name,
@@ -144,8 +152,7 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_object_versions(Bucket=self.bucket_name)
         objs = resp.get('Versions', [])
         for obj in objs:
-            obj.pop('LastModified')
-            obj.pop('Owner')
+            self._sanitize_obj_listing(obj)
             obj.pop('VersionId')
         self.assertEqual([{
             'ETag': '"%s"' % obj_etag,
@@ -165,7 +172,7 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_objects_v2(Bucket=self.bucket_name)
         objs = resp.get('Contents', [])
         for obj in objs:
-            obj.pop('LastModified')
+            self._sanitize_obj_listing(obj)
         self.assertEqual([{
             'ETag': '"%s"' % new_obj_etag,
             'Key': obj_name,
@@ -177,8 +184,7 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_object_versions(Bucket=self.bucket_name)
         objs = resp.get('Versions', [])
         for obj in objs:
-            obj.pop('LastModified')
-            obj.pop('Owner')
+            self._sanitize_obj_listing(obj)
             obj.pop('VersionId')
         self.assertEqual([{
             'ETag': '"%s"' % new_obj_etag,
@@ -207,7 +213,7 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_objects_v2(Bucket=self.bucket_name)
         objs = resp.get('Contents', [])
         for obj in objs:
-            obj.pop('LastModified')
+            self._sanitize_obj_listing(obj)
         self.assertEqual([{
             'ETag': '"%s"' % etags[0],
             'Key': obj_name,
@@ -220,8 +226,7 @@ class TestObjectVersioning(BaseS3TestCase):
         objs = resp.get('Versions', [])
         versions = []
         for obj in objs:
-            obj.pop('LastModified')
-            obj.pop('Owner')
+            self._sanitize_obj_listing(obj)
             versions.append(obj.pop('VersionId'))
         self.assertEqual([{
             'ETag': '"%s"' % etags[0],
@@ -252,8 +257,7 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_object_versions(Bucket=self.bucket_name)
         objs = resp.get('Versions', [])
         for obj in objs:
-            obj.pop('LastModified')
-            obj.pop('Owner')
+            self._sanitize_obj_listing(obj)
             obj.pop('VersionId')
         self.assertEqual([{
             'ETag': '"%s"' % etags[0],
@@ -273,7 +277,7 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_objects_v2(Bucket=self.bucket_name)
         objs = resp.get('Contents', [])
         for obj in objs:
-            obj.pop('LastModified')
+            self._sanitize_obj_listing(obj)
         self.assertEqual([{
             'ETag': '"%s"' % etags[0],
             'Key': obj_name,
@@ -291,8 +295,7 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_object_versions(Bucket=self.bucket_name)
         objs = resp.get('Versions', [])
         for obj in objs:
-            obj.pop('LastModified')
-            obj.pop('Owner')
+            self._sanitize_obj_listing(obj)
             obj.pop('VersionId')
         self.assertEqual([{
             'ETag': '"%s"' % etags[2],
@@ -306,7 +309,7 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_objects_v2(Bucket=self.bucket_name)
         objs = resp.get('Contents', [])
         for obj in objs:
-            obj.pop('LastModified')
+            self._sanitize_obj_listing(obj)
         self.assertEqual([{
             'ETag': '"%s"' % etags[2],
             'Key': obj_name,
@@ -335,8 +338,7 @@ class TestObjectVersioning(BaseS3TestCase):
         objs = resp.get('Versions', [])
         versions = []
         for obj in objs:
-            obj.pop('LastModified')
-            obj.pop('Owner')
+            self._sanitize_obj_listing(obj)
             versions.append(obj.pop('VersionId'))
         self.assertEqual([{
             'ETag': '"%s"' % etag,
@@ -349,8 +351,7 @@ class TestObjectVersioning(BaseS3TestCase):
         delete_markers = resp.get('DeleteMarkers', [])
         marker_versions = []
         for marker in delete_markers:
-            marker.pop('LastModified')
-            marker.pop('Owner')
+            self._sanitize_obj_listing(marker)
             marker_versions.append(marker.pop('VersionId'))
         self.assertEqual([{
             'Key': obj_name,
@@ -398,13 +399,88 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_object_versions(Bucket=self.bucket_name)
         delete_markers = resp.get('DeleteMarkers', [])
         for marker in delete_markers:
-            marker.pop('LastModified')
-            marker.pop('Owner')
+            self._sanitize_obj_listing(marker)
         self.assertEqual([{
             'Key': obj_name,
             'IsLatest': True,
             'VersionId': marker_versions[1],
         }], delete_markers)
+
+    def test_multipart_upload(self):
+        obj_name = self.create_name('versioned-obj')
+        obj_data = b'data'
+
+        mu = self.client.create_multipart_upload(
+            Bucket=self.bucket_name,
+            Key=obj_name)
+        part_md5 = self.client.upload_part(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            UploadId=mu['UploadId'],
+            PartNumber=1,
+            Body=obj_data)['ETag']
+        complete_response = self.client.complete_multipart_upload(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            UploadId=mu['UploadId'],
+            MultipartUpload={'Parts': [
+                {'PartNumber': 1, 'ETag': part_md5},
+            ]})
+        obj_etag = complete_response['ETag']
+
+        delete_response = self.client.delete_object(
+            Bucket=self.bucket_name,
+            Key=obj_name)
+        marker_version_id = delete_response['VersionId']
+
+        resp = self.client.list_object_versions(Bucket=self.bucket_name)
+        objs = resp.get('Versions', [])
+        versions = []
+        for obj in objs:
+            self._sanitize_obj_listing(obj)
+            versions.append(obj.pop('VersionId'))
+        self.assertEqual([{
+            'ETag': obj_etag,
+            'IsLatest': False,
+            'Key': obj_name,
+            'Size': len(obj_data),
+            'StorageClass': 'STANDARD',
+        }], objs)
+
+        markers = resp.get('DeleteMarkers', [])
+        for marker in markers:
+            marker.pop('LastModified')
+            marker.pop('Owner')
+        self.assertEqual([{
+            'IsLatest': True,
+            'Key': obj_name,
+            'VersionId': marker_version_id,
+        }], markers)
+
+        # Can still get the old version
+        resp = self.client.get_object(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            VersionId=versions[0])
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(obj_etag, resp['ETag'])
+
+        delete_response = self.client.delete_object(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            VersionId=versions[0])
+
+        resp = self.client.list_object_versions(Bucket=self.bucket_name)
+        self.assertEqual([], resp.get('Versions', []))
+
+        markers = resp.get('DeleteMarkers', [])
+        for marker in markers:
+            self._sanitize_obj_listing(marker)
+        self.assertEqual([{
+            'IsLatest': True,
+            'Key': obj_name,
+            'VersionId': marker_version_id,
+        }], markers)
 
     def test_get_versioned_object(self):
         etags = []
@@ -420,8 +496,7 @@ class TestObjectVersioning(BaseS3TestCase):
         objs = resp.get('Versions', [])
         versions = []
         for obj in objs:
-            obj.pop('LastModified')
-            obj.pop('Owner')
+            self._sanitize_obj_listing(obj)
             versions.append(obj.pop('VersionId'))
         self.assertEqual([{
             'ETag': '"%s"' % etags[0],
@@ -594,15 +669,15 @@ class TestObjectVersioning(BaseS3TestCase):
         resp = self.client.list_objects(Bucket=self.bucket_name)
         objs = resp.get('Contents', [])
         for obj in objs:
-            obj.pop('LastModified')
+            owner = obj.pop('Owner')
+            self._sanitize_obj_listing(obj)
             # one difference seems to be the Owner key
-            self.assertEqual({'DisplayName', 'ID'},
-                             set(obj.pop('Owner').keys()))
+            self.assertEqual({'DisplayName', 'ID'}, set(owner.keys()))
         self.assertEqual(expected, objs)
         resp = self.client.list_objects_v2(Bucket=self.bucket_name)
         objs = resp.get('Contents', [])
         for obj in objs:
-            obj.pop('LastModified')
+            self._sanitize_obj_listing(obj)
         self.assertEqual(expected, objs)
 
         # versioned listings has something for everyone
@@ -623,8 +698,7 @@ class TestObjectVersioning(BaseS3TestCase):
         objs = resp.get('Versions', [])
         versions = []
         for obj in objs:
-            obj.pop('LastModified')
-            obj.pop('Owner')
+            self._sanitize_obj_listing(obj)
             versions.append(obj.pop('VersionId'))
         self.assertEqual(expected, objs)
 

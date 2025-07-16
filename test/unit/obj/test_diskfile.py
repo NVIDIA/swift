@@ -38,9 +38,8 @@ from contextlib import closing, contextmanager
 from gzip import GzipFile
 import pyeclib.ec_iface
 
-from eventlet import hubs, timeout, tpool
-from swift.obj.diskfile import update_auditor_status, EUCLEAN, \
-    should_part_listdir
+from eventlet import hubs, timeout, tpool, spawn, sleep
+from swift.obj.diskfile import update_auditor_status, EUCLEAN, LogTraceContext
 from test import BaseTestCase
 from test.debug_logger import debug_logger
 from test.unit import (mock as unit_mock, temptree, mock_check_drive,
@@ -49,8 +48,7 @@ from test.unit import (mock as unit_mock, temptree, mock_check_drive,
                        encode_frag_archive_bodies, skip_if_no_xattrs)
 from swift.obj import diskfile
 from swift.common import utils
-from swift.common.utils import libc
-from swift.common.utils import hash_path, mkdirs, Timestamp, \
+from swift.common.utils import hash_path, mkdirs, Timestamp, lock_path, \
     encode_timestamps, O_TMPFILE, md5 as _md5, MD5_OF_EMPTY_STRING
 from swift.common import ring
 from swift.common.splice import splice
@@ -7787,6 +7785,21 @@ class TestSuffixHashes(unittest.TestCase):
 
     # invalidate_hash tests - behavior
 
+    def test_invalidate_hash_race_with_partition_delete(self):
+        part_dir = os.path.join(self.testdir, '0')
+        suffix_dir = os.path.join(part_dir, 'fff')
+        os.makedirs(suffix_dir)
+
+        def replicatorish():
+            with lock_path(part_dir):
+                sleep(0.01)
+                rmtree(part_dir)
+                sleep(0.01)
+
+        spawn(replicatorish)
+        sleep(0)  # make sure thread starts
+        diskfile.invalidate_hash(suffix_dir)
+
     def test_invalidate_hash_file_does_not_exist(self):
         for policy in self.iter_policies():
             df_mgr = self.df_router[policy]
@@ -9536,6 +9549,62 @@ class TestSuffixHashes(unittest.TestCase):
             hashes = df_mgr.get_hashes('sda1', '0', [], policy)
             self.assertEqual(hashes, expected)
 
+    def test_get_hashes_multi_file_multi_suffix_tracing(self):
+        # paths is a map of suffix to list of paths, suffix is the suffix with
+        # the multiple hashes
+        paths, suffix = find_paths_with_matching_suffixes(needed_matches=2,
+                                                          needed_suffixes=3)
+        # focus on the reconstructor
+        policy = [p for p in self.iter_policies()
+                  if p.policy_type == EC_POLICY][0]
+        df_mgr = self.df_router[policy]
+        # maybe the expirer is running, let's make a lot of tombstones
+        all_paths = sum(paths.values(), [])
+        for path in all_paths:
+            df = df_mgr.get_diskfile(self.existing_device, '0',
+                                     # each path is (a, c, o)
+                                     *path,
+                                     policy=policy,
+                                     frag_index=4)
+            timestamp = self.ts()
+            df.delete(timestamp)
+        # make a trace
+        self.logger.clear()
+        df_mgr.get_hashes('sda1', '0', [], policy)
+        lines = self.logger.get_lines_for_level('debug')
+        self.assertEqual(
+            f'Run listdir on {self.testdir}/node/sda1/objects/0', lines[0])
+        chunk_pattern = \
+            r'\[(.*) took ([\d.]+) ms txid-([a-f0-9]+) chunk ([\d]+)/([\d]+)\]'
+        counter = 1
+        timing, txid, total = None, None, None
+        for line in lines[1:]:
+            m = re.match(chunk_pattern, line)
+            if m:
+                method, timing, txid, chunk, total = m.groups()
+            else:
+                self.fail(f'Unexpected line: {line}')
+            self.assertEqual('get_hashes', method)
+            self.assertEqual(counter, int(chunk))
+            counter += 1
+        trace_info = []
+        for i, line in enumerate(lines[1:]):
+            prefix = (f'[get_hashes took {timing} ms txid-{txid} '
+                      f'chunk {i + 1}/{total}] ')
+            self.assertTrue(line.startswith(prefix), line)
+            trace_info.extend(line[len(prefix):].splitlines())
+        boiler_plate = 9
+        per_suffix = 4
+        per_hash = 3
+        total_expected = boiler_plate + per_suffix * len(paths) + \
+            per_hash * len(all_paths)
+        self.assertEqual(total_expected, len(trace_info))
+        # most of the per suffix trace_info will only have 7 lines, but the
+        # interesting one has two hashes (4 + 3 * 2)
+        interesting_suffix_trace_info = [x for x in trace_info
+                                         if '_%s' % suffix in x]
+        self.assertEqual(10, len(interesting_suffix_trace_info))
+
     # get_hashes tests - error handling
 
     def test_get_hashes_bad_dev(self):
@@ -9774,6 +9843,52 @@ class TestHashesHelpers(unittest.TestCase):
 
     def tearDown(self):
         rmtree(self.testdir, ignore_errors=1)
+
+    def test_log_trace_context_chunk_size(self):
+        # sanity
+        trace = LogTraceContext('test')
+        with trace.open_span('test_span'):
+            trace.message('test_msg')
+        self.assertEqual(2, len(trace.messages))
+        logger = debug_logger()
+        trace.log(logger)
+        self.assertEqual(1, len(logger.get_lines_for_level('debug')))
+
+        # now test with more messages
+        trace = LogTraceContext('test')
+        with trace.open_span('test_span'):
+            for i in range(100):
+                trace.message('test_msg')
+        self.assertEqual(101, len(trace.messages))
+        logger = debug_logger()
+        trace.log(logger)
+        self.assertEqual(2, len(logger.get_lines_for_level('debug')))
+
+        # now with smaller chunk size
+        def get_log_messages(messages, chunk_size):
+            trace = LogTraceContext('test')
+            trace.MAX_MESSAGES_PER_CHUNK = chunk_size
+            with trace.open_span('test_span'):
+                for i in range(messages - 1):
+                    trace.message('test_msg')
+            self.assertEqual(messages, len(trace.messages))
+            logger = debug_logger()
+            trace.log(logger)
+            return logger.get_lines_for_level('debug')
+        expectations = {
+            # messages, chunk_size: log_messages
+            (15, 16): 1,
+            (16, 16): 1,
+            (17, 16): 2,
+        }
+        for (messages, chunk_size), expected in expectations.items():
+            log_messages = get_log_messages(messages, chunk_size)
+            self.assertEqual(expected, len(log_messages))
+        # we could just output last chunk with only one trace message, but it's
+        # (probably/) better for all messages to be roughly even sized
+        log_messages = get_log_messages(31, 10)
+        self.assertEqual([8, 8, 8, 7],
+                         [len(m.splitlines()) for m in log_messages])
 
     def test_read_legacy_hashes(self):
         hashes = {'fff': 'fake'}

@@ -29,7 +29,7 @@ Ring v0
 -------
 
 Initially, rings were simply pickle dumps of the RingData object. `With
-Swift 1.3.0 <https://opendev.org/openstack/swift/commit/fc6391ea>`_, this
+Swift 1.3.0 <https://opendev.org/openstack/swift/commit/fc6391ea>`__, this
 changed to pickling a pure-stdlib data structure, but the core concept
 was the same.
 
@@ -37,12 +37,12 @@ Ring v1
 -------
 
 Pickle presented some problems, however. While `there are security
-concerns <https://docs.python.org/3/library/pickle.html>`_ around unpickling
+concerns <https://docs.python.org/3/library/pickle.html>`__ around unpickling
 untrusted data, security boundaries are generally drawn such that rings are
 assumed to be trusted. Ultimately, what pushed us to a new format were
-`performance considerations <https://bugs.launchpad.net/swift/+bug/1031954>`_.
+`performance considerations <https://bugs.launchpad.net/swift/+bug/1031954>`__.
 
-Starting in `Swift 1.7.0 <https://opendev.org/openstack/swift/commit/f8ce43a2>`_,
+Starting in `Swift 1.7.0 <https://opendev.org/openstack/swift/commit/f8ce43a2>`__,
 Swift began using a new format (while still being willing to read the old one).
 The new format starts with some magic so we may identify it as such::
 
@@ -87,18 +87,18 @@ In order, the following new fields have been added:
 
 * ``byteorder`` specifies whether the host-order for the
   replica-to-part-to-device table is "big" or "little" endian. Added in
-  `Swift 2.12.0 <https://opendev.org/openstack/swift/commit/1ec6e2bb>`_,
+  `Swift 2.12.0 <https://opendev.org/openstack/swift/commit/1ec6e2bb>`__,
   this allows rings written on big-endian machines to be read on
   little-endian machines and vice-versa.
 * ``next_part_power`` indicates whether a partition-power increase is in
-  progress. Added in `Swift 2.15.0 <https://opendev.org/openstack/swift/commit/e1140666>`_,
+  progress. Added in `Swift 2.15.0 <https://opendev.org/openstack/swift/commit/e1140666>`__,
   this will have one of two values, if present: the ring's current
   ``part_power``, indicating that there may be hardlinks to clean up,
   or ``part_power + 1`` indicating that hardlinks may need to be created.
   See :ref:`the documentation<modify_part_power>`
   for more information.
 * ``version`` specifies the version number of the ring-builder that was used
-  to write this ring. Added in `Swift 2.24.0 <https://opendev.org/openstack/swift/commit/6853616a>`_,
+  to write this ring. Added in `Swift 2.24.0 <https://opendev.org/openstack/swift/commit/6853616a>`__,
   this allows the comparing of rings from different machines to determine
   which is newer.
 
@@ -107,9 +107,8 @@ Ring v2
 
 The way that v1 rings dealt with fractional replicas made it impossible
 to reliably serialize additional large data structures after the
-replica-to-part-to-device table. So v2 has been designed to be extensable.
-
-.. note:: v2 is a new feature and maybe not be fully stable yet.
+replica-to-part-to-device table. The v2 format has been designed to be
+extensable.
 
 The new format starts with magic similar to v1::
 
@@ -166,25 +165,35 @@ Finally, a "tail" is written:
 
 * the gzip stream is flushed with another ``Z_FULL_FLUSH``,
 * the stream is switched to uncompressed,
-* the eight-byte offset of the compressed start of the index is written, and
-* the stream is flushed with ``Z_FINISH``.
+* the eight-byte offset of the uncompressed start of the index is written,
+* the gzip stream is flushed with another ``Z_FULL_FLUSH``,
+* the eight-byte offset of the compressed start of the index is written,
+* the gzip stream is flushed with another ``Z_FULL_FLUSH``, and
+* the gzip stream is closed; this involves:
+
+  * flushing the underlying deflate stream with ``Z_FINISH``
+  * writing ``CRC32`` (of the full uncompressed data)
+  * writing ``ISIZE`` (the length of the full uncompressed data ``mod 2 ** 32``)
 
 By switching to uncompressed, we can know exactly how many bytes will be
-written in the tail, so that when reading we can quickly seek to read the
+written in the tail, so that when reading we can quickly seek to and read the
 index offset, seek to the index start, and read the index. From there we
 can do similar things for any other section.
 
 
 * Seek to the end of the file
-* Go back 31 bytes in the underlying file; this should leave us at a zlib
-  flush point
-* Decompress 8 bytes from the zlib stream to get the location of the start of
-  the index BLOB
+* Go back 31 bytes in the underlying file; this should leave us at the start of
+  the deflate block containing the offset for the compressed start
+* Decompress 8 bytes from the deflate stream to get the location of the
+  compressed start of the index BLOB
 * Seek to that location
 * Read/decompress the size of the index BLOB
 * Read/decompress the json serialized index.
 
-.. note:: This 31 bytes is the 8 byte location and the tail of the gzip file.
+.. note:: This 31 bytes is the deflate block containing the 8 byte location,
+   a ``Z_FULL_FLUSH`` block, the ``Z_FINISH`` block, and the ``CRC32`` and
+   ``ISIZE``. For more information, see `RFC 1951`_ (for the deflate stream)
+   and `RFC 1952`_ (for the gzip format).
 
 The currently defined section and section names upstream are as follows:
 
@@ -235,3 +244,6 @@ This BLOB is the replica-to-part-to-device table. It's length will be
 Note that this is why we increased the size of ``<data-length>`` as compared to
 the v1 format -- otherwise, we may not be able to represent rings with both
 high ``replica_count`` and high ``part_power``.
+
+.. _RFC 1952: https://rfc-editor.org/rfc/rfc1952
+.. _RFC 1951: https://rfc-editor.org/rfc/rfc1951
