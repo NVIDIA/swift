@@ -1405,8 +1405,9 @@ class ObjectController(BaseStorageServer):
                 response_class = HTTPNoContent
             else:
                 response_class = HTTPConflict
-        timing_start = record_slow_timing(
-            timing_breakdown, 'metadata_read', timing_start)
+        finally:
+            timing_start = record_slow_timing(
+                timing_breakdown, 'metadata_read', timing_start)
 
         response_timestamp = max(orig_timestamp, req_timestamp)
         orig_delete_at = Timestamp(orig_metadata.get('X-Delete-At') or 0)
@@ -1452,8 +1453,9 @@ class ObjectController(BaseStorageServer):
                 record_slow_timing(
                     timing_breakdown, 'tombstone_write', timing_start)
                 return HTTPInsufficientStorage(drive=device, request=request)
-            timing_start = record_slow_timing(
-                timing_breakdown, 'tombstone_write', timing_start)
+            finally:
+                timing_start = record_slow_timing(
+                    timing_breakdown, 'tombstone_write', timing_start)
 
             self.container_update(
                 'DELETE', account, container, obj, request,

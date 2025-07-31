@@ -743,31 +743,40 @@ class LogTraceContext:
         self.messages = []
         # Generate a unique transaction ID for this trace
         self.txid = str(uuid.uuid4())[:8]  # Use first 8 chars for brevity
-        if logger:
-            logger.debug(f"no LogTraceContext for {self.name}")
 
     @classmethod
-    def get_trace(cls, name, logger, trace=None):
+    @contextmanager
+    def start_context(cls, start, logger, trace=None):
         """
-        This is mostly for message passing between methods; we use the logger's
+        Since you can't (shouldn't reasonably?) persist a green.threading.local
+        across tpool.execute some callers will pass in a trace instance from
+        their kwargs.
+
+        This ensures a tpool worker won't leak a stale thread local from our
+        caller into it's next job.
+        """
+        try:
+            logger._cls_thread_local.trace = trace
+            trace = cls.get_trace(start, logger)
+            with trace.open_span(start):
+                yield trace
+        finally:
+            logger._cls_thread_local.trace = None
+
+    @classmethod
+    def get_trace(cls, name, logger):
+        """
+        This is for message passing between methods; we use the logger's
         green.threading.local because dfm instances are shared across
-        greenthreads and thread pools. Since you can't (shouldn't reasonably?)
-        persist a green.threading.local across tpool.execute some callers will
-        pass in a trace instance from their kwargs.
+        greenthreads and thread pools.
 
-        If no LogTraceContext is available, this method will create one.  The
-        LogTraceContext instance will always be persisted on the logger, but
-        that's mostly to prevent a bunch of "if not trace" checks - if no one
-        calls the log method then it's essentially a noop stub placeholder.
-
-        N.B. I would not recommend a bunch of logging from inside a tpool, that
-        be the way to deadlocks and grimlins.
+        If no LogTraceContext is available, this method will create one to
+        prevent a bunch of "if not trace" checks.
         """
-        logger._cls_thread_local.trace = (
-            trace
-            or getattr(logger._cls_thread_local, 'trace', None)
-            or LogTraceContext(name, logger))
-        return logger._cls_thread_local.trace
+        if getattr(logger._cls_thread_local, 'trace', None):
+            return logger._cls_thread_local.trace
+        else:
+            return LogTraceContext(name, logger)
 
     def open_span(self, span_name, summary_key=None):
         self.spans.append({
@@ -801,13 +810,34 @@ class LogTraceContext:
     def __exit__(self, exc_type, exc_value, traceback):
         self.close_span()
 
+    def is_valid(self):
+        """
+        Normally a call to get_trace will be w/i start_context, so either the
+        trace is the passed in explicitly OR it's reset to None.
+
+        However, if you manage to get into an instrumented context behind
+        start_context (e.g. _finalize_put) *AND* your tpool worker previously
+        explicitly set it's thread_local to a trace object that has since been
+        logged from the parent, we can validate the state of this context.
+        """
+        return self.messages is not None
+
     def log(self, logger):
+        """
+        This will output all captured span messages from the trace to the
+        logger using a chunked template to comply with syslog length limits.
+
+        N.B. I would not recommend a bunch of logging from inside a tpool, that
+        be the way to deadlocks and grimlins.
+        """
         # this trace is done
-        logger._cls_thread_local.trace = None
         duration = time.time() - self.start
+        # we want to prevent accidental reuse
+        logger._cls_thread_local.trace = None
+        messages, self.messages = self.messages, None
 
         # Calculate optimal chunk size for even distribution
-        total_messages = len(self.messages)
+        total_messages = len(messages)
         num_chunks = math.ceil(total_messages / self.MAX_MESSAGES_PER_CHUNK)
         num_msg_per_chunk = math.ceil(total_messages / max(1, num_chunks))
 
@@ -815,7 +845,7 @@ class LogTraceContext:
         message_chunks = []
         current_chunk = []
 
-        for msg in self.messages:
+        for msg in messages:
             current_chunk.append(msg)
 
             if len(current_chunk) >= num_msg_per_chunk:
@@ -823,7 +853,7 @@ class LogTraceContext:
                 current_chunk = []
 
         # we need message_chunks to always have at least one (possibly empty)
-        # chunk so that we always get a message_summary (not that self.messages
+        # chunk so that we always get a message_summary (not that messages
         # should ever actually *be* empty)
         if current_chunk or not message_chunks:
             message_chunks.append(current_chunk)
@@ -1371,7 +1401,7 @@ class BaseDiskFileManager(object):
                     quar_path = quarantine_renamer(device_path,
                                                    join(hsh_path,
                                                         "made-up-filename"))
-                    logging.exception(
+                    logging.error(
                         'Quarantined %(hsh_path)s to %(quar_path)s because '
                         'it is not a directory', {'hsh_path': hsh_path,
                                                   'quar_path': quar_path})
@@ -1389,7 +1419,7 @@ class BaseDiskFileManager(object):
                         # to quarantine the whole suffix
                         quar_path = quarantine_renamer(device_path, hsh_path)
                         orig_path = path
-                    logging.exception(
+                    logging.error(
                         'Quarantined %(orig_path)s to %(quar_path)s because '
                         'it could not be listed', {'orig_path': orig_path,
                                                    'quar_path': quar_path})
@@ -1457,9 +1487,8 @@ class BaseDiskFileManager(object):
 
         :returns: (int, dict) tuple, i.e. (num_hashed, sanitized_suffix_hashes)
         """
-        trace = LogTraceContext.get_trace('_get_hashes', self.logger,
-                                          trace=kwargs.pop('trace', None))
-        with trace.open_span('_get_hashes'):
+        with LogTraceContext.start_context('_get_hashes', self.logger,
+                                           trace=kwargs.pop('trace', None)):
             hashed, hashes = self.__get_hashes(*args, **kwargs)
             hashes.pop('updated', None)
             hashes.pop('valid', None)

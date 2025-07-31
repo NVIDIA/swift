@@ -15,7 +15,6 @@
 
 import array
 
-import pickle  # nosec: B403
 import json
 from collections import defaultdict
 from os.path import getmtime
@@ -33,13 +32,6 @@ from swift.common.ring.utils import tiers_for_dev, BYTES_TO_TYPE_CODE
 
 DEFAULT_RELOAD_TIME = 15
 RING_CODECS = {
-    0: {
-        "serialize": lambda ring_data, writer: pickle.dump(
-            ring_data.to_dict(), writer, protocol=2),
-        # NB: Old-style pickled ring can't respect metadata_only
-        "deserialize": lambda cls, reader, _metadata_only, _include_devices:
-            pickle.load(reader),  # nosec: B301
-    },
     1: {
         "serialize": lambda ring_data, writer: ring_data.serialize_v1(writer),
         "deserialize": lambda cls, reader, metadata_only, _include_devices:
@@ -68,12 +60,10 @@ def normalize_devices(devs):
     #                and replication_port are required for
     #                replication process. An old replication
     #                ring doesn't contain this parameters into
-    #                device. Old-style pickled rings won't have
-    #                region information.
+    #                device.
     for dev in devs:
         if dev is None:
             continue
-        dev.setdefault('region', 1)
         if 'ip' in dev:
             dev.setdefault('replication_ip', dev['ip'])
         if 'port' in dev:
@@ -219,16 +209,12 @@ class RingData(object):
         """
         with RingReader.open(filename) as reader:
             if reader.version not in RING_CODECS:
-                raise Exception('Unknown ring format version %d' %
-                                reader.version)
+                raise Exception('Unknown ring format version %d for %r' % (
+                                reader.version, filename))
             ring_data = RING_CODECS[reader.version]['deserialize'](
                 cls, reader, metadata_only, include_devices)
 
-        if hasattr(ring_data, 'devs'):
-            # pickled RingData; make sure we've got region/replication info
-            normalize_devices(ring_data.devs)
-        else:
-            ring_data = cls.from_dict(ring_data)
+        ring_data = cls.from_dict(ring_data)
         ring_data.format_version = reader.version
         for attr in ('size', 'raw_size'):
             setattr(ring_data, attr, getattr(reader, attr))

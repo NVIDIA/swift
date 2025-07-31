@@ -2564,7 +2564,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         argv = ["", self.tmpfile, "write_ring"]
         self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
 
-        for version in "0", "1", "2":
+        for version in ("1", "2"):
             argv = ["", self.tmpfile, "write_ring", "--format-version",
                     version]
             self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
@@ -2619,7 +2619,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         self.assertEqual(exp_out, out[-len(exp_out):])
         self.assertIn("Defaulting to --format-version=1", out)
 
-        for version in 0, 1, 2:
+        for version in (1, 2):
             out, err = self.run_srb("write_ring",
                                     "--format-version={}".format(version),
                                     exp_results=exp_results)

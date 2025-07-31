@@ -32,10 +32,13 @@ except ImportError:
     pkg_files = None
 
 
+# See if anycrc is available...
 if anycrc:
     crc32c_anycrc = anycrc.Model('CRC32C').calc
+    crc64nvme_anycrc = anycrc.Model('CRC64-NVME').calc
 else:
     crc32c_anycrc = None
+    crc64nvme_anycrc = None
 
 
 # If isal is available system-wide, great!
@@ -49,6 +52,7 @@ if isal_lib is None and pkg_files is not None:
         isal_lib = isal_libs[0].locate()
 
 isal = ctypes.CDLL(isal_lib) if isal_lib else None
+
 if hasattr(isal, 'crc32_iscsi'):  # isa-l >= 2.16
     isal.crc32_iscsi.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint]
     isal.crc32_iscsi.restype = ctypes.c_uint
@@ -65,7 +69,22 @@ if hasattr(isal, 'crc32_iscsi'):  # isa-l >= 2.16
 else:
     crc32c_isal = None
 
+if hasattr(isal, 'crc64_rocksoft_refl'):  # isa-l >= 2.31.0
+    isal.crc64_rocksoft_refl.argtypes = [
+        ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
+    isal.crc64_rocksoft_refl.restype = ctypes.c_uint64
 
+    def crc64nvme_isal(data, value=0):
+        return isal.crc64_rocksoft_refl(
+            value,
+            data,
+            len(data),
+        )
+else:
+    crc64nvme_isal = None
+
+
+# The kernel may also provide crc32c
 AF_ALG = getattr(socket, 'AF_ALG', 38)
 try:
     _sock = socket.socket(AF_ALG, socket.SOCK_SEQPACKET)
@@ -113,26 +132,6 @@ def _select_crc32c_impl():
         raise NotImplementedError(
             'no crc32c implementation, install isal or anycrc')
     return selected
-
-
-if anycrc:
-    crc64nvme_anycrc = anycrc.Model('CRC64-NVME').calc
-else:
-    crc64nvme_anycrc = None
-
-if hasattr(isal, 'crc64_rocksoft_refl'):  # isa-l >= 2.31.0
-    isal.crc64_rocksoft_refl.argtypes = [
-        ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64]
-    isal.crc64_rocksoft_refl.restype = ctypes.c_uint64
-
-    def crc64nvme_isal(data, value=0):
-        return isal.crc64_rocksoft_refl(
-            value,
-            data,
-            len(data),
-        )
-else:
-    crc64nvme_isal = None
 
 
 def _select_crc64nvme_impl():
@@ -184,7 +183,8 @@ class CRCHasher(object):
 
     def digest(self):
         """
-        Return the current CRC value as a 4-byte big-endian integer.
+        Return the current CRC value as a big-endian integer of length
+        ``width / 8`` bytes.
 
         :returns: Packed CRC value. (bytes)
         """

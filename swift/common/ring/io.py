@@ -45,6 +45,10 @@ class GzipReader(object):
         self.fp = fileobj
         self.reset_decompressor()
 
+    @property
+    def name(self):
+        return self.fp.name
+
     def close(self):
         self.fp.close()
 
@@ -169,24 +173,6 @@ class GzipReader(object):
         data, self.buffer = self.buffer[:amount], self.buffer[amount:]
         return data
 
-    def readline(self):
-        # apparently pickle needs this?
-        while b'\n' not in self.buffer:
-            if self._buffer_chunk():
-                break
-
-        line, sep, self.buffer = self.buffer.partition(b'\n')
-        return line + sep
-
-    def readinto(self, buffer):
-        # Retained so pickle is happy on python 3.8.0 and 3.8.1 (i.e., versions
-        # released with https://github.com/python/cpython/commit/91f4380c but
-        # neither https://github.com/python/cpython/commit/9f37872e nor
-        # https://github.com/python/cpython/commit/b19f7ecf )
-        chunk = self.read(len(buffer))
-        buffer[:len(chunk)] = chunk
-        return len(chunk)
-
 
 class SectionReader(object):
     """
@@ -292,11 +278,14 @@ class RingReader(GzipReader):
 
         magic = self.read(4)
         if magic != b"R1NG":
-            self.version = 0
-        else:
-            self.version, = struct.unpack("!H", self.read(2))
-            if self.version not in (1, 2):
-                raise ValueError("Unsupported ring version: %d" % self.version)
+            raise ValueError(f"Bad ring magic: {magic!r}")
+
+        self.version, = struct.unpack("!H", self.read(2))
+        if self.version not in (1, 2):
+            msg = f"Unsupported ring version: {self.version}"
+            if hasattr(fileobj, "name"):
+                msg += f" for {fileobj.name!r}"
+            raise ValueError(msg)
 
         # NB: In a lot of places, "raw" implies "file on disk", i.e., the
         # compressed stream -- but here it's actually the uncompressed stream.
@@ -586,7 +575,7 @@ class RingWriter(GzipWriter):
 
     def write_magic(self, version):
         """
-        Write our file magic for identifying post-pickle rings.
+        Write our file magic for identifying Swift rings.
 
         :param version: the ring version; should be 1 or 2
         """

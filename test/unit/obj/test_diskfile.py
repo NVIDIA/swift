@@ -34,8 +34,7 @@ from random import shuffle, randint, random
 from shutil import rmtree
 from time import time
 from tempfile import mkdtemp
-from contextlib import closing, contextmanager
-from gzip import GzipFile
+from contextlib import contextmanager
 import pyeclib.ec_iface
 
 from eventlet import hubs, timeout, tpool, spawn, sleep
@@ -116,28 +115,25 @@ def _create_test_ring(path, policy):
         [1, 2, 3, 0, 5, 6, 4],
         [2, 3, 0, 1, 6, 4, 5]]
     intended_devs = [
-        {'id': 0, 'device': 'sda1', 'zone': 0, 'ip': '127.0.0.0',
+        {'id': 0, 'device': 'sda1', 'region': 1, 'zone': 0, 'ip': '127.0.0.0',
          'port': 6200},
-        {'id': 1, 'device': 'sda1', 'zone': 1, 'ip': '127.0.0.1',
+        {'id': 1, 'device': 'sda1', 'region': 1, 'zone': 1, 'ip': '127.0.0.1',
          'port': 6200},
-        {'id': 2, 'device': 'sda1', 'zone': 2, 'ip': '127.0.0.2',
+        {'id': 2, 'device': 'sda1', 'region': 1, 'zone': 2, 'ip': '127.0.0.2',
          'port': 6200},
-        {'id': 3, 'device': 'sda1', 'zone': 4, 'ip': '127.0.0.3',
+        {'id': 3, 'device': 'sda1', 'region': 1, 'zone': 4, 'ip': '127.0.0.3',
          'port': 6200},
-        {'id': 4, 'device': 'sda1', 'zone': 5, 'ip': '127.0.0.4',
+        {'id': 4, 'device': 'sda1', 'region': 1, 'zone': 5, 'ip': '127.0.0.4',
          'port': 6200},
-        {'id': 5, 'device': 'sda1', 'zone': 6,
+        {'id': 5, 'device': 'sda1', 'region': 1, 'zone': 6,
          'ip': 'fe80::202:b3ff:fe1e:8329', 'port': 6200},
-        {'id': 6, 'device': 'sda1', 'zone': 7,
+        {'id': 6, 'device': 'sda1', 'region': 1, 'zone': 7,
          'ip': '2001:0db8:85a3:0000:0000:8a2e:0370:7334',
          'port': 6200}]
     intended_part_shift = 30
     intended_reload_time = 15
-    with closing(GzipFile(testgz, 'wb')) as f:
-        pickle.dump(
-            ring.RingData(intended_replica2part2dev_id, intended_devs,
-                          intended_part_shift),
-            f)
+    ring.RingData(intended_replica2part2dev_id, intended_devs,
+                  intended_part_shift).save(testgz)
     return ring.Ring(path, ring_name=ring_name,
                      reload_time=intended_reload_time)
 
@@ -9974,6 +9970,180 @@ class TestHashesHelpers(unittest.TestCase):
         diskfile.write_hashes(self.testdir, corrupted_hashes)
         result = diskfile.read_hashes(self.testdir)
         self.assertFalse(result['valid'])
+
+
+class TestLogTraceContext(unittest.TestCase):
+
+    def test_ephemeral_log_trace_in_tpool(self):
+
+        captured = []
+
+        class SomeTestClass:
+
+            def __init__(self):
+                self.logger = debug_logger('some-test-class')
+
+            def _be_helpful(self):
+                trace = LogTraceContext.get_trace('test', self.logger)
+                trace.message('helped')
+                captured.append((threading.get_ident(), trace))
+
+            def some_instrumented_helper(self):
+                with LogTraceContext.start_context(
+                        'helping', self.logger) as trace:
+                    self._be_helpful()
+                captured.append((threading.get_ident(), trace))
+
+        o = SomeTestClass()
+        tpool.execute(o.some_instrumented_helper)
+        self.assertFalse(getattr(o.logger._cls_thread_local, 'trace', None))
+        # one thread_id, two trace objects
+        ids, traces = zip(*captured)
+        self.assertEqual(2, len(ids))
+        self.assertEqual(1, len(set(ids)))
+        self.assertEqual(2, len(traces))
+        self.assertEqual(2, len(set(traces)))
+
+        # each time you call get_trace in the tpool it creates a new object
+        captured = []
+        num_workers = len(tpool._threads)
+        m = 3
+        for i in range(num_workers * m):
+            tpool.execute(o.some_instrumented_helper)
+        self.assertFalse(getattr(o.logger._cls_thread_local, 'trace', None))
+        expected = num_workers * m * 2
+        ids, traces = zip(*captured)
+        self.assertEqual(expected, len(ids))
+        self.assertEqual(num_workers, len(set(ids)))
+        self.assertEqual(expected, len(traces))
+        self.assertEqual(expected, len(set(traces)))
+
+    def test_local_log_trace_across_tpool(self):
+
+        captured = []
+
+        class SomeTestClass:
+
+            def __init__(self):
+                self.logger = debug_logger('some-test-class')
+
+            def _be_helpful(self):
+                trace = LogTraceContext.get_trace('test', self.logger)
+                trace.message('helped')
+                captured.append((threading.get_ident(), trace))
+
+            def some_instrumented_helper(self, trace=None):
+                with LogTraceContext.start_context(
+                        'helping', self.logger, trace=trace):
+                    self._be_helpful()
+                captured.append((threading.get_ident(), trace))
+
+        o = SomeTestClass()
+        # you don't *have* to pass a trace object
+        tpool.execute(o.some_instrumented_helper)
+        self.assertFalse(getattr(o.logger._cls_thread_local, 'trace', None))
+        self.assertEqual(2, len(captured))
+        # one thread_id, two trace objects
+        ids, traces = zip(*captured)
+        self.assertEqual(2, len(ids))
+        self.assertEqual(1, len(set(ids)))
+        self.assertEqual(2, len(traces))
+        self.assertEqual(2, len(set(traces)))
+
+        # but it'd be a lot *cooler* if you did!
+        captured = []
+        trace = LogTraceContext('across_tpool')
+        tpool.execute(o.some_instrumented_helper, trace=trace)
+        self.assertFalse(getattr(o.logger._cls_thread_local, 'trace', None))
+        # ... because we have our own reference to this object
+        ids, traces = zip(*captured)
+        self.assertEqual(2, len(ids))
+        self.assertEqual(1, len(set(ids)))
+        self.assertEqual(2, len(traces))
+        self.assertEqual(1, len(set(traces)))
+        self.assertEqual({trace}, set(traces))
+
+        # ... so we could create another one!?
+        trace2 = LogTraceContext('across_tpool2')
+        tpool.execute(o.some_instrumented_helper, trace=trace2)
+        ids, traces = zip(*captured)
+        self.assertEqual(4, len(ids))
+        # seems like tpool is round-robin, up to EVENTLET_THREADPOOL_SIZE
+        num_workers = min(len(tpool._threads), 2)
+        self.assertEqual(num_workers, len(set(ids)))
+        self.assertEqual(4, len(traces))
+        self.assertEqual(2, len(set(traces)))
+        self.assertEqual({trace, trace2}, set(traces))
+
+    def test_accidental_reuse(self):
+        logger = debug_logger('test-reuse')
+        orig_trace = LogTraceContext('reuse')
+        self.assertFalse(getattr(logger._cls_thread_local, 'trace', None))
+
+        def test_use(trace=None):
+            with LogTraceContext.start_context(
+                    'test', logger, trace=trace) as ctx:
+                self.assertEqual(orig_trace, logger._cls_thread_local.trace)
+                self.assertEqual(ctx, orig_trace)
+                ctx.message('use')
+        tpool.execute(test_use, orig_trace)
+
+        def test_purposful_reuse(trace):
+            with LogTraceContext.start_context('test', logger, trace=trace):
+                trace = LogTraceContext.get_trace('test', logger)
+                self.assertEqual(trace, logger._cls_thread_local.trace)
+                self.assertEqual(orig_trace, logger._cls_thread_local.trace)
+                trace.message('purposful_reuse')
+        tpool.execute(test_purposful_reuse, orig_trace)
+
+        # this should be the end of this trace's existance
+        orig_trace.log(logger)
+        # so, accidental re-use is not supported
+        self.assertFalse(orig_trace.is_valid())
+        self.assertRaises(AttributeError, orig_trace.message,
+                          'accidental_reuse')
+
+        # instead get_trace should return a new instance
+        self.assertFalse(getattr(logger._cls_thread_local, 'trace', None))
+        new_trace = LogTraceContext.get_trace('test', logger)
+        self.assertNotEqual(new_trace, orig_trace)
+
+    def test_malicious_reuse(self):
+        logger = debug_logger('test-reuse')
+        orig_trace = LogTraceContext('reuse')
+        self.assertFalse(getattr(logger._cls_thread_local, 'trace', None))
+
+        def deep_instrumentation():
+            # how could this know it's thread local is stale?
+            trace = LogTraceContext.get_trace('test', logger)
+            trace.message('oops')
+
+        captured = None
+
+        def innocent_bystander(trace=None):
+            before = getattr(logger._cls_thread_local, 'trace', None)
+            with LogTraceContext.start_context('test', logger, trace=trace):
+                deep_instrumentation()
+            after = logger._cls_thread_local.trace
+            nonlocal captured
+            captured = (before, after)
+
+        tpool.set_num_threads(1)
+        tpool.execute(innocent_bystander, trace=orig_trace)
+        self.assertEqual(captured, (mock.ANY, None))
+        for i in range(10):
+            tpool.execute(deep_instrumentation)
+
+        # tpools can't keep appending to their trace if we reset the thread
+        # local coming out of start_context
+        self.assertEqual(2, len(orig_trace.messages))
+        orig_trace.log(logger)
+        self.assertFalse(orig_trace.is_valid())
+
+        # to further minimize risk start_context can reset when not explicitly
+        # starting a new trace
+        tpool.execute(innocent_bystander)
+        self.assertEqual(captured, (None, None))
 
 
 if __name__ == '__main__':

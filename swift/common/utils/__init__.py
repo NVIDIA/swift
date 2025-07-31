@@ -1498,9 +1498,7 @@ class CooperativeCachePopulator(object):
     after ``token_ttl``, requests which see cache miss will start a new round
     of cooperation token session.
 
-    :param logger: the metrics logger.
-    :param op_type: name of the operation type, will be used as the metrics
-        label.
+    :param app: the application instance containing app.logger, app.statsd
     :param infocache: the infocache instance.
     :param memcache: the memcache instance, must be a valid MemcacheRing.
     :param cache_key: the cache key.
@@ -1517,12 +1515,16 @@ class CooperativeCachePopulator(object):
         from backend; default to be 3, which give redundancy when any request
         with token fails to fetch data from the backend or fails to set new
         data into memcached; 0 means no cooperative token is used.
+    :param labels: the default labels for emitting labeled metrics, for example
+        resource or operation type, account, container, etc.
     """
 
-    def __init__(self, logger, op_type, infocache, memcache,
-                 cache_key, cache_ttl, avg_backend_fetch_time, num_tokens=3):
-        self._logger = logger
-        self._op_type = op_type
+    def __init__(self, app, infocache, memcache,
+                 cache_key, cache_ttl, avg_backend_fetch_time, num_tokens=3,
+                 labels=None):
+        self._logger = app.logger
+        self._statsd = app.statsd
+        self._labels = labels or {}
         self._infocache = infocache
         self._memcache = memcache
         self._cache_key = cache_key
@@ -1540,6 +1542,8 @@ class CooperativeCachePopulator(object):
         self.set_cache_state = None
         # Indicates if this request has acquired one token.
         self.token_acquired = False
+        # Indicates if the request has no token and doesn't get enough retries.
+        self.lack_retries = False
         # The HttpResponse object returned by ``do_fetch_backend`` if called.
         self.backend_resp = None
 
@@ -1615,7 +1619,8 @@ class CooperativeCachePopulator(object):
                 num_waits += 1
             else:
                 # Request has no token and doesn't get enough retries.
-                self._logger.increment('token.%s.lack_retries' % self._op_type)
+                self.lack_retries = True
+
                 # To have one last check, when eventlet scheduling didn't give
                 # this greenthread enough cpu cycles and it didn't have enough
                 # times of retries.
@@ -1639,13 +1644,17 @@ class CooperativeCachePopulator(object):
         :returns: value of the data fetched from backend or memcache; None if
             not exist.
         """
+        labels = {
+            **self._labels,
+        }
         if not self._num_tokens:
             # Cooperative token disabled, fetch from backend.
             data = self._query_backend_and_set_cache()
-            self._logger.increment(
-                'token.%s.backend_reqs.token_disabled.%d' %
-                (self._op_type, self.backend_resp.status_int)
-            )
+            labels['event'] = 'backend_reqs'
+            labels['token'] = 'disabled'  # nosec bandit B105
+            labels['status'] = self.backend_resp.status_int
+            self._statsd.increment('swift_token', labels=labels)
+
             return data
 
         total_requests = 0
@@ -1664,10 +1673,9 @@ class CooperativeCachePopulator(object):
             # set the data in memcache.
             self.token_acquired = True
             data = self._query_backend_and_set_cache()
-            self._logger.increment(
-                'token.%s.backend_reqs.with_token.%d' %
-                (self._op_type, self.backend_resp.status_int)
-            )
+            labels['event'] = 'backend_reqs'
+            labels['status'] = self.backend_resp.status_int
+
             if self.set_cache_state == 'set':
                 # Since the successful finish of one whole cooperative token
                 # session only depends on a single successful request. So when
@@ -1675,9 +1683,7 @@ class CooperativeCachePopulator(object):
                 # memcache set successful, it can remove all cooperative tokens
                 #  of this token session.
                 self._memcache.delete(self._token_key)
-                self._logger.increment(
-                    'token.%s.done_token_reqs' % self._op_type
-                )
+
         else:
             # No token acquired, it means that there are requests in-flight
             # which will fetch data form the backend servers and update them in
@@ -1685,19 +1691,24 @@ class CooperativeCachePopulator(object):
             data = self._sleep_and_retry_memcache()
             if data is not None:
                 req_served_from_cache = True
-                self._logger.increment(
-                    'token.%s.cache_served_reqs' % self._op_type)
+                labels['event'] = 'cache_served'
+
             else:
                 # Still no cache data fetched.
                 data = self._query_backend_and_set_cache()
 
+            labels['lack_retries'] = self.lack_retries
+
         if not self.token_acquired and not req_served_from_cache:
-            # Total number of requests equals to 'cache_served_reqs' plus
-            # 'backend_reqs.with_token' and 'backend_reqs.no_token'.
-            self._logger.increment(
-                'token.%s.backend_reqs.no_token.%d' %
-                (self._op_type, self.backend_resp.status_int)
-            )
+            # Total number of requests equals to 'cache_served' plus
+            # 'backend_reqs' 'with_token' and 'backend_reqs' 'no_token'.
+            labels['event'] = 'backend_reqs'
+            labels['status'] = self.backend_resp.status_int
+
+        labels['token'] = 'with_token' if self.token_acquired else 'no_token'
+        if self.set_cache_state:
+            labels['set_cache_state'] = self.set_cache_state
+        self._statsd.increment('swift_token', labels=labels)
         return data
 
 

@@ -40,6 +40,7 @@ from swift.common.utils import Watchdog, get_logger, \
     parse_options, non_negative_int, config_positive_float_value
 from swift.common.registry import register_swift_info
 from swift.common.constraints import check_utf8, valid_api_version
+from swift.common.statsd_client import get_labeled_statsd_client
 from swift.proxy.controllers import AccountController, ContainerController, \
     ObjectControllerRouter, InfoController
 from swift.proxy.controllers.base import get_container_info, \
@@ -199,7 +200,7 @@ class Application(object):
     """WSGI application for the proxy server."""
 
     def __init__(self, conf, logger=None, account_ring=None,
-                 container_ring=None):
+                 container_ring=None, statsd=None):
         # This is for the sake of tests which instantiate an Application
         # directly rather than via loadapp().
         self._pipeline_final_app = self
@@ -211,6 +212,7 @@ class Application(object):
                                      statsd_tail_prefix='proxy-server')
         else:
             self.logger = logger
+        self.statsd = statsd or get_labeled_statsd_client(conf, self.logger)
         self.backend_user_agent = 'proxy-server %s' % os.getpid()
 
         swift_dir = conf.get('swift_dir', '/etc/swift')

@@ -21,7 +21,8 @@ import io
 import itertools
 
 from swift.common.statsd_client import StatsdClient
-from test.debug_logger import debug_logger, FakeStatsdClient
+from test.debug_logger import debug_logger, FakeStatsdClient, \
+    debug_labeled_statsd_client
 from test.unit import temptree, make_timestamp_iter, with_tempdir, \
     mock_timestamp_now, FakeIterable
 from test.unit.common.test_memcached import MockedMemcachePool, \
@@ -124,6 +125,13 @@ class MockOs(object):
             return object.__getattr__(self, name)
         except AttributeError:
             return getattr(os, name)
+
+
+class MockApp(object):
+
+    def __init__(self, logger, statsd):
+        self.logger = logger
+        self.statsd = statsd
 
 
 class MockSys(object):
@@ -3068,6 +3076,13 @@ class TestCooperativeCachePopulator(unittest.TestCase):
 
     def setUp(self):
         self.logger = debug_logger()
+        conf = {
+            'log_statsd_host': 'host',
+            'log_statsd_port': 8125,
+            'statsd_label_mode': 'dogstatsd',
+            'statsd_emit_legacy': True,
+        }
+        self.statsd = debug_labeled_statsd_client(conf)
         self.memcache = TestableMemcacheRing(
             ['1.2.3.4:11211'], logger=self.logger)
         mock_cache = MockMemcached()
@@ -3094,14 +3109,14 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             return "backend data", TestCooperativeCachePopulator.backend_resp
 
     class DelayedCachePopulator(CooperativeCachePopulator):
-        def __init__(self, logger, op_type, infocache, memcache,
+        def __init__(self, app, infocache, memcache,
                      cache_key, cache_ttl, avg_backend_fetch_time,
                      backend_delay=0,
                      fetch_backend_failure=False,
-                     num_tokens=3):
+                     num_tokens=3, labels=None):
             super().__init__(
-                logger, op_type, infocache, memcache, cache_key,
-                cache_ttl, avg_backend_fetch_time, num_tokens
+                app, infocache, memcache, cache_key, cache_ttl,
+                avg_backend_fetch_time, num_tokens, labels=labels
             )
             self._backend_delay = backend_delay
             self._fetch_backend_failure = fetch_backend_failure
@@ -3119,14 +3134,18 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         # Test the first request will acquire the token, fetch data from
         # the backend and set it into Memcached.
         obj = self.MockCachePopulator(
-            self.logger, "test",
+            MockApp(self.logger, self.statsd),
             self.infocache, self.memcache,
             self.cache_key, self.cache_ttl,
             self.avg_backend_fetch_time,
-            num_tokens=10
+            num_tokens=10, labels={
+                'resource': "test",
+            }
         )
         self.assertEqual(obj._logger, self.logger)
-        self.assertEqual(obj._op_type, "test")
+        self.assertEqual(obj._labels, {
+            'resource': "test",
+        })
         self.assertEqual(obj._infocache, self.infocache)
         self.assertEqual(obj._memcache, self.memcache)
         self.assertEqual(obj._cache_key, self.cache_key)
@@ -3144,11 +3163,13 @@ class TestCooperativeCachePopulator(unittest.TestCase):
 
     def test_populator_num_tokens_zero(self):
         populator = self.MockCachePopulator(
-            self.logger, "updating_shard",
+            MockApp(self.logger, self.statsd),
             self.infocache, self.memcache,
             self.cache_key, self.cache_ttl,
             avg_backend_fetch_time=.1,
-            num_tokens=0,
+            num_tokens=0, labels={
+                'resource': "updating_shard",
+            }
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
@@ -3163,22 +3184,29 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             [(self.cache_key, "backend data", self.cache_ttl)]
         )
         self.assertEqual(self.memcache.del_calls, [])
-        stats = self.logger.statsd_client.get_stats_counts()
-        self.assertEqual(
-            {'token.updating_shard.backend_reqs.token_disabled.200': 1},
-            stats
-        )
+        stats = self.statsd.get_labeled_stats_counts()
+        self.assertEqual({
+            ('swift_token', frozenset({
+                'resource': 'updating_shard',
+                'event': 'backend_reqs',
+                'token': 'disabled',
+                'status': 200,
+            }.items())): 1,
+        }, stats)
 
     def test_first_request_with_token(self):
         # Test the first request will acquire the token, fetch data from
         # the backend and set it into Memcached.
         populator = self.MockCachePopulator(
-            self.logger, "test",
+            MockApp(self.logger, self.statsd),
             self.infocache,
             self.memcache,
             self.cache_key,
             self.cache_ttl,
             self.avg_backend_fetch_time,
+            labels={
+                'resource': "test",
+            }
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
@@ -3196,21 +3224,30 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             [(self.cache_key, "backend data", self.cache_ttl)]
         )
         self.assertEqual(self.memcache.del_calls, [(self.token_key)])
-        stats = self.logger.statsd_client.get_stats_counts()
-        self.assertEqual({'token.test.backend_reqs.with_token.200': 1,
-                          'token.test.done_token_reqs': 1},
-                         stats)
+        stats = self.statsd.get_labeled_stats_counts()
+        self.assertEqual({
+            ('swift_token', frozenset({
+                'resource': "test",
+                'event': 'backend_reqs',
+                'token': 'with_token',
+                'set_cache_state': 'set',
+                'status': 200,
+            }.items())): 1,
+        }, stats)
 
     def test_first_request_with_token_with_encoder(self):
         # Test the processing of first request with cache data encoder and
         # decoder.
         populator = self.DataTransformCachePopulator(
-            self.logger, "test",
+            MockApp(self.logger, self.statsd),
             self.infocache,
             self.memcache,
             self.cache_key,
             self.cache_ttl,
             self.avg_backend_fetch_time,
+            labels={
+                'resource': "test",
+            }
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
@@ -3228,10 +3265,16 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             [(self.cache_key, "BACKEND DATA", self.cache_ttl)]
         )
         self.assertEqual(self.memcache.del_calls, [(self.token_key)])
-        stats = self.logger.statsd_client.get_stats_counts()
-        self.assertEqual({'token.test.backend_reqs.with_token.200': 1,
-                          'token.test.done_token_reqs': 1},
-                         stats)
+        stats = self.statsd.get_labeled_stats_counts()
+        self.assertEqual({
+            ('swift_token', frozenset({
+                'resource': "test",
+                'event': 'backend_reqs',
+                'token': 'with_token',
+                'set_cache_state': 'set',
+                'status': 200,
+            }.items())): 1,
+        }, stats)
 
     def test_following_request_with_token(self):
         # Test the following request (not the first one) which also acquires
@@ -3244,12 +3287,15 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         # Test the following request to get the token.
         self.memcache.incr_calls = []
         populator = self.MockCachePopulator(
-            self.logger, "test",
+            MockApp(self.logger, self.statsd),
             self.infocache,
             self.memcache,
             self.cache_key,
             self.cache_ttl,
             self.avg_backend_fetch_time,
+            labels={
+                'resource': "test",
+            }
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
@@ -3267,10 +3313,16 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             [(self.cache_key, "backend data", self.cache_ttl)]
         )
         self.assertEqual(self.memcache.del_calls, [(self.token_key)])
-        stats = self.logger.statsd_client.get_stats_counts()
-        self.assertEqual({'token.test.backend_reqs.with_token.200': 1,
-                          'token.test.done_token_reqs': 1},
-                         stats)
+        stats = self.statsd.get_labeled_stats_counts()
+        self.assertEqual({
+            ('swift_token', frozenset({
+                'resource': "test",
+                'event': 'backend_reqs',
+                'token': 'with_token',
+                'set_cache_state': 'set',
+                'status': 200,
+            }.items())): 1,
+        }, stats)
 
     def test_fetch_data_cache_hit_without_token(self):
         # Test the request which doesn't acquire the token, then keep sleeping
@@ -3280,6 +3332,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                             total_miss_retries,
                             expected_sleep_calls):
             self.logger.statsd_client.clear()
+            self.statsd.clear()
             num_tokens_per_session = random.randint(1, 3)
             retries = 0
 
@@ -3309,13 +3362,16 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             self.memcache.incr_calls = []
             self.memcache.set_calls = []
             populator = self.MockCachePopulator(
-                self.logger, "test",
+                MockApp(self.logger, self.statsd),
                 self.infocache,
                 self.memcache,
                 self.cache_key,
                 self.cache_ttl,
                 avg_backend_fetch_time=avg_fetch_time,
                 num_tokens=num_tokens_per_session,
+                labels={
+                    'resource': "test",
+                }
             )
             populator._token_ttl = 10
             with mock.patch.object(utils.eventlet, 'sleep') as mock_sleep:
@@ -3336,8 +3392,15 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                 [('NOT_EXISTED_YET')] * (retries - 1) + [(self.cache_key)]
             )
             self.assertFalse(populator.token_acquired)
-            stats = self.logger.statsd_client.get_stats_counts()
-            self.assertEqual({'token.test.cache_served_reqs': 1}, stats)
+            stats = self.statsd.get_labeled_stats_counts()
+            self.assertEqual({
+                ('swift_token', frozenset({
+                    'resource': "test",
+                    'event': 'cache_served',
+                    'token': 'no_token',
+                    'lack_retries': False,
+                }.items())): 1,
+            }, stats)
 
         # 'expected' maps:
         # (avg_backend_fetch_time, total_miss_retries) ->
@@ -3381,13 +3444,16 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.memcache.incr_calls = []
         self.memcache.set_calls = []
         populator = self.MockCachePopulator(
-            self.logger, "test",
+            MockApp(self.logger, self.statsd),
             self.infocache,
             self.memcache,
             self.cache_key,
             self.cache_ttl,
             self.avg_backend_fetch_time,
-            num_tokens_per_session
+            num_tokens_per_session,
+            labels={
+                'resource': "test",
+            }
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
@@ -3407,8 +3473,17 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(
             self.memcache.get_calls, [('NOT_EXISTED_YET')] * retries)
         self.assertEqual(self.memcache.del_calls, [])
-        stats = self.logger.statsd_client.get_stats_counts()
-        self.assertEqual({'token.test.backend_reqs.no_token.200': 1}, stats)
+        stats = self.statsd.get_labeled_stats_counts()
+        self.assertEqual({
+            ('swift_token', frozenset({
+                'resource': "test",
+                'event': 'backend_reqs',
+                'token': 'no_token',
+                'lack_retries': False,
+                'set_cache_state': 'set',
+                'status': 200,
+            }.items())): 1,
+        }, stats)
 
     def test_fetch_data_req_lacks_enough_retries(self):
         # Test the request which doesn't acquire the token, then keep sleeping
@@ -3434,12 +3509,15 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.memcache.incr_calls = []
         self.memcache.set_calls = []
         populator = self.MockCachePopulator(
-            self.logger, "test",
+            MockApp(self.logger, self.statsd),
             self.infocache,
             self.memcache,
             self.cache_key,
             self.cache_ttl,
             self.avg_backend_fetch_time,
+            labels={
+                'resource': "test",
+            }
         )
         with patch('time.time', ) as mock_time:
             mock_time.side_effect = itertools.count(4000.99, 1.0)
@@ -3461,10 +3539,17 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(
             self.memcache.get_calls, [('NOT_EXISTED_YET')] * 2)
         self.assertEqual(self.memcache.del_calls, [])
-        stats = self.logger.statsd_client.get_stats_counts()
-        self.assertEqual({'token.test.lack_retries': 1,
-                          'token.test.backend_reqs.no_token.200': 1},
-                         stats)
+        stats = self.statsd.get_labeled_stats_counts()
+        self.assertEqual({
+            ('swift_token', frozenset({
+                'resource': "test",
+                'event': 'backend_reqs',
+                'token': 'no_token',
+                'lack_retries': True,
+                'set_cache_state': 'set',
+                'status': 200,
+            }.items())): 1,
+        }, stats)
 
     def test_get_token_connection_error(self):
         # Test the request which couldn't acquire the token due to memcached
@@ -3475,12 +3560,15 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock_cache, mock_cache)] * 2)
         populator = self.MockCachePopulator(
-            self.logger, "test",
+            MockApp(self.logger, self.statsd),
             self.infocache,
             self.memcache,
             self.cache_key,
             self.cache_ttl,
             self.avg_backend_fetch_time,
+            labels={
+                'resource': "test",
+            }
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
@@ -3497,9 +3585,16 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             [(self.cache_key, "backend data", self.cache_ttl)]
         )
         self.assertEqual(self.memcache.del_calls, [])
-        stats = self.logger.statsd_client.get_stats_counts()
-        self.assertEqual({'token.test.backend_reqs.no_token.200': 1},
-                         stats)
+        stats = self.statsd.get_labeled_stats_counts()
+        self.assertEqual({
+            ('swift_token', frozenset({
+                'resource': "test",
+                'event': 'backend_reqs',
+                'token': 'no_token',
+                'set_cache_state': 'set',
+                'status': 200,
+            }.items())): 1,
+        }, stats)
 
     def test_set_data_connection_error(self):
         # Test the request which is able to acquire the token, but fails to set
@@ -3511,12 +3606,15 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock_cache, mock_cache)] * 2)
         populator = self.MockCachePopulator(
-            self.logger, "test",
+            MockApp(self.logger, self.statsd),
             self.infocache,
             self.memcache,
             self.cache_key,
             self.cache_ttl,
             self.avg_backend_fetch_time,
+            labels={
+                'resource': "test",
+            }
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
@@ -3533,9 +3631,16 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             [(self.cache_key, "backend data", self.cache_ttl)]
         )
         self.assertEqual(self.memcache.del_calls, [])
-        stats = self.logger.statsd_client.get_stats_counts()
-        self.assertEqual({'token.test.backend_reqs.with_token.200': 1},
-                         stats)
+        stats = self.statsd.get_labeled_stats_counts()
+        self.assertEqual({
+            ('swift_token', frozenset({
+                'resource': "test",
+                'event': 'backend_reqs',
+                'token': 'with_token',
+                'set_cache_state': 'set_error',
+                'status': 200,
+            }.items())): 1,
+        }, stats)
 
     def test_get_token_data_set_connection_errors(self):
         # Test the request which couldn't acquire the token due to memcached
@@ -3548,12 +3653,15 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.memcache._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock_cache, mock_cache)] * 2)
         populator = self.MockCachePopulator(
-            self.logger, "test",
+            MockApp(self.logger, self.statsd),
             self.infocache,
             self.memcache,
             self.cache_key,
             self.cache_ttl,
             self.avg_backend_fetch_time,
+            labels={
+                'resource': "test",
+            }
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
@@ -3570,9 +3678,16 @@ class TestCooperativeCachePopulator(unittest.TestCase):
             [(self.cache_key, "backend data", self.cache_ttl)]
         )
         self.assertEqual(self.memcache.del_calls, [])
-        stats = self.logger.statsd_client.get_stats_counts()
-        self.assertEqual({'token.test.backend_reqs.no_token.200': 1},
-                         stats)
+        stats = self.statsd.get_labeled_stats_counts()
+        self.assertEqual({
+            ('swift_token', frozenset({
+                'resource': "test",
+                'event': 'backend_reqs',
+                'token': 'no_token',
+                'set_cache_state': 'set_error',
+                'status': 200,
+            }.items())): 1,
+        }, stats)
 
     def test_fetch_data_from_cache_connection_error(self):
         # Test the request which doesn't acquire the token, then keep sleeping
@@ -3591,12 +3706,15 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.memcache.incr_calls = []
         self.memcache.set_calls = []
         populator = self.MockCachePopulator(
-            self.logger, "test",
+            MockApp(self.logger, self.statsd),
             self.infocache,
             self.memcache,
             self.cache_key,
             self.cache_ttl,
             self.avg_backend_fetch_time,
+            labels={
+                'resource': "test",
+            }
         )
         data = populator.fetch_data()
         self.assertEqual(data, "backend data")
@@ -3615,9 +3733,17 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         self.assertEqual(
             self.memcache.get_calls[0], self.cache_key)
         self.assertEqual(self.memcache.del_calls, [])
-        stats = self.logger.statsd_client.get_stats_counts()
-        self.assertEqual({'token.test.backend_reqs.no_token.200': 1},
-                         stats)
+        stats = self.statsd.get_labeled_stats_counts()
+        self.assertEqual({
+            ('swift_token', frozenset({
+                'resource': "test",
+                'event': 'backend_reqs',
+                'token': 'no_token',
+                'lack_retries': False,
+                'set_cache_state': 'set',
+                'status': 200,
+            }.items())): 1,
+        }, stats)
 
     def test_concurrent_requests(self):
         # Simulate multiple concurrent threads, each of them issues a
@@ -3628,13 +3754,16 @@ class TestCooperativeCachePopulator(unittest.TestCase):
         def worker_process():
             # Initialize new populator instance in each process.
             populator = self.DelayedCachePopulator(
-                self.logger, "test",
+                MockApp(self.logger, self.statsd),
                 {},
                 self.memcache,
                 self.cache_key,
                 self.cache_ttl,
                 self.avg_backend_fetch_time,
                 backend_delay=self.avg_backend_fetch_time,
+                labels={
+                    'resource': "test",
+                }
             )
             data = populator.fetch_data()
 
@@ -3656,12 +3785,23 @@ class TestCooperativeCachePopulator(unittest.TestCase):
 
         # Wait for all requests to complete
         pool.waitall()
-        stats = self.logger.statsd_client.get_stats_counts()
+        stats = self.statsd.get_labeled_stats_counts()
         self.assertEqual({
-            'token.test.backend_reqs.with_token.200': 3,
-            'token.test.cache_served_reqs': 97,
-            'token.test.done_token_reqs': 3,
+            ('swift_token', frozenset({
+                'resource': 'test',
+                'event': 'backend_reqs',
+                'token': 'with_token',
+                'set_cache_state': 'set',
+                'status': 200,
+            }.items())): 3,
+            ('swift_token', frozenset({
+                'resource': 'test',
+                'event': 'cache_served',
+                'token': 'no_token',
+                'lack_retries': False,
+            }.items())): 97
         }, stats)
+
         self.assertEqual(
             self.memcache.incr_calls,
             [(self.token_key, 1, self.avg_backend_fetch_time * 10)] * 100
@@ -3691,7 +3831,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                            fetch_backend_failure=False):
             # Initialize new populator instance in each process.
             populator = self.DelayedCachePopulator(
-                self.logger, "test",
+                MockApp(self.logger, self.statsd),
                 {},
                 self.memcache,
                 self.cache_key,
@@ -3699,6 +3839,9 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                 self.avg_backend_fetch_time,
                 backend_delay,
                 fetch_backend_failure,
+                labels={
+                    'resource': "test",
+                }
             )
             if exec_delay:
                 eventlet.sleep(exec_delay)
@@ -3768,7 +3911,7 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                            fetch_backend_failure=False):
             # Initialize new populator instance in each process.
             populator = self.DelayedCachePopulator(
-                self.logger, "test",
+                MockApp(self.logger, self.statsd),
                 {},
                 self.memcache,
                 self.cache_key,
@@ -3776,6 +3919,9 @@ class TestCooperativeCachePopulator(unittest.TestCase):
                 self.avg_backend_fetch_time,
                 backend_delay,
                 fetch_backend_failure,
+                labels={
+                    'resource': "test",
+                }
             )
             if exec_delay:
                 eventlet.sleep(exec_delay)

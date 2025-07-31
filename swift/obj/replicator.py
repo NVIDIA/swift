@@ -42,7 +42,7 @@ from swift.common.http import HTTP_OK, HTTP_INSUFFICIENT_STORAGE
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.obj import ssync_sender
 from swift.obj.diskfile import get_data_dir, get_tmp_dir, DiskFileRouter, \
-    invalidate_hash
+    LogTraceContext, invalidate_hash
 from swift.common.storage_policy import POLICIES, REPL_POLICY
 from swift.common.exceptions import PartitionLockTimeout
 
@@ -699,11 +699,15 @@ class ObjectReplicator(Daemon):
         failure_devs_info = set()
         begin = time.time()
         df_mgr = self._df_router[job['policy']]
+        trace = LogTraceContext('replicator.update')
         try:
             hashed, local_hash = tpool.execute(
                 df_mgr._get_hashes, job['device'],
                 job['partition'], job['policy'],
-                do_listdir=self.do_listdir(job['partition']))
+                do_listdir=_do_listdir(
+                    int(job['partition']),
+                    self.replication_cycle),
+                trace=trace)
             stats.suffix_hash += hashed
             self.logger.update_stats('suffix.hashes', hashed)
             attempts_left = len(job['nodes'])
@@ -760,7 +764,7 @@ class ObjectReplicator(Daemon):
                     hashed, recalc_hash = tpool.execute(
                         df_mgr._get_hashes,
                         job['device'], job['partition'], job['policy'],
-                        recalculate=suffixes)
+                        recalculate=suffixes, trace=trace)
                     self.logger.update_stats('suffix.hashes', hashed)
                     local_hash = recalc_hash
                     suffixes = [suffix for suffix in local_hash if
@@ -785,6 +789,8 @@ class ObjectReplicator(Daemon):
                     self.logger.exception("Error syncing with node: %s",
                                           node_str)
             stats.suffix_count += len(local_hash)
+            # this has the side-effect of relasing the trace obj from the
+            # thread-local
         except StopIteration:
             self.logger.error('Ran out of handoffs while replicating '
                               'partition %s of policy %d',
@@ -793,6 +799,7 @@ class ObjectReplicator(Daemon):
             failure_devs_info.update(target_devs_info)
             self.logger.exception("Error syncing partition")
         finally:
+            trace.log(self.logger)
             stats.add_failure_stats(failure_devs_info)
             stats.success += len(target_devs_info - failure_devs_info)
             self.partition_times.append(time.time() - begin)

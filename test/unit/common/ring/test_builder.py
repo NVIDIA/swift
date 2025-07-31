@@ -2813,17 +2813,6 @@ class TestPartPowerIncrease(unittest.TestCase):
     def tearDown(self):
         rmtree(self.testdir, ignore_errors=1)
 
-
-class TestPartPowerIncrease(unittest.TestCase):
-
-    FORMAT_VERSION = 1
-
-    def setUp(self):
-        self.testdir = mkdtemp()
-
-    def tearDown(self):
-        rmtree(self.testdir, ignore_errors=1)
-
     def test_prepare_increase_partition_power(self):
         ring_file = os.path.join(self.testdir, 'test_partpower.ring.gz')
 

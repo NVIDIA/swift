@@ -13,13 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import array
 import collections
 import dataclasses
 import io
 import json
 import os.path
-import pickle
 import unittest
 from unittest import mock
 import zlib
@@ -52,6 +50,9 @@ class TestRoundTrip(unittest.TestCase):
     def test_arbitrary_bytes(self):
         buf = io.BytesIO()
         with RingWriter(buf) as writer:
+            # Still need to write good magic, or we won't be able to read
+            writer.write_magic(1)
+            # but after that, we can kinda do whatever
             writer.write(b'\xde\xad\xbe\xef' * 10240)
             writer.write(b'\xda\x7a\xda\x7a' * 10240)
             good_pos = writer.tell()
@@ -67,8 +68,9 @@ class TestRoundTrip(unittest.TestCase):
 
         buf.seek(0)
         reader = RingReader(buf)
-        self.assertEqual(reader.version, 0)
-        self.assertEqual(reader.raw_size, 12 * 10240)
+        self.assertEqual(reader.version, 1)
+        self.assertEqual(reader.raw_size, 6 + 12 * 10240)
+        self.assertEqual(reader.read(6), b'R1NG\x00\x01')
         self.assertRepeats(reader.read(40960), b'\xde\xad\xbe\xef', 10240)
         self.assertRepeats(reader.read(40960), b'\xda\x7a\xda\x7a', 10240)
         self.assertRepeats(reader.read(40960), b'more', 10240)
@@ -77,44 +79,12 @@ class TestRoundTrip(unittest.TestCase):
         self.assertRepeats(reader.read(40960), b'more', 10240)
         # Even all the way to the beginning
         reader.seek(0)
+        self.assertEqual(reader.read(6), b'R1NG\x00\x01')
         self.assertRepeats(reader.read(40960), b'\xde\xad\xbe\xef', 10240)
         # but not arbitrarily
         reader.seek(good_pos - 100)
         with self.assertRaises(zlib.error):
             reader.read(1)
-
-    def test_pickle(self):
-        data = {
-            "foo": "bar",
-            "baz": [1, 2, 3],
-            "quux": array.array('I', range(4)),
-            "quuux": bytearray(b"\xde\xad\xbe\xef"),
-        }
-        buf = io.BytesIO()
-        with RingWriter(buf) as writer:
-            writer.write(pickle.dumps(data, protocol=2))
-
-        buf.seek(0)
-        reader = RingReader(buf)
-        self.assertEqual(reader.version, 0)
-        self.assertEqual(data, pickle.loads(reader.read(2 ** 10)))
-
-        # section-based access only works for v2
-        self.assertFalse('foo' in reader)
-        with self.assertRaises(ValueError) as caught:
-            with reader.open_section('foo'):
-                pass
-        self.assertEqual('No index loaded', str(caught.exception))
-
-        buf = io.BytesIO()
-        # they also work as writable/readable for pickle
-        with RingWriter(buf) as writer:
-            pickle.dump(data, writer, protocol=2)
-
-        buf.seek(0)
-        reader = RingReader(buf)
-        self.assertEqual(reader.version, 0)
-        self.assertEqual(data, pickle.load(reader))
 
     def test_sections(self):
         buf = io.BytesIO()

@@ -197,10 +197,16 @@ class CooperativeNamespaceCachePopulator(CooperativeCachePopulator):
         cache_ttl = ctrl.app.recheck_updating_shard_ranges
         avg_backend_fetch_time = ctrl.app.namespace_avg_backend_fetch_time
         num_tokens = ctrl.app.namespace_cache_tokens_per_session
+        labels = {
+            'resource': 'shard_updating',
+        }
+        if account is not None:
+            labels['account'] = account
+        if container is not None:
+            labels['container'] = container
         super().__init__(
-            ctrl.app.logger, 'shard_updating',
-            infocache, memcache, cache_key, cache_ttl,
-            avg_backend_fetch_time, num_tokens
+            ctrl.app, infocache, memcache, cache_key, cache_ttl,
+            avg_backend_fetch_time, num_tokens, labels=labels
         )
         self.ctrl = ctrl
         self.account = account

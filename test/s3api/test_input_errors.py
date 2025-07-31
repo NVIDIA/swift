@@ -58,6 +58,24 @@ def _crc32(payload=b''):
     ).decode('ascii')
 
 
+def get_raw_conn(request):
+    # requests is going to try *real hard* to either send a "Content-Length" or
+    # "Transfer-encoding: chunked" header so dip down to our bufferedhttp to do
+    # the sending/parsing when we want to override those headers
+    host, port = parse_socket_string(request['host'], None)
+    if port:
+        port = int(port)
+    return bufferedhttp.http_connect_raw(
+        host,
+        port,
+        request['method'],
+        request['path'],
+        request['headers'],
+        '&'.join('%s=%s' % (k, v) for k, v in request['query'].items()),
+        request['https']
+    )
+
+
 EMPTY_SHA256 = _sha256()
 EPOCH = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
 
@@ -594,6 +612,28 @@ class InputErrorsMixin(object):
         # self.assertIn('<CalculatedDigest>%s</CalculatedDigest>'
         #               % md5_of_body, respbody)
 
+    def assertBadChecksumDigest(self, resp, crc_type, crc_in_headers):
+        """
+        Check that the response is a well-formed BadDigest error that would be
+        raised for a checksum mismatch
+
+        :param resp: the ``requests`` response
+        :param crc_type: the CRC type
+        :param crc_in_headers: the crc value sent in headers
+        """
+        respbody = resp.content
+        if not isinstance(respbody, str):
+            respbody = respbody.decode('utf8')
+        self.assertEqual((resp.status_code, resp.reason), (400, 'Bad Request'),
+                         respbody)
+        self.assertIn('<Code>BadDigest</Code>', respbody)
+        self.assertIn("<Message>The %s you specified did not match the "
+                      "calculated checksum.</Message>" % crc_type,
+                      respbody)
+        self.assertNotIn('Expected', respbody)
+        self.assertNotIn('Computed', respbody)
+        self.assertNotIn(crc_in_headers, respbody)
+
     def assertIncompleteBody(
         self,
         resp,
@@ -771,23 +811,9 @@ class InputErrorsMixin(object):
             method='PUT',
         )
         self.conn.sign_request(request)
-        # requests is not our friend here; it's going to try *real hard* to
-        # either send a "Content-Length" or "Transfer-encoding: chunked" header
-        # so dip down to our bufferedhttp to do the sending/parsing
-        host, port = parse_socket_string(request['host'], None)
-        if port:
-            port = int(port)
-        conn = bufferedhttp.http_connect_raw(
-            host,
-            port,
-            request['method'],
-            request['path'],
-            request['headers'],
-            '&'.join('%s=%s' % (k, v) for k, v in request['query'].items()),
-            request['https']
-        )
-        conn.send(TEST_BODY)
-        return conn.getresponse()
+        raw_conn = get_raw_conn(request)
+        raw_conn.send(TEST_BODY)
+        return raw_conn.getresponse()
 
     def test_no_md5_no_sha_no_content_length(self):
         resp = self.get_response_put_object_no_md5_no_sha_no_content_length()
@@ -928,10 +954,7 @@ class InputErrorsMixin(object):
                 'content-md5': _md5(TEST_BODY),
                 'x-amz-content-sha256': _sha256(TEST_BODY),
                 'x-amz-checksum-crc32': _crc32(b'not the body')})
-        self.assertEqual(resp.status_code, 400, resp.content)
-        self.assertIn(b'<Code>BadDigest</Code>', resp.content)
-        self.assertIn(b'<Message>The CRC32 you specified did not match the '
-                      b'calculated checksum.</Message>', resp.content)
+        self.assertBadChecksumDigest(resp, 'CRC32', _crc32(b'not the body'))
 
     def test_good_md5_bad_sha_bad_crc_header(self):
         resp = self.conn.make_request(
@@ -1180,23 +1203,9 @@ class InputErrorsMixin(object):
             headers={'x-amz-content-sha256': _sha256(TEST_BODY)},
         )
         self.conn.sign_request(request)
-        # requests is not our friend here; it's going to try *real hard* to
-        # either send a "Content-Length" or "Transfer-encoding: chunked" header
-        # so dip down to our bufferedhttp to do the sending/parsing
-        host, port = parse_socket_string(request['host'], None)
-        if port:
-            port = int(port)
-        conn = bufferedhttp.http_connect_raw(
-            host,
-            port,
-            request['method'],
-            request['path'],
-            request['headers'],
-            '&'.join('%s=%s' % (k, v) for k, v in request['query'].items()),
-            request['https']
-        )
-        conn.send(TEST_BODY)
-        resp = conn.getresponse()
+        raw_conn = get_raw_conn(request)
+        raw_conn.send(TEST_BODY)
+        resp = raw_conn.getresponse()
         body = resp.read()
         self.assertEqual(resp.status, 411, body)
         self.assertIn(b'<Code>MissingContentLength</Code>', body)
@@ -2029,14 +2038,11 @@ class TestV4AuthHeaders(InputErrorsMixin, BaseS3TestCaseWithBucket):
             body=chunked_body,
             headers={
                 'x-amz-sdk-checksum-algorithm': 'crc32',
-                'x-amz-checksum-crc32': _crc32(b'not the test body'),
+                'x-amz-checksum-crc32': _crc32(b'not the body'),
                 'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
                 'content-encoding': 'aws-chunked',
                 'x-amz-decoded-content-length': str(len(TEST_BODY))})
-        self.assertEqual(resp.status_code, 400, resp.content)
-        self.assertIn(b'<Code>BadDigest</Code>', resp.content)
-        self.assertIn(b'<Message>The CRC32 you specified did not match the '
-                      b'calculated checksum.</Message>', resp.content)
+        self.assertBadChecksumDigest(resp, 'CRC32', _crc32(b'not the body'))
 
     def test_strm_unsgnd_pyld_trl_declared_algo_declared_no_trailer_sent(self):
         chunked_body = b''.join(
@@ -2282,17 +2288,14 @@ class TestV4AuthHeaders(InputErrorsMixin, BaseS3TestCaseWithBucket):
                 'content-encoding': 'aws-chunked',
                 'x-amz-decoded-content-length': str(len(TEST_BODY)),
                 'x-amz-trailer': 'x-amz-checksum-crc32'})
-        self.assertEqual(resp.status_code, 400, resp.content)
-        self.assertIn(b'<Code>BadDigest</Code>', resp.content)
-        self.assertIn(b'<Message>The CRC32 you specified did not match the '
-                      b'calculated checksum.</Message>', resp.content)
+        self.assertBadChecksumDigest(resp, 'CRC32', _crc32(b'not the body'))
 
     def test_strm_unsgnd_pyld_trl_with_trailer_checksum_invalid(self):
         chunked_body = b''.join(
             b'%x\r\n%s\r\n' % (len(chunk), chunk)
             for chunk in [TEST_BODY, b''])[:-2]
         chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {"not=base-64"}\r\n',
+            f'x-amz-checksum-crc32: {"not-base-64"}\r\n',
         ]).encode('ascii')
         resp = self.conn.make_request(
             self.bucket_name,
@@ -2308,6 +2311,8 @@ class TestV4AuthHeaders(InputErrorsMixin, BaseS3TestCaseWithBucket):
         self.assertIn(b'<Code>InvalidRequest</Code>', resp.content)
         self.assertIn(b'<Message>Value for x-amz-checksum-crc32 trailing '
                       b'header is invalid.</Message>', resp.content)
+        # the bad value is not reflected back in the response
+        self.assertNotIn(b'not-base-64', resp.content)
 
     def test_strm_unsgnd_pyld_trl_content_sha256_in_trailer(self):
         chunked_body = b''.join(
@@ -3006,10 +3011,7 @@ class TestV4AuthHeaders(InputErrorsMixin, BaseS3TestCaseWithBucket):
                 'content-encoding': 'aws-chunked',
                 'x-amz-decoded-content-length': str(len(TEST_BODY)),
                 'x-amz-trailer': 'x-amz-checksum-crc32'})
-        self.assertEqual(resp.status_code, 400, resp.content)
-        self.assertIn(b'<Code>BadDigest</Code>', resp.content)
-        self.assertIn(b'<Message>The CRC32 you specified did not match the '
-                      b'calculated checksum.</Message>', resp.content)
+        self.assertBadChecksumDigest(resp, 'CRC32', _crc32(TEST_BODY[:-1]))
 
     def test_strm_unsgnd_pyld_trl_extra_line_then_trailer_ok(self):
         chunked_body = b''.join(
@@ -3930,6 +3932,47 @@ class NotV4AuthHeadersMixin:
                 'x-amz-decoded-content-length': str(len(chunked_body))})
         self.assertSHA256Mismatch(resp, 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
                                   _sha256(chunked_body))
+
+    def test_no_md5_no_sha_good_crc_header_body_too_long_ok(self):
+        request = self.conn.build_request(
+            self.bucket_name,
+            'test-obj',
+            method='PUT',
+            headers={
+                'x-amz-checksum-crc32': _crc32(TEST_BODY),
+                'content-length': str(len(TEST_BODY)),
+            },
+        )
+        self.conn.sign_request(request)
+        raw_conn = get_raw_conn(request)
+        # send more than expected body; as long as the crc is correct for the
+        # content-length part of the body that is actually read then it's ok
+        raw_conn.send(TEST_BODY + b'0123456789')
+        resp = raw_conn.getresponse()
+        body = resp.read()
+        self.assertEqual(resp.status, 200, body)
+
+    def test_no_md5_no_sha_bad_crc_header_body_too_long(self):
+        request = self.conn.build_request(
+            self.bucket_name,
+            'test-obj',
+            method='PUT',
+            headers={
+                'x-amz-checksum-crc32': _crc32(TEST_BODY),
+                'content-length': str(len(TEST_BODY[:-10])),
+            },
+        )
+        self.conn.sign_request(request)
+        raw_conn = get_raw_conn(request)
+        # content-length is less than sent body; not all the body is read so
+        # the calculated crc will mismatch the body crc
+        raw_conn.send(TEST_BODY)
+        resp = raw_conn.getresponse()
+        body = resp.read().decode('utf-8')
+        self.assertEqual(resp.status, 400, body)
+        self.assertIn('<Code>BadDigest</Code>', body)
+        self.assertIn('<Message>The CRC32 you specified did not match the '
+                      'calculated checksum.</Message>', body)
 
 
 class TestV4AuthQuery(InputErrorsMixin,

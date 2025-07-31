@@ -63,7 +63,9 @@ from swift.common.splice import splice
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          POLICIES, EC_POLICY)
 from swift.common.exceptions import DiskFileDeviceUnavailable, \
-    DiskFileNoSpace, DiskFileQuarantined, DiskFileStateChanged
+    DiskFileNoSpace, DiskFileQuarantined, DiskFileStateChanged, \
+    DiskFileXattrNotSupported, DiskFileExpired, DiskFileDeleted, \
+    DiskFileNotExist
 from swift.common.wsgi import init_request_processor
 
 
@@ -5792,10 +5794,11 @@ class TestObjectController(BaseTestCase):
                          'tombstone_write=15.000s, container_update=5.100s',
                          error_lines[0])
 
-    def test_DELETE_log_slow_503(self):
+    def _do_test_DELETE_log_slow_metadata_read_exception(
+            self, exc, exp_status):
 
         def mock_read_metadata(self, current_time):
-            raise DiskFileStateChanged()
+            raise exc
 
         t_put = utils.Timestamp.now()
         req = Request.blank('/sda1/p/a/c/o',
@@ -5809,7 +5812,7 @@ class TestObjectController(BaseTestCase):
         self.assertEqual(self.object_controller.slow_delete_log_threshold, 120)
         now = time()
         with mock.patch('time.time', side_effect=[now] * 5 +
-                        [now + 10.0] + [now + 50.0] + [now + 120.1] * 6):
+                        [now + 10.0] + [now + 50.0] + [now + 120.1] * 10):
             with mock.patch('swift.obj.diskfile.BaseDiskFile.read_metadata',
                             mock_read_metadata):
                 t_delete = utils.Timestamp.now()
@@ -5817,14 +5820,66 @@ class TestObjectController(BaseTestCase):
                                     environ={'REQUEST_METHOD': 'DELETE'},
                                     headers={'X-Timestamp': t_delete.internal})
                 resp = req.get_response(self.object_controller)
-        self.assertEqual(resp.status_int, 503)
         error_lines = self.object_controller.logger.get_lines_for_level(
             'warning')
         self.assertEqual(1, len(error_lines))
+        return resp, error_lines[0]
+
+    def test_DELETE_log_slow_xattr_not_supported(self):
+        resp, error = self._do_test_DELETE_log_slow_metadata_read_exception(
+            DiskFileXattrNotSupported(), 507)
+        self.assertEqual(resp.status_int, 507)
+        self.assertEqual('Slow DELETE (120.100s) for /sda1/p/a/c/o, '
+                         'status 507, diskfile_acquisition=40.000s, '
+                         'metadata_read=70.100s', error)
+
+    def test_DELETE_log_slow_expired(self):
+        resp, error = self._do_test_DELETE_log_slow_metadata_read_exception(
+            DiskFileExpired(), 404)
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(
+            'Slow DELETE (120.100s) for /sda1/p/a/c/o, status 404, '
+            'diskfile_acquisition=40.000s, metadata_read=70.100s, '
+            'delete_at_update=0.000s, tombstone_write=0.000s, '
+            'container_update=0.000s', error)
+
+    def test_DELETE_log_slow_deleted(self):
+        resp, error = self._do_test_DELETE_log_slow_metadata_read_exception(
+            DiskFileDeleted(), 404)
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(
+            'Slow DELETE (120.100s) for /sda1/p/a/c/o, status 404, '
+            'diskfile_acquisition=40.000s, metadata_read=70.100s, '
+            'delete_at_update=0.000s, tombstone_write=0.000s, '
+            'container_update=0.000s', error)
+
+    def test_DELETE_log_slow_not_exist(self):
+        resp, error = self._do_test_DELETE_log_slow_metadata_read_exception(
+            DiskFileNotExist(), 404)
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(
+            'Slow DELETE (120.100s) for /sda1/p/a/c/o, status 404, '
+            'diskfile_acquisition=40.000s, metadata_read=70.100s, '
+            'delete_at_update=0.000s, tombstone_write=0.000s, '
+            'container_update=0.000s', error)
+
+    def test_DELETE_log_slow_quarantined(self):
+        resp, error = self._do_test_DELETE_log_slow_metadata_read_exception(
+            DiskFileQuarantined(), 507)
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(
+            'Slow DELETE (120.100s) for /sda1/p/a/c/o, status 404, '
+            'diskfile_acquisition=40.000s, metadata_read=70.100s, '
+            'delete_at_update=0.000s, tombstone_write=0.000s, '
+            'container_update=0.000s', error)
+
+    def test_DELETE_log_slow_state_changed(self):
+        resp, error = self._do_test_DELETE_log_slow_metadata_read_exception(
+            DiskFileStateChanged(), 503)
+        self.assertEqual(resp.status_int, 503)
         self.assertEqual('Slow DELETE (120.100s) for /sda1/p/a/c/o, '
                          'status 503, diskfile_acquisition=40.000s, '
-                         'metadata_read=70.100s',
-                         error_lines[0])
+                         'metadata_read=70.100s', error)
 
     def test_object_update_with_offset(self):
         container_updates = []

@@ -33,6 +33,10 @@ Swift 1.3.0 <https://opendev.org/openstack/swift/commit/fc6391ea>`__, this
 changed to pickling a pure-stdlib data structure, but the core concept
 was the same.
 
+.. note:
+
+    Swift 2.36.0 dropped support for v0 rings.
+
 Ring v1
 -------
 
