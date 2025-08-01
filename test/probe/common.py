@@ -367,6 +367,9 @@ class ProbeTest(unittest.TestCase):
     Don't instantiate this directly, use a child class instead.
     """
 
+    def _make_name(self, prefix):
+        return ('%s%s' % (prefix, uuid4())).encode()
+
     def _load_rings_and_configs(self):
         self.ipport2server = {}
         self.configs = defaultdict(dict)
