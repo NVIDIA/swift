@@ -25,23 +25,62 @@ from swift.common.http import is_server_error
 from swift.common.swob import Response, HTTPException
 
 
-DEFAULT_SLOW_REQUEST_THRESHOLD = 60.0
+class TimingBreakdown(object):
+    """
+    Helper for recording an ordered breakdown of elapsed times between events.
+    Example:
+        tb = TimingBreakdown()
+        # ... do something ...
+        tb.record('step1')
+        # ... do something else ...
+        tb.record('step2')
+        print(tb.breakdown)  # [('step1', 0.123), ('step2', 0.456)]
+    """
+    def __init__(self, start_time=None):
+        self._breakdown = []
+        if start_time is None:
+            self._last_time = time.time()
+        else:
+            self._last_time = start_time
+
+    def record(self, event):
+        """
+        Record a new event. Stores the elapsed time since the last record or
+        start under the given key, updates the internal last-time.
+
+        :param event: The name of the event to record.
+        """
+        now = time.time()
+        elapsed = now - self._last_time
+        self._breakdown.append((event, elapsed))
+        self._last_time = now
+
+    @property
+    def breakdown(self):
+        """
+        Get a list of all recorded events and elapsed times in insertion order.
+        Returns a list of tuples: [(event_name, elapsed_time), ...]
+        """
+        return self._breakdown
 
 
-def slow_request_logging(threshold_attr=None):
+def request_timing_logging(threshold_attr):
     """
     Returns a decorator that logs slow operations with timing breakdown. The
     function must accept the 'timing_breakdown' parameter.
 
     :param threshold_attr: The attribute name of the controller class that
-        contains the slow threshold for the operation; if not provided,
-        the default threshold DEFAULT_SLOW_REQUEST_THRESHOLD is used.
+        contains the slow threshold for the operation; this attribute name
+        must be provided in the controller class. Set to -1 to disable
+        slow operation logging entirely.
     """
     def decorating_func(func):
         @functools.wraps(func)
-        def _slow_request_logging(ctrl, req, *args, **kwargs):
-            timing_breakdown = defaultdict(float)
+        def _request_timing_logging(ctrl, req, *args, **kwargs):
             start_time = time.time()
+            timing_breakdown = TimingBreakdown(start_time=start_time)
+            req_method = req.method
+            req_path = req.path
 
             try:
                 resp = func(
@@ -52,42 +91,21 @@ def slow_request_logging(threshold_attr=None):
                 resp = e
 
             total_time = time.time() - start_time
-            threshold = (getattr(ctrl, threshold_attr,
-                                 DEFAULT_SLOW_REQUEST_THRESHOLD)
-                         if threshold_attr
-                         else DEFAULT_SLOW_REQUEST_THRESHOLD)
-            if total_time > threshold:
+            threshold = getattr(ctrl, threshold_attr)
+            if threshold != -1 and total_time > threshold:
                 timing_parts = []
-                for operation, duration in timing_breakdown.items():
+                for operation, duration in timing_breakdown.breakdown:
                     timing_parts.append(
                         '%s=%.3fs' % (operation, duration))
                 ctrl.logger.warning(
-                    'Slow %s (%.3fs) for %s, status %d, %s',
-                    req.method, total_time, req.path, resp.status_int,
-                    ', '.join(timing_parts)
+                    'Slow %s (%.3fs) for %s, status %d, start_time=%.3f, %s',
+                    req_method, total_time, req_path, resp.status_int,
+                    start_time, ', '.join(timing_parts)
                 )
 
             return resp
-        return _slow_request_logging
+        return _request_timing_logging
     return decorating_func
-
-
-def record_slow_timing(timing_breakdown, key, timing_start):
-    """
-    Records a timing event if timing_breakdown is enabled.
-
-    :param timing_breakdown: A dictionary to store timing information, or None.
-    :param key: The key under which to store the timing information.
-    :param timing_start: The start time of the event.
-    :returns: The current time, to be used as the next timing_start.
-    """
-    if timing_breakdown is not None and \
-            isinstance(timing_breakdown, defaultdict):
-        now = time.time()
-        # Add the duration to the existing value for this key
-        timing_breakdown[key] += now - timing_start
-        return now
-    return timing_start
 
 
 def labeled_timing_stats(metric, **dec_kwargs):

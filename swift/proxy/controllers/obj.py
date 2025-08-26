@@ -2917,14 +2917,23 @@ class ECObjectController(BaseObjectController):
             policy_options = self.app.get_policy_options(policy)
             concurrency = policy.ec_ndata \
                 if policy_options.concurrent_gets else 1
-            # every frag-archive has all metadata so we only need one!
-            head_nodes = iter(policy.object_ring.get_part_nodes(partition))
-            if policy_options.experimental_ec_head_limit:
-                head_nodes = itertools.islice(
-                    head_nodes, policy_options.experimental_ec_head_limit)
+
+            # AFAICT this is the best way to build a normal node_iter limited
+            # by the ec_head_node_count
+            part_nodes = policy.object_ring.get_part_nodes(partition)
+            node_chain = itertools.chain(
+                part_nodes, policy.object_ring.get_more_nodes(partition))
+            # policy.object_ring.replica_count is a float, and real rings don't
+            # have a replicas attribute, so we use len(part_nodes) to keep the
+            # node_count_fn from returning a value that will blow-up
+            # itertools.islice
+            node_count = policy_options.ec_head_node_count_fn(len(part_nodes))
+            head_nodes = itertools.islice(node_chain, node_count)
+            # N.B. GetOrHeadHandler will wrap GreenthreadSafeIterator for us
             node_iter = NodeIter(
                 'object', self.app, policy.object_ring, partition, self.logger,
                 req, policy=policy, node_iter=head_nodes)
+
             resp = self.GETorHEAD_base(
                 req, 'Object', node_iter, partition,
                 req.swift_entity_path, concurrency, policy)

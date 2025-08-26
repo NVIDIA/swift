@@ -3361,9 +3361,9 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
 
-    def test_HEAD_404_experimental_ec_head_limit(self):
-        def do_test(head_limit):
-            conf = {'experimental_ec_head_limit': head_limit,
+    def test_HEAD_404_ec_head_node_count(self):
+        def do_test(head_limit, expected_requests):
+            conf = {'ec_head_node_count': head_limit,
                     'conn_timeout': 1.0}
             self.app = PatchedObjControllerApp(
                 conf, account_ring=FakeRing(),
@@ -3372,14 +3372,19 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             self.app.container_info = dict(self.fake_container_info())
 
             req = swift.common.swob.Request.blank('/v1/a/c/o', method="HEAD")
-            # We should only make head_limit requests before we give up
-            head_statuses = [404] * head_limit
-            with set_http_connect(*head_statuses):
-                resp = req.get_response(self.app)
+            # We should only make expected_requests requests before we give up
+            head_statuses = [404] * expected_requests
+            try:
+                with set_http_connect(*head_statuses):
+                    resp = req.get_response(self.app)
+            except AssertionError as e:
+                self.fail('%s for ec_head_node_count: %s' % (e, head_limit))
             self.assertEqual(resp.status_int, 404)
 
-        for head_limit in range(2, self.policy.object_ring.replicas + 1):
-            do_test(head_limit)
+        for head_limit in range(2, self.policy.object_ring.replica_count + 1):
+            do_test(str(head_limit), head_limit)
+        do_test('1 * replicas', self.policy.object_ring.replica_count)
+        do_test('2 * replicas', 2 * self.policy.object_ring.replica_count)
 
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')

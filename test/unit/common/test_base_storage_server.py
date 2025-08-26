@@ -22,8 +22,8 @@ import unittest
 import os
 
 from swift.common.base_storage_server import BaseStorageServer, \
-    timing_stats, labeled_timing_stats, slow_request_logging, \
-    record_slow_timing
+    timing_stats, labeled_timing_stats, request_timing_logging, \
+    TimingBreakdown
 from swift.common.swob import Request, Response, HTTPInsufficientStorage
 from test.debug_logger import debug_logger, debug_labeled_statsd_client
 
@@ -219,7 +219,61 @@ class TestLabeledTimingStatsDecorator(unittest.TestCase):
             mock_controller.statsd.calls)
 
 
-class TestSlowRequestLoggingDecorator(unittest.TestCase):
+class TestTimingBreakdown(unittest.TestCase):
+
+    def test_init_default_start_time(self):
+        with mock.patch('time.time', return_value=1000.0):
+            tb = TimingBreakdown()
+        self.assertEqual(tb._breakdown, [])
+        self.assertEqual(tb._last_time, 1000.0)
+
+    def test_init_explicit_start_time(self):
+        tb = TimingBreakdown(start_time=500.0)
+        self.assertEqual(tb._breakdown, [])
+        self.assertEqual(tb._last_time, 500.0)
+
+    def test_record_single_event(self):
+        tb = TimingBreakdown(start_time=1000.0)
+        with mock.patch('time.time', return_value=1001.5):
+            tb.record('event1')
+        self.assertEqual(tb.breakdown, [('event1', 1.5)])
+        self.assertEqual(tb._last_time, 1001.5)
+
+    def test_record_multiple_events(self):
+        tb = TimingBreakdown(start_time=1000.0)
+        with mock.patch('time.time', side_effect=[1001.5, 1003.0]):
+            tb.record('event1')
+            tb.record('event2')
+        expected = [('event1', 1.5), ('event2', 1.5)]
+        self.assertEqual(tb.breakdown, expected)
+        self.assertEqual(tb._last_time, 1003.0)
+
+    def test_record_preserves_order(self):
+        tb = TimingBreakdown(start_time=1000.0)
+        with mock.patch('time.time', side_effect=[1001.0, 1002.0, 1003.0]):
+            tb.record('third')
+            tb.record('first')
+            tb.record('second')
+        # Check that order is preserved
+        breakdown_events = [event for event, duration in tb.breakdown]
+        self.assertEqual(breakdown_events, ['third', 'first', 'second'])
+
+    def test_record_allows_duplicate_keys(self):
+        tb = TimingBreakdown(start_time=1000.0)
+        with mock.patch('time.time', side_effect=[1001.0, 1002.5]):
+            tb.record('event1')
+            tb.record('event1')  # Same key again
+        expected = [('event1', 1.0), ('event1', 1.5)]
+        self.assertEqual(tb.breakdown, expected)
+
+    def test_zero_elapsed_time(self):
+        tb = TimingBreakdown(start_time=1000.0)
+        with mock.patch('time.time', return_value=1000.0):  # Same time
+            tb.record('instant')
+        self.assertEqual(tb.breakdown, [('instant', 0.0)])
+
+
+class TestRequestTimingLoggingDecorator(unittest.TestCase):
 
     def test_slow_operation_with_breakdown(self):
 
@@ -230,24 +284,29 @@ class TestSlowRequestLoggingDecorator(unittest.TestCase):
                 self.status = status
                 self.logger = debug_logger()
 
-            @slow_request_logging(threshold_attr='slow_threshold')
+            @request_timing_logging(threshold_attr='slow_threshold')
             def handle_slow_req(self, req, timing_breakdown):
-                timing_breakdown['operation_1'] = 0.011
-                timing_breakdown['operation_2'] = 0.07
-                timing_breakdown['operation_3'] = 0.02
+                # Simulate operations with specific durations
+                timing_breakdown.record('operation_1')  # 0.011s
+                timing_breakdown.record('operation_2')  # 0.070s
+                timing_breakdown.record('operation_3')  # 0.020s
                 return Response(status=self.status)
 
         req = Request.blank('/v1/a/c/o')
         controller = SlowController(200)
-        now = time.time()
-        with mock.patch('time.time', side_effect=[now, now + 0.101]):
+        with mock.patch('time.time', side_effect=[
+                1000.0,      # start_time in decorator
+                1000.011,    # operation_1 record
+                1000.081,    # operation_2 record
+                1000.101,    # operation_3 record
+                1000.101]):  # total_time in decorator
             controller.handle_slow_req(req)
 
         error_lines = controller.logger.get_lines_for_level('warning')
-        self.assertEqual(1, len(error_lines))
-        self.assertEqual('Slow GET (0.101s) for /v1/a/c/o, status 200, '
-                         'operation_1=0.011s, operation_2=0.070s, '
-                         'operation_3=0.020s', error_lines[0])
+        self.assertEqual(['Slow GET (0.101s) for /v1/a/c/o, status 200, '
+                          'start_time=1000.000, operation_1=0.011s, '
+                          'operation_2=0.070s, operation_3=0.020s'],
+                         error_lines)
 
     def test_slow_operation_empty_breakdown(self):
 
@@ -258,20 +317,21 @@ class TestSlowRequestLoggingDecorator(unittest.TestCase):
                 self.status = status
                 self.logger = debug_logger()
 
-            @slow_request_logging(threshold_attr='slow_threshold')
+            @request_timing_logging(threshold_attr='slow_threshold')
             def handle_slow_req(self, req, timing_breakdown):
+                # Don't record any timing events
                 return Response(status=self.status)
 
         req = Request.blank('/v1/a/c/o')
         controller = SlowController(200)
-        now = time.time()
+        now = 1000.0
         with mock.patch('time.time', side_effect=[now, now + 0.15]):
             controller.handle_slow_req(req)
 
         error_lines = controller.logger.get_lines_for_level('warning')
-        self.assertEqual(1, len(error_lines))
-        self.assertEqual('Slow GET (0.150s) for /v1/a/c/o, status 200, ',
-                         error_lines[0])
+        self.assertEqual(['Slow GET (0.150s) for /v1/a/c/o, status 200, '
+                          'start_time=1000.000, '],
+                         error_lines)
 
     def test_fast_operation_no_warning(self):
 
@@ -282,19 +342,77 @@ class TestSlowRequestLoggingDecorator(unittest.TestCase):
                 self.status = status
                 self.logger = debug_logger()
 
-            @slow_request_logging(threshold_attr='slow_threshold')
+            @request_timing_logging(threshold_attr='slow_threshold')
             def handle_slow_req(self, req, timing_breakdown):
-                timing_breakdown['operation_1'] = 0.099
+                # Simulate a fast operation
+                timing_breakdown.record('operation_1')  # 0.099s
                 return Response(status=self.status)
 
         req = Request.blank('/v1/a/c/o')
         controller = SlowController(200)
-        now = time.time()
-        with mock.patch('time.time', side_effect=[now, now + 0.099]):
+        # Mock time.time() calls: start_time, operation_1, end_time
+        with mock.patch('time.time', side_effect=[1000.0, 1000.099, 1000.099]):
             controller.handle_slow_req(req)
 
         error_lines = controller.logger.get_lines_for_level('warning')
-        self.assertEqual(0, len(error_lines))
+        self.assertFalse(error_lines)
+
+    def test_disabled_threshold_no_warning(self):
+
+        class DisabledController(object):
+            slow_threshold = -1  # Disabled threshold
+
+            def __init__(self, status):
+                self.status = status
+                self.logger = debug_logger()
+
+            @request_timing_logging(threshold_attr='slow_threshold')
+            def handle_slow_req(self, req, timing_breakdown):
+                # Simulate very slow operations
+                timing_breakdown.record('operation_1')  # 5.0s
+                timing_breakdown.record('operation_2')  # 10.0s
+                return Response(status=self.status)
+
+        req = Request.blank('/v1/a/c/o')
+        controller = DisabledController(200)
+        with mock.patch('time.time', side_effect=[
+                1000.0,      # start_time in decorator
+                1005.0,      # operation_1 record (5s)
+                1015.0,      # operation_2 record (10s)
+                1020.0]):    # total_time in decorator (20s total)
+            controller.handle_slow_req(req)
+
+        # Should not log any warnings despite very slow operation
+        error_lines = controller.logger.get_lines_for_level('warning')
+        self.assertFalse(error_lines)
+
+    def test_zero_threshold_logs_everything(self):
+
+        class ZeroThresholdController(object):
+            slow_threshold = 0
+
+            def __init__(self, status):
+                self.status = status
+                self.logger = debug_logger()
+
+            @request_timing_logging(threshold_attr='slow_threshold')
+            def handle_slow_req(self, req, timing_breakdown):
+                # Simulate tiny operation
+                timing_breakdown.record('operation_1')  # 0.001s
+                return Response(status=self.status)
+
+        req = Request.blank('/v1/a/c/o')
+        controller = ZeroThresholdController(200)
+        with mock.patch('time.time', side_effect=[
+                1000.0,      # start_time in decorator
+                1000.001,    # operation_1 record
+                1000.002]):  # total_time in decorator
+            controller.handle_slow_req(req)
+
+        error_lines = controller.logger.get_lines_for_level('warning')
+        self.assertEqual(['Slow GET (0.002s) for /v1/a/c/o, status 200, '
+                          'start_time=1000.000, operation_1=0.001s'],
+                         error_lines)
 
     def test_no_slow_threshold_attr(self):
 
@@ -303,65 +421,37 @@ class TestSlowRequestLoggingDecorator(unittest.TestCase):
                 self.status = status
                 self.logger = debug_logger()
 
-            # No threshold_attr attribute, the default threshold is used.
-            @slow_request_logging()
             def handle_req(self, req, timing_breakdown):
-                timing_breakdown['operation_1'] = 59.0
+                with mock.patch('time.time', return_value=1059.0):
+                    timing_breakdown.record('operation_1')  # 59.0s
                 return Response(status=self.status)
 
-        req = Request.blank('/v1/a/c/o')
         controller = NormalController(200)
-        now = time.time()
-        with mock.patch('time.time', side_effect=[now, now + 59.9]):
-            controller.handle_req(req)
-
-        error_lines = controller.logger.get_lines_for_level('warning')
-        self.assertEqual(0, len(error_lines))
-
-        req = Request.blank('/v1/a/c/o')
-        now = time.time()
-        with mock.patch('time.time', side_effect=[now, now + 60.1]):
-            controller.handle_req(req)
-
-        error_lines = controller.logger.get_lines_for_level('warning')
-        self.assertEqual(1, len(error_lines))
-        self.assertEqual('Slow GET (60.100s) for /v1/a/c/o, status 200, '
-                         'operation_1=59.000s',
-                         error_lines[0])
+        with self.assertRaises(TypeError):
+            # Decorator is applied without threshold_attr
+            _ = request_timing_logging()(controller.handle_req)
 
     def test_missing_threshold_value(self):
 
         class NormalController(object):
-            # No slow_threshold_attr value, the default threshold is used.
+            # No slow_threshold attribute
 
             def __init__(self, status):
                 self.status = status
                 self.logger = debug_logger()
 
-            @slow_request_logging(threshold_attr='slow_threshold')
+            @request_timing_logging(threshold_attr='slow_threshold')
             def handle_req(self, req, timing_breakdown):
-                timing_breakdown['operation_1'] = 59.0
+                with mock.patch('time.time', return_value=1059.0):
+                    timing_breakdown.record('operation_1')  # 59.0s
                 return Response(status=self.status)
 
         req = Request.blank('/v1/a/c/o')
         controller = NormalController(200)
-        now = time.time()
-        with mock.patch('time.time', side_effect=[now, now + 59.9]):
+
+        # Should raise AttributeError: 'slow_threshold' doesn't exist
+        with self.assertRaises(AttributeError):
             controller.handle_req(req)
-
-        error_lines = controller.logger.get_lines_for_level('warning')
-        self.assertEqual(0, len(error_lines))
-
-        req = Request.blank('/v1/a/c/o')
-        now = time.time()
-        with mock.patch('time.time', side_effect=[now, now + 60.1]):
-            controller.handle_req(req)
-
-        error_lines = controller.logger.get_lines_for_level('warning')
-        self.assertEqual(1, len(error_lines))
-        self.assertEqual('Slow GET (60.100s) for /v1/a/c/o, status 200, '
-                         'operation_1=59.000s',
-                         error_lines[0])
 
     def test_slow_operation_with_exception(self):
 
@@ -372,66 +462,55 @@ class TestSlowRequestLoggingDecorator(unittest.TestCase):
                 self.status = status
                 self.logger = debug_logger()
 
-            @slow_request_logging(threshold_attr='slow_threshold')
+            @request_timing_logging(threshold_attr='slow_threshold')
             def handle_req(self, req, timing_breakdown):
-                timing_breakdown['before_error'] = 0.05
+                # Simulate operation before error
+                timing_breakdown.record('before_error')  # 0.05s
                 raise HTTPInsufficientStorage()
 
         req = Request.blank('/v1/a/c/o')
         controller = SlowExceptionController(None)
-        now = time.time()
-        with mock.patch('time.time', side_effect=[now, now + 0.15]):
+        # Mock time.time() calls: start_time, before_error, end_time
+        with mock.patch('time.time', side_effect=[1000.0, 1000.05, 1000.15]):
             controller.handle_req(req)
 
         error_lines = controller.logger.get_lines_for_level('warning')
-        self.assertEqual(1, len(error_lines))
-        self.assertEqual('Slow GET (0.150s) for /v1/a/c/o, status 507, '
-                         'before_error=0.050s',
-                         error_lines[0])
+        self.assertEqual(['Slow GET (0.150s) for /v1/a/c/o, status 507, '
+                          'start_time=1000.000, before_error=0.050s'],
+                         error_lines)
 
+    def test_slow_operation_with_duplicate_events(self):
 
-class TestRecordSlowTiming(unittest.TestCase):
+        class SlowController(object):
+            slow_threshold = 0.1
 
-    def test_timing_disabled(self):
-        timing_breakdown = None
-        timing_start = 1000.0
-        new_start = record_slow_timing(
-            timing_breakdown, 'test_key', timing_start)
-        self.assertIsNone(timing_breakdown)
-        self.assertEqual(new_start, timing_start)
+            def __init__(self, status):
+                self.status = status
+                self.logger = debug_logger()
 
-    def test_timing_not_dict(self):
-        timing_breakdown = []
-        timing_start = 1000.0
-        new_start = record_slow_timing(
-            timing_breakdown, 'test_key', timing_start)
-        self.assertEqual(timing_breakdown, [])
-        self.assertEqual(new_start, timing_start)
+            @request_timing_logging(threshold_attr='slow_threshold')
+            def handle_slow_req(self, req, timing_breakdown):
+                # Simulate operations with duplicate event names
+                timing_breakdown.record('db_query')  # 0.030s
+                timing_breakdown.record('cache_check')  # 0.020s
+                timing_breakdown.record('db_query')  # 0.040s
+                return Response(status=self.status)
 
-    def test_new_key(self):
-        timing_breakdown = defaultdict(float)
-        now = time.time()
-        with mock.patch('time.time', side_effect=[now + 1.5]):
-            timing_start = now
-            new_start = record_slow_timing(
-                timing_breakdown, 'test_key', timing_start)
+        req = Request.blank('/v1/a/c/o')
+        controller = SlowController(200)
+        with mock.patch('time.time', side_effect=[
+                1000.0,      # start_time in decorator
+                1000.030,    # first db_query record
+                1000.050,    # cache_check record
+                1000.090,    # second db_query record
+                1000.110]):  # total_time in decorator
+            controller.handle_slow_req(req)
 
-        self.assertEqual(new_start, now + 1.5)
-        self.assertIn('test_key', timing_breakdown)
-        self.assertAlmostEqual(timing_breakdown['test_key'], 1.5)
-
-    def test_existing_key(self):
-        timing_breakdown = defaultdict(float)
-        timing_breakdown['test_key'] = 2.5  # Pre-existing value
-        now = time.time()
-        with mock.patch('time.time', side_effect=[now + 1.5]):
-            timing_start = now
-            new_start = record_slow_timing(
-                timing_breakdown, 'test_key', timing_start)
-
-        self.assertEqual(new_start, now + 1.5)
-        self.assertIn('test_key', timing_breakdown)
-        self.assertAlmostEqual(timing_breakdown['test_key'], 4.0)
+        error_lines = controller.logger.get_lines_for_level('warning')
+        self.assertEqual(['Slow GET (0.110s) for /v1/a/c/o, status 200, '
+                          'start_time=1000.000, db_query=0.030s, '
+                          'cache_check=0.020s, db_query=0.040s'],
+                         error_lines)
 
 
 class TestTimingStatsDecorators(unittest.TestCase):

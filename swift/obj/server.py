@@ -47,8 +47,7 @@ from swift.common.request_helpers import resolve_ignore_range_header, \
 from swift.obj import ssync_receiver, expirer
 from swift.common.http import is_success, HTTP_MOVED_PERMANENTLY
 from swift.common.base_storage_server import BaseStorageServer, \
-    timing_stats, labeled_timing_stats, slow_request_logging, \
-    record_slow_timing
+    timing_stats, labeled_timing_stats, request_timing_logging
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.request_helpers import get_name_and_placement, \
     is_user_meta, is_sys_or_user_meta, is_object_transient_sysmeta, \
@@ -1349,7 +1348,7 @@ class ObjectController(BaseStorageServer):
     @public
     @timing_stats()
     @labeled_timing_stats(metric=LABELED_METRIC_NAME)
-    @slow_request_logging(threshold_attr='slow_delete_log_threshold')
+    @request_timing_logging(threshold_attr='slow_delete_log_threshold')
     def DELETE(self, request, timing_stats_labels, timing_breakdown):
         """Handle HTTP DELETE requests for the Swift Object Server."""
         device, partition, account, container, obj, policy = \
@@ -1365,13 +1364,14 @@ class ObjectController(BaseStorageServer):
         try:
             disk_file = self.get_diskfile(
                 device, partition, account, container, obj,
-                policy=policy, next_part_power=next_part_power)
+                policy=policy, next_part_power=next_part_power,
+                timing_breakdown=timing_breakdown)
         except DiskFileDeviceUnavailable:
             record_slow_timing(
                 timing_breakdown, 'diskfile_acquisition', timing_start)
             return HTTPInsufficientStorage(drive=device, request=request)
-        timing_start = record_slow_timing(
-            timing_breakdown, 'diskfile_acquisition', timing_start)
+        finally:
+            timing_breakdown.record('diskfile_acquisition')
 
         try:
             orig_metadata = disk_file.read_metadata(current_time=req_timestamp)
@@ -1406,8 +1406,7 @@ class ObjectController(BaseStorageServer):
             else:
                 response_class = HTTPConflict
         finally:
-            timing_start = record_slow_timing(
-                timing_breakdown, 'metadata_read', timing_start)
+            timing_breakdown.record('metadata_read')
 
         response_timestamp = max(orig_timestamp, req_timestamp)
         orig_delete_at = Timestamp(orig_metadata.get('X-Delete-At') or 0)
@@ -1443,8 +1442,7 @@ class ObjectController(BaseStorageServer):
             request, device, account, container, obj, policy, {},
             orig_delete_at, 0
         )
-        timing_start = record_slow_timing(
-            timing_breakdown, 'delete_at_update', timing_start)
+        timing_breakdown.record('delete_at_update')
 
         if orig_timestamp < req_timestamp:
             try:
@@ -1454,15 +1452,13 @@ class ObjectController(BaseStorageServer):
                     timing_breakdown, 'tombstone_write', timing_start)
                 return HTTPInsufficientStorage(drive=device, request=request)
             finally:
-                timing_start = record_slow_timing(
-                    timing_breakdown, 'tombstone_write', timing_start)
+                timing_breakdown.record('tombstone_write')
 
             self.container_update(
                 'DELETE', account, container, obj, request,
                 HeaderKeyDict({'x-timestamp': req_timestamp.internal}),
                 device, policy)
-            record_slow_timing(
-                timing_breakdown, 'container_update', timing_start)
+            timing_breakdown.record('container_update')
 
         response = response_class(
             request=request,

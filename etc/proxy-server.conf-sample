@@ -327,6 +327,10 @@ use = egg:swift#proxy
 # This option may be overridden in a per-policy configuration section.
 # request_node_count = 2 * replicas
 #
+# Limit the number of nodes to contact for EC policy HEAD request.
+# This option may be overridden in a per-policy configuration section.
+# ec_head_node_count = 1 * replicas
+#
 # Specifies which backend servers to prefer on reads. Format is a comma
 # separated list of affinity descriptors of the form <selection>=<priority>.
 # The <selection> may be r<N> for selecting nodes in region N or r<N>z<M> for
@@ -433,7 +437,7 @@ use = egg:swift#proxy
 # concurrent_gets = off
 # concurrency_timeout = 0.5
 # concurrent_ec_extra_requests = 0
-# request_node_count = 2 * replicas
+# ec_head_node_count =
 
 [filter:tempauth]
 use = egg:swift#tempauth
@@ -1147,7 +1151,7 @@ use = egg:swift#proxy_logging
 # Template used to format access logs. All words surrounded by curly brackets
 # will be substituted with the appropriate values. For more information, see
 # https://docs.openstack.org/swift/latest/logs.html
-# log_msg_template = {client_ip} {remote_addr} {end_time.datetime} {method} {path} {protocol} {status_int} {referer} {user_agent} {auth_token} {bytes_recvd} {bytes_sent} {client_etag} {transaction_id} {headers} {request_time} {source} {log_info} {start_time} {end_time} {policy_index}
+# log_msg_template = {client_ip} {remote_addr} {end_time.datetime} {method} {path} {protocol} {status_int} {referer} {user_agent} {auth_token} {bytes_recvd} {bytes_sent} {client_etag} {transaction_id} {headers} {request_time} {source} {log_info} {start_time} {end_time} {policy_index} {access_user_id}
 
 # Note: Put before both ratelimit and auth in the pipeline.
 [filter:bulk]
