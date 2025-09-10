@@ -193,7 +193,7 @@ class ProxyOverrideOptions(object):
             'concurrent_gets',
             'concurrency_timeout',
             'concurrent_ec_extra_requests',
-            'request_node_count',
+            'ec_head_node_count',
         ))
 
 

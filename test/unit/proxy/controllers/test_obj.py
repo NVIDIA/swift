@@ -3381,10 +3381,60 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                 self.fail('%s for ec_head_node_count: %s' % (e, head_limit))
             self.assertEqual(resp.status_int, 404)
 
-        for head_limit in range(2, self.policy.object_ring.replica_count + 1):
+        for head_limit in range(2, 2 * self.policy.object_ring.replica_count):
             do_test(str(head_limit), head_limit)
         do_test('1 * replicas', self.policy.object_ring.replica_count)
         do_test('2 * replicas', 2 * self.policy.object_ring.replica_count)
+
+    def test_too_small_ec_head_limit(self):
+        conf = {'ec_head_node_count': '1',
+                'conn_timeout': 1.0}
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=self.logger)
+        self.logger.clear()
+        self.app.container_info = dict(self.fake_container_info())
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method="HEAD")
+        # only one request made
+        head_statuses = [404]
+        with set_http_connect(*head_statuses):
+            resp = req.get_response(self.app)
+        # apparently you can configure your HEADs to 503
+        self.assertEqual(resp.status_int, 503)
+
+    def test_too_large_ec_head_limit(self):
+        conf = {'ec_head_node_count': '3 * replicas',
+                'conn_timeout': 1.0}
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=self.logger)
+        self.logger.clear()
+        self.app.container_info = dict(self.fake_container_info())
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method="HEAD")
+        # XXX this is probably a bug by some definition, but why would you
+        # *increase* head_count higher than request_count
+        head_statuses = [404] * self.app.request_node_count(
+            self.policy.object_ring.replica_count)
+        with set_http_connect(*head_statuses):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+
+        # sanity, you *could* dig thru the whole cluster if you try hard enough
+        conf['request_node_count'] = '5 * replicas'
+        # give FakeRing extra get_more_nodes
+        self.policy.object_ring.max_more_nodes = \
+            5 * self.policy.object_ring.replica_count
+        self.app = PatchedObjControllerApp(
+            conf, account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=self.logger)
+        self.logger.clear()
+        self.app.container_info = dict(self.fake_container_info())
+        head_statuses = [404] * (3 * self.policy.object_ring.replica_count)
+        with set_http_connect(*head_statuses):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
 
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
