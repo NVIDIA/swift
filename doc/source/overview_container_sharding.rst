@@ -169,6 +169,7 @@ containers that are being sharded to recon cache. For example::
                 "cleaved": 2,
                 "container": "c1",
                 "created": 5,
+                "db_sharding_total_elapsed": 210.0911569595337,
                 "db_state": "sharding",
                 "error": null,
                 "file_size": 26624,
@@ -177,8 +178,12 @@ containers that are being sharded to recon cache. For example::
                 "node_index": 1,
                 "object_count": 3349030,
                 "path": <path_to_db>,
+                "processing_time": 0.003812551498413086,
                 "root": "AUTH_test/c1",
-                "state": "sharding"
+                "state": "sharding",
+                "tombstones": -1,
+                "total_replicate_calls": 4,
+                "total_replicate_time": 0.0754995346069336
             }
         ]
     }
