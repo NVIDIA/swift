@@ -439,9 +439,7 @@ class BaseObjectController(Controller):
                 # record the general cache set metrics.
                 record_cache_op_metrics(
                     self.logger, self.server_type.lower(), 'shard_updating',
-                    cache_populator.set_cache_state,
-                    cache_populator.backend_resp
-                )
+                    cache_populator.set_cache_state, None)
                 # TODO: use enum to unify 'set_cache_state' in existing
                 # 'set_namespaces_in_cache' and CooperativeCachePopulator, and
                 # convert existing usages of response to just status code.
@@ -1201,6 +1199,7 @@ class ECAppIter(object):
 
     :param logger: a logger
     """
+
     def __init__(self, path, policy, internal_parts_iters, range_specs,
                  fa_length, obj_length, logger, force_metadata_checks=False):
         self.path = path
@@ -1765,6 +1764,7 @@ class Putter(object):
     :param logger: a Logger instance
     :param chunked: boolean indicating if the request encoding is chunked
     """
+
     def __init__(self, conn, node, resp, path, connect_duration, watchdog,
                  write_timeout, send_exception_handler, logger,
                  chunked=False):
@@ -1925,6 +1925,7 @@ class MIMEPutter(Putter):
 
     An HTTP PUT request that supports streaming.
     """
+
     def __init__(self, conn, node, resp, path, connect_duration, watchdog,
                  write_timeout, send_exception_handler, logger, mime_boundary,
                  multiphase=False):
@@ -2167,6 +2168,7 @@ class ECGetResponseBucket(object):
     A helper class to encapsulate the properties of buckets in which fragment
     getters and alternate nodes are collected.
     """
+
     def __init__(self, policy, timestamp):
         """
         :param policy: an instance of ECStoragePolicy
@@ -2310,6 +2312,7 @@ class ECGetResponseCollection(object):
     This class encapsulates logic for selecting the best bucket from the
     collection, and for choosing alternate nodes.
     """
+
     def __init__(self, policy):
         """
         :param policy: an instance of ECStoragePolicy

@@ -4558,19 +4558,20 @@ class TestReplicatedObjectController(
                 'container.info.cache.miss.200': 1,
                 'container.info.infocache.hit': 1,
                 'object.shard_updating.cache.miss.200': 1,
-                'object.shard_updating.cache.set.200': 1
+                'object.shard_updating.cache.set': 1
             })
             stats = self.app.statsd.get_labeled_stats_counts()
-            self.assertEqual(stats, {
-                ('swift_token', frozenset({
-                    'resource': 'shard_updating',
-                    'account': 'a',
-                    'container': 'c',
-                    'event': 'backend_reqs',
-                    'token': 'disabled',
-                    'status': 200,
-                }.items())): 1,
-            })
+            self.assertEqual({
+                ('swift_coop_cache', frozenset((
+                    ('resource', 'shard_updating'),
+                    ('account', 'a'),
+                    ('container', 'c'),
+                    ('event', 'backend_reqs'),
+                    ('set_cache_state', 'set'),
+                    ('token', 'disabled'),
+                    ('status', 200)),
+                )): 1,
+            }, stats)
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
             info_lines = self.logger.get_lines_for_level('info')
             self.assertIn(
@@ -4946,19 +4947,20 @@ class TestReplicatedObjectController(
                 'container.info.cache.hit': 1,
                 'account.info.cache.hit': 1,
                 'object.shard_updating.cache.skip.200': 1,
-                'object.shard_updating.cache.set.200': 1
+                'object.shard_updating.cache.set': 1
             })
             stats = self.app.statsd.get_labeled_stats_counts()
-            self.assertEqual(stats, {
-                ('swift_token', frozenset({
-                    'resource': 'shard_updating',
-                    'account': 'a',
-                    'container': 'c',
-                    'event': 'backend_reqs',
-                    'token': 'disabled',
-                    'status': 200,
-                }.items())): 1,
-            })
+            self.assertEqual({
+                ('swift_coop_cache', frozenset((
+                    ('resource', 'shard_updating'),
+                    ('account', 'a'),
+                    ('container', 'c'),
+                    ('event', 'backend_reqs'),
+                    ('set_cache_state', 'set'),
+                    ('token', 'disabled'),
+                    ('status', 200)),
+                )): 1,
+            }, stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
 
@@ -5042,6 +5044,18 @@ class TestReplicatedObjectController(
                     'status': 200,
                 }.items())): 2,
             })
+            stats = self.app.statsd.get_labeled_stats_counts()
+            self.assertEqual({
+                ('swift_coop_cache', frozenset((
+                    ('resource', 'shard_updating'),
+                    ('account', 'a'),
+                    ('container', 'c'),
+                    ('event', 'backend_reqs'),
+                    ('set_cache_state', 'set'),
+                    ('token', 'disabled'),
+                    ('status', 200)),
+                )): 2,
+            }, stats)
 
         do_test('POST', 'sharding')
         do_test('POST', 'sharded')
@@ -5104,19 +5118,20 @@ class TestReplicatedObjectController(
                 'container.info.cache.miss.200': 1,
                 'container.info.infocache.hit': 1,
                 'object.shard_updating.cache.skip.200': 1,
-                'object.shard_updating.cache.set_error.200': 1
+                'object.shard_updating.cache.set_error': 1
             })
             stats = self.app.statsd.get_labeled_stats_counts()
-            self.assertEqual(stats, {
-                ('swift_token', frozenset({
-                    'resource': 'shard_updating',
-                    'account': 'a',
-                    'container': 'c',
-                    'event': 'backend_reqs',
-                    'token': 'disabled',
-                    'status': 200,
-                }.items())): 1,
-            })
+            self.assertEqual({
+                ('swift_coop_cache', frozenset((
+                    ('resource', 'shard_updating'),
+                    ('account', 'a'),
+                    ('container', 'c'),
+                    ('event', 'backend_reqs'),
+                    ('set_cache_state', 'set_error'),
+                    ('token', 'disabled'),
+                    ('status', 200)),
+                )): 1,
+            }, stats)
             # verify statsd prefix is not mutated
             self.assertEqual([], self.app.logger.log_dict['set_statsd_prefix'])
             # sanity check: namespaces not in cache

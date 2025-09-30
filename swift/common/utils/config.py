@@ -85,7 +85,7 @@ def config_positive_int_value(value):
 
 def config_positive_float_value(value):
     """
-    Returns positive float value if it can be cast by float() and it's an
+    Returns positive float value if it can be cast by float() and it's a
     float > 0. (not including zero) Raises ValueError otherwise.
     """
     try:

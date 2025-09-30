@@ -955,8 +955,7 @@ def get_namespaces_from_cache(req, cache_key, skip_chance):
         cache_state = 'error'
 
     ns_bound_list = namespace_bounds_to_list(bounds)
-    if ns_bound_list:
-        infocache[cache_key] = ns_bound_list
+    infocache[cache_key] = ns_bound_list
     return ns_bound_list, cache_state
 
 
@@ -967,10 +966,13 @@ def set_namespaces_in_cache(req, cache_key, ns_bound_list, time):
     :param req: a :class:`swift.common.swob.Request` object.
     :param cache_key: the cache key for both infocache and memcache.
     :param ns_bound_list: a :class:`swift.common.utils.NamespaceBoundList`;
-                          must be not None or empty.
+                          should NOT be None nor empty.
     :param time: how long the namespaces should remain in memcache.
     :return: the cache_state.
     """
+    if cache_key.startswith('shard-updating'):
+        raise ValueError('shard-updating cache should use '
+                         'CooperativeNamespaceCachePopulator')
     infocache = req.environ.setdefault('swift.infocache', {})
     infocache[cache_key] = ns_bound_list
     memcache = cache_from_env(req.environ, True)
@@ -983,6 +985,12 @@ def set_namespaces_in_cache(req, cache_key, ns_bound_list, time):
         else:
             cache_state = 'set'
     else:
+        # N.B. get_namespaces_from_cache is used for both types of namespace
+        # cache objects (updating and listing), and both code paths only call
+        # that helper if memcache is enabled.  But this function is now only
+        # used to set cache *listing* namespace objects over in
+        # ContainerController, so if that code path learns to not call it when
+        # memcache is disabled this func could also drop cache_state=disabled
         cache_state = 'disabled'
     return cache_state
 
@@ -1239,6 +1247,7 @@ class GetterBase(object):
         server type.
     :param logger: a logger instance.
     """
+
     def __init__(self, app, req, node_iter, partition, policy,
                  path, backend_headers, node_timeout, resource_type,
                  logger=None):
@@ -1422,6 +1431,7 @@ class GetOrHeadHandler(GetterBase):
     :param policy: the policy instance, or None if Account or Container.
     :param logger: a logger instance.
     """
+
     def __init__(self, app, req, server_type, node_iter, partition, path,
                  backend_headers, concurrency=1, policy=None, logger=None):
         newest = config_true_value(req.headers.get('x-newest', 'f'))

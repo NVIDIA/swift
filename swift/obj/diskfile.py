@@ -1384,10 +1384,9 @@ class BaseDiskFileManager(object):
         for hsh in path_contents:
             hsh_path = join(path, hsh)
             try:
-                cleanup_span = trace.open_span('cleanup_ondisk_files')
-                ondisk_info = self.cleanup_ondisk_files(
-                    hsh_path, policy=policy)
-                cleanup_span.close_span()
+                with trace.open_span('cleanup_ondisk_files'):
+                    ondisk_info = self.cleanup_ondisk_files(
+                        hsh_path, policy=policy)
             except OSError as err:
                 partition_path = dirname(path)
                 objects_path = dirname(partition_path)
@@ -1566,10 +1565,9 @@ class BaseDiskFileManager(object):
             if not hash_:
                 suffix_dir = join(partition_path, suffix)
                 try:
-                    suffix_span = trace.open_span(f'hash_{suffix}')
-                    hashes[suffix] = self._hash_suffix(
-                        suffix_dir, policy=policy)
-                    suffix_span.close_span()
+                    with trace.open_span(f'hash_{suffix}'):
+                        hashes[suffix] = self._hash_suffix(
+                            suffix_dir, policy=policy)
                     hashed += 1
                 except PathNotDir:
                     del hashes[suffix]
@@ -1580,15 +1578,20 @@ class BaseDiskFileManager(object):
         trace.message(f"hashed: {hashed}")
         if modified:
             lock_span = trace.open_span('lock')
-            with lock_path(partition_path):
-                lock_span.close_span()
-                reread_span = trace.open_span('reread_hashes')
-                if read_hashes(partition_path) == orig_hashes:
-                    reread_span.close_span()
-                    write_span = trace.open_span('write_hashes')
-                    write_hashes(partition_path, hashes)
-                    write_span.close_span()
-                    return hashed, hashes
+            closed_lock_span = False
+            try:
+                with lock_path(partition_path):
+                    lock_span.close_span()
+                    closed_lock_span = True
+                    with trace.open_span('reread_hashes'):
+                        current_hashes = read_hashes(partition_path)
+                    if current_hashes == orig_hashes:
+                        with trace.open_span('write_hashes'):
+                            write_hashes(partition_path, hashes)
+                        return hashed, hashes
+            finally:
+                if not closed_lock_span:
+                    lock_span.close_span()
             with trace.open_span('rehash_again'):
                 return self.__get_hashes(device, partition, policy,
                                          recalculate=recalculate,
@@ -3508,6 +3511,7 @@ class ECDiskFileWriter(BaseDiskFileWriter):
             new_durable_data_file_path = replace_partition_in_path(
                 self.manager.devices, durable_data_file_path,
                 self.next_part_power)
+        error_in_ppi_rename = False
         try:
             try:
                 os.rename(data_file_path, durable_data_file_path)
@@ -3517,11 +3521,9 @@ class ECDiskFileWriter(BaseDiskFileWriter):
                     try:
                         os.rename(new_data_file_path,
                                   new_durable_data_file_path)
-                    except OSError as exc:
-                        self.manager.logger.exception(
-                            'Renaming new path %s to %s failed: %s',
-                            new_data_file_path, new_durable_data_file_path,
-                            exc)
+                    except OSError:
+                        error_in_ppi_rename = True
+                        raise  # Still translate to a DiskFileError below
 
             except (OSError, IOError) as err:
                 if err.errno == errno.ENOENT:
@@ -3539,6 +3541,10 @@ class ECDiskFileWriter(BaseDiskFileWriter):
                              for frag in durables):
                         return
 
+                if error_in_ppi_rename:
+                    self.manager.logger.error(
+                        'Renaming new path %s to %s failed',
+                        new_data_file_path, new_durable_data_file_path)
                 if err.errno not in (errno.ENOSPC, errno.EDQUOT):
                     # re-raise to catch all handler
                     raise
