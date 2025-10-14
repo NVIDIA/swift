@@ -48,11 +48,6 @@ TEST_ACCOUNT_NAME = 'a c t'
 TEST_CONTAINER_NAME = 'c o n'
 
 
-def teardown_module():
-    "clean up my monkey patching"
-    reload_module(db_replicator)
-
-
 @contextmanager
 def lock_parent_directory(filename):
     yield True
