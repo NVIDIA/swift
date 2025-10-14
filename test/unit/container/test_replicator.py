@@ -156,16 +156,10 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         local_sync = mock.Mock()
         different_region = False
 
-        with mock.patch.object(daemon, '_sync_shard_ranges') as mock_sync, \
-             mock.patch.object(db_replicator.Replicator,
-                               '_choose_replication_mode',
-                               return_value=True) as mock_choose_repl_mode:
+        with mock.patch.object(daemon, '_sync_shard_ranges') as mock_sync:
             daemon._choose_replication_mode(
                 node, rinfo, info, local_sync, broker, http, different_region)
             mock_sync.assert_not_called()
-            mock_choose_repl_mode.assert_called_once_with(
-                node, rinfo, info, local_sync, broker, http, different_region
-            )
 
         node_str = '%(ip)s:%(port)s/%(device)s' % node
         lines = self.logger.get_lines_for_level('warning')
@@ -191,10 +185,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         different_region = False
 
         with mock.patch.object(daemon, '_sync_shard_ranges',
-                               return_value=True), \
-                mock.patch.object(db_replicator.Replicator,
-                                  '_choose_replication_mode',
-                                  return_value=True):
+                               return_value=True):
 
             daemon._choose_replication_mode(
                 node, rinfo, info, local_sync, broker, http, different_region)
