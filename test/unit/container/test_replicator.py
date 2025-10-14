@@ -142,8 +142,6 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
              % node_str], lines)
 
     def test_choose_replication_mode_warning_for_old_peer(self):
-        daemon = replicator.ContainerReplicator({}, logger=self.logger)
-
         broker = mock.Mock()
         broker.db_file = '/path/to/db'
         broker.path = '/v1/AUTH_a/c'
@@ -156,16 +154,19 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         local_sync = mock.Mock()
         different_region = False
 
-        with mock.patch.object(daemon, '_sync_shard_ranges') as mock_sync, \
-             mock.patch.object(db_replicator.Replicator,
-                               '_choose_replication_mode',
-                               return_value=True) as mock_choose_repl_mode:
-            daemon._choose_replication_mode(
-                node, rinfo, info, local_sync, broker, http, different_region)
-            mock_sync.assert_not_called()
-            mock_choose_repl_mode.assert_called_once_with(
-                node, rinfo, info, local_sync, broker, http, different_region
-            )
+        with mock.patch('swift.common.db_replicator.Replicator.'
+                        '_choose_replication_mode',
+                        return_value=True) as mock_choose_repl_mode:
+            daemon = replicator.ContainerReplicator({}, logger=self.logger)
+
+            with mock.patch.object(daemon, '_sync_shard_ranges') as mock_sync:
+                daemon._choose_replication_mode(
+                    node, rinfo, info, local_sync, broker, http,
+                    different_region)
+        mock_sync.assert_not_called()
+        mock_choose_repl_mode.assert_called_once_with(
+            node, rinfo, info, local_sync, broker, http, different_region
+        )
 
         node_str = '%(ip)s:%(port)s/%(device)s' % node
         lines = self.logger.get_lines_for_level('warning')
@@ -175,8 +176,6 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
              % node_str], lines)
 
     def test_choose_replication_mode_sharded_nothing_more_to_replicate(self):
-        daemon = replicator.ContainerReplicator({}, logger=self.logger)
-
         broker = mock.Mock()
         broker.db_file = '/path/to/db'
         broker.path = '/v1/AUTH_a/c'
@@ -190,14 +189,14 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         local_sync = mock.Mock()
         different_region = False
 
-        with mock.patch.object(daemon, '_sync_shard_ranges',
-                               return_value=True), \
-                mock.patch.object(db_replicator.Replicator,
-                                  '_choose_replication_mode',
-                                  return_value=True):
-
-            daemon._choose_replication_mode(
-                node, rinfo, info, local_sync, broker, http, different_region)
+        with mock.patch('swift.common.db_replicator.Replicator.'
+                        '_choose_replication_mode', return_value=True):
+            daemon = replicator.ContainerReplicator({}, logger=self.logger)
+            with mock.patch.object(daemon, '_sync_shard_ranges',
+                                   return_value=True):
+                daemon._choose_replication_mode(
+                    node, rinfo, info, local_sync, broker, http,
+                    different_region)
 
         node_str = '%(ip)s:%(port)s/%(device)s' % node
         lines = self.logger.get_lines_for_level('debug')
@@ -2990,15 +2989,15 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertEqual(str(dev_err.exception), expected_error_string)
 
     def test_delete_db_logs_on_sync_store_error(self):
-        daemon = replicator.ContainerReplicator({}, logger=self.logger)
-        daemon.sync_store = mock.Mock()
-        broker = self._get_broker('a', 'c', node_index=0)
+        with mock.patch('swift.common.db_replicator.Replicator.delete_db',
+                        return_value=True) as mock_delete_db:
+            daemon = replicator.ContainerReplicator({}, logger=self.logger)
+            daemon.sync_store = mock.Mock()
+            broker = self._get_broker('a', 'c', node_index=0)
 
-        daemon.sync_store.remove_synced_container.side_effect = Exception(
-            'Failed to remove sync_store entry')
+            daemon.sync_store.remove_synced_container.side_effect = Exception(
+                'Failed to remove sync_store entry')
 
-        with mock.patch.object(db_replicator.Replicator, 'delete_db',
-                               return_value=True) as mock_delete_db:
             delete_success = daemon.delete_db(broker)
 
         lines = self.logger.get_lines_for_level('error')
