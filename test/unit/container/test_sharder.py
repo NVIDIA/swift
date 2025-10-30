@@ -47,7 +47,7 @@ from swift.common.utils import ShardRange, Timestamp, hash_path, \
     encode_timestamps, parse_db_filename, quorum_size, Everything, md5, \
     ShardName, Namespace
 
-from test.debug_logger import debug_logger
+from test.debug_logger import debug_logger, debug_labeled_statsd_client
 from test.unit import FakeRing, make_timestamp_iter, unlink_files, \
     mocked_http_conn, mock_timestamp_now, mock_timestamp_now_with_iter, \
     attach_fake_replication_rpc
@@ -58,6 +58,13 @@ class BaseTestSharder(unittest.TestCase):
         self.tempdir = mkdtemp()
         self.ts_iter = make_timestamp_iter()
         self.logger = debug_logger('sharder-test')
+        conf = {
+            'log_statsd_host': 'host',
+            'log_statsd_port': 8125,
+            'statsd_label_mode': 'dogstatsd',
+            'statsd_emit_legacy': True,
+        }
+        self.statsd = debug_labeled_statsd_client(conf)
 
     def tearDown(self):
         shutil.rmtree(self.tempdir, ignore_errors=True)
@@ -150,6 +157,8 @@ class TestSharder(BaseTestSharder):
         logger = self.logger if use_logger else None
         if logger:
             logger.clear()
+            self.statsd.clear()
+
         with mock.patch(
                 'swift.container.sharder.internal_client.InternalClient') \
                 as mock_ic:
@@ -857,6 +866,7 @@ class TestSharder(BaseTestSharder):
                          'found': 0, 'created': 2, 'cleaved': 1, 'active': 2,
                          'state': 'sharding', 'db_state': 'unsharded',
                          'error': 'kapow!'}]}
+
             self._assert_stats(
                 expected_in_progress_stats, sharder, 'sharding_in_progress')
 
@@ -1079,6 +1089,7 @@ class TestSharder(BaseTestSharder):
     @contextmanager
     def _mock_sharder(self, conf=None, replicas=3):
         self.logger.clear()
+        self.statsd.clear()
         conf = conf or {}
         conf['devices'] = self.tempdir
         fake_ring = FakeRing(replicas=replicas, separate_replication=True)
@@ -1087,7 +1098,8 @@ class TestSharder(BaseTestSharder):
             with mock.patch(
                     'swift.common.db_replicator.ring.Ring',
                     return_value=fake_ring):
-                sharder = ContainerSharder(conf, logger=self.logger)
+                sharder = ContainerSharder(conf, logger=self.logger,
+                                           statsd=self.statsd)
                 sharder._local_device_ids = {dev['id']: dev
                                              for dev in fake_ring.devs}
                 sharder._replicate_object = mock.MagicMock(
@@ -2570,7 +2582,7 @@ class TestSharder(BaseTestSharder):
             % broker.db_file, lines[0])
         self.assertIn(
             'Completed cleaving, DB set to sharded state, path: a/c, db: %s'
-            % broker.db_file, lines[1:])
+            % broker.db_file, lines)
 
         self.assertTrue(self.logger.statsd_client.calls['timing_since'])
         self.assertEqual(
@@ -2593,6 +2605,33 @@ class TestSharder(BaseTestSharder):
             self.logger.statsd_client.calls['timing_since'][-1][0][0])
         self.assertGreater(
             self.logger.statsd_client.calls['timing_since'][-1][0][1], 0)
+
+        # tried using get_labeled_stats_counts here but for inexplicable
+        # reasons it always returned an empty defaultdict
+        timing_calls = self.statsd.calls['timing']
+        main_metrics = [call[0] for call in timing_calls]
+
+        self.assertEqual('sharder.sharding.time_to_first_cleave',
+                         main_metrics[0][0])
+        self.assertGreater(main_metrics[0][1], 0)
+        self.assertEqual('sharder.sharding.time_to_last_cleave',
+                         main_metrics[1][0])
+        self.assertGreater(main_metrics[1][1], 0)
+
+        # check labels
+        for call in timing_calls:
+            label_names = list(call[1]['labels'].keys())
+            self.assertIn('account', label_names)
+            self.assertIn('container', label_names)
+            self.assertEqual(call[1]['labels']['account'], 'a')
+            self.assertEqual(call[1]['labels']['container'], 'c')
+
+            if call[0][0] == 'sharder.sharding.time_to_first_cleave':
+                self.assertIn('ranges_todo', label_names)
+                self.assertEqual(call[1]['labels']['ranges_todo'], 2)
+            else:
+                self.assertIn('ranges_done', label_names)
+                self.assertEqual(call[1]['labels']['ranges_done'], 2)
 
         # check shard ranges were updated to ACTIVE
         self.assertEqual([ShardRange.ACTIVE] * 2,
