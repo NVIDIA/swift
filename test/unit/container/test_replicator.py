@@ -370,6 +370,126 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
                              "mismatch remote %s %r != %r" % (
                                  k, remote_info[k], v))
 
+    def test_force_replication_mode_rsync(self):
+        put_timestamp = time.time()
+        # create "local" broker
+        broker = self._get_broker('a', 'c', node_index=0)
+        broker.initialize(put_timestamp, POLICIES.default.idx)
+        # create "remote" broker
+        remote_broker = self._get_broker('a', 'c', node_index=1)
+        remote_broker.initialize(put_timestamp, POLICIES.default.idx)
+        # add some rows to both db
+        for i in range(500):
+            put_timestamp = time.time()
+            for db in (broker, remote_broker):
+                path = '/a/c/o_%s' % i
+                db.put_object(path, put_timestamp, 0, 'content-type', 'etag',
+                              storage_policy_index=db.storage_policy_index)
+        # add one more row to local. normally this would trigger usync
+        broker.put_object('/a/c/o_missing', time.time(), 0,
+                          'content-type', 'etag',
+                          storage_policy_index=broker.storage_policy_index)
+
+        # replicate with force_replication_mode='rsync'
+        daemon = replicator.ContainerReplicator(
+            {'force_replication_mode': 'rsync'})
+        self._install_fake_rsync_file(daemon)
+
+        part, node = self._get_broker_part_node(remote_broker)
+        info = broker.get_replication_info()
+        success = daemon._repl_to_node(node, broker, part, info)
+
+        # should use rsync (remote_merge) instead of usync (diff)
+        self.assertTrue(success)
+        self.assertEqual(1, daemon.stats['remote_merge'])
+        self.assertEqual(0, daemon.stats['diff'])
+
+    def test_force_replication_mode_usync(self):
+        # Test that force_replication_mode='usync' uses usync even when
+        # auto mode would use rsync
+        put_timestamp = time.time()
+        # create "local" broker with many objects
+        broker = self._get_broker('a', 'c', node_index=0)
+        broker.initialize(put_timestamp, POLICIES.default.idx)
+        # create "remote" broker with few objects
+        remote_broker = self._get_broker('a', 'c', node_index=1)
+        remote_broker.initialize(put_timestamp, POLICIES.default.idx)
+
+        # add many rows to local (this would trigger rsync in auto mode)
+        for i in range(100):
+            broker.put_object('/a/c/o_%s' % i, time.time(), 0,
+                              'content-type', 'etag',
+                              storage_policy_index=broker.storage_policy_index)
+        # add just a few to remote
+        for i in range(10):
+            obj_name = '/a/c/o_%s' % i
+            remote_broker.put_object(
+                obj_name, time.time(), 0, 'content-type', 'etag',
+                storage_policy_index=remote_broker.storage_policy_index)
+
+        # replicate with force_replication_mode='usync',
+        # made per_diff very small since that'd make it use rsync in this case
+        # (double verify we're forcing usync here)
+        daemon = replicator.ContainerReplicator(
+            {'force_replication_mode': 'usync', 'per_diff': 1})
+        part, node = self._get_broker_part_node(remote_broker)
+        info = broker.get_replication_info()
+        success = daemon._repl_to_node(node, broker, part, info)
+
+        # should use usync (diff) instead of rsync (remote_merge)
+        self.assertTrue(success)
+        self.assertEqual(0, daemon.stats['remote_merge'])
+        self.assertGreater(daemon.stats['diff'], 0)
+
+    def test_force_replication_mode_auto(self):
+        put_timestamp = time.time()
+
+        # part 1: auto mode with small diff should use usync
+        broker = self._get_broker('a', 'c', node_index=0)
+        broker.initialize(put_timestamp, POLICIES.default.idx)
+        remote_broker = self._get_broker('a', 'c', node_index=1)
+        remote_broker.initialize(put_timestamp, POLICIES.default.idx)
+
+        for i in range(10):
+            put_timestamp = time.time()
+            for db in (broker, remote_broker):
+                path = '/a/c/o_%s' % i
+                db.put_object(path, put_timestamp, 0, 'content-type', 'etag',
+                              storage_policy_index=db.storage_policy_index)
+        broker.put_object('/a/c/o_extra', time.time(), 0,
+                          'content-type', 'etag',
+                          storage_policy_index=broker.storage_policy_index)
+        daemon = replicator.ContainerReplicator(
+            {'force_replication_mode': 'auto'})
+        part, node = self._get_broker_part_node(remote_broker)
+        info = broker.get_replication_info()
+        success = daemon._repl_to_node(node, broker, part, info)
+
+        self.assertTrue(success)
+        self.assertEqual(1, daemon.stats['diff'])
+        self.assertEqual(0, daemon.stats['remote_merge'])
+
+        # part 2: auto mode with "large" diff should use rsync
+        broker2 = self._get_broker('b', 'd', node_index=0)
+        broker2.initialize(time.time(), POLICIES.default.idx)
+        remote_broker2 = self._get_broker('b', 'd', node_index=1)
+        remote_broker2.initialize(time.time(), POLICIES.default.idx)
+
+        # Add one row to local
+        broker2.put_object('/b/d/o', time.time(), 0, 'content-type', 'etag',
+                           storage_policy_index=broker2.storage_policy_index)
+        daemon2 = replicator.ContainerReplicator({
+            'force_replication_mode': 'auto',
+            'per_diff': 0
+        })
+        self._install_fake_rsync_file(daemon2)
+        part2, node2 = self._get_broker_part_node(remote_broker2)
+        info2 = broker2.get_replication_info()
+        success2 = daemon2._repl_to_node(node2, broker2, part2, info2)
+
+        self.assertTrue(success2)
+        self.assertEqual(1, daemon2.stats['remote_merge'])
+
     def test_sync_remote_can_not_keep_up(self):
         put_timestamp = time.time()
         # create "local" broker
