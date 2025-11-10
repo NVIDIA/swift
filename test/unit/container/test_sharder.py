@@ -47,7 +47,7 @@ from swift.common.utils import ShardRange, Timestamp, hash_path, \
     encode_timestamps, parse_db_filename, quorum_size, Everything, md5, \
     ShardName, Namespace
 
-from test.debug_logger import debug_logger
+from test.debug_logger import debug_logger, debug_labeled_statsd_client
 from test.unit import FakeRing, make_timestamp_iter, unlink_files, \
     mocked_http_conn, mock_timestamp_now, mock_timestamp_now_with_iter, \
     attach_fake_replication_rpc
@@ -58,6 +58,13 @@ class BaseTestSharder(unittest.TestCase):
         self.tempdir = mkdtemp()
         self.ts_iter = make_timestamp_iter()
         self.logger = debug_logger('sharder-test')
+        conf = {
+            'log_statsd_host': 'host',
+            'log_statsd_port': 8125,
+            'statsd_label_mode': 'dogstatsd',
+            'statsd_emit_legacy': True,
+        }
+        self.statsd = debug_labeled_statsd_client(conf)
 
     def tearDown(self):
         shutil.rmtree(self.tempdir, ignore_errors=True)
@@ -150,6 +157,8 @@ class TestSharder(BaseTestSharder):
         logger = self.logger if use_logger else None
         if logger:
             logger.clear()
+            self.statsd.clear()
+
         with mock.patch(
                 'swift.container.sharder.internal_client.InternalClient') \
                 as mock_ic:
@@ -467,6 +476,16 @@ class TestSharder(BaseTestSharder):
             recon = json.load(fd)
         stats = recon['sharding_stats']['sharding'].get(category)
         self.assertEqual(expected, stats)
+
+    def assert_labeled_timing_since_stats(self, exp_metrics_values_labels):
+        statsd_calls = self.statsd.calls['timing_since']
+        exp_calls = []
+        for metric, value, labels in exp_metrics_values_labels:
+            exp_calls.append(((metric, mock.ANY), {'labels': labels}))
+        self.assertEqual(exp_calls, statsd_calls)
+        for i, (metric, value, labels) in enumerate(exp_metrics_values_labels):
+            self.assertAlmostEqual(
+                value, statsd_calls[i][0][1], places=4, msg=i)
 
     def test_increment_stats(self):
         with self._mock_sharder() as sharder:
@@ -1088,6 +1107,7 @@ class TestSharder(BaseTestSharder):
     @contextmanager
     def _mock_sharder(self, conf=None, replicas=3):
         self.logger.clear()
+        self.statsd.clear()
         conf = conf or {}
         conf['devices'] = self.tempdir
         fake_ring = FakeRing(replicas=replicas, separate_replication=True)
@@ -1096,7 +1116,8 @@ class TestSharder(BaseTestSharder):
             with mock.patch(
                     'swift.common.db_replicator.ring.Ring',
                     return_value=fake_ring):
-                sharder = ContainerSharder(conf, logger=self.logger)
+                sharder = ContainerSharder(conf, logger=self.logger,
+                                           statsd=self.statsd)
                 sharder._local_device_ids = {dev['id']: dev
                                              for dev in fake_ring.devs}
                 sharder._replicate_object = mock.MagicMock(
@@ -2579,7 +2600,7 @@ class TestSharder(BaseTestSharder):
             % broker.db_file, lines[0])
         self.assertIn(
             'Completed cleaving, DB set to sharded state, path: a/c, db: %s'
-            % broker.db_file, lines[1:])
+            % broker.db_file, lines)
 
         self.assertTrue(self.logger.statsd_client.calls['timing_since'])
         self.assertEqual(
@@ -2602,6 +2623,13 @@ class TestSharder(BaseTestSharder):
             self.logger.statsd_client.calls['timing_since'][-1][0][0])
         self.assertGreater(
             self.logger.statsd_client.calls['timing_since'][-1][0][1], 0)
+
+        self.assert_labeled_timing_since_stats([
+            ('swift_container_sharder_time_to_first_cleave', mock.ANY,
+             {'account': 'a', 'container': 'c', 'ranges_todo': 2}),
+            ('swift_container_sharder_time_to_last_cleave', mock.ANY,
+             {'account': 'a', 'container': 'c', 'ranges_done': 2}),
+        ])
 
         # check shard ranges were updated to ACTIVE
         self.assertEqual([ShardRange.ACTIVE] * 2,
@@ -9115,7 +9143,8 @@ class TestCleavingContext(BaseTestSharder):
         self.assertFalse(ctx.cleaving_done)
 
     def test_iter(self):
-        ctx = CleavingContext('test', 'curs', 12, 11, 10, False, True, 0, 4)
+        ctx = CleavingContext('test', 'curs', 12, 11, 10, False, True, 0, 4,
+                              0, 0)
         expected = {'ref': 'test',
                     'cursor': 'curs',
                     'max_row': 12,
@@ -9277,8 +9306,8 @@ class TestCleavingContext(BaseTestSharder):
         broker = self._make_old_style_sharding_broker()
         old_db_id = broker.get_brokers()[0].get_info()['id']
         last_mod = Timestamp.now()
-        ctx = CleavingContext(
-            old_db_id, 'curs', 12, 11, 2, True, True, 2, 4, 2, 0.5)
+        ctx = CleavingContext(old_db_id, 'curs', 12, 11, 2, True, True, 2, 4,
+                              2, 0.5)
         with mock_timestamp_now(last_mod):
             ctx.store(broker)
         key = 'X-Container-Sysmeta-Shard-Context-%s' % old_db_id
@@ -9390,7 +9419,8 @@ class TestCleavingContext(BaseTestSharder):
         broker = self._make_sharding_broker()
         old_db_id = broker.get_brokers()[0].get_info()['id']
         last_mod = Timestamp.now()
-        ctx = CleavingContext(old_db_id, 'curs', 12, 11, 2, True, True, 2, 4)
+        ctx = CleavingContext(old_db_id, 'curs', 12, 11, 2, True, True, 2, 4,
+                              4, 0.5)
         with mock_timestamp_now(last_mod):
             ctx.store(broker)
         key = 'X-Container-Sysmeta-Shard-Context-%s' % old_db_id
@@ -9404,8 +9434,8 @@ class TestCleavingContext(BaseTestSharder):
                     'misplaced_done': True,
                     'ranges_done': 2,
                     'ranges_todo': 4,
-                    'replication_count': 0,
-                    'replication_time': 0}
+                    'replication_count': 4,
+                    'replication_time': 0.5}
         self.assertEqual(expected, data)
         # last modified is the metadata timestamp
         self.assertEqual(broker.metadata[key][1], last_mod.internal)
@@ -9515,8 +9545,6 @@ class TestCleavingContext(BaseTestSharder):
             self.assertEqual(0, ctx.ranges_todo)
             self.assertEqual(0, ctx.replication_count)
             self.assertEqual(0, ctx.replication_time)
-            self.assertEqual(0, ctx.replication_count)
-            self.assertEqual(0, ctx.replication_time)
         ctx.reset()
         check_context()
         # check idempotency
@@ -9540,6 +9568,7 @@ class TestCleavingContext(BaseTestSharder):
             self.assertEqual(0, ctx.ranges_todo)
             self.assertEqual(0, ctx.replication_count)
             self.assertEqual(0, ctx.replication_time)
+
         ctx.start()
         check_context()
         # check idempotency

@@ -248,15 +248,8 @@ class ProxyLoggingMiddleware(object):
         self.reveal_sensitive_prefix = int(
             conf.get('reveal_sensitive_prefix', 16))
         self.check_log_msg_template_validity()
-        statsd_emit_buffer_xfer_bytes_ms = int(
-            conf.get('statsd_emit_buffer_xfer_bytes_ms', -1))
-        if statsd_emit_buffer_xfer_bytes_ms < 0:
-            self.emit_buffer_xfer_bytes_sec = -1
-        elif statsd_emit_buffer_xfer_bytes_ms == 0:
-            self.emit_buffer_xfer_bytes_sec = 0
-        else:
-            self.emit_buffer_xfer_bytes_sec = (
-                statsd_emit_buffer_xfer_bytes_ms / 1000.0)
+        self.emit_buffer_xfer_bytes_sec = float(
+            conf.get('statsd_emit_buffer_xfer_bytes_seconds', -1))
 
     def check_log_msg_template_validity(self):
         replacements = {

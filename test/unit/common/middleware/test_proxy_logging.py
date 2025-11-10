@@ -223,7 +223,7 @@ class TestBufferXferEmitCallback(BaseTestProxyLogging):
         conf = {
             'log_headers': 'yes',
             'statsd_label_mode': 'dogstatsd',
-            'statsd_emit_buffer_xfer_bytes_ms': 0,
+            'statsd_emit_buffer_xfer_bytes_seconds': 0,
         }
         self.statsd = debug_labeled_statsd_client(conf)
         app = proxy_logging.ProxyLoggingMiddleware(
@@ -282,7 +282,7 @@ class TestBufferXferEmitCallback(BaseTestProxyLogging):
         conf = {
             'log_headers': 'yes',
             'statsd_label_mode': 'dogstatsd',
-            'statsd_emit_buffer_xfer_bytes_ms': -1,
+            'statsd_emit_buffer_xfer_bytes_seconds': -1,
         }
         self.statsd = debug_labeled_statsd_client(conf)
         app = proxy_logging.ProxyLoggingMiddleware(
@@ -308,7 +308,7 @@ class TestBufferXferEmitCallback(BaseTestProxyLogging):
         conf = {
             'log_headers': 'yes',
             'statsd_label_mode': 'dogstatsd',
-            'statsd_emit_buffer_xfer_bytes_ms': 1000000,
+            'statsd_emit_buffer_xfer_bytes_seconds': 1000,
         }
         self.statsd = debug_labeled_statsd_client(conf)
         app = proxy_logging.ProxyLoggingMiddleware(
@@ -347,7 +347,7 @@ class TestBufferXferEmitCallback(BaseTestProxyLogging):
         conf = {
             'log_headers': 'yes',
             'statsd_label_mode': 'dogstatsd',
-            'statsd_emit_buffer_xfer_bytes_ms': 1000,
+            'statsd_emit_buffer_xfer_bytes_seconds': 1,
         }
         self.statsd = debug_labeled_statsd_client(conf)
         app = proxy_logging.ProxyLoggingMiddleware(
@@ -2063,9 +2063,9 @@ class TestProxyLogging(BaseTestProxyLogging):
         return status, headers, body
 
     def test_xfer_stats_put(self):
-        buffer_str = b'some stuff\n' + \
-                     b'some other stuff\n' + \
-                     b'some additional extra stuff\n'
+        buffer_str = (b'some stuff\n'
+                      b'some other stuff\n'
+                      b'some additional extra stuff\n')
         buffer_len = len(buffer_str)
         read_calls = 0
         read_bytes = 0
@@ -2139,7 +2139,7 @@ class TestProxyLogging(BaseTestProxyLogging):
 
         conf = {
             'statsd_label_mode': 'dogstatsd',
-            'statsd_emit_buffer_xfer_bytes_ms': 0,
+            'statsd_emit_buffer_xfer_bytes_seconds': 0,
         }
         app = proxy_logging.ProxyLoggingMiddleware(
             FakeApp(read_callback=capture_stats), conf, logger=self.logger)
@@ -2172,7 +2172,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         conf = {
             'log_headers': 'yes',
             'statsd_label_mode': 'dogstatsd',
-            'statsd_emit_buffer_xfer_bytes_ms': 0,
+            'statsd_emit_buffer_xfer_bytes_seconds': 0,
         }
         app = proxy_logging.ProxyLoggingMiddleware(
             FakeApp(
@@ -2235,14 +2235,14 @@ class TestProxyLogging(BaseTestProxyLogging):
 
         conf = {
             'statsd_label_mode': 'dogstatsd',
-            'statsd_emit_buffer_xfer_bytes_ms': 5,
+            'statsd_emit_buffer_xfer_bytes_seconds': 0.005,
         }
         app = proxy_logging.ProxyLoggingMiddleware(
             FakeApp(), conf, logger=self.logger)
         app.statsd = self.statsd
-        buffer_str = b'some stuff\n' + \
-                     b'some other stuff\n' + \
-                     b'some additional stuff and blah\n'
+        buffer_str = (b'some stuff\n'
+                      b'some other stuff\n'
+                      b'some additional stuff and blah\n')
         buffer_len = len(buffer_str)
         req = Request.blank(
             '/v1/a/c',
@@ -2308,7 +2308,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         buffer_len = sum(len(b) for b in buffers)
         conf = {
             'statsd_label_mode': 'dogstatsd',
-            'statsd_emit_buffer_xfer_bytes_ms': 5,
+            'statsd_emit_buffer_xfer_bytes_seconds': 0.005,
         }
         app = proxy_logging.ProxyLoggingMiddleware(
             FakeApp(
@@ -2368,7 +2368,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         proxy_logging_conf = {
             'access_log_route': 'proxy_access',
             'statsd_label_mode': 'dogstatsd',
-            'statsd_emit_buffer_xfer_bytes_ms': 0,
+            'statsd_emit_buffer_xfer_bytes_seconds': 0,
             'storage_domain': storage_domain,
         }
         app = proxy_logging.ProxyLoggingMiddleware(
@@ -2378,9 +2378,9 @@ class TestProxyLogging(BaseTestProxyLogging):
 
     def test_xfer_stats_put_s3api(self):
         app, swift = self._make_logged_pipeline(rewrite_path=True)
-        buffer_str = b'some stuff\n' + \
-                     b'some other stuff\n' + \
-                     b'some additional stuff\n'
+        buffer_str = (b'some stuff\n'
+                      b'some other stuff\n'
+                      b'some additional stuff\n')
         buffer_len = len(buffer_str)
         etag = md5(buffer_str, usedforsecurity=False).hexdigest()
         last_modified = 'Fri, 01 Apr 2014 12:00:00 GMT'
@@ -2539,9 +2539,9 @@ class TestProxyLogging(BaseTestProxyLogging):
 
     def test_base_labels_put_swift(self):
         app, swift = self._make_logged_pipeline()
-        buffer_str = b'some stuff\n' + \
-                     b'some other stuff\n' + \
-                     b'some additional stuff\n'
+        buffer_str = (b'some stuff\n'
+                      b'some other stuff\n'
+                      b'some additional stuff\n')
         etag = md5(buffer_str, usedforsecurity=False).hexdigest()
         last_modified = 'Fri, 01 Apr 2014 12:00:00 GMT'
 
@@ -2581,9 +2581,9 @@ class TestProxyLogging(BaseTestProxyLogging):
 
     def test_base_labels_put_s3api(self):
         app, swift = self._make_logged_pipeline()
-        buffer_str = b'some stuff\n' + \
-                     b'some other stuff\n' + \
-                     b'some additional stuff\n'
+        buffer_str = (b'some stuff\n'
+                      b'some other stuff\n'
+                      b'some additional stuff\n')
         etag = md5(buffer_str, usedforsecurity=False).hexdigest()
         last_modified = 'Fri, 01 Apr 2014 12:00:00 GMT'
 
@@ -2626,9 +2626,9 @@ class TestProxyLogging(BaseTestProxyLogging):
 
     def test_base_labels_put_s3api_storage_domain(self):
         app, swift = self._make_logged_pipeline(storage_domain='domain')
-        buffer_str = b'some stuff\n' + \
-                     b'some other stuff\n' + \
-                     b'some additional stuff\n'
+        buffer_str = (b'some stuff\n'
+                      b'some other stuff\n'
+                      b'some additional stuff\n')
 
         etag = md5(buffer_str, usedforsecurity=False).hexdigest()
         last_modified = 'Fri, 01 Apr 2014 12:00:00 GMT'
