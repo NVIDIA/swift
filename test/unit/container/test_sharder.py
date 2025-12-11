@@ -868,8 +868,7 @@ class TestSharder(BaseTestSharder):
                          'found': 1, 'created': 2, 'cleaved': 1, 'active': 1,
                          'shrinking': 0,
                          'state': 'sharding', 'db_state': 'unsharded',
-                         'error': None, 'processing_time': mock.ANY,
-                         'db_sharding_total_elapsed': mock.ANY},
+                         'error': None, 'processing_time': mock.ANY},
                         {'object_count': 10, 'tombstones': -1, 'account': 'a',
                          'container': 'c1',
                          'meta_timestamp': mock.ANY,
@@ -933,8 +932,7 @@ class TestSharder(BaseTestSharder):
                          'shrinking': 0,
                          'state': 'sharding', 'db_state': 'sharding',
                          'error': None, 'processing_time': mock.ANY,
-                         'tombstones': 5,
-                         'db_sharding_total_elapsed': mock.ANY},
+                         'tombstones': 5},
                         {'object_count': 0, 'account': 'a', 'container': 'c1',
                          'meta_timestamp': mock.ANY,
                          'file_size': os.stat(brokers[1].db_file).st_size,
@@ -944,8 +942,7 @@ class TestSharder(BaseTestSharder):
                          'shrinking': 0,
                          'state': 'sharding', 'db_state': 'unsharded',
                          'error': None, 'processing_time': mock.ANY,
-                         'tombstones': -1,
-                         'db_sharding_total_elapsed': mock.ANY}]}
+                         'tombstones': -1}]}
             self._assert_stats(
                 expected_in_progress_stats, sharder, 'sharding_in_progress')
 
@@ -969,6 +966,7 @@ class TestSharder(BaseTestSharder):
                 sharder._local_device_ids = {999: {}}
                 sharder._one_shard_cycle(Everything(), Everything())
 
+            self.maxDiff = None
             expected_in_progress_stats = {
                 'all': [{'object_count': 0, 'account': 'a', 'container': 'c0',
                          'meta_timestamp': mock.ANY,
@@ -980,8 +978,7 @@ class TestSharder(BaseTestSharder):
                          'state': 'sharded', 'db_state': 'sharded',
                          'error': None, 'processing_time': mock.ANY,
                          'tombstones': 5,
-                         'db_sharding_total_elapsed': mock.ANY,
-                         'total_replicate_calls': mock.ANY,
+                         'total_sharding_time': mock.ANY,
                          'total_replicate_time': mock.ANY},
                         {'object_count': 0, 'account': 'a', 'container': 'c1',
                          'meta_timestamp': mock.ANY,
@@ -992,8 +989,7 @@ class TestSharder(BaseTestSharder):
                          'shrinking': 0,
                          'state': 'sharding', 'db_state': 'unsharded',
                          'error': None, 'processing_time': mock.ANY,
-                         'tombstones': -1,
-                         'db_sharding_total_elapsed': mock.ANY}]}
+                         'tombstones': -1}]}
             self._assert_stats(
                 expected_in_progress_stats, sharder, 'sharding_in_progress')
 
@@ -1029,8 +1025,7 @@ class TestSharder(BaseTestSharder):
                          'shrinking': 0,
                          'state': 'sharding', 'db_state': 'unsharded',
                          'error': None, 'processing_time': mock.ANY,
-                         'tombstones': -1,
-                         'db_sharding_total_elapsed': mock.ANY}]}
+                         'tombstones': -1}]}
             self._assert_stats(
                 expected_in_progress_stats, sharder, 'sharding_in_progress')
 
@@ -1543,7 +1538,6 @@ class TestSharder(BaseTestSharder):
         self.assertEqual(9, context.max_row)
         self.assertEqual(0, context.ranges_done)
         self.assertEqual(4, context.ranges_todo)
-        self.assertEqual(0, context.replication_count)
         self.assertEqual(0, context.replication_time)
 
         self.assertEqual(SHARDING, broker.get_db_state())
@@ -1730,7 +1724,6 @@ class TestSharder(BaseTestSharder):
         self.assertEqual(9, context.max_row)
         self.assertEqual(3, context.ranges_done)
         self.assertEqual(1, context.ranges_todo)
-        self.assertEqual(4, context.replication_count)
         self.assertGreater(context.replication_time, 0)
 
         unlink_files(expected_shard_dbs)
@@ -1795,7 +1788,6 @@ class TestSharder(BaseTestSharder):
         self.assertEqual(9, context.max_row)
         self.assertEqual(4, context.ranges_done)
         self.assertEqual(0, context.ranges_todo)
-        self.assertEqual(5, context.replication_count)
         self.assertGreater(context.replication_time, 0)
 
         unlink_files(expected_shard_dbs)
@@ -1869,7 +1861,6 @@ class TestSharder(BaseTestSharder):
         self.assertEqual(9, context.max_row)
         self.assertEqual(5, context.ranges_done)
         self.assertEqual(0, context.ranges_todo)
-        self.assertEqual(6, context.replication_count)
         self.assertGreater(context.replication_time, 0)
 
         with self._mock_sharder(conf=conf) as sharder:
@@ -9143,8 +9134,7 @@ class TestCleavingContext(BaseTestSharder):
         self.assertFalse(ctx.cleaving_done)
 
     def test_iter(self):
-        ctx = CleavingContext('test', 'curs', 12, 11, 10, False, True, 0, 4,
-                              0, 0)
+        ctx = CleavingContext('test', 'curs', 12, 11, 10, False, True, 0, 4, 0)
         expected = {'ref': 'test',
                     'cursor': 'curs',
                     'max_row': 12,
@@ -9154,7 +9144,6 @@ class TestCleavingContext(BaseTestSharder):
                     'misplaced_done': True,
                     'ranges_done': 0,
                     'ranges_todo': 4,
-                    'replication_count': 0,
                     'replication_time': 0}
         self.assertEqual(expected, dict(ctx))
 
@@ -9175,7 +9164,6 @@ class TestCleavingContext(BaseTestSharder):
                     'misplaced_done': True,
                     'ranges_done': 0,
                     'ranges_todo': 0,
-                    'replication_count': 0,
                     'replication_time': 0,
                     'ref': ref,
                 })
@@ -9205,7 +9193,6 @@ class TestCleavingContext(BaseTestSharder):
                   'misplaced_done': True,
                   'ranges_done': 2,
                   'ranges_todo': 4,
-                  'replication_count': 2,
                   'replication_time': 0.5}
         key = 'X-Container-Sysmeta-Shard-Context-%s' % db_id
         broker.update_metadata(
@@ -9221,7 +9208,6 @@ class TestCleavingContext(BaseTestSharder):
         self.assertFalse(ctx.cleaving_done)
         self.assertEqual(2, ctx.ranges_done)
         self.assertEqual(4, ctx.ranges_todo)
-        self.assertEqual(2, ctx.replication_count)
         self.assertEqual(0.5, ctx.replication_time)
 
     def test_load_all(self):
@@ -9307,7 +9293,7 @@ class TestCleavingContext(BaseTestSharder):
         old_db_id = broker.get_brokers()[0].get_info()['id']
         last_mod = Timestamp.now()
         ctx = CleavingContext(old_db_id, 'curs', 12, 11, 2, True, True, 2, 4,
-                              2, 0.5)
+                              0.5)
         with mock_timestamp_now(last_mod):
             ctx.store(broker)
         key = 'X-Container-Sysmeta-Shard-Context-%s' % old_db_id
@@ -9321,7 +9307,6 @@ class TestCleavingContext(BaseTestSharder):
                     'misplaced_done': True,
                     'ranges_done': 2,
                     'ranges_todo': 4,
-                    'replication_count': 2,
                     'replication_time': 0.5}
         self.assertEqual(expected, data)
         # last modified is the metadata timestamp
@@ -9420,7 +9405,7 @@ class TestCleavingContext(BaseTestSharder):
         old_db_id = broker.get_brokers()[0].get_info()['id']
         last_mod = Timestamp.now()
         ctx = CleavingContext(old_db_id, 'curs', 12, 11, 2, True, True, 2, 4,
-                              4, 0.5)
+                              0.5)
         with mock_timestamp_now(last_mod):
             ctx.store(broker)
         key = 'X-Container-Sysmeta-Shard-Context-%s' % old_db_id
@@ -9434,7 +9419,6 @@ class TestCleavingContext(BaseTestSharder):
                     'misplaced_done': True,
                     'ranges_done': 2,
                     'ranges_todo': 4,
-                    'replication_count': 4,
                     'replication_time': 0.5}
         self.assertEqual(expected, data)
         # last modified is the metadata timestamp
@@ -9531,7 +9515,7 @@ class TestCleavingContext(BaseTestSharder):
     def test_reset(self):
         ctx = CleavingContext('test', 'curs', 12, 11, 2, True, True,
                               ranges_done=5, ranges_todo=3,
-                              replication_count=10, replication_time=5.5)
+                              replication_time=5.5)
 
         def check_context():
             self.assertEqual('test', ctx.ref)
@@ -9543,7 +9527,6 @@ class TestCleavingContext(BaseTestSharder):
             self.assertFalse(ctx.cleaving_done)
             self.assertEqual(0, ctx.ranges_done)
             self.assertEqual(0, ctx.ranges_todo)
-            self.assertEqual(0, ctx.replication_count)
             self.assertEqual(0, ctx.replication_time)
         ctx.reset()
         check_context()
@@ -9554,7 +9537,7 @@ class TestCleavingContext(BaseTestSharder):
     def test_start(self):
         ctx = CleavingContext('test', 'curs', 12, 11, 2, True, True,
                               ranges_done=5, ranges_todo=3,
-                              replication_count=10, replication_time=5.5)
+                              replication_time=5.5)
 
         def check_context():
             self.assertEqual('test', ctx.ref)
@@ -9566,7 +9549,6 @@ class TestCleavingContext(BaseTestSharder):
             self.assertFalse(ctx.cleaving_done)
             self.assertEqual(0, ctx.ranges_done)
             self.assertEqual(0, ctx.ranges_todo)
-            self.assertEqual(0, ctx.replication_count)
             self.assertEqual(0, ctx.replication_time)
 
         ctx.start()

@@ -2167,6 +2167,31 @@ class BaseDiskFileWriter(object):
         """
         return self._upload_size, self._chunks_etag.hexdigest()
 
+    def _safe_metadata_linkat(self, target_path, metadata):
+        try:
+            # It was an unnamed temp file created by open() with O_TMPFILE
+            link_fd_to_path(self._fd, target_path,
+                            self._diskfile._dirs_created)
+        except FileExistsError:
+            # The file already exists at target_path. This can happen in two
+            # scenarios:
+            # 1. created by replication: ssync replicated this object to the
+            #    node before the client's PUT request arrived. In this case,
+            #    the existing_metadata will be identical to metadata, and we
+            #    should silently succeed to maintain idempotency.
+            #
+            # 2. Timestamp collision with conflicting data: Two concurrent PUT
+            #    requests with the same timestamp but different content (e.g.
+            #    due to different encryption IVs used) raced to create the same
+            #    object. In this case, metadata will differ and we must raise
+            #    an error to prevent silent data corruption.
+            with open(target_path, 'rb') as f:
+                existing_metadata = read_metadata(f)
+            if existing_metadata != metadata:
+                raise FileExistsError(
+                    'Conflicting pre-existing metadata: %r != %r (on disk)' % (
+                        metadata, existing_metadata))
+
     def _finalize_put(self, metadata, target_path, cleanup,
                       logger_thread_locals):
         if self._diskfile.timing_breakdown:
@@ -2192,9 +2217,7 @@ class BaseDiskFileWriter(object):
             # It was a named temp file created by mkstemp()
             renamer(self._tmppath, target_path)
         else:
-            # It was an unnamed temp file created by open() with O_TMPFILE
-            link_fd_to_path(self._fd, target_path,
-                            self._diskfile._dirs_created)
+            self._safe_metadata_linkat(target_path, metadata)
 
         # Check if the partition power will/has been increased
         new_target_path = None
@@ -2346,6 +2369,7 @@ class BaseDiskFileReader(object):
     :param etag_validate_frac: the probability that we should perform etag
                                validation during a complete file read
     """
+
     def __init__(self, fp, data_file, obj_size, etag,
                  disk_chunk_size, keep_cache_size, device_path, logger,
                  quarantine_hook, use_splice, pipe_size, diskfile,

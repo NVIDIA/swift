@@ -13,19 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import defaultdict
+from collections import defaultdict, Counter
 from io import BytesIO
 from unittest import mock
+import uuid
 import os
 import random
 
-from swift.common import internal_client
+from swift.common import internal_client, direct_client
 from swift.common.utils import Timestamp, hash_path
 from swift.obj.diskfile import _read_file_metadata
 
-from test.probe.common import ECProbeTest
+from test.probe.common import ECProbeTest, ReplProbeTest
 
-from swift.proxy.controllers.obj import MIMEPutter, ECObjectController
+from swift.proxy.controllers.obj import MIMEPutter, ECObjectController, \
+    ReplicatedObjectController
 from eventlet import spawn, event, Timeout, sleep
 
 
@@ -374,3 +376,174 @@ class TestECCollision(ECProbeTest):
                 self.assertEqual({}, m)
                 counts[None] += 1
         self.assertEqual(counts, {'foo': 5, None: 1})
+
+
+class TestReplicatedCollision(ReplProbeTest):
+
+    def setUp(self):
+        super(TestReplicatedCollision, self).setUp()
+        self.container_name = 'container-%s' % uuid.uuid4()
+        self.object_name = 'object-%s' % uuid.uuid4()
+        self.swift = internal_client.InternalClient(
+            '/etc/swift/internal-client.conf', 'probe-test', 1)
+        self.swift.create_container(
+            self.account, self.container_name,
+            headers={'x-storage-policy': self.policy.name})
+
+    def test_replicator_race(self):
+        # Tests a race condition where object replication runs concurrently
+        # with an in-progress replicated object upload. The test triggers
+        # the replicator after the first replica completes but while remaining
+        # replicas are still receiving data. This simulates a scenario where
+        # replication processes might run while writes are ongoing.
+        num_sent = 0
+
+        orig_make_putter = ReplicatedObjectController._make_putter
+
+        def _patch_putter(*args, **kwargs):
+            putter = orig_make_putter(*args, **kwargs)
+
+            orig_end_of_object_data = putter.end_of_object_data
+
+            def patched_end_of_object_data(*args, **kwargs):
+                nonlocal num_sent
+                if num_sent >= 1:
+                    self.replicators.once()
+                num_sent += 1
+                return orig_end_of_object_data(*args, **kwargs)
+
+            putter.end_of_object_data = patched_end_of_object_data
+            return putter
+
+        contents = b'a' * 97
+        now = Timestamp.now()
+        headers = {
+            'x-timestamp': now.internal,
+        }
+        with mock.patch.object(ReplicatedObjectController, '_make_putter',
+                               _patch_putter):
+            self.swift.upload_object(BytesIO(contents), self.account,
+                                     self.container_name, self.object_name,
+                                     headers=headers)
+        self.assertEqual(num_sent, self.policy.object_ring.replica_count)
+
+        # Verify all replicas exist and have correct data
+        p, nodes = self.policy.object_ring.get_nodes(
+            self.account, self.container_name, self.object_name)
+
+        head_responses = []
+        for node in nodes:
+            # Get metadata from each replica
+            metadata = direct_client.direct_head_object(
+                node, p, self.account, self.container_name,
+                self.object_name)
+            head_responses.append(metadata)
+
+        # Verify we got responses from all replicas
+        self.assertEqual(len(head_responses),
+                         self.policy.object_ring.replica_count)
+
+        # Verify all replicas have the same timestamp
+        timestamps = [resp['X-Timestamp'] for resp in head_responses]
+        self.assertEqual(timestamps[0], str(now.normal))
+
+        # Verify content regardless of encryption turned on or off.
+        _, _, body_iter = self.swift.get_object(
+            self.account, self.container_name, self.object_name)
+        body = b''.join(body_iter)
+        self.assertEqual(
+            body, contents, "Content mismatch when reading through proxy")
+
+    def test_request_race(self):
+        # Tests a race condition where two concurrent PUT requests with
+        # identical timestamps but different metadatas (to simulate different
+        # ETags due to different IVs used) write to the same object.
+        contents = b'a' * 97
+        now = Timestamp.now()
+        base_headers = {
+            'x-timestamp': now.internal,
+        }
+
+        num_sent = 0
+        is_race_request = False
+        captured_statuses = []
+
+        orig_make_putter = ReplicatedObjectController._make_putter
+        orig_get_put_responses = ReplicatedObjectController._get_put_responses
+
+        def _patch_get_put_responses(self, req, putters, num_nodes, **kwargs):
+            """Capture statuses before processing"""
+            statuses, reasons, bodies, etags = orig_get_put_responses(
+                self, req, putters, num_nodes, **kwargs)
+            captured_statuses.append(list(statuses))
+            return statuses, reasons, bodies, etags
+
+        def _patch_putter(*args, **kwargs):
+            putter = orig_make_putter(*args, **kwargs)
+
+            orig_end_of_object_data = putter.end_of_object_data
+
+            def patched_end_of_object_data(*args, **kwargs):
+                nonlocal num_sent, is_race_request
+                if num_sent == 1 and not is_race_request:
+                    headers = dict(base_headers)
+                    headers['x-object-meta-color'] = 'red'
+                    is_race_request = True
+                    self.swift.upload_object(
+                        BytesIO(contents), self.account, self.container_name,
+                        self.object_name, headers=headers)
+                    is_race_request = False
+                num_sent += 1
+                return orig_end_of_object_data(*args, **kwargs)
+
+            putter.end_of_object_data = patched_end_of_object_data
+            return putter
+
+        headers = dict(base_headers)
+        headers['x-object-meta-color'] = 'blue'
+        with mock.patch.object(ReplicatedObjectController, '_make_putter',
+                               _patch_putter), \
+                mock.patch.object(ReplicatedObjectController,
+                                  '_get_put_responses',
+                                  _patch_get_put_responses), \
+                self.assertRaises(internal_client.UnexpectedResponse) as ctx:
+            self.swift.upload_object(BytesIO(contents), self.account,
+                                     self.container_name, self.object_name,
+                                     headers=headers)
+        self.assertEqual(ctx.exception.resp.status_int, 503)
+        self.assertEqual(num_sent, self.policy.object_ring.replica_count * 2)
+        self.assertEqual(len(captured_statuses), 2,
+                         "Should have captured statuses from both requests")
+        sorted_statuses = [sorted(statuses) for statuses in captured_statuses]
+        self.assertEqual(sorted_statuses, [[201, 201, 500], [201, 500, 500]])
+
+        head_responses = []
+        p, nodes = self.policy.object_ring.get_nodes(
+            self.account, self.container_name, self.object_name)
+        for node in nodes:
+            metadata = direct_client.direct_head_object(
+                node, p, self.account, self.container_name,
+                self.object_name)
+            head_responses.append(metadata)
+        self.assertEqual(len(head_responses),
+                         self.policy.object_ring.replica_count)
+        color_counts = Counter([
+            resp['X-Object-Meta-Color']
+            for resp in head_responses
+        ])
+        if color_counts == {None: 3}:
+            # encryption enabled.
+            color_counts = Counter([
+                resp['X-Object-Transient-Sysmeta-Crypto-Meta-Color']
+                for resp in head_responses
+            ])
+            self.assertEqual({1, 2}, set(color_counts.values()))
+        else:
+            # encryption disabled.
+            self.assertEqual({'blue': 1, 'red': 2}, color_counts)
+        # This is an unreconcilable state, three replicas might have different
+        # data because of different encryption ivs, but because it's replicated
+        # it's at least readable.
+        self.assertEqual(
+            {str(now.normal): 3},
+            Counter([resp['X-Timestamp'] for resp in head_responses]))

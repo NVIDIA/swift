@@ -656,7 +656,6 @@ class TestManageShardRanges(unittest.TestCase):
                     '  "ranges_done": 0,',
                     '  "ranges_todo": 0,',
                     '  "ref": "%s",' % retiring_db_id,
-                    '  "replication_count": 0,',
                     '  "replication_time": 0',
                     '}',
                     'Metadata:',

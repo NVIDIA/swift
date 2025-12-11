@@ -631,7 +631,7 @@ class CleavingContext(object):
     def __init__(self, ref, cursor='', max_row=None, cleave_to_row=None,
                  last_cleave_to_row=None, cleaving_done=False,
                  misplaced_done=False, ranges_done=0, ranges_todo=0,
-                 replication_count=0, replication_time=0):
+                 replication_time=0):
         self.ref = ref
         self._cursor = None
         self.cursor = cursor
@@ -642,7 +642,6 @@ class CleavingContext(object):
         self.misplaced_done = misplaced_done
         self.ranges_done = ranges_done
         self.ranges_todo = ranges_todo
-        self.replication_count = replication_count
         self.replication_time = replication_time
 
     def __iter__(self):
@@ -655,7 +654,6 @@ class CleavingContext(object):
         yield 'misplaced_done', self.misplaced_done
         yield 'ranges_done', self.ranges_done
         yield 'ranges_todo', self.ranges_todo
-        yield 'replication_count', self.replication_count
         yield 'replication_time', self.replication_time
 
     def __repr__(self):
@@ -734,7 +732,6 @@ class CleavingContext(object):
         self.cleaving_done = False
         self.misplaced_done = False
         self.last_cleave_to_row = self.cleave_to_row
-        self.replication_count = 0
         self.replication_time = 0
 
     def start(self):
@@ -743,7 +740,6 @@ class CleavingContext(object):
         self.ranges_todo = 0
         self.cleaving_done = False
         self.cleave_to_row = self.max_row
-        self.replication_count = 0
         self.replication_time = 0
 
     def range_done(self, new_cursor):
@@ -1026,7 +1022,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         if own_shard_range.state not in ShardRange.CLEAVING_STATES:
             return
 
-        sharded_context = None
+        sharded_ctx = None
         if db_state == SHARDED:
             contexts = CleavingContext.load_all(broker)
             if not contexts:
@@ -1039,19 +1035,19 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                 return
 
             contexts_sorted = sorted(contexts, key=lambda x: float(x[1]))
-            sharded_context = contexts_sorted[-1][0]
+            sharded_ctx = contexts_sorted[-1]
 
         update_own_shard_range_stats(broker, own_shard_range)
         info = self._make_stats_info(broker, node, own_shard_range)
 
-        if sharded_context:
-            info["total_replicate_calls"] = sharded_context.replication_count
-            info["total_replicate_time"] = sharded_context.replication_time
+        if sharded_ctx:
+            info["total_replicate_time"] = sharded_ctx[0].replication_time
+            sharding_total_elapsed = (float(sharded_ctx[1])
+                                      - float(own_shard_range.epoch))
+            info['total_sharding_time'] = sharding_total_elapsed
 
         if processing_time:
             info['processing_time'] = processing_time
-            sharding_total_elapsed = time.time() - float(own_shard_range.epoch)
-            info['db_sharding_total_elapsed'] = sharding_total_elapsed
 
         info['state'] = own_shard_range.state_text
         info['db_state'] = broker.get_db_state()
@@ -2108,7 +2104,6 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
             success, responses = self._replicate_object(
                 shard_part, shard_broker.db_file, node_id)
             cleaving_context.replication_time += time.time() - replicate_start
-            cleaving_context.replication_count += 1
 
             replication_successes = responses.count(True)
             if (not success and (not responses or
@@ -2273,7 +2268,7 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
         self.db_logger.debug(
             broker, 'Cleaved %s shard ranges', len(ranges_done))
 
-        if (cleaving_context.cleaving_done):
+        if cleaving_context.cleaving_done:
             self.statsd.timing_since(
                 'swift_container_sharder_time_to_last_cleave',
                 float(own_shard_range.epoch), labels={

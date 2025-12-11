@@ -178,12 +178,12 @@ containers that are being sharded to recon cache. For example::
                 "node_index": 1,
                 "object_count": 3349030,
                 "path": <path_to_db>,
-                "processing_time": 0.003812551498413086,
+                "processing_time": 0.00381,
                 "root": "AUTH_test/c1",
                 "state": "sharding",
                 "tombstones": -1,
-                "total_replicate_calls": 4,
-                "total_replicate_time": 0.0754995346069336
+                "total_replicate_time": 0.07549,
+                "total_sharding_time": 210.091,
             }
         ]
     }

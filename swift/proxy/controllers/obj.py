@@ -1245,7 +1245,7 @@ class ReplicatedObjectController(BaseObjectController):
         etag = etags.pop() if len(etags) else None
         resp = self.best_response(req, statuses, reasons, bodies,
                                   'Object PUT', etag=etag)
-        resp.last_modified = Timestamp(req.headers['X-Timestamp']).ceil()
+        resp.last_modified = Timestamp(req.headers['X-Timestamp'])
         return resp
 
 
@@ -3579,5 +3579,5 @@ class ECObjectController(BaseObjectController):
         resp = self.best_response(req, statuses, reasons, bodies,
                                   'Object PUT', etag=etag,
                                   quorum_size=min_conns)
-        resp.last_modified = Timestamp(req.headers['X-Timestamp']).ceil()
+        resp.last_modified = Timestamp(req.headers['X-Timestamp'])
         return resp

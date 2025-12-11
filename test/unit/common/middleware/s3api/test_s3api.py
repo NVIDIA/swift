@@ -54,6 +54,9 @@ from swift.common.middleware.s3api.s3api import filter_factory, \
     S3ApiMiddleware
 from swift.common.middleware.s3api.s3token import S3Token
 
+SHA256_OF_EMPTY_STRING = \
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+
 
 class TestListingMiddleware(S3ApiTestCase):
     def test_s3_etag_in_json(self):
@@ -2278,6 +2281,29 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         do_test('x-amz-checksum-sha1')
         do_test('x-amz-checksum-sha256')
 
+    def test_emit_stats_x_amz_sdk_checksum_algorithm(self):
+        def do_test(algo):
+            headers = {
+                'x-amz-sdk-checksum-algorithm': algo,
+            }
+            labels = self._do_test_emit_header_stats(headers)
+            self.assertEqual({'method': 'PUT',
+                              'type': 'UNKNOWN',
+                              'status': 400,
+                              'header_x_amz_sdk_checksum_algorithm':
+                                  algo.replace('-', '')},
+                             labels)
+        do_test('CRC32')
+        do_test('CRC32C')
+        do_test('CRC64NVME')
+        do_test('SHA1')
+        do_test('SHA256')
+        do_test('CRC-32')
+        do_test('CRC-32C')
+        do_test('CRC-64NVME')
+        do_test('SHA-1')
+        do_test('SHA-256')
+
     def test_emit_stats_x_amz_checksum_algorithm(self):
         def do_test(algo):
             headers = {
@@ -2287,7 +2313,8 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             self.assertEqual({'method': 'PUT',
                               'type': 'UNKNOWN',
                               'status': 400,
-                              'header_x_amz_checksum_algorithm': algo},
+                              'header_x_amz_checksum_algorithm':
+                                  algo.replace('-', '')},
                              labels)
         do_test('CRC32')
         do_test('CRC32C')

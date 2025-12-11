@@ -2294,7 +2294,6 @@ class TestContainerSharding(BaseAutoContainerSharding):
                                          'path': mock.ANY,
                                          'root': mock.ANY,
                                          'processing_time': mock.ANY,
-                                         'db_sharding_total_elapsed': mock.ANY
                                          }]}
         actual = recon['sharding_stats']['sharding']['sharding_in_progress']
         self.assertEqual(expected_in_progress, actual)
@@ -2376,8 +2375,7 @@ class TestContainerSharding(BaseAutoContainerSharding):
                                          'path': mock.ANY,
                                          'root': mock.ANY,
                                          'processing_time': mock.ANY,
-                                         'db_sharding_total_elapsed': mock.ANY,
-                                         'total_replicate_calls': mock.ANY,
+                                         'total_sharding_time': mock.ANY,
                                          'total_replicate_time': mock.ANY
                                          }]}
         actual = recon['sharding_stats']['sharding']['sharding_in_progress']

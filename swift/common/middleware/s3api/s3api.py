@@ -156,7 +156,7 @@ from swift.common.statsd_client import get_labeled_statsd_client
 from swift.common.middleware import app_property
 from swift.common.middleware.s3api.exception import NotS3Request, \
     InvalidSubresource
-from swift.common.middleware.s3api.s3request import get_request_class
+from swift.common.middleware.s3api import s3request
 from swift.common.middleware.s3api.s3response import ErrorResponse, \
     InternalError, MethodNotAllowed, S3ResponseBase, S3NotImplemented
 from swift.common.utils import get_logger, config_true_value, \
@@ -182,12 +182,9 @@ WELL_KNOWN_SPECIFIC_SHA256_VALUES = (
 # https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html#AmazonS3-Type-Object-ChecksumAlgorithm
 # https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html
 # docs are unclear whether the header value is the (un-)hyphenated form
+
+# algorithms for x-amz-checksum-algorithm/ x-amz-sdk-checksum-algorithm
 WELL_KNOWN_CHECKSUM_ALGORITHMS = (
-    'CRC-64NVME',
-    'CRC-32',
-    'CRC-32C',
-    'SHA-1',
-    'SHA-256',
     'CRC64NVME',
     'CRC32',
     'CRC32C',
@@ -381,17 +378,18 @@ class S3ApiMiddleware(object):
                     label_val = classify_checksum_header_value(hdr_val)
             elif hdr_key == 'content-md5':
                 label_val = classify_checksum_header_value(hdr_val)
-            elif hdr_key in WELL_KNOWN_CHECKSUM_HEADERS:
+            elif hdr_key in s3request.CHECKSUMS_BY_HEADER.keys():
                 label_val = classify_checksum_header_value(hdr_val)
             elif hdr_key == 'x-amz-trailer':
-                if hdr_val.lower() in WELL_KNOWN_CHECKSUM_HEADERS:
+                if hdr_val.lower() in s3request.CHECKSUMS_BY_HEADER.keys():
                     label_val = hdr_val.lower()
                 else:
                     label_val = 'unknown'
             elif hdr_key in ('x-amz-checksum-algorithm',
                              'x-amz-sdk-checksum-algorithm'):
-                if hdr_val.upper() in WELL_KNOWN_CHECKSUM_ALGORITHMS:
-                    label_val = hdr_val.upper()
+                hdr_val_normalised = hdr_val.upper().replace('-', '')
+                if hdr_val_normalised in WELL_KNOWN_CHECKSUM_ALGORITHMS:
+                    label_val = hdr_val_normalised
                 else:
                     label_val = 'unknown'
 
@@ -406,9 +404,9 @@ class S3ApiMiddleware(object):
 
         labels['status'] = resp.status_int
         labels['method'] = env.get('REQUEST_METHOD')
-        if 'swift.backend_path' in env:
-            vers, acc, con, obj = split_path(
-                env.get('swift.backend_path'), 1, 4, True)
+        swift_path = env.get('swift.backend_path')
+        if swift_path:
+            vers, acc, con, obj = split_path(swift_path, 1, 4, True)
             if obj:
                 labels['type'] = 'object'
                 labels['account'] = acc
@@ -459,7 +457,7 @@ class S3ApiMiddleware(object):
             return [b'']
 
         try:
-            req_class = get_request_class(env, self.conf.s3_acl)
+            req_class = s3request.get_request_class(env, self.conf.s3_acl)
             req = req_class(env, self.app, self.conf)
             resp = self.handle_request(req)
             if req.policy_index is not None:
