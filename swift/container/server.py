@@ -339,7 +339,7 @@ class ContainerController(BaseStorageServer):
         headers = {'Location': quote(location),
                    'X-Backend-Location-Is-Quoted': 'true',
                    'X-Backend-Redirect-Timestamp':
-                       containing_range.timestamp.internal}
+                       containing_range.timestamp.normal}
 
         # we do not want the host added to the location
         req.environ['swift.leave_relative_location'] = True
@@ -459,6 +459,10 @@ class ContainerController(BaseStorageServer):
                 raise HTTPBadRequest(
                     'X-Backend-Storage-Policy-Index header is required')
             try:
+                # the original request may have been an object update with
+                # a hex part in the timestamp which we want to remove for the
+                # container timestamp
+                req_timestamp = req_timestamp.normalized()
                 broker.initialize(req_timestamp.internal, policy_index)
             except DatabaseAlreadyExists:
                 pass
