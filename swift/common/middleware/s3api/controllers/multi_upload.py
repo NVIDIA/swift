@@ -68,7 +68,8 @@ import time
 from swift.common import constraints
 from swift.common.swob import Range, bytes_to_wsgi, normalize_etag, \
     wsgi_to_str, parse_date_header
-from swift.common.utils import json, public, reiterate, md5, Timestamp
+from swift.common.utils import json, public, reiterate, md5
+from swift.common.utils.timestamp import Timestamp, NormalTimestamp
 from swift.common.request_helpers import get_container_update_override_key, \
     get_param
 
@@ -657,7 +658,8 @@ class UploadController(Controller):
 
         resp, is_marker = _get_upload_info(req, self.app, upload_id)
         if (is_marker and
-                resp.sw_headers.get('X-Backend-Timestamp') >= Timestamp.now()):
+                Timestamp(resp.sw_headers.get('X-Backend-Timestamp', 0))
+                >= NormalTimestamp.now()):
             # Somehow the marker was created in the future w.r.t. this thread's
             # clock. The manifest PUT may succeed but the subsequent marker
             # DELETE will fail, so don't attempt either.
