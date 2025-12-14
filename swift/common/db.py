@@ -31,8 +31,8 @@ import sqlite3
 
 from swift.common.constraints import MAX_META_COUNT, MAX_META_OVERALL_SIZE, \
     check_utf8
-from swift.common.utils import Timestamp, renamer, \
-    mkdirs, lock_parent_directory, fallocate, md5
+from swift.common.utils import Timestamp, NormalTimestamp, \
+    renamer, mkdirs, lock_parent_directory, fallocate, md5
 from swift.common.exceptions import LockTimeout
 from swift.common.swob import HTTPBadRequest
 
@@ -672,7 +672,7 @@ class DatabaseBroker(object):
                                    delete_timestamp=MAX(?, delete_timestamp)
             ''' % self.db_type, (created_at, put_timestamp, delete_timestamp))
             if old_status != self._is_deleted(conn):
-                timestamp = Timestamp.now()
+                timestamp = NormalTimestamp.now()
                 self._update_status_changed_at(conn, timestamp.internal)
 
             conn.commit()
@@ -1116,7 +1116,6 @@ class DatabaseBroker(object):
                           timestamp will be removed.
         :returns: True if conn.commit() should be called
         """
-        timestamp = Timestamp(timestamp)
         try:
             row = conn.execute('SELECT metadata FROM %s_stat' %
                                self.db_type).fetchone()
@@ -1128,7 +1127,7 @@ class DatabaseBroker(object):
                 md = json.loads(md)
                 keys_to_delete = []
                 for key, (value, value_timestamp) in md.items():
-                    if value == '' and Timestamp(value_timestamp) < timestamp:
+                    if value == '' and value_timestamp < str(timestamp):
                         keys_to_delete.append(key)
                 if keys_to_delete:
                     for key in keys_to_delete:

@@ -137,6 +137,7 @@ from swift.common.utils.timestamp import (  # noqa
     MAX_OFFSET,
     PRECISION,
     Timestamp,
+    NormalTimestamp,
     encode_timestamps,
     decode_timestamps,
     normalize_timestamp,
@@ -3985,6 +3986,19 @@ class NamespaceBoundList(object):
         return namespaces
 
 
+def _make_shard_timestamp(value):
+    """
+    Cast value to a NormalTimestamp.
+
+    :param value: a str, number, or NormalTimestamp instance.
+    :raises ValueError: if ``value`` cannot be parsed as a NormalTimestamp.
+    :return: a NormalTimestamp instance.
+    """
+    if value is None or isinstance(value, NormalTimestamp):
+        return value
+    return NormalTimestamp(value)
+
+
 class ShardName(object):
     """
     Encapsulates the components of a shard name.
@@ -4006,10 +4020,28 @@ class ShardName(object):
                  parent_container_hash,
                  timestamp,
                  index):
+        """
+        Construct an instance of :class:`~swift.common.utils.ShardName`.
+
+        :param account: the hidden internal account to which the shard
+            container belongs.
+        :param root_container: the name of the root container for the shard.
+        :param parent_container_hash: a hash of the name of the parent
+            container for the shard.
+        :param timestamp: an instance of
+            :class:`~swift.common.utils.timestamp.NormalTimestamp`
+        :param index: a unique index that will distinguish the path from any
+            other path generated using the same combination of
+            ``account``, ``root_container``, ``parent_container`` and
+            ``timestamp``.
+
+        :return: an instance of :class:`~swift.common.utils.ShardName`.
+        :raises ValueError: if any argument is None
+        """
         self.account = self._validate(account)
         self.root_container = self._validate(root_container)
         self.parent_container_hash = self._validate(parent_container_hash)
-        self.timestamp = Timestamp(timestamp)
+        self.timestamp = _make_shard_timestamp(timestamp)
         self.index = int(index)
 
     @classmethod
@@ -4022,7 +4054,7 @@ class ShardName(object):
         return '%s/%s-%s-%s-%s' % (self.account,
                                    self.root_container,
                                    self.parent_container_hash,
-                                   self.timestamp.internal,
+                                   self.timestamp.normal,
                                    self.index)
 
     @classmethod
@@ -4053,7 +4085,8 @@ class ShardName(object):
             shard; for initial first generation shards this should be the same
             as ``root_container``; for shards of shards this should be the name
             of the sharding shard container.
-        :param timestamp: an instance of :class:`~swift.common.utils.Timestamp`
+        :param timestamp: an instance of
+            :class:`~swift.common.utils.timestamp.NormalTimestamp`
         :param index: a unique index that will distinguish the path from any
             other path generated using the same combination of
             ``account``, ``root_container``, ``parent_container`` and
@@ -4104,6 +4137,11 @@ class ShardRange(Namespace):
     conflicts when a shard range needs to be merged with an existing shard
     range record and the most recent version of an attribute should be
     persisted.
+
+    All ShardRange timestamps should be NormalTimestamps i.e. without any
+    offset part. In particular, the epoch timestamp is embedded in sharded
+    container DB file names in a format that does not represent the extended
+    Timestamp hex part.
 
     :param name: the name of the shard range; this MUST take the form of a
         path to a container i.e. <account_name>/<container_name>.
@@ -4322,25 +4360,20 @@ class ShardRange(Namespace):
             shard; for initial first generation shards this should be the same
             as ``root_container``; for shards of shards this should be the name
             of the sharding shard container.
-        :param timestamp: an instance of :class:`~swift.common.utils.Timestamp`
+        :param timestamp: an instance of
+            :class:`~swift.common.utils.timestamp.NormalTimestamp`
         :param index: a unique index that will distinguish the path from any
             other path generated using the same combination of
             ``shards_account``, ``root_container``, ``parent_container`` and
             ``timestamp``.
         :return: a string of the form <account_name>/<container_name>
         """
-        timestamp = cls._to_timestamp(timestamp)
+        timestamp = _make_shard_timestamp(timestamp)
         return str(ShardName.create(shards_account,
                                     root_container,
                                     parent_container,
                                     timestamp,
                                     index))
-
-    @classmethod
-    def _to_timestamp(cls, timestamp):
-        if timestamp is None or isinstance(timestamp, Timestamp):
-            return timestamp
-        return Timestamp(timestamp)
 
     @property
     def name(self):
@@ -4371,7 +4404,7 @@ class ShardRange(Namespace):
     def timestamp(self, ts):
         if ts is None:
             raise TypeError('timestamp cannot be None')
-        self._timestamp = self._to_timestamp(ts)
+        self._timestamp = _make_shard_timestamp(ts)
 
     @property
     def meta_timestamp(self):
@@ -4381,7 +4414,7 @@ class ShardRange(Namespace):
 
     @meta_timestamp.setter
     def meta_timestamp(self, ts):
-        self._meta_timestamp = self._to_timestamp(ts)
+        self._meta_timestamp = _make_shard_timestamp(ts)
 
     @property
     def object_count(self):
@@ -4434,7 +4467,7 @@ class ShardRange(Namespace):
             current time will be set.
         :raises ValueError: if ``object_count`` or ``bytes_used`` cannot be
             cast to an int, or if meta_timestamp is neither None nor can be
-            cast to a :class:`~swift.common.utils.Timestamp`.
+            cast to a :class:`~swift.common.utils.timestamp.NormalTimestamp`.
         """
         if self.object_count != int(object_count):
             self.object_count = int(object_count)
@@ -4445,7 +4478,7 @@ class ShardRange(Namespace):
             self.reported = False
 
         if meta_timestamp is None:
-            self.meta_timestamp = Timestamp.now()
+            self.meta_timestamp = NormalTimestamp.now()
         else:
             self.meta_timestamp = meta_timestamp
 
@@ -4459,14 +4492,14 @@ class ShardRange(Namespace):
             current time will be set.
         :raises ValueError: if ``tombstones`` cannot be cast to an int, or
             if meta_timestamp is neither None nor can be cast to a
-            :class:`~swift.common.utils.Timestamp`.
+            :class:`~swift.common.utils.timestamp.NormalTimestamp`.
         """
         tombstones = int(tombstones)
         if 0 <= tombstones != self.tombstones:
             self.tombstones = tombstones
             self.reported = False
         if meta_timestamp is None:
-            self.meta_timestamp = Timestamp.now()
+            self.meta_timestamp = NormalTimestamp.now()
         else:
             self.meta_timestamp = meta_timestamp
 
@@ -4530,7 +4563,7 @@ class ShardRange(Namespace):
 
     @state_timestamp.setter
     def state_timestamp(self, ts):
-        self._state_timestamp = self._to_timestamp(ts)
+        self._state_timestamp = _make_shard_timestamp(ts)
 
     @property
     def epoch(self):
@@ -4538,7 +4571,7 @@ class ShardRange(Namespace):
 
     @epoch.setter
     def epoch(self, epoch):
-        self._epoch = self._to_timestamp(epoch)
+        self._epoch = _make_shard_timestamp(epoch)
 
     @property
     def reported(self):
@@ -4587,7 +4620,7 @@ class ShardRange(Namespace):
         if timestamp is None and self.deleted:
             return False
         self.deleted = True
-        self.timestamp = timestamp or Timestamp.now()
+        self.timestamp = timestamp or NormalTimestamp.now()
         return True
 
     # It's a little funny that we're making this mutable class hashable, but
@@ -4601,22 +4634,22 @@ class ShardRange(Namespace):
     def __repr__(self):
         return '%s<%r to %r as of %s, (%d, %d) as of %s, %s as of %s>' % (
             self.__class__.__name__, self.lower, self.upper,
-            self.timestamp.internal, self.object_count, self.bytes_used,
-            self.meta_timestamp.internal, self.state_text,
-            self.state_timestamp.internal)
+            self.timestamp.normal, self.object_count, self.bytes_used,
+            self.meta_timestamp.normal, self.state_text,
+            self.state_timestamp.normal)
 
     def __iter__(self):
         yield 'name', self.name
-        yield 'timestamp', self.timestamp.internal
+        yield 'timestamp', self.timestamp.normal
         yield 'lower', str(self.lower)
         yield 'upper', str(self.upper)
         yield 'object_count', self.object_count
         yield 'bytes_used', self.bytes_used
-        yield 'meta_timestamp', self.meta_timestamp.internal
+        yield 'meta_timestamp', self.meta_timestamp.normal
         yield 'deleted', 1 if self.deleted else 0
         yield 'state', self.state
-        yield 'state_timestamp', self.state_timestamp.internal
-        yield 'epoch', self.epoch.internal if self.epoch is not None else None
+        yield 'state_timestamp', self.state_timestamp.normal
+        yield 'epoch', self.epoch.normal if self.epoch is not None else None
         yield 'reported', 1 if self.reported else 0
         yield 'tombstones', self.tombstones
 
