@@ -5451,7 +5451,7 @@ class TestSharder(BaseTestSharder):
                         # we don't expect these PUTs to have offsets but it's
                         # used here to verify that the internal format of the
                         # Timestamp is used for X-Timestamp
-                        now.offset = 1
+                        now.increment_offset(1)
                         res = sharder._send_shard_ranges(
                             broker, 'a', 'c', shard_ranges)
 
@@ -8530,7 +8530,7 @@ class TestCleavingContext(BaseTestSharder):
 
         self.assertEqual(
             1, len(old_broker.get_objects()))
-        now = self.ts().internal
+        now = float(self.ts())
         broker.get_brokers()[0].reclaim(now, now)
         self.assertFalse(old_broker.get_objects())
 
@@ -8642,7 +8642,7 @@ class TestCleavingContext(BaseTestSharder):
 
         self.assertEqual(
             1, len(old_broker.get_objects()))
-        now = self.ts().internal
+        now = float(self.normal_ts())
         broker.get_brokers()[0].reclaim(now, now)
         self.assertFalse(old_broker.get_objects())
 
