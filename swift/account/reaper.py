@@ -34,7 +34,8 @@ from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER
 from swift.common.ring import Ring
 from swift.common.ring.utils import is_local_device
 from swift.common.utils import get_logger, whataremyips, config_true_value, \
-    Timestamp, md5, node_to_string, parse_options
+    md5, node_to_string, parse_options
+from swift.common.utils.timestamp import Timestamp, NormalTimestamp
 from swift.common.daemon import Daemon
 from swift.common.storage_policy import POLICIES, PolicyError
 
@@ -405,7 +406,7 @@ class AccountReaper(Daemon):
             marker = objects[-1]['name']
         successes = 0
         failures = 0
-        timestamp = Timestamp.now()
+        timestamp = NormalTimestamp.now()
         for node in nodes:
             anode = account_nodes.pop()
             try:
