@@ -273,7 +273,7 @@ class TestContainerController(BaseTestContainerController):
         sys_meta_key = '%stest' % get_sys_meta_prefix('container')
         sys_meta_key = sys_meta_key.title()
         user_meta_key = 'X-Container-Meta-Test'
-        ts = next(self.ts_iter)
+        ts = self.normal_ts()
         hdrs_in = {sys_meta_key: 'foo',
                    user_meta_key: 'bar',
                    'x-timestamp': ts.internal,
@@ -299,7 +299,7 @@ class TestContainerController(BaseTestContainerController):
         sys_meta_key = '%stest' % get_sys_meta_prefix('container')
         sys_meta_key = sys_meta_key.title()
         user_meta_key = 'X-Container-Meta-Test'
-        ts = next(self.ts_iter)
+        ts = self.normal_ts()
         hdrs_in = {sys_meta_key: 'foo',
                    user_meta_key: 'bar',
                    'x-timestamp': ts.internal,
