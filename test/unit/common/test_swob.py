@@ -27,6 +27,8 @@ from unittest import mock
 
 import swift.common.swob as swob
 from swift.common import utils, exceptions
+from test.unit import BaseUnitTestCase, mock_timestamp_now, \
+    mock_normal_timestamp_now
 
 from test.unit.common.middleware.helpers import LeakTrackingIter
 
@@ -442,7 +444,7 @@ class TestAccept(unittest.TestCase):
         self.assertEqual(repr(acc), "application/json")
 
 
-class TestRequest(unittest.TestCase):
+class TestRequest(BaseUnitTestCase):
     def test_blank(self):
         req = swob.Request.blank(
             '/', environ={'REQUEST_METHOD': 'POST'},
@@ -642,6 +644,94 @@ class TestRequest(unittest.TestCase):
         self.assertEqual(req.timestamp, expected)
         self.assertEqual(req.timestamp.normal, expected.normal)
         self.assertEqual(req.timestamp.internal, expected.internal)
+
+    def test_ensure_x_timestamp_valid_extended_timestamp_exists(self):
+        def do_test(method, path):
+            ts = self.ts()
+            req = swob.Request.blank(path,
+                                     environ={'REQUEST_METHOD': method},
+                                     headers={'X-Timestamp': ts.internal})
+            self.assertEqual(ts, req.ensure_x_timestamp())
+
+        do_test('HEAD', '/v1/a')
+        do_test('GET', '/v1/a')
+        do_test('HEAD', '/v1/a/c')
+        do_test('GET', '/v1/a/c')
+        do_test('PUT', '/v1/a/c/o')
+        do_test('DELETE', '/v1/a/c/o')
+
+    def test_ensure_x_timestamp_valid_normal_timestamp_exists(self):
+        def do_test(method, path):
+            norm_ts = self.normal_ts()
+            req = swob.Request.blank(path,
+                                     environ={'REQUEST_METHOD': method},
+                                     headers={'X-Timestamp': norm_ts.internal})
+            self.assertEqual(norm_ts, req.ensure_x_timestamp())
+
+        do_test('PUT', '/v1/a')
+        do_test('POST', '/v1/a')
+        do_test('DELETE', '/v1/a')
+        do_test('PUT', '/v1/a/c')
+        do_test('POST', '/v1/a/c')
+        do_test('DELETE', '/v1/a/c')
+        do_test('POST', '/v1/a/c/o')
+        do_test('DELETE', '/v1/a/c/o')
+
+    def test_ensure_x_timestamp_invalid_extended_timestamp_exists(self):
+        def do_test(method, path):
+            ts = self.ts()
+            req = swob.Request.blank(path,
+                                     environ={'REQUEST_METHOD': method},
+                                     headers={'X-Timestamp': ts.internal})
+            with self.assertRaises(swob.HTTPException) as cm:
+                req.ensure_x_timestamp()
+            self.assertEqual(cm.exception.status, '400 Bad Request')
+            self.assertEqual(cm.exception.body,
+                             b'Invalid X-Timestamp header: %r' % ts.internal)
+
+        do_test('PUT', '/v1/a')
+        do_test('POST', '/v1/a')
+        do_test('DELETE', '/v1/a')
+        do_test('PUT', '/v1/a/c')
+        do_test('POST', '/v1/a/c')
+        do_test('DELETE', '/v1/a/c')
+        do_test('POST', '/v1/a/c/o')
+        do_test('GET', '/info')
+        do_test('HEAD', '/info')
+
+    def test_ensure_x_timestamp_valid_extended_timestamp_added(self):
+        def do_test(method, path):
+            with mock_timestamp_now() as ts_now:
+                req = swob.Request.blank(path,
+                                         environ={'REQUEST_METHOD': method})
+                req.ensure_x_timestamp()
+            self.assertEqual(ts_now.internal,
+                             req.headers.get('X-Timestamp'))
+
+        do_test('PUT', '/v1/a/c/o')
+
+    def test_ensure_x_timestamp_valid_normal_timestamp_added(self):
+        def do_test(method, path):
+            with mock_normal_timestamp_now() as ts_now:
+                req = swob.Request.blank(path,
+                                         environ={'REQUEST_METHOD': method})
+                req.ensure_x_timestamp()
+            self.assertEqual(ts_now.internal, req.headers.get('X-Timestamp'))
+
+        do_test('PUT', '/v1/a')
+        do_test('POST', '/v1/a')
+        do_test('DELETE', '/v1/a')
+        do_test('GET', '/v1/a')
+        do_test('HEAD', '/v1/a')
+        do_test('PUT', '/v1/a/c')
+        do_test('POST', '/v1/a/c')
+        do_test('DELETE', '/v1/a/c')
+        do_test('GET', '/v1/a/c')
+        do_test('HEAD', '/v1/a/c')
+        do_test('POST', '/v1/a/c/o')
+        do_test('DELETE', '/v1/a/c/o')
+        do_test('GET', '/v1/a/c/o')
+        do_test('HEAD', '/v1/a/c/o')
 
     def test_path(self):
         req = swob.Request.blank('/hi?a=b&c=d')
@@ -906,6 +996,22 @@ class TestRequest(unittest.TestCase):
 
         req = swob.Request.blank('/v1')
         self.assertIsNone(req.swift_entity_path)
+
+    def test_swift_entity_type(self):
+        req = swob.Request.blank('/v1/a/c/o')
+        self.assertEqual(req.swift_entity_type, 'object')
+
+        req = swob.Request.blank('/v1/a/c')
+        self.assertEqual(req.swift_entity_type, 'container')
+
+        req = swob.Request.blank('/v1/a')
+        self.assertEqual(req.swift_entity_type, 'account')
+
+        req = swob.Request.blank('/v1')
+        self.assertIsNone(req.swift_entity_type)
+
+        req = swob.Request.blank('')
+        self.assertIsNone(req.swift_entity_type)
 
     def test_path_qs(self):
         req = swob.Request.blank('/hi/there?hello=equal&acl')
