@@ -39,6 +39,7 @@ from types import SimpleNamespace
 from eventlet.timeout import Timeout
 
 from swift.common.memcached import MemcacheConnectionError
+from swift.common.utils.timestamp import generate_timestamp
 from swift.common.wsgi import make_pre_authed_env, make_pre_authed_request
 from swift.common.utils import Timestamp, WatchdogTimeout, config_true_value, \
     public, split_path, list_from_csv, GreenthreadSafeIterator, \
@@ -2325,10 +2326,12 @@ class Controller(object):
         """
         partition, nodes = self.app.account_ring.get_nodes(account)
         path = '/%s' % account
-        headers = {'X-Timestamp': Timestamp.now().internal,
-                   'X-Trans-Id': self.trans_id,
-                   'X-Openstack-Request-Id': self.trans_id,
-                   'Connection': 'close'}
+        headers = {
+            'X-Timestamp': generate_timestamp('account', 'PUT').internal,
+            'X-Trans-Id': self.trans_id,
+            'X-Openstack-Request-Id': self.trans_id,
+            'Connection': 'close'
+        }
         # transfer any x-account-sysmeta headers from original request
         # to the autocreate PUT
         headers.update((k, v)

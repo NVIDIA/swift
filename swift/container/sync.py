@@ -497,7 +497,8 @@ class ContainerSync(Daemon):
                 metadata.get('x-timestamp', Timestamp.zero()))
             self.logger.debug("remote obj timestamp %s local obj %s" %
                               (timestamp.internal, remote_ts.internal))
-            if timestamp <= remote_ts:
+            # remote_ts is from a response and therefore a .normal.
+            if timestamp.normal <= remote_ts.normal:
                 return True
             # Object in remote should be updated
             return False
@@ -593,7 +594,7 @@ class ContainerSync(Daemon):
 
                 timestamp = Timestamp(
                     headers.get('x-timestamp', Timestamp.zero()))
-                if timestamp < ts_meta:
+                if timestamp.normal < ts_meta.normal:
                     if exc:
                         raise exc
                     raise Exception(

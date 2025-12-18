@@ -2346,6 +2346,23 @@ class TestDiskFileManager(DiskFileManagerMixin, BaseUnitTestCase):
                 info = mgr.parse_on_disk_filename(fname, POLICIES.default)
                 self.assertEqual(ts, info['timestamp'])
                 self.assertEqual(ext, info['ext'])
+                self.assertIsNone(info['ctype_timestamp'])
+
+    def test_parse_on_disk_filename_with_explicit_ctype_timestamp(self):
+        mgr = self.df_router[POLICIES.default]
+        ts = Timestamp('1234567890.00001')
+        fname = '%s-186a0.meta' % ts.internal
+        info = mgr.parse_on_disk_filename(fname, POLICIES.default)
+        self.assertEqual({'timestamp': ts,
+                          'ext': '.meta',
+                          'ctype_timestamp': Timestamp('1234567889.00001')},
+                         info)
+        fname = '%s+0.meta' % ts.internal
+        info = mgr.parse_on_disk_filename(fname, POLICIES.default)
+        self.assertEqual({'timestamp': ts,
+                          'ext': '.meta',
+                          'ctype_timestamp': ts},
+                         info)
 
     def test_parse_on_disk_filename_errors(self):
         mgr = self.df_router[POLICIES.default]
@@ -2447,59 +2464,63 @@ class TestDiskFileManager(DiskFileManagerMixin, BaseUnitTestCase):
     def test_yield_hashes_yields_content_type_timestamp(self):
         hash_ = '9373a92d072897b136b3fc06595b4abc'
         ts_iter = make_timestamp_iter()
-        ts0, ts1, ts2, ts3, ts4 = (next(ts_iter) for _ in range(5))
-        data_file = ts1.internal + '.data'
+        ts0_meta = next(ts_iter)
+        ts1_data = next(ts_iter)
+        (ts2_meta, ts3_meta, ts4_meta) = (next(ts_iter) for _ in range(3))
+        data_file = ts1_data.internal + '.data'
 
         # no content-type delta
-        meta_file = ts2.internal + '.meta'
+        meta_file = ts2_meta.internal + '.meta'
         suffix_map = {'abc': {hash_: [data_file, meta_file]}}
-        expected = {hash_: {'ts_data': ts1,
-                            'ts_meta': ts2}}
+        expected = {hash_: {'ts_data': ts1_data,
+                            'ts_meta': ts2_meta}}
         self._check_yield_hashes(POLICIES.default, suffix_map, expected)
 
         # non-zero content-type delta
-        delta = ts3.raw - ts2.raw
-        meta_file = '%s-%x.meta' % (ts3.internal, delta)
+        delta = ts3_meta.raw - ts2_meta.raw
+        meta_file = '%s-%x.meta' % (ts3_meta.internal, delta)
         suffix_map = {'abc': {hash_: [data_file, meta_file]}}
-        expected = {hash_: {'ts_data': ts1,
-                            'ts_meta': ts3,
-                            'ts_ctype': ts2}}
+        expected = {hash_: {'ts_data': ts1_data,
+                            'ts_meta': ts3_meta,
+                            # XXX we lost precision!
+                            'ts_ctype': ts2_meta.normalized()}}
         self._check_yield_hashes(POLICIES.default, suffix_map, expected)
 
         # zero content-type delta
-        meta_file = '%s+0.meta' % ts3.internal
+        meta_file = '%s+0.meta' % ts3_meta.internal
         suffix_map = {'abc': {hash_: [data_file, meta_file]}}
-        expected = {hash_: {'ts_data': ts1,
-                            'ts_meta': ts3,
-                            'ts_ctype': ts3}}
+        expected = {hash_: {'ts_data': ts1_data,
+                            'ts_meta': ts3_meta,
+                            'ts_ctype': ts3_meta}}
         self._check_yield_hashes(POLICIES.default, suffix_map, expected)
 
         # content-type in second meta file
-        delta = ts3.raw - ts2.raw
-        meta_file1 = '%s-%x.meta' % (ts3.internal, delta)
-        meta_file2 = '%s.meta' % ts4.internal
+        delta = ts3_meta.raw - ts2_meta.raw
+        meta_file1 = '%s-%x.meta' % (ts3_meta.internal, delta)
+        meta_file2 = '%s.meta' % ts4_meta.internal
         suffix_map = {'abc': {hash_: [data_file, meta_file1, meta_file2]}}
-        expected = {hash_: {'ts_data': ts1,
-                            'ts_meta': ts4,
-                            'ts_ctype': ts2}}
+        expected = {hash_: {'ts_data': ts1_data,
+                            'ts_meta': ts4_meta,
+                            # XXX we lost precision!
+                            'ts_ctype': ts2_meta.normalized()}}
         self._check_yield_hashes(POLICIES.default, suffix_map, expected)
 
         # obsolete content-type in second meta file, older than data file
-        delta = ts3.raw - ts0.raw
-        meta_file1 = '%s-%x.meta' % (ts3.internal, delta)
-        meta_file2 = '%s.meta' % ts4.internal
+        delta = ts3_meta.raw - ts0_meta.raw
+        meta_file1 = '%s-%x.meta' % (ts3_meta.internal, delta)
+        meta_file2 = '%s.meta' % ts4_meta.internal
         suffix_map = {'abc': {hash_: [data_file, meta_file1, meta_file2]}}
-        expected = {hash_: {'ts_data': ts1,
-                            'ts_meta': ts4}}
+        expected = {hash_: {'ts_data': ts1_data,
+                            'ts_meta': ts4_meta}}
         self._check_yield_hashes(POLICIES.default, suffix_map, expected)
 
         # obsolete content-type in second meta file, same time as data file
-        delta = ts3.raw - ts1.raw
-        meta_file1 = '%s-%x.meta' % (ts3.internal, delta)
-        meta_file2 = '%s.meta' % ts4.internal
+        delta = ts3_meta.raw - ts1_data.raw
+        meta_file1 = '%s-%x.meta' % (ts3_meta.internal, delta)
+        meta_file2 = '%s.meta' % ts4_meta.internal
         suffix_map = {'abc': {hash_: [data_file, meta_file1, meta_file2]}}
-        expected = {hash_: {'ts_data': ts1,
-                            'ts_meta': ts4}}
+        expected = {hash_: {'ts_data': ts1_data,
+                            'ts_meta': ts4_meta}}
         self._check_yield_hashes(POLICIES.default, suffix_map, expected)
 
     def test_yield_hashes_suffix_filter(self):
@@ -3353,26 +3374,36 @@ class TestECDiskFileManager(DiskFileManagerMixin, BaseUnitTestCase):
     def test_make_on_disk_filename_for_meta_with_content_type(self):
         # verify .meta filename encodes content-type timestamp
         mgr = self.df_router[POLICIES.default]
-        time_ = 1234567890.00001
-        for delta in (0, 1, 111111):
-            t_meta = Timestamp(time_)
-            t_type = Timestamp(time_ - delta / 100000.)
-            sign = '-' if delta else '+'
+
+        def do_test(delta):
+            t_meta = self.ts()
+            if delta:
+                sign = '-'
+                t_ctype = Timestamp(t_meta, delta=-1 * delta)
+                # XXX we've lost precision for t_ctype
+                exp_t_ctype = t_ctype.normalized()
+            else:
+                sign = '+'
+                t_ctype = t_meta
+                exp_t_ctype = t_ctype
             expected = '%s%s%x.meta' % (t_meta.short, sign, delta)
             actual = mgr.make_on_disk_filename(
-                t_meta, '.meta', ctype_timestamp=t_type)
+                t_meta, '.meta', ctype_timestamp=t_ctype)
             self.assertEqual(expected, actual)
             parsed = mgr.parse_on_disk_filename(actual, POLICIES.default)
             self.assertEqual(parsed, {
                 'timestamp': t_meta,
                 'frag_index': None,
                 'ext': '.meta',
-                'ctype_timestamp': t_type
+                'ctype_timestamp': exp_t_ctype
             })
             # these functions are inverse
             self.assertEqual(
                 mgr.make_on_disk_filename(**parsed),
                 expected)
+        do_test(0)
+        do_test(1)
+        do_test(111111)
 
     def test_yield_hashes_legacy_durable(self):
         old_ts = Timestamp('1383180000.12345')
@@ -5115,36 +5146,62 @@ class DiskFileMixin(BaseDiskFileTestMixin):
         # a combination of a meta file without content-type and an older meta
         # file with content-type should be cleaned up in favour of a meta file
         # at newer time with content-type
-        ts_iter = make_timestamp_iter()
-        df, df_data = self._create_test_file(b'1234567890',
-                                             timestamp=next(ts_iter))
-        file_count = len(os.listdir(df._datadir))
-        timestamp = next(ts_iter)
-        timestamp2 = next(ts_iter)
-        metadata = {'X-Timestamp': timestamp2.internal,
-                    'X-Object-Meta-test': 'data'}
+        ts_data = self.ts()
+        df, df_data = self._create_test_file(b'1234567890', timestamp=ts_data)
+        orig_metadata = df.read_metadata()
+        data_file = os.path.basename(df._data_file)
+        dl = os.listdir(df._datadir)
+        self.assertEqual([data_file], dl)
+        ts_meta1 = ts_ctype = self.ts().normalized()
+        ts_meta2 = self.ts().normalized()
+        # this results in meta_x: ts2.meta
+        metadata = {'X-Timestamp': ts_meta2.internal,
+                    'X-Object-Meta-test': 'meta2'}
         df.write_metadata(metadata)
-        metadata = {'X-Timestamp': timestamp.internal,
-                    'X-Object-Meta-test': 'data',
+        meta_file2 = '%s.meta' % ts_meta2.internal
+        # this results in meta_file1: ts1+0.meta
+        metadata = {'X-Timestamp': ts_meta1.internal,
+                    'X-Object-Meta-test': 'meta1',
                     'Content-Type': 'foo',
-                    'Content-Type-Timestamp': timestamp.internal}
+                    'Content-Type-Timestamp': ts_ctype.internal}
         df.write_metadata(metadata)
+        meta_file1 = '%s+0.meta' % ts_meta1.internal
 
         dl = os.listdir(df._datadir)
-        self.assertEqual(len(dl), file_count + 2, dl)
+        self.assertEqual([data_file, meta_file1, meta_file2], sorted(dl))
 
-        metadata = {'X-Timestamp': timestamp2.internal,
-                    'X-Object-Meta-test': 'data',
+        # this results in meta_file3: ts2-186a0.meta
+        metadata = {'X-Timestamp': ts_meta2.internal,
+                    'X-Object-Meta-test': 'meta3',
                     'Content-Type': 'foo',
-                    'Content-Type-Timestamp': timestamp.internal}
+                    'Content-Type-Timestamp': ts_ctype.internal}
         df.write_metadata(metadata)
+        meta_file3 = '%s-%x.meta' % (ts_meta2.internal,
+                                     ts_meta2.raw - ts_meta1.raw)
 
         dl = os.listdir(df._datadir)
-        self.assertEqual(len(dl), file_count + 1, dl)
-        exp_name = '%s-%x.meta' % (timestamp2.internal,
-                                   timestamp2.raw - timestamp.raw)
-        self.assertTrue(exp_name in set(dl),
-                        'Expected file %s not found in %s' % (exp_name, dl))
+        # Prior to disk cleanup:
+        # the reverse sorted meta files are (note '.' reverse sorts before '-')
+        #   meta_file2: ts2.meta with ctype
+        #   meta_file3: ts2-186a0.meta
+        #   meta_file1: ts1+0.meta with ctype
+        # After on disk cleanup:
+        #   meta_file1 has same ts_ctype as meta_file3, but meta_file3 has
+        #   newer ts_meta so meta_file3 is retained and meta_file1 is
+        #   discarded.
+        #   meta_file3 has same ts_meta as meta_file2 but explicit ts_ctype so
+        #   meta_file3 is retained and meta_file2 is discarded.
+        # Only one meta file is retained: meta_file3
+        # self.assertEqual([data_file, meta_file3], sorted(dl))
+        self.assertEqual([data_file, meta_file3], sorted(dl))
+        exp_metadata = dict(orig_metadata)
+        exp_metadata.update(
+            {'X-Timestamp': ts_meta2.internal,
+             'X-Object-Meta-test': 'meta3',
+             'Content-Type': 'foo',
+             'Content-Type-Timestamp': ts_ctype.internal}
+        )
+        self.assertEqual(exp_metadata, df.read_metadata())
 
     def test_write_metadata_no_xattr(self):
         timestamp = Timestamp.now().internal
@@ -8748,6 +8805,8 @@ class TestSuffixHashes(BaseUnitTestCase):
             for policy in self.iter_policies():
                 ts_data, ts_ctype, ts_meta = (
                     self.ts(), self.ts(), self.ts())
+                ts_ctype = ts_ctype.normalized()
+                ts_meta = ts_meta.normalized()
 
                 filenames = [_make_datafilename(ts_data, policy, frag_index=4,
                                                 durable=not legacy_durable),
@@ -8766,6 +8825,7 @@ class TestSuffixHashes(BaseUnitTestCase):
         def do_test(legacy_durable):
             for policy in self.iter_policies():
                 ts_data, ts_meta = (self.ts(), self.ts())
+                ts_meta = ts_meta.normalized()
 
                 filenames = [_make_datafilename(ts_data, policy, frag_index=4,
                                                 durable=not legacy_durable),
@@ -8785,6 +8845,8 @@ class TestSuffixHashes(BaseUnitTestCase):
         def do_test(legacy_durable):
             for policy in self.iter_policies():
                 ts_ctype, ts_data, ts_meta = (self.ts(), self.ts(), self.ts())
+                ts_ctype = ts_ctype.normalized()
+                ts_meta = ts_meta.normalized()
 
                 filenames = [_make_datafilename(ts_data, policy, frag_index=4,
                                                 durable=not legacy_durable),
@@ -8805,6 +8867,9 @@ class TestSuffixHashes(BaseUnitTestCase):
             for policy in self.iter_policies():
                 ts_data, ts_older_meta, ts_ctype, ts_newer_meta = (
                     self.ts() for _ in range(4))
+                ts_older_meta = ts_older_meta.normalized()
+                ts_ctype = ts_ctype.normalized()
+                ts_newer_meta = ts_newer_meta.normalized()
 
                 filenames = [_make_datafilename(ts_data, policy, frag_index=4,
                                                 durable=not legacy_durable),
@@ -8814,7 +8879,8 @@ class TestSuffixHashes(BaseUnitTestCase):
                     filenames.append(ts_data.internal + '.durable')
 
                 self._verify_get_hashes(
-                    filenames, ts_data, ts_newer_meta, ts_ctype, policy)
+                    filenames, ts_data, ts_newer_meta, ts_ctype,
+                    policy)
 
         do_test(False)
         do_test(True)
@@ -8826,6 +8892,8 @@ class TestSuffixHashes(BaseUnitTestCase):
             for policy in self.iter_policies():
                 ts_data, ts_older_meta, ts_newer_meta = (
                     self.ts() for _ in range(3))
+                ts_older_meta = ts_older_meta.normalized()
+                ts_newer_meta = ts_newer_meta.normalized()
 
                 filenames = [_make_datafilename(ts_data, policy, frag_index=4,
                                                 durable=not legacy_durable),
@@ -8834,7 +8902,8 @@ class TestSuffixHashes(BaseUnitTestCase):
                     filenames.append(ts_data.internal + '.durable')
 
                 self._verify_get_hashes(
-                    filenames, ts_data, ts_newer_meta, ts_newer_meta, policy)
+                    filenames, ts_data, ts_newer_meta, ts_newer_meta,
+                    policy)
 
         do_test(False)
         do_test(True)
@@ -8846,6 +8915,9 @@ class TestSuffixHashes(BaseUnitTestCase):
             for policy in self.iter_policies():
                 ts_data, ts_ctype, ts_older_meta, ts_newer_meta = (
                     self.ts() for _ in range(4))
+                ts_older_meta = ts_older_meta.normalized()
+                ts_ctype = ts_ctype.normalized()
+                ts_newer_meta = ts_newer_meta.normalized()
 
                 filenames = [_make_datafilename(ts_data, policy, frag_index=4,
                                                 durable=not legacy_durable),
@@ -8855,7 +8927,8 @@ class TestSuffixHashes(BaseUnitTestCase):
                     filenames.append(ts_data.internal + '.durable')
 
                 self._verify_get_hashes(
-                    filenames, ts_data, ts_newer_meta, ts_ctype, policy)
+                    filenames, ts_data, ts_newer_meta, ts_ctype,
+                    policy)
 
         do_test(False)
         do_test(True)
@@ -8867,6 +8940,8 @@ class TestSuffixHashes(BaseUnitTestCase):
             for policy in self.iter_policies():
                 ts_data, ts_older_meta, ts_newer_meta = (
                     self.ts() for _ in range(3))
+                ts_older_meta = ts_older_meta.normalized()
+                ts_newer_meta = ts_newer_meta.normalized()
 
                 filenames = [_make_datafilename(ts_data, policy, frag_index=4,
                                                 durable=not legacy_durable),
@@ -8876,7 +8951,8 @@ class TestSuffixHashes(BaseUnitTestCase):
                     filenames.append(ts_data.internal + '.durable')
 
                 self._verify_get_hashes(
-                    filenames, ts_data, ts_newer_meta, ts_older_meta, policy)
+                    filenames, ts_data, ts_newer_meta, ts_older_meta,
+                    policy)
 
         do_test(False)
         do_test(True)
@@ -8888,6 +8964,9 @@ class TestSuffixHashes(BaseUnitTestCase):
             for policy in self.iter_policies():
                 ts_ctype, ts_data, ts_older_meta, ts_newer_meta = (
                     self.ts() for _ in range(4))
+                ts_older_meta = ts_older_meta.normalized()
+                ts_ctype = ts_ctype.normalized()
+                ts_newer_meta = ts_newer_meta.normalized()
 
                 filenames = [_make_datafilename(ts_data, policy, frag_index=4,
                                                 durable=not legacy_durable),

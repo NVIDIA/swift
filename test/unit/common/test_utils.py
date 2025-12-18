@@ -5855,6 +5855,9 @@ class TestShardName(unittest.TestCase):
         with self.assertRaises(ValueError):
             ts = Timestamp.now(offset=1)
             utils.ShardName.create('a', 'root', 'parent', ts, 1)
+        with self.assertRaises(ValueError):
+            ts = Timestamp.now(version=2)
+            utils.ShardName.create('a', 'root', 'parent', ts, 1)
 
 
 class BaseNamespaceShardRange(object):

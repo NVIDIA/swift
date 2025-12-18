@@ -358,9 +358,9 @@ class ObjectContext(ObjectVersioningContext):
 
         req.method = 'PUT'
         # inch x-timestamp forward, just in case
-        req.ensure_x_timestamp()
-        req.headers['X-Timestamp'] = Timestamp(
-            req.timestamp, offset=1).internal
+        ts = req.ensure_x_timestamp()
+        ts.increment_offset(1)
+        req.headers['X-Timestamp'] = ts.internal
         req.headers[TGT_ETAG_SYSMETA_SYMLINK_HDR] = put_etag
         req.headers[TGT_BYTES_SYSMETA_SYMLINK_HDR] = put_bytes
         # N.B. in stack mode DELETE we use content_type from listing

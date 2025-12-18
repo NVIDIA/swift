@@ -1045,7 +1045,10 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertEqual(objects[0], expected)
         # the second object's listing has ts_meta as its last modified time
         # but its full composite timestamp is in the hash field.
-        expected = ('%s:/a/c/o2' % remote_policy.idx, ts_meta.internal, 0,
+        # ts_meta jitter was lost when it timestamps were encoded
+        jitterless_ts_meta = ts_meta.normalized()
+        expected = ('%s:/a/c/o2' % remote_policy.idx,
+                    jitterless_ts_meta.internal, 0,
                     'application/x-put',
                     encode_timestamps(ts_data, ts_ctype, ts_meta))
         self.assertEqual(objects[1], expected)
@@ -1130,7 +1133,10 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertEqual(objects[0], expected)
         # the second object's listing has ts_meta as its last modified time
         # but its full composite timestamp is in the hash field.
-        expected = ('%s:/a/c/o2' % remote_policy.idx, ts_meta.internal, 0,
+        # ts_meta jitter was lost when it timestamps were encoded
+        jitterless_ts_meta = ts_meta.normalized()
+        expected = ('%s:/a/c/o2' % remote_policy.idx,
+                    jitterless_ts_meta, 0,
                     'application/x-put',
                     encode_timestamps(ts_data, ts_ctype, ts_meta))
         self.assertEqual(objects[1], expected)
@@ -1215,7 +1221,10 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertEqual(objects[0], expected)
         # the second object's listing has ts_meta as its last modified time
         # but its full composite timestamp is in the hash field.
-        expected = ('%s:/a/c/o2' % remote_policy.idx, ts_meta.internal, 0,
+        # ts_meta jitter was lost when it timestamps were encoded
+        jitterless_ts_meta = ts_meta.normalized()
+        expected = ('%s:/a/c/o2' % remote_policy.idx,
+                    jitterless_ts_meta.internal, 0,
                     'application/x-put',
                     encode_timestamps(ts_data, ts_ctype, ts_meta))
         self.assertEqual(objects[1], expected)

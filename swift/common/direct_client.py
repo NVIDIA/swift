@@ -31,10 +31,11 @@ from swift.common.exceptions import ClientException
 from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER, \
     get_ip_port
 from swift.common.swob import normalize_etag
-from swift.common.utils import FileLikeIter, quote, Timestamp
+from swift.common.utils import FileLikeIter, quote
 from swift.common.http import HTTP_NO_CONTENT, HTTP_INSUFFICIENT_STORAGE, \
     is_success, is_server_error
 from swift.common.header_key_dict import HeaderKeyDict
+from swift.common.utils.timestamp import generate_timestamp
 
 
 class DirectClientException(ClientException):
@@ -117,7 +118,8 @@ def _make_req(node, part, method, path, headers, stype,
 
     ip, port = get_ip_port(node, headers)
     headers.setdefault('X-Backend-Allow-Reserved-Names', 'true')
-    headers.setdefault('X-Timestamp', Timestamp.now().internal)
+    headers.setdefault('X-Timestamp',
+                       generate_timestamp(stype, method).internal)
     with Timeout(conn_timeout):
         conn = http_connect(ip, port, node['device'], part,
                             method, path, headers=headers)

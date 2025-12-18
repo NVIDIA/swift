@@ -42,7 +42,7 @@ from swift.obj.ssync_receiver import SsyncInputProxy
 from test import listen_zero, unit
 from test.debug_logger import debug_logger
 from test.unit import (patch_policies, make_timestamp_iter, mock_check_drive,
-                       skip_if_no_xattrs)
+                       skip_if_no_xattrs, BaseUnitTestCase)
 from test.unit.obj.common import write_diskfile
 
 
@@ -2677,13 +2677,14 @@ class TestSsyncRxServer(unittest.TestCase):
         self.assertFalse(mock_missing_check.called)
 
 
-class TestModuleMethods(unittest.TestCase):
-    def test_decode_missing(self):
+class TestModuleMethods(BaseUnitTestCase):
+    def test_decode_missing_legacy_timestamps(self):
         object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
-        ts_iter = make_timestamp_iter()
-        t_data = next(ts_iter)
-        t_meta = next(ts_iter)
-        t_ctype = next(ts_iter)
+        # legacy timestamps do not have hex part by default, only when offset
+        # is non-zero
+        t_data = self.ts().normalized()
+        t_meta = self.ts().normalized()
+        t_ctype = self.ts().normalized()
         d_meta_data = t_meta.raw - t_data.raw
         d_ctype_data = t_ctype.raw - t_data.raw
 
@@ -2724,15 +2725,10 @@ class TestModuleMethods(unittest.TestCase):
         self.assertEqual(
             expected, ssync_receiver.decode_missing(msg.encode('ascii')))
 
-        # timestamps have offsets
-        t_data_offset = utils.Timestamp(t_data, offset=99)
-        t_meta_offset = utils.Timestamp(t_meta, offset=1)
-        t_ctype_offset = utils.Timestamp(t_ctype, offset=2)
-        expected = dict(object_hash=object_hash,
-                        ts_data=t_data_offset,
-                        ts_meta=t_meta_offset,
-                        ts_ctype=t_ctype_offset,
-                        durable=True)
+        # legacy timestamps with offsets
+        t_data_offset = utils.Timestamp(t_data.normal, offset=99)
+        t_meta_offset = utils.Timestamp(t_meta.normal, offset=1)
+        t_ctype_offset = utils.Timestamp(t_ctype.normal, offset=2)
         expected = ('%s %s_0000000000000063 m:%x__1,t:%x__2'
                     % (object_hash, t_data.internal, d_meta_data,
                        d_ctype_data))
@@ -2819,6 +2815,147 @@ class TestModuleMethods(unittest.TestCase):
         check_durable('yes')
         check_durable('true')
         check_durable('True')
+
+    def test_decode_missing_all_equal(self):
+        object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
+        t_data = self.ts()
+        msg = '%s %s' % (object_hash, t_data.internal)
+        expected = dict(object_hash=object_hash,
+                        ts_data=t_data,
+                        ts_meta=t_data,
+                        ts_ctype=t_data,
+                        durable=True)
+        self.assertEqual(
+            expected, ssync_receiver.decode_missing(msg.encode('ascii')))
+        self.assertEqual(
+            msg, ssync_sender.encode_missing(**expected).decode('ascii'))
+
+    def test_decode_missing_different_t_meta(self):
+        object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
+        t_data, t_meta = self.ts(), self.ts()
+        d_meta_data = t_meta.raw - t_data.raw
+        msg = '%s %s m:%x__%x' % (object_hash, t_data.internal,
+                                  d_meta_data, t_meta.hex_part)
+        expected = dict(object_hash=object_hash,
+                        ts_data=t_data,
+                        ts_meta=t_meta,
+                        ts_ctype=t_data,
+                        durable=True)
+        self.assertEqual(
+            expected, ssync_receiver.decode_missing(msg.encode('ascii')))
+        self.assertEqual(
+            msg, ssync_sender.encode_missing(**expected).decode('ascii'))
+
+    def test_decode_missing_different_t_meta_and_t_ctype(self):
+        object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
+        t_data, t_meta, t_ctype = self.ts(), self.ts(), self.ts()
+        d_meta_data = t_meta.raw - t_data.raw
+        d_ctype_data = t_ctype.raw - t_data.raw
+        msg = '%s %s m:%x__%x,t:%x__%x' % (object_hash, t_data.internal,
+                                           d_meta_data, t_meta.hex_part,
+                                           d_ctype_data, t_ctype.hex_part)
+        expected = dict(object_hash=object_hash,
+                        ts_data=t_data,
+                        ts_meta=t_meta,
+                        ts_ctype=t_ctype,
+                        durable=True)
+        self.assertEqual(
+            expected, ssync_receiver.decode_missing(msg.encode('ascii')))
+        self.assertEqual(
+            msg, ssync_sender.encode_missing(**expected).decode('ascii'))
+        # order doesn't matter
+        msg = '%s %s t:%x__%x,m:%x__%x' % (object_hash, t_data.internal,
+                                           d_ctype_data, t_ctype.hex_part,
+                                           d_meta_data, t_meta.hex_part)
+        self.assertEqual(
+            expected, ssync_receiver.decode_missing(msg.encode('ascii')))
+
+    def test_decode_missing_different_t_meta_and_t_ctype_non_durable(self):
+        object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
+        t_data, t_meta, t_ctype = self.ts(), self.ts(), self.ts()
+        d_meta_data = t_meta.raw - t_data.raw
+        d_ctype_data = t_ctype.raw - t_data.raw
+        msg = '%s %s m:%x__%x,t:%x__%x,durable:False' % (
+            object_hash, t_data.internal,
+            d_meta_data, t_meta.hex_part,
+            d_ctype_data, t_ctype.hex_part)
+        expected = dict(object_hash=object_hash,
+                        ts_data=t_data,
+                        ts_meta=t_meta,
+                        ts_ctype=t_ctype,
+                        durable=False)
+        self.assertEqual(
+            expected, ssync_receiver.decode_missing(msg.encode('ascii')))
+        self.assertEqual(
+            msg, ssync_sender.encode_missing(**expected).decode('ascii'))
+
+    def test_decode_missing_different_t_meta_and_t_ctype_durable(self):
+        object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
+        t_data, t_meta, t_ctype = self.ts(), self.ts(), self.ts()
+        d_meta_data = t_meta.raw - t_data.raw
+        d_ctype_data = t_ctype.raw - t_data.raw
+        msg = '%s %s m:%x__%x,t:%x__%x,durable:True' % (
+            object_hash, t_data.internal,
+            d_meta_data, t_meta.hex_part,
+            d_ctype_data, t_ctype.hex_part)
+        expected = dict(object_hash=object_hash,
+                        ts_data=t_data,
+                        ts_meta=t_meta,
+                        ts_ctype=t_ctype,
+                        durable=True)
+        self.assertEqual(
+            expected, ssync_receiver.decode_missing(msg.encode('ascii')))
+
+    def test_decode_missing_t_meta_and_t_ctype_raw_delta_is_0(self):
+        object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
+        t_data = self.ts()
+        msg = '%s %s t:0__%x,m:0__%x' % (object_hash, t_data.internal,
+                                         t_data.hex_part, t_data.hex_part)
+        expected = dict(object_hash=object_hash,
+                        ts_data=t_data,
+                        ts_meta=t_data,
+                        ts_ctype=t_data,
+                        durable=True)
+        self.assertEqual(
+            expected, ssync_receiver.decode_missing(msg.encode('ascii')))
+
+    def test_decode_missing_different_t_meta_and_t_ctype_and_unexpected(self):
+        object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
+        t_data, t_meta, t_ctype = self.ts(), self.ts(), self.ts()
+        d_meta_data = t_meta.raw - t_data.raw
+        d_ctype_data = t_ctype.raw - t_data.raw
+        msg = '%s %s m:%x__%x,junk,t:%x__%x more junk' % (
+            object_hash, t_data.internal,
+            d_meta_data, t_meta.hex_part,
+            d_ctype_data, t_ctype.hex_part)
+        expected = dict(object_hash=object_hash,
+                        ts_data=t_data,
+                        ts_meta=t_meta,
+                        ts_ctype=t_ctype,
+                        durable=True)
+        self.assertEqual(
+            expected, ssync_receiver.decode_missing(msg.encode('ascii')))
+
+    def test_decode_missing_different_t_meta_and_t_ctype_and_offsets(self):
+        object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
+        t_data = utils.Timestamp(self.ts(), offset=99)
+        t_meta = utils.Timestamp(self.ts(), offset=1)
+        t_ctype = utils.Timestamp(self.ts(), offset=2)
+        d_meta_data = t_meta.raw - t_data.raw
+        d_ctype_data = t_ctype.raw - t_data.raw
+        msg = '%s %s m:%x__%x,t:%x__%x' % (
+            object_hash, t_data.internal,
+            d_meta_data, t_meta.hex_part,
+            d_ctype_data, t_ctype.hex_part)
+        expected = dict(object_hash=object_hash,
+                        ts_data=t_data,
+                        ts_meta=t_meta,
+                        ts_ctype=t_ctype,
+                        durable=True)
+        self.assertEqual(
+            expected, ssync_receiver.decode_missing(msg.encode('ascii')))
+        self.assertEqual(
+            msg, ssync_sender.encode_missing(**expected).decode('ascii'))
 
     def test_encode_wanted(self):
         ts_iter = make_timestamp_iter()
