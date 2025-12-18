@@ -4066,15 +4066,11 @@ class TestReplicatedObjectController(
 
     def test_PUT(self):
         with save_globals():
-            controller = ReplicatedObjectController(
-                self.app, 'account', 'container', 'object')
-
             def test_status_map(statuses, expected):
-                req = Request.blank('/v1/a/c/o.jpg', {})
+                req = Request.blank('/v1/a/c/o.jpg', {'REQUEST_METHOD': 'PUT'})
                 req.content_length = 0
-                self.app.update_request(req)
                 with mocked_http_conn(*statuses) as mock_conn:
-                    res = controller.PUT(req)
+                    res = req.get_response(self.app)
                 expected = str(expected)
                 self.assertEqual(res.status[:len(expected)], expected)
                 self.assertEqual(
@@ -4083,7 +4079,7 @@ class TestReplicatedObjectController(
                 timestamps = [req['headers'].get('X-Timestamp')
                               for req in mock_conn.requests[-3:]]
                 self.assertEqual(1, len(set(timestamps)))
-                self.assert_valid_timestamp(timestamps[0])
+                self.assert_valid_extended_timestamp(timestamps[0])
             test_status_map((200, 200, 201, 201, 201), 201)
             test_status_map((200, 200, 201, 201, 500), 201)
             test_status_map((200, 200, 204, 404, 404), 404)
@@ -4202,7 +4198,8 @@ class TestReplicatedObjectController(
                 timestamps = [req['headers'].get('X-Timestamp')
                               for req in mock_conn.requests[-3:]]
                 self.assertEqual(1, len(set(timestamps)))
-                self.assert_valid_timestamp(timestamps[0])
+                self.assert_valid_normal_timestamp(timestamps[0])
+
             test_status_map((200, 200, 202, 202, 202), 202)
             test_status_map((200, 200, 202, 202, 500), 202)
             test_status_map((200, 200, 202, 500, 500), 503)
@@ -5184,7 +5181,7 @@ class TestReplicatedObjectController(
                 timestamps = [req['headers'].get('X-Timestamp')
                               for req in mock_conn.requests[-3:]]
                 self.assertEqual(1, len(set(timestamps)))
-                self.assert_valid_timestamp(timestamps[0])
+                self.assert_valid_normal_timestamp(timestamps[0])
 
             test_status_map((200, 200, 204, 204, 204), 204)
             test_status_map((200, 200, 204, 204, 500), 204)
@@ -10336,7 +10333,7 @@ class TestContainerController(BaseTestCase):
                 timestamps = [req['headers'].get('X-Timestamp')
                               for req in mock_conn.requests[-3:]]
                 self.assertEqual(1, len(set(timestamps)))
-                self.assert_valid_timestamp(timestamps[0])
+                self.assert_valid_normal_timestamp(timestamps[0])
 
             test_status_map((200, 201, 201, 201), 201,
                             missing_container=True)
@@ -10493,7 +10490,7 @@ class TestContainerController(BaseTestCase):
                 timestamps = [req['headers'].get('X-Timestamp')
                               for req in mock_conn.requests[-3:]]
                 self.assertEqual(1, len(set(timestamps)))
-                self.assert_valid_timestamp(timestamps[0])
+                self.assert_valid_normal_timestamp(timestamps[0])
 
             test_status_map((200, 201, 201, 201), 201, missing_container=True)
             test_status_map((200, 201, 201, 500), 201, missing_container=True)
@@ -10696,7 +10693,7 @@ class TestContainerController(BaseTestCase):
                 timestamps = [req['headers'].get('X-Timestamp')
                               for req in mock_conn.requests[-3:]]
                 self.assertEqual(1, len(set(timestamps)))
-                self.assert_valid_timestamp(timestamps[0])
+                self.assert_valid_normal_timestamp(timestamps[0])
 
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
@@ -11380,7 +11377,7 @@ class TestContainerController(BaseTestCase):
         timestamps = [req['headers'].get('X-Timestamp')
                       for req in mock_conn.requests[-3:]]
         self.assertEqual(1, len(set(timestamps)))
-        self.assert_valid_timestamp(timestamps[0])
+        self.assert_valid_normal_timestamp(timestamps[0])
 
     def test_DELETE_backed_x_timestamp_header(self):
         timestamps = []
@@ -11405,7 +11402,7 @@ class TestContainerController(BaseTestCase):
         timestamps.pop(0)  # account existence check
         self.assertEqual(3, len(timestamps))
         self.assertEqual(1, len(set(timestamps)))
-        self.assert_valid_timestamp(timestamps[0])
+        self.assert_valid_normal_timestamp(timestamps[0])
 
     def test_node_read_timeout_no_retry_to_container(self):
         with save_globals():
@@ -11443,7 +11440,7 @@ class TestContainerController(BaseTestCase):
                 timestamps = [req['headers'].get('X-Timestamp')
                               for req in mock_conn.requests[-3:]]
                 self.assertEqual(1, len(set(timestamps)))
-                self.assert_valid_timestamp(timestamps[0])
+                self.assert_valid_normal_timestamp(timestamps[0])
 
             test_status_map((201, 201, 201), 201)
             test_status_map((201, 201, 500), 201)
@@ -11634,7 +11631,7 @@ class TestAccountController(BaseTestCase):
             post_timestamps = [req['headers'].get('X-Timestamp')
                                for req in mock_conn.requests]
             self.assertEqual(1, len(set(post_timestamps)))
-            self.assert_valid_timestamp(post_timestamps[0])
+            self.assert_valid_normal_timestamp(post_timestamps[0])
 
     def test_POST_autocreate(self):
         def check_backend_requests(mock_conn):
@@ -11644,11 +11641,11 @@ class TestAccountController(BaseTestCase):
             post_timestamps = [req['headers'].get('X-Timestamp')
                                for req in mock_conn.requests[:3]]
             self.assertEqual(1, len(set(post_timestamps)))
-            self.assert_valid_timestamp(post_timestamps[0])
+            self.assert_valid_normal_timestamp(post_timestamps[0])
             put_timestamps = [req['headers'].get('X-Timestamp')
                               for req in mock_conn.requests[3:6]]
             self.assertEqual(1, len(set(put_timestamps)))
-            self.assert_valid_timestamp(put_timestamps[0])
+            self.assert_valid_normal_timestamp(put_timestamps[0])
             retry_timestamps = [req['headers'].get('X-Timestamp')
                                 for req in mock_conn.requests[:3]]
             self.assertEqual(1, len(set(retry_timestamps)))
@@ -11761,7 +11758,7 @@ class TestAccountController(BaseTestCase):
                 timestamps = [req['headers'].get('X-Timestamp')
                               for req in mock_conn.requests[-3:]]
                 self.assertEqual(1, len(set(timestamps)))
-                self.assert_valid_timestamp(timestamps[0])
+                self.assert_valid_normal_timestamp(timestamps[0])
 
             test_status_map((201, 201, 201), 201)
             test_status_map((201, 201, 500), 201)
@@ -11986,7 +11983,7 @@ class TestAccountController(BaseTestCase):
                 timestamps = [req['headers'].get('X-Timestamp')
                               for req in mock_conn.requests[-3:]]
                 self.assertEqual(1, len(set(timestamps)))
-                self.assert_valid_timestamp(timestamps[0])
+                self.assert_valid_normal_timestamp(timestamps[0])
 
             test_status_map((201, 201, 201), 201)
             test_status_map((201, 201, 500), 201)
