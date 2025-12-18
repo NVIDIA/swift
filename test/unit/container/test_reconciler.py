@@ -31,6 +31,7 @@ from collections import defaultdict
 import urllib.parse
 from swift.common.storage_policy import StoragePolicy, ECStoragePolicy
 from swift.common.swob import Request
+from swift.common.utils.timestamp import parse_timestamp
 
 from swift.container import reconciler
 from swift.container.server import gen_resp_headers, ContainerController
@@ -65,6 +66,13 @@ class FakeStoragePolicySwift(object):
             return getattr(self.storage_policy[None], name)
 
     def __call__(self, env, start_response):
+        req = Request(env)
+        # Don't add x-timestamp like the proxy app would but do validate any
+        # existing x-timestamp
+        if 'X-Timestamp' in req.headers:
+            parse_timestamp(
+                req.headers['X-Timestamp'], req.swift_entity_type, req.method)
+
         method = env['REQUEST_METHOD']
         path = env['PATH_INFO']
         _, acc, cont, obj = split_path(env['PATH_INFO'], 0, 4,
