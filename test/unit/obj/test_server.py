@@ -47,7 +47,7 @@ from test.debug_logger import debug_logger, FakeStatsdClient, \
 from test.unit import mocked_http_conn, \
     make_timestamp_iter, DEFAULT_TEST_EC_TYPE, skip_if_no_xattrs, \
     connect_tcp, readuntil2crlfs, patch_policies, encode_frag_archive_bodies, \
-    mock_check_drive, FakeRing, BaseUnitTestCase, mock_timestamp_now, \
+    mock_check_drive, FakeRing, BaseUnitTestCase, mock_normal_timestamp_now, \
     requires_o_tmpfile_support_in_tmp
 from swift.obj import server as object_server
 from swift.obj import updater, diskfile
@@ -55,7 +55,7 @@ from swift.common import utils, bufferedhttp, http_protocol
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import hash_path, mkdirs, NullLogger, \
     storage_directory, public, replication, encode_timestamps, md5
-from swift.common.utils.timestamp import Timestamp
+from swift.common.utils.timestamp import Timestamp, NormalTimestamp
 from swift.common import constraints
 from swift.common.request_helpers import get_reserved_name
 from swift.common.statsd_client import LabeledStatsdClient
@@ -4072,7 +4072,7 @@ class TestObjectController(BaseUnitTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 400)
         self.assertEqual(
-            b"X-Timestamp should be a UNIX timestamp float value; was 'bad'",
+            b"Invalid X-Timestamp header: 'bad'",
             resp.body)
 
         req = Request.blank(
@@ -4082,8 +4082,8 @@ class TestObjectController(BaseUnitTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 400)
         self.assertEqual(
-            b"X-Timestamp should be a UNIX timestamp float value; "
-            b"was '1234567890.12345_0000000000000001_1'",
+            b"Invalid X-Timestamp header: "
+            b"'1234567890.12345_0000000000000001_1'",
             resp.body)
 
     def test_GET_range_zero_byte_object(self):
@@ -8126,8 +8126,8 @@ class TestObjectController(BaseUnitTestCase):
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'},
             headers={})
-        ts_req = Timestamp(float(ts_now), delta=99 * 1e5)
-        with mock_timestamp_now(ts_req):
+        ts_req = NormalTimestamp(float(ts_now), delta=99 * 1e5)
+        with mock_normal_timestamp_now(ts_req):
             resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(ts_req, req.timestamp)
@@ -8136,8 +8136,8 @@ class TestObjectController(BaseUnitTestCase):
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'},
             headers={})
-        ts_req = Timestamp(float(ts_now), delta=101 * 1e5)
-        with mock_timestamp_now(ts_req):
+        ts_req = NormalTimestamp(float(ts_now), delta=101 * 1e5)
+        with mock_normal_timestamp_now(ts_req):
             resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(ts_req, req.timestamp)
