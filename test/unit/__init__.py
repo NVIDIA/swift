@@ -1138,9 +1138,10 @@ def make_timestamp_iter(offset=0):
     """
     Returns an iterator that yields monotonically increasing Timestamps.
 
-    Note: the float part of each yielded Timestamp will increase by 1.
+    Note: the float part of each yielded Timestamp will increase by 1 but the
+    hex part will have random jitter.
     """
-    return iter(Timestamp(t)
+    return iter(Timestamp(t, version=2)
                 for t in itertools.count(int(time.time()) + offset))
 
 
@@ -1155,7 +1156,7 @@ def make_normal_timestamp_iter():
 @contextmanager
 def mock_timestamp_now(now=None):
     if now is None:
-        now = Timestamp.now()
+        now = Timestamp.now(version=2)
     with mocklib.patch.object(
             Timestamp, 'now', classmethod(lambda *args, **kwargs: now)):
         yield now
@@ -1174,6 +1175,13 @@ def mock_normal_timestamp_now(now=None):
 def mock_normal_timestamp_now_with_iter(ts_iter):
     with mocklib.patch('swift.common.utils.timestamp.NormalTimestamp.now',
                        side_effect=ts_iter):
+        yield
+
+
+@contextmanager
+def mock_timestamp_randint(value):
+    with mocklib.patch('swift.common.utils.timestamp.random.randint',
+                       return_value=value):
         yield
 
 
