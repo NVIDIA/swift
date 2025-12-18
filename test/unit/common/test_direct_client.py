@@ -280,7 +280,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual('/sda/0/a', path)
             headers = args[4]
             self.assertIn('X-Timestamp', headers)
-            self.assert_valid_timestamp(headers['X-Timestamp'])
+            self.assert_valid_normal_timestamp(headers['X-Timestamp'])
             self.assertIn('User-Agent', headers)
 
     def test_direct_delete_account_replication_net(self):
@@ -306,7 +306,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual('/sda/0/a', path)
             headers = args[4]
             self.assertIn('X-Timestamp', headers)
-            self.assert_valid_timestamp(headers['X-Timestamp'])
+            self.assert_valid_normal_timestamp(headers['X-Timestamp'])
             self.assertIn('User-Agent', headers)
 
     def test_direct_delete_account_failure(self):
@@ -321,7 +321,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual('DELETE', conn.method)
             self.assertEqual('/sda/0/a', conn.path)
             self.assertIn('X-Timestamp', conn.req_headers)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers['X-Timestamp'])
             self.assertIn('User-Agent', conn.req_headers)
             self.assertEqual(raised.exception.http_status, 500)
@@ -546,7 +546,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'DELETE')
             self.assertEqual(conn.path, self.container_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
 
     def test_direct_delete_container_replication_net(self):
@@ -560,7 +560,7 @@ class TestDirectClient(BaseTestCase):
             self.assertNotEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'DELETE')
             self.assertEqual(conn.path, self.container_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
 
     def test_direct_delete_container_with_timestamp(self):
@@ -588,7 +588,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'DELETE')
             self.assertEqual(conn.path, self.container_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
 
         self.assertEqual(raised.exception.http_status, 500)
@@ -614,7 +614,7 @@ class TestDirectClient(BaseTestCase):
                              'application/json')
             self.assertEqual(conn.req_headers['User-Agent'], 'my UA')
             self.assertIn('x-timestamp', conn.req_headers)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
             self.assertEqual('bar', conn.req_headers.get('x-foo'))
             self.assertEqual(
@@ -638,7 +638,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.req_headers['Content-Type'],
                              'application/json')
             self.assertIn('x-timestamp', conn.req_headers)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
             self.assertEqual('bar', conn.req_headers.get('x-foo'))
             self.assertNotIn('Content-Length', conn.req_headers)
@@ -674,7 +674,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.method, 'PUT')
             self.assertEqual(conn.path, self.obj_path)
             self.assertIn('x-timestamp', conn.req_headers)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
             self.assertEqual('bar', conn.req_headers.get('x-foo'))
 
@@ -708,7 +708,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.path, self.container_path)
             self.assertEqual(conn.req_headers['User-Agent'], 'my UA')
             self.assertIn('x-timestamp', conn.req_headers)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
             self.assertEqual('bar', conn.req_headers.get('x-foo'))
         self.assertEqual(204, resp.status)
@@ -721,7 +721,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'DELETE')
             self.assertEqual(conn.path, self.obj_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
 
         self.assertIsNone(rv)
@@ -737,7 +737,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'DELETE')
             self.assertEqual(conn.path, self.obj_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
 
         self.assertEqual(raised.exception.http_status, 500)
@@ -844,15 +844,15 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'POST')
             self.assertEqual(conn.path, self.obj_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
 
         for header in headers:
             self.assertEqual(conn.req_headers[header], headers[header])
 
     def test_direct_post_object_retains_existing_timestamp(self):
-        ts = Timestamp.now()
-        self.assert_valid_timestamp(ts)
+        ts = Timestamp.now(version=2)
+        self.assert_valid_extended_timestamp(ts)
         headers = {'Key': 'value',
                    'X-Timestamp': ts.internal}
 
@@ -863,7 +863,7 @@ class TestDirectClient(BaseTestCase):
                 self.node, self.part, self.account, self.container, self.obj,
                 headers)
             actual_ts = Timestamp(conn.req_headers.get('X-Timestamp'))
-            actual_ts = self.assert_valid_timestamp(actual_ts)
+            actual_ts = self.assert_valid_extended_timestamp(actual_ts)
             self.assertEqual(ts, actual_ts)
 
     def test_direct_post_object_error(self):
@@ -894,7 +894,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'DELETE')
             self.assertEqual(conn.path, self.obj_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
         self.assertIsNone(resp)
 
@@ -921,7 +921,7 @@ class TestDirectClient(BaseTestCase):
                     self.obj)
             self.assertEqual(conn.method, 'DELETE')
             self.assertEqual(conn.path, self.obj_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_normal_timestamp(
                 conn.req_headers.get('X-Timestamp'))
         self.assertEqual(raised.exception.http_status, 503)
         self.assertTrue('DELETE' in str(raised.exception))
@@ -971,7 +971,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'PUT')
             self.assertEqual(conn.path, self.obj_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_extended_timestamp(
                 conn.req_headers.get('X-Timestamp'))
         self.assertEqual(
             md5(b'123456', usedforsecurity=False).hexdigest(),
@@ -989,7 +989,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'PUT')
             self.assertEqual(conn.path, self.obj_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_extended_timestamp(
                 conn.req_headers.get('X-Timestamp'))
         self.assertEqual(raised.exception.http_status, 500)
 
@@ -1004,7 +1004,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'PUT')
             self.assertEqual(conn.path, self.obj_path)
-            self.assert_valid_timestamp(
+            self.assert_valid_extended_timestamp(
                 conn.req_headers.get('X-Timestamp'))
         self.assertEqual(
             md5(b'6\r\n123456\r\n0\r\n\r\n',
@@ -1024,7 +1024,7 @@ class TestDirectClient(BaseTestCase):
             self.assertEqual(self.obj_path, conn.path)
             self.assertEqual(conn.req_headers['Content-Length'], '0')
             self.assertEqual(conn.req_headers['Content-Type'], 'Text')
-            self.assert_valid_timestamp(
+            self.assert_valid_extended_timestamp(
                 conn.req_headers.get('X-Timestamp'))
         self.assertEqual(
             md5(b'0\r\n\r\n', usedforsecurity=False).hexdigest(),
