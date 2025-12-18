@@ -31,6 +31,7 @@ from swift.common.utils.timestamp import Timestamp
 from test import unit
 from test.debug_logger import debug_logger
 from swift.common.storage_policy import StoragePolicy, POLICIES
+from test.unit import mock_normal_timestamp_now, mock_timestamp_now
 
 
 class FakeBroker(object):
@@ -416,10 +417,8 @@ class TestReaper(unittest.TestCase):
                 return headers, obj_list
 
             mocks['direct_get_container'].side_effect = fake_get_container
-            mock_timestamps = [Timestamp(1429117638.86767),
-                               Timestamp(1429117639.67676)]
-            with patch('swift.common.utils.Timestamp.now',
-                       side_effect=mock_timestamps):
+            with mock_timestamp_now() as ts_now, \
+                    mock_normal_timestamp_now() as ts_normal_now:
                 r.reap_container('a', 'partition', acc_nodes, 'c')
 
             # verify calls to direct_delete_object
@@ -431,7 +430,7 @@ class TestReaper(unittest.TestCase):
                                  ['X-Backend-Storage-Policy-Index'],
                                  policy.idx)
                 self.assertEqual(kwargs['headers']['X-Timestamp'],
-                                 mock_timestamps[0].internal)
+                                 ts_now.internal)
 
             # verify calls to direct_delete_container
             self.assertEqual(mocks['direct_delete_container'].call_count, 3)
@@ -445,7 +444,7 @@ class TestReaper(unittest.TestCase):
                     'X-Account-Partition': 'partition',
                     'X-Account-Device': device,
                     'X-Account-Override-Deleted': 'yes',
-                    'X-Timestamp': mock_timestamps[1].internal,
+                    'X-Timestamp': ts_normal_now.internal,
                     'x-backend-use-replication-network': 'true',
                 }
                 ring = r.get_object_ring(policy.idx)
