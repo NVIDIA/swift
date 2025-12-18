@@ -134,7 +134,6 @@ from swift.common.utils.timestamp import (  # noqa
     NORMAL_FORMAT,
     INTERNAL_FORMAT,
     SHORT_FORMAT,
-    MAX_OFFSET,
     PRECISION,
     Timestamp,
     NormalTimestamp,

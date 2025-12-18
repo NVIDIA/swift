@@ -21,6 +21,7 @@ from swift.common.swob import Request
 from swift.common.middleware.s3api import utils, s3request
 from swift.common.middleware.s3api.exception import InvalidBucketNameParseError
 from swift.common.middleware.s3api.utils import make_header_label
+from test.unit import mock_timestamp_randint
 
 strs = [
     ('Owner', 'owner'),
@@ -353,11 +354,17 @@ class TestS3Timestamp(unittest.TestCase):
         self.assertEqual(0.0, float(ts))
         self.assertEqual('1970-01-01T00:00:00.000000', ts.isoformat)
 
-        ts = utils.S3Timestamp(1402440452.0)
+    @mock_timestamp_randint(0xa)
+    def test_to_from_s3xmlformat_v2(self):
+        ts = utils.S3Timestamp(1402440452.0, version=2)
         self.assertIsInstance(ts, utils.S3Timestamp)
+        self.assertEqual(0x200000000a000000, ts.hex_part)
         ts1 = utils.S3Timestamp.from_s3xmlformat(ts.s3xmlformat)
         self.assertIsInstance(ts1, utils.S3Timestamp)
-        self.assertEqual(ts, ts1)
+        self.assertEqual(ts.s3xmlformat, ts1.s3xmlformat)
+        # jitter is lost when roundtripping via s3xmlformat
+        self.assertEqual(ts.normal, ts1.normal)
+        self.assertEqual(0, ts1.hex_part)
 
     def test_from_isoformat(self):
         ts = utils.S3Timestamp.from_isoformat('2014-06-10T22:47:32.054580')
