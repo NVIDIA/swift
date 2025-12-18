@@ -29,7 +29,7 @@ from swift.common.wsgi import ConfigString
 from swift.common.exceptions import ClientException
 from swift.common.storage_policy import StoragePolicy
 import test
-from test.unit import patch_policies, with_tempdir
+from test.unit import patch_policies, with_tempdir, mock_timestamp_randint
 
 utils.HASH_PATH_SUFFIX = b'endcap'
 utils.HASH_PATH_PREFIX = b'endcap'
@@ -837,7 +837,8 @@ class TestContainerSync(unittest.TestCase):
                     hex = 'abcdef'
 
             sync.uuid = FakeUUID
-            ts_data = Timestamp(1.1)
+            with mock_timestamp_randint(0xa):
+                ts_data = Timestamp(1.1, version=2)
 
             def fake_delete_object(path, name=None, headers=None, proxy=None,
                                    logger=None, timeout=None):
@@ -846,7 +847,7 @@ class TestContainerSync(unittest.TestCase):
                 if realm:
                     self.assertEqual(headers, {
                         'x-container-sync-auth':
-                        'US abcdef a2401ecb1256f469494a0abcb0eb62ffa73eca63',
+                        'US abcdef 5018b55675978cda9d007c5d2f3fb6bf5ff926ce',
                         'x-timestamp': ts_data.internal})
                 else:
                     self.assertEqual(
