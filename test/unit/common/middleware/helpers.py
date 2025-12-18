@@ -23,6 +23,7 @@ from swift.common.request_helpers import is_user_meta, \
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import HTTPMethodNotAllowed
 from swift.common.utils import split_path, md5
+from swift.common.utils.timestamp import parse_timestamp
 
 from test.debug_logger import debug_logger
 from test.unit import FakeRing
@@ -316,6 +317,12 @@ class FakeSwift(object):
                 return resp(env, start_response)
 
         req = swob.Request(env)
+
+        # Don't add x-timestamp like the proxy app would but do validate any
+        # existing x-timestamp
+        if 'X-Timestamp' in req.headers:
+            parse_timestamp(
+                req.headers['X-Timestamp'], req.swift_entity_type, req.method)
 
         # Capture the request before reading the body, in case the iter raises
         # an exception.
