@@ -208,11 +208,14 @@ class TestContainerBroker(test_db.TestDbBase):
         broker.initialize(self.ts().internal, 0)
 
         def do_test(now, reclaim_age, put_ts, delete_ts, expected):
-            mocked_get.return_value.\
-                __enter__.return_value.\
-                execute.return_value.\
-                fetchone.return_value = dict(delete_timestamp=delete_ts,
-                                             put_timestamp=put_ts)
+            mocked_get.return_value. \
+                __enter__.return_value. \
+                execute.return_value. \
+                fetchone.return_value = dict(
+                    # use no jitter here so that the 'right on reclaim' test
+                    # works
+                    delete_timestamp=Timestamp(delete_ts).normal,
+                    put_timestamp=Timestamp(put_ts).internal)
 
             self.assertEqual(expected,
                              broker.is_old_enough_to_reclaim(now, reclaim_age))
@@ -2049,36 +2052,42 @@ class TestContainerBroker(test_db.TestDbBase):
                             '5af83e3196bf99f440f31f2e1a6c9afe')
 
         # hash and size change with same data timestamp are ignored
-        t_encoded = encode_timestamps(t[0], t[1], t[1])
+        t_encoded = encode_timestamps(t[0],
+                                      t[1].normalized(),
+                                      t[1].normalized())
         broker.put_object('obj_name', t[0].internal, 456,
                           'application/x-test-2',
                           '1234567890abcdeffedcba0987654321',
-                          ctype_timestamp=t[1].internal,
-                          meta_timestamp=t[1].internal)
+                          ctype_timestamp=t[1].normalized().internal,
+                          meta_timestamp=t[1].normalized().internal)
         self.assertEqual(1, len(broker.get_items_since(0, 100)))
         self._assert_db_row(broker, 'obj_name', t_encoded, 123,
                             'application/x-test-2',
                             '5af83e3196bf99f440f31f2e1a6c9afe')
 
         # content-type change with same timestamp is ignored
-        t_encoded = encode_timestamps(t[0], t[1], t[2])
+        t_encoded = encode_timestamps(t[0],
+                                      t[1].normalized(),
+                                      t[2].normalized())
         broker.put_object('obj_name', t[0].internal, 456,
                           'application/x-test-ignored',
                           '1234567890abcdeffedcba0987654321',
-                          ctype_timestamp=t[1].internal,
-                          meta_timestamp=t[2].internal)
+                          ctype_timestamp=t[1].normalized().internal,
+                          meta_timestamp=t[2].normalized().internal)
         self.assertEqual(1, len(broker.get_items_since(0, 100)))
         self._assert_db_row(broker, 'obj_name', t_encoded, 123,
                             'application/x-test-2',
                             '5af83e3196bf99f440f31f2e1a6c9afe')
 
         # update with differing newer timestamps
-        t_encoded = encode_timestamps(t[4], t[6], t[8])
+        t_encoded = encode_timestamps(t[4],
+                                      t[6].normalized(),
+                                      t[8].normalized())
         broker.put_object('obj_name', t[4].internal, 789,
                           'application/x-test-3',
                           'abcdef1234567890abcdef1234567890',
-                          ctype_timestamp=t[6].internal,
-                          meta_timestamp=t[8].internal)
+                          ctype_timestamp=t[6].normalized().internal,
+                          meta_timestamp=t[8].normalized().internal)
         self.assertEqual(1, len(broker.get_items_since(0, 100)))
         self._assert_db_row(broker, 'obj_name', t_encoded, 789,
                             'application/x-test-3',
@@ -2088,31 +2097,35 @@ class TestContainerBroker(test_db.TestDbBase):
         broker.put_object('obj_name', t[3].internal, 9999,
                           'application/x-test-ignored',
                           'ignored_hash',
-                          ctype_timestamp=t[5].internal,
-                          meta_timestamp=t[7].internal)
+                          ctype_timestamp=t[5].normalized().internal,
+                          meta_timestamp=t[7].normalized().internal)
         self.assertEqual(1, len(broker.get_items_since(0, 100)))
         self._assert_db_row(broker, 'obj_name', t_encoded, 789,
                             'application/x-test-3',
                             'abcdef1234567890abcdef1234567890')
 
         # content_type_timestamp == None defaults to data timestamp
-        t_encoded = encode_timestamps(t[9], t[9], t[8])
+        t_encoded = encode_timestamps(t[9],
+                                      t[9].normalized(),
+                                      t[8].normalized())
         broker.put_object('obj_name', t[9].internal, 9999,
                           'application/x-test-new',
                           'new_hash',
                           ctype_timestamp=None,
-                          meta_timestamp=t[7].internal)
+                          meta_timestamp=t[7].normalized().internal)
         self.assertEqual(1, len(broker.get_items_since(0, 100)))
         self._assert_db_row(broker, 'obj_name', t_encoded, 9999,
                             'application/x-test-new',
                             'new_hash')
 
         # meta_timestamp == None defaults to data timestamp
-        t_encoded = encode_timestamps(t[9], t[10], t[10])
+        t_encoded = encode_timestamps(t[9],
+                                      t[10].normalized(),
+                                      t[10].normalized())
         broker.put_object('obj_name', t[8].internal, 1111,
                           'application/x-test-newer',
                           'older_hash',
-                          ctype_timestamp=t[10].internal,
+                          ctype_timestamp=t[10].normalized().internal,
                           meta_timestamp=None)
         self.assertEqual(1, len(broker.get_items_since(0, 100)))
         self._assert_db_row(broker, 'obj_name', t_encoded, 9999,
@@ -2157,7 +2170,7 @@ class TestContainerBroker(test_db.TestDbBase):
         listing = broker.list_objects_iter(100, '', None, None, '')
         self.assertEqual(len(listing), 1)
         self.assertEqual(listing[0][0], 'obj1')
-        self.assertEqual(listing[0][1], t1.internal)
+        self.assertEqual(listing[0][1], t1.normalized().internal)
 
         # used later
         t2 = self.ts()
@@ -2169,7 +2182,7 @@ class TestContainerBroker(test_db.TestDbBase):
         listing = broker.list_objects_iter(100, '', None, None, '')
         self.assertEqual(len(listing), 1)
         self.assertEqual(listing[0][0], 'obj1')
-        self.assertEqual(listing[0][1], t3.internal)
+        self.assertEqual(listing[0][1], t3.normalized().internal)
 
         # all parts updated at t2, last-modified should remain at t3
         t_encoded = encode_timestamps(t2, t2, t2)
@@ -2177,7 +2190,7 @@ class TestContainerBroker(test_db.TestDbBase):
         listing = broker.list_objects_iter(100, '', None, None, '')
         self.assertEqual(len(listing), 1)
         self.assertEqual(listing[0][0], 'obj1')
-        self.assertEqual(listing[0][1], t3.internal)
+        self.assertEqual(listing[0][1], t3.normalized().internal)
 
         # all parts updated at t4, last-modified should be t4
         t4 = self.ts()
@@ -6734,50 +6747,50 @@ class TestUpdateNewItemFromExisting(unittest.TestCase):
         #
         ({'created_at': t3.internal},
          {'created_at': t0,
-          'ctype_timestamp': t0,
-          'meta_timestamp': t0},
+          'ctype_timestamp': t0.normalized(),
+          'meta_timestamp': t0.normalized()},
          {'created_at': t3.internal,
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal},
          {'created_at': t0,
-          'ctype_timestamp': t0,
-          'meta_timestamp': t1},
+          'ctype_timestamp': t0.normalized(),
+          'meta_timestamp': t1.normalized()},
          {'created_at': t3.internal,
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal},
          {'created_at': t0,
-          'ctype_timestamp': t1,
-          'meta_timestamp': t1},
+          'ctype_timestamp': t1.normalized(),
+          'meta_timestamp': t1.normalized()},
          {'created_at': t3.internal,
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal},
          {'created_at': t0,
-          'ctype_timestamp': t1,
-          'meta_timestamp': t2},
+          'ctype_timestamp': t1.normalized(),
+          'meta_timestamp': t2.normalized()},
          {'created_at': t3.internal,
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal},
          {'created_at': t0,
-          'ctype_timestamp': t1,
-          'meta_timestamp': t3},
+          'ctype_timestamp': t1.normalized(),
+          'meta_timestamp': t3.normalized()},
          {'created_at': t3.internal,
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal},
          {'created_at': t0,
-          'ctype_timestamp': t3,
-          'meta_timestamp': t3},
+          'ctype_timestamp': t3.normalized(),
+          'meta_timestamp': t3.normalized()},
          {'created_at': t3.internal,
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal},
          {'created_at': t3,
-          'ctype_timestamp': t3,
-          'meta_timestamp': t3},
+          'ctype_timestamp': t3.normalized(),
+          'meta_timestamp': t3.normalized()},
          {'created_at': t3.internal,
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
@@ -6787,64 +6800,64 @@ class TestUpdateNewItemFromExisting(unittest.TestCase):
         #
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t0,
-          'ctype_timestamp': t0,
-          'meta_timestamp': t0},
+          'ctype_timestamp': t0.normalized(),
+          'meta_timestamp': t0.normalized()},
          {'created_at': t3.internal + '+2+2',
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t3,
-          'ctype_timestamp': t3,
-          'meta_timestamp': t3},
+          'ctype_timestamp': t3.normalized(),
+          'meta_timestamp': t3.normalized()},
          {'created_at': t3.internal + '+2+2',
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t3,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t4},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t4.normalized()},
          {'created_at': t3.internal + '+2+2',
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t3,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t5},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t5.normalized()},
          {'created_at': t3.internal + '+2+2',
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t3,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t7},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t7.normalized()},
          {'created_at': t3.internal + '+2+2',
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t3,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t7},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t7.normalized()},
          {'created_at': t3.internal + '+2+2',
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t3,
-          'ctype_timestamp': t5,
-          'meta_timestamp': t5},
+          'ctype_timestamp': t5.normalized(),
+          'meta_timestamp': t5.normalized()},
          {'created_at': t3.internal + '+2+2',
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t3,
-          'ctype_timestamp': t5,
-          'meta_timestamp': t6},
+          'ctype_timestamp': t5.normalized(),
+          'meta_timestamp': t6.normalized()},
          {'created_at': t3.internal + '+2+2',
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t3,
-          'ctype_timestamp': t5,
-          'meta_timestamp': t7},
+          'ctype_timestamp': t5.normalized(),
+          'meta_timestamp': t7.normalized()},
          {'created_at': t3.internal + '+2+2',
          'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
     )
@@ -6853,29 +6866,29 @@ class TestUpdateNewItemFromExisting(unittest.TestCase):
         # no existing record
         (None,
          {'created_at': t4,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t4},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t4.normalized()},
          {'created_at': t4.internal,
           'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         (None,
          {'created_at': t4,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t5},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t5.normalized()},
          {'created_at': t4.internal + '+0+1',
           'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         (None,
          {'created_at': t4,
-          'ctype_timestamp': t5,
-          'meta_timestamp': t5},
+          'ctype_timestamp': t5.normalized(),
+          'meta_timestamp': t5.normalized()},
          {'created_at': t4.internal + '+1+0',
           'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         (None,
          {'created_at': t4,
-          'ctype_timestamp': t5,
-          'meta_timestamp': t6},
+          'ctype_timestamp': t5.normalized(),
+          'meta_timestamp': t6.normalized()},
          {'created_at': t4.internal + '+1+1',
           'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
@@ -6886,29 +6899,29 @@ class TestUpdateNewItemFromExisting(unittest.TestCase):
         #
         ({'created_at': t3.internal},
          {'created_at': t4,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t4},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t4.normalized()},
          {'created_at': t4.internal,
          'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         ({'created_at': t3.internal},
          {'created_at': t4,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t5},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t5.normalized()},
          {'created_at': t4.internal + '+0+1',
          'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         ({'created_at': t3.internal},
          {'created_at': t4,
-          'ctype_timestamp': t5,
-          'meta_timestamp': t5},
+          'ctype_timestamp': t5.normalized(),
+          'meta_timestamp': t5.normalized()},
          {'created_at': t4.internal + '+1+0',
          'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         ({'created_at': t3.internal},
          {'created_at': t4,
-          'ctype_timestamp': t5,
-          'meta_timestamp': t6},
+          'ctype_timestamp': t5.normalized(),
+          'meta_timestamp': t6.normalized()},
          {'created_at': t4.internal + '+1+1',
          'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
@@ -6918,36 +6931,36 @@ class TestUpdateNewItemFromExisting(unittest.TestCase):
         #
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t4,
-          'ctype_timestamp': t6,
-          'meta_timestamp': t8},
+          'ctype_timestamp': t6.normalized(),
+          'meta_timestamp': t8.normalized()},
          {'created_at': t4.internal + '+2+2',
          'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t6,
-          'ctype_timestamp': t6,
-          'meta_timestamp': t8},
+          'ctype_timestamp': t6.normalized(),
+          'meta_timestamp': t8.normalized()},
          {'created_at': t6.internal + '+0+2',
          'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t4,
-          'ctype_timestamp': t8,
-          'meta_timestamp': t8},
+          'ctype_timestamp': t8.normalized(),
+          'meta_timestamp': t8.normalized()},
          {'created_at': t4.internal + '+4+0',
          'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t6,
-          'ctype_timestamp': t8,
-          'meta_timestamp': t8},
+          'ctype_timestamp': t8.normalized(),
+          'meta_timestamp': t8.normalized()},
          {'created_at': t6.internal + '+2+0',
          'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t8,
-          'ctype_timestamp': t8,
-          'meta_timestamp': t8},
+          'ctype_timestamp': t8.normalized(),
+          'meta_timestamp': t8.normalized()},
          {'created_at': t8.internal,
          'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
     )
@@ -6960,22 +6973,22 @@ class TestUpdateNewItemFromExisting(unittest.TestCase):
         #
         ({'created_at': t3.internal},
          {'created_at': t3,
-          'ctype_timestamp': t3,
-          'meta_timestamp': t4},
+          'ctype_timestamp': t3.normalized(),
+          'meta_timestamp': t4.normalized()},
          {'created_at': t3.internal + '+0+1',
           'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal},
          {'created_at': t3,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t4},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t4.normalized()},
          {'created_at': t3.internal + '+1+0',
           'etag': 'Existing', 'size': 'eXisting', 'content_type': 'neW_item'}),
 
         ({'created_at': t3.internal},
          {'created_at': t3,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t5},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t5.normalized()},
          {'created_at': t3.internal + '+1+1',
           'etag': 'Existing', 'size': 'eXisting', 'content_type': 'neW_item'}),
 
@@ -6985,44 +6998,44 @@ class TestUpdateNewItemFromExisting(unittest.TestCase):
         #
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t3,
-          'ctype_timestamp': t3,
-          'meta_timestamp': t8},
+          'ctype_timestamp': t3.normalized(),
+          'meta_timestamp': t8.normalized()},
          {'created_at': t3.internal + '+2+3',
           'etag': 'Existing', 'size': 'eXisting', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t3,
-          'ctype_timestamp': t6,
-          'meta_timestamp': t8},
+          'ctype_timestamp': t6.normalized(),
+          'meta_timestamp': t8.normalized()},
          {'created_at': t3.internal + '+3+2',
           'etag': 'Existing', 'size': 'eXisting', 'content_type': 'neW_item'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t4,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t6},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t6.normalized()},
          {'created_at': t4.internal + '+1+2',
           'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'exIsting'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t4,
-          'ctype_timestamp': t6,
-          'meta_timestamp': t6},
+          'ctype_timestamp': t6.normalized(),
+          'meta_timestamp': t6.normalized()},
          {'created_at': t4.internal + '+2+1',
           'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'neW_item'}),
 
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t4,
-          'ctype_timestamp': t4,
-          'meta_timestamp': t8},
+          'ctype_timestamp': t4.normalized(),
+          'meta_timestamp': t8.normalized()},
          {'created_at': t4.internal + '+1+3',
           'etag': 'New_item', 'size': 'nEw_item', 'content_type': 'exIsting'}),
 
         # this scenario is to check that the deltas are in hex
         ({'created_at': t3.internal + '+2+2'},
          {'created_at': t2,
-          'ctype_timestamp': t20,
-          'meta_timestamp': t30},
+          'ctype_timestamp': t20.normalized(),
+          'meta_timestamp': t30.normalized()},
          {'created_at': t3.internal + '+11+a',
           'etag': 'Existing', 'size': 'eXisting', 'content_type': 'neW_item'}),
     )
