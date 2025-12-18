@@ -1168,7 +1168,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         for policy_index in test_indexes:
             req = swob.Request.blank(
                 '/v1/a/c/o', method='DELETE', headers={
-                    'X-Timestamp': self.ts().internal})
+                    'X-Timestamp': self.normal_ts().internal})
             codes = [409] * self.obj_ring.replicas
             ts_iter = itertools.repeat(self.ts().internal)
             with set_http_connect(*codes, timestamps=ts_iter):
@@ -1419,7 +1419,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
                       for captured in mock_conn.requests]
         self.assertEqual(self.replicas(), len(timestamps))
         self.assertEqual(1, len(set(timestamps)))
-        self.assert_valid_timestamp(timestamps[0])
+        self.assert_valid_normal_timestamp(timestamps[0])
 
     def test_POST_sufficient_primaries_succeed_others_404(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
@@ -1612,7 +1612,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                       for captured in mock_conn.requests]
         self.assertEqual(3, len(timestamps))
         self.assertEqual(1, len(set(timestamps)))
-        self.assert_valid_timestamp(timestamps[0])
+        self.assert_valid_extended_timestamp(timestamps[0])
 
     def test_PUT_error_with_footers(self):
         footers_callback = make_footers_callback(b'')
@@ -2100,7 +2100,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         self.assertNotIn('Connection', resp.headers)
         self.assertEqual('GET', mock_conn.requests[0]['method'])
         timestamp = mock_conn.requests[0]['headers'].get('X-Timestamp')
-        self.assert_valid_timestamp(timestamp)
+        self.assert_valid_normal_timestamp(timestamp)
 
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
@@ -2113,7 +2113,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         self.assertNotIn('Connection', resp.headers)
         self.assertEqual('HEAD', mock_conn.requests[0]['method'])
         timestamp = mock_conn.requests[0]['headers'].get('X-Timestamp')
-        self.assert_valid_timestamp(timestamp)
+        self.assert_valid_normal_timestamp(timestamp)
 
     def test_GET_slow_read(self):
         self.app.recoverable_node_timeout = 0.01
@@ -2996,7 +2996,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 202)
 
-    def test_x_timestamp_not_overridden(self):
+    def test_x_timestamp_added_when_missing(self):
         def do_test(method, base_headers, resp_code):
             # no given x-timestamp
             req = swob.Request.blank(
@@ -3011,33 +3011,42 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                 # check value can be parsed as valid timestamp
                 Timestamp(req['headers']['X-Timestamp'])
 
-            # given x-timestamp is retained
-            def do_check(ts):
-                headers = dict(base_headers)
-                headers['X-Timestamp'] = ts.internal
-                req = swob.Request.blank(
-                    '/v1/a/c/o', method=method, headers=headers)
-                codes = [resp_code] * self.replicas()
-                with mocked_http_conn(*codes) as fake_conn:
-                    resp = req.get_response(self.app)
-                self.assertEqual(resp.status_int, resp_code)
-                self.assertEqual(self.replicas(), len(fake_conn.requests))
-                for req in fake_conn.requests:
-                    self.assertEqual(ts.internal,
-                                     req['headers']['X-Timestamp'])
+        do_test('PUT', {'Content-Length': 0}, 200)
+        do_test('DELETE', {}, 204)
 
-            do_check(Timestamp.now())
-            do_check(Timestamp.now(offset=123))
+    def test_x_timestamp_not_overridden(self):
+        # given x-timestamp is retained
+        def do_test(method, base_headers, ts, resp_code):
+            headers = dict(base_headers)
+            headers['X-Timestamp'] = ts.internal
+            req = swob.Request.blank(
+                '/v1/a/c/o', method=method, headers=headers)
+            codes = [resp_code] * self.replicas()
+            with mocked_http_conn(*codes) as fake_conn:
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, resp_code)
+            self.assertEqual(self.replicas(), len(fake_conn.requests))
+            for req in fake_conn.requests:
+                self.assertEqual(ts.internal,
+                                 req['headers']['X-Timestamp'])
 
+        ts = self.ts()
+        do_test('PUT', {'Content-Length': 0}, ts, 200)
+        ts.increment_offset(123)
+        do_test('PUT', {'Content-Length': 0}, ts, 200)
+        do_test('DELETE', {}, self.normal_ts(), 204)
+
+    def test_x_timestamp_sanity_checked(self):
+        def do_test(method, base_headers, resp_code):
             # given x-timestamp gets sanity checked
             headers = dict(base_headers)
             headers['X-Timestamp'] = 'bad timestamp'
             req = swob.Request.blank(
                 '/v1/a/c/o', method=method, headers=headers)
-            with mocked_http_conn() as fake_conn:
+            with mocked_http_conn():
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 400)
-            self.assertIn(b'X-Timestamp should be a UNIX timestamp ',
+            self.assertIn(b"Invalid X-Timestamp header: 'bad timestamp'",
                           resp.body)
 
         do_test('PUT', {'Content-Length': 0}, 200)
@@ -3447,7 +3456,7 @@ class TestECObjController(ECObjectControllerMixin, BaseUnitTestCase):
                           if h.lower().startswith('x-object-sysmeta-ec-')])
         self.assertEqual('GET', mock_conn.requests[0]['method'])
         timestamp = mock_conn.requests[0]['headers'].get('X-Timestamp')
-        self.assert_valid_timestamp(timestamp)
+        self.assert_valid_normal_timestamp(timestamp)
 
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o',
@@ -3465,7 +3474,7 @@ class TestECObjController(ECObjectControllerMixin, BaseUnitTestCase):
                           if h.lower().startswith('x-object-sysmeta-ec-')])
         self.assertEqual('HEAD', mock_conn.requests[0]['method'])
         timestamp = mock_conn.requests[0]['headers'].get('X-Timestamp')
-        self.assert_valid_timestamp(timestamp)
+        self.assert_valid_normal_timestamp(timestamp)
 
     def test_GET_disconnect(self):
         self.app.recoverable_node_timeout = 0.01
@@ -7408,7 +7417,7 @@ class TestECObjControllerMimePutter(BaseObjectControllerMixin,
                       for captured in mock_conn.requests]
         self.assertEqual(self.replicas(), len(timestamps))
         self.assertEqual(1, len(set(timestamps)))
-        self.assert_valid_timestamp(timestamps[0])
+        self.assert_valid_extended_timestamp(timestamps[0])
 
     def test_PUT_with_body_and_bad_etag(self):
         segment_size = self.policy.ec_segment_size

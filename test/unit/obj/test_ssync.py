@@ -1805,15 +1805,16 @@ class TestSsyncReplication(TestBaseSsync):
         name = 'o1'
         t1 = next(self.ts_iter)
         tx_objs[name] = self._create_ondisk_files(tx_df_mgr, name, policy, t1)
-        t1_type = next(self.ts_iter)
-        metadata_1 = {'X-Timestamp': t1_type.internal,
-                      'Content-Type': 'text/test',
-                      'Content-Type-Timestamp': t1_type.internal}
-        tx_objs[name][0].write_metadata(metadata_1)
-        t1_meta = next(self.ts_iter)
-        metadata_2 = {'X-Timestamp': t1_meta.internal,
-                      'X-Object-Meta-Test': name}
-        tx_objs[name][0].write_metadata(metadata_2)
+        t1_type = next(self.ts_iter).normalized()
+        metadata = {'X-Timestamp': t1_type.internal,
+                    'Content-Type': 'text/test',
+                    'Content-Type-Timestamp': t1_type.internal}
+        tx_objs[name][0].write_metadata(metadata)
+        t1_meta = next(self.ts_iter).normalized()
+        # mimic object server merging old and new metadata...
+        metadata.update({'X-Timestamp': t1_meta.internal,
+                         'X-Object-Meta-Test': name})
+        tx_objs[name][0].write_metadata(metadata)
         expected_subreqs['PUT'].append(name)
         expected_subreqs['POST'].append(name)
 
@@ -1822,15 +1823,17 @@ class TestSsyncReplication(TestBaseSsync):
         name = 'o2'
         t2 = next(self.ts_iter)
         tx_objs[name] = self._create_ondisk_files(tx_df_mgr, name, policy, t2)
-        t2_type = next(self.ts_iter)
-        metadata_1 = {'X-Timestamp': t2_type.internal,
-                      'Content-Type': 'text/test',
-                      'Content-Type-Timestamp': t2_type.internal}
-        tx_objs[name][0].write_metadata(metadata_1)
-        t2_meta = next(self.ts_iter)
+        t2_type = next(self.ts_iter).normalized()
+        metadata = {'X-Timestamp': t2_type.internal,
+                    'Content-Type': 'text/test',
+                    'Content-Type-Timestamp': t2_type.internal}
+        tx_objs[name][0].write_metadata(metadata)
+        t2_meta = next(self.ts_iter).normalized()
         metadata_2 = {'X-Timestamp': t2_meta.internal,
                       'X-Object-Meta-Test': name}
-        tx_objs[name][0].write_metadata(metadata_2)
+        # mimic object server merging old and new metadata...
+        metadata.update(metadata_2)
+        tx_objs[name][0].write_metadata(metadata)
         rx_objs[name] = self._create_ondisk_files(rx_df_mgr, name, policy, t2)
         rx_objs[name][0].write_metadata(metadata_2)
         expected_subreqs['POST'].append(name)
@@ -1840,15 +1843,17 @@ class TestSsyncReplication(TestBaseSsync):
         name = 'o3'
         t3 = next(self.ts_iter)
         tx_objs[name] = self._create_ondisk_files(tx_df_mgr, name, policy, t3)
-        t3_type = next(self.ts_iter)
-        metadata_1 = {'X-Timestamp': t3_type.internal,
-                      'Content-Type': 'text/test',
-                      'Content-Type-Timestamp': t3_type.internal}
-        tx_objs[name][0].write_metadata(metadata_1)
-        t3_meta = next(self.ts_iter)
+        t3_type = next(self.ts_iter).normalized()
+        metadata = {'X-Timestamp': t3_type.internal,
+                    'Content-Type': 'text/test',
+                    'Content-Type-Timestamp': t3_type.internal}
+        tx_objs[name][0].write_metadata(metadata)
+        t3_meta = next(self.ts_iter).normalized()
         metadata_2 = {'X-Timestamp': t3_meta.internal,
                       'X-Object-Meta-Test': name}
-        tx_objs[name][0].write_metadata(metadata_2)
+        # mimic object server merging old and new metadata...
+        metadata.update(metadata_2)
+        tx_objs[name][0].write_metadata(metadata)
         rx_objs[name] = self._create_ondisk_files(rx_df_mgr, name, policy, t3)
         metadata_2b = {'X-Timestamp': t3_meta.internal,
                        'X-Object-Meta-Test': name,
@@ -1862,29 +1867,31 @@ class TestSsyncReplication(TestBaseSsync):
         name = 'o4'
         t4 = next(self.ts_iter)
         tx_objs[name] = self._create_ondisk_files(tx_df_mgr, name, policy, t4)
-        t4_type = next(self.ts_iter)
-        t4_meta = next(self.ts_iter)
+        t4_type = next(self.ts_iter).normalized()
+        t4_meta = next(self.ts_iter).normalized()
         metadata_2b = {'X-Timestamp': t4_meta.internal,
                        'X-Object-Meta-Test': name,
                        'Content-Type': 'text/test',
                        'Content-Type-Timestamp': t4_type.internal}
         tx_objs[name][0].write_metadata(metadata_2b)
         rx_objs[name] = self._create_ondisk_files(rx_df_mgr, name, policy, t4)
-        metadata_1 = {'X-Timestamp': t4_type.internal,
-                      'Content-Type': 'text/test',
-                      'Content-Type-Timestamp': t4_type.internal}
-        rx_objs[name][0].write_metadata(metadata_1)
+        metadata = {'X-Timestamp': t4_type.internal,
+                    'Content-Type': 'text/test',
+                    'Content-Type-Timestamp': t4_type.internal}
+        rx_objs[name][0].write_metadata(metadata)
         metadata_2 = {'X-Timestamp': t4_meta.internal,
                       'X-Object-Meta-Test': name}
-        rx_objs[name][0].write_metadata(metadata_2)
+        # mimic object server merging old and new metadata...
+        metadata.update(metadata_2)
+        rx_objs[name][0].write_metadata(metadata)
 
         # o5 on tx with one meta file having latest content-type, rx has
         # .data and no .meta
         name = 'o5'
         t5 = next(self.ts_iter)
         tx_objs[name] = self._create_ondisk_files(tx_df_mgr, name, policy, t5)
-        t5_type = next(self.ts_iter)
-        t5_meta = next(self.ts_iter)
+        t5_type = next(self.ts_iter).normalized()
+        t5_meta = next(self.ts_iter).normalized()
         metadata = {'X-Timestamp': t5_meta.internal,
                     'X-Object-Meta-Test': name,
                     'Content-Type': 'text/test',

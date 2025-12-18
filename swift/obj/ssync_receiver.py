@@ -48,6 +48,15 @@ def decode_missing(line):
     result['ts_data'] = ts_data = Timestamp(t_data)
     result['ts_meta'] = result['ts_ctype'] = ts_data
     result['durable'] = True  # default to True in case this key isn't sent
+
+    def ts_delta_hex_to_timestamp(ts, delta, hex_part):
+        # Creating from ts.normal will ignore ts_data offset and make a
+        # jitterless timestamp...
+        ts = Timestamp(ts.normal, delta=int(delta, 16))
+        # then apply any jitter/offset...
+        ts.hex_part = int(hex_part or '0', 16)
+        return ts
+
     if len(parts) > 2:
         # allow for a comma separated list of k:v pairs to future-proof
         subparts = urllib.parse.unquote(parts[2]).split(',')
@@ -56,15 +65,10 @@ def decode_missing(line):
             if k == 'm':
                 v, _, o = v.partition('__')
                 # ignore ts_data offset when calculating ts_meta
-                result['ts_meta'] = Timestamp(ts_data.normal,
-                                              delta=int(v, 16),
-                                              offset=int(o or '0', 16))
+                result['ts_meta'] = ts_delta_hex_to_timestamp(ts_data, v, o)
             elif k == 't':
                 v, _, o = v.partition('__')
-                # ignore ts_data offset when calculating ts_ctype
-                result['ts_ctype'] = Timestamp(Timestamp(ts_data).normal,
-                                               delta=int(v, 16),
-                                               offset=int(o or '0', 16))
+                result['ts_ctype'] = ts_delta_hex_to_timestamp(ts_data, v, o)
             elif k == 'durable':
                 result['durable'] = utils.config_true_value(v)
     return result

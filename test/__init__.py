@@ -116,17 +116,20 @@ class BaseTestCase(unittest.TestCase):
 
         self.fail(self._formatMessage(msg, standardMsg))
 
-    def assert_valid_timestamp(self, timestamp):
+    def assert_valid_extended_timestamp(self, timestamp):
         """
         Helper that asserts the given timestamp is a valid Timestamp
-        representation.
+        representation and has a hex part.
 
         :param timestamp: a string or instance of Timestamp
+        :returns: a Timestamp
         """
         try:
-            return Timestamp(timestamp)
+            timestamp = Timestamp(timestamp)
+            self.assertTrue(timestamp.hex_part)
+            return timestamp
         except (ValueError, TypeError) as e:
-            self.fail('Invalid timestamp (%r): %r' % (timestamp, e))
+            self.fail('Invalid Timestamp (%r): %r' % (timestamp, e))
 
     def assert_valid_normal_timestamp(self, timestamp):
         """

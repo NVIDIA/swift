@@ -956,11 +956,14 @@ class TestSender(SenderBase):
             b':MISSING_CHECK: START',
             b'9d41d8cd98f00b204e9800998ecf0abc %s' % (
                 timestamps[0].internal.encode('ascii')),
-            b'9d41d8cd98f00b204e9800998ecf0def %s m:186a0' % (
-                timestamps[1].internal.encode('ascii')),
+            b'9d41d8cd98f00b204e9800998ecf0def %s m:186a0__%x' % (
+                timestamps[1].internal.encode('ascii'),
+                timestamps[2].hex_part),
             (b'9d41d8cd98f00b204e9800998ecf1def %s '
-             b'm:30d40,t:186a0' % (
-                 timestamps[3].internal.encode('ascii'))),
+             b'm:30d40__%x,t:186a0__%x' % (
+                 timestamps[3].internal.encode('ascii'),
+                 timestamps[5].hex_part,
+                 timestamps[4].hex_part)),
             b':MISSING_CHECK: END']
         self.assertConnectionMessages(expected_messages, connection.sent)
         self.assertEqual(send_map, {})
@@ -1026,8 +1029,9 @@ class TestSender(SenderBase):
             b':MISSING_CHECK: START',
             b'9d41d8cd98f00b204e9800998ecf0abc %s' % (
                 timestamps[0].internal.encode('ascii')),
-            b'9d41d8cd98f00b204e9800998ecf0def %s m:186a0' % (
-                timestamps[1].internal.encode('ascii')),
+            b'9d41d8cd98f00b204e9800998ecf0def %s m:186a0__%x' % (
+                timestamps[1].internal.encode('ascii'),
+                timestamps[2].hex_part),
             b':MISSING_CHECK: END']
         self.assertConnectionMessages(expected_messages, connection.sent)
         self.assertEqual(send_map, {})
@@ -1086,8 +1090,9 @@ class TestSender(SenderBase):
             b':MISSING_CHECK: START',
             b'9d41d8cd98f00b204e9800998ecf0abc %s' % (
                 timestamps[0].internal.encode('ascii')),
-            b'9d41d8cd98f00b204e9800998ecf0def %s m:186a0' % (
-                timestamps[1].internal.encode('ascii')),
+            b'9d41d8cd98f00b204e9800998ecf0def %s m:186a0__%x' % (
+                timestamps[1].internal.encode('ascii'),
+                timestamps[2].hex_part),
             b':MISSING_CHECK: END']
         self.assertConnectionMessages(expected_messages, connection.sent)
         self.assertEqual(send_map, {})
@@ -2040,9 +2045,10 @@ class TestModuleMethods(unittest.TestCase):
     def test_encode_missing(self):
         object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
         ts_iter = make_timestamp_iter()
-        t_data = next(ts_iter)
-        t_type = next(ts_iter)
-        t_meta = next(ts_iter)
+        # version 1 timestamps first
+        t_data = Timestamp(next(ts_iter).normal)
+        t_type = Timestamp(next(ts_iter).normal)
+        t_meta = Timestamp(next(ts_iter).normal)
         d_meta_data = t_meta.raw - t_data.raw
         d_type_data = t_type.raw - t_data.raw
 
@@ -2104,6 +2110,22 @@ class TestModuleMethods(unittest.TestCase):
         t_meta_offset = utils.Timestamp(t_meta, offset=1)
         t_type_offset = utils.Timestamp(t_type, offset=2)
         expected = ('%s %s m:%x__1,t:%x__2'
+                    % (object_hash, t_data_offset.internal, d_meta_data,
+                       d_type_data))
+        self.assertEqual(
+            expected.encode('ascii'),
+            ssync_sender.encode_missing(
+                object_hash, t_data_offset, t_meta_offset, t_type_offset,
+                durable=True))
+
+        # timestamps with a jitter are also supported
+        t_data_offset = utils.Timestamp(t_data.normal + "_2feed12345000000",
+                                        offset=99)
+        t_meta_offset = utils.Timestamp(t_meta.normal + "_2cafe12345000000",
+                                        offset=1)
+        t_type_offset = utils.Timestamp(t_type.normal + '_2beef12345000000',
+                                        offset=2)
+        expected = ('%s %s m:%x__2cafe12345000001,t:%x__2beef12345000002'
                     % (object_hash, t_data_offset.internal, d_meta_data,
                        d_type_data))
         self.assertEqual(

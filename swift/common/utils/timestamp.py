@@ -19,14 +19,23 @@ import datetime
 import functools
 import math
 import time
+import random
 
 
 NORMAL_FORMAT = "%016.05f"
 INTERNAL_FORMAT = NORMAL_FORMAT + '_%016x'
 SHORT_FORMAT = NORMAL_FORMAT + '_%x'
 HEX_PART_DIGITS = 16
-MAX_OFFSET = (16 ** HEX_PART_DIGITS) - 1
+MAX_HEX_PART = (16 ** HEX_PART_DIGITS) - 1
+# Note: Previous versions of the Timestamp class allocated the entire 16 digit
+# hex_part to offset. To accommodate Timestamps with jitter, the offset of a
+# legacy Timestamps has now been restricted to a maximum of 0x1fffffffffffffff,
+# based on the assumption that no existing Timestamp has a larger offset.
+# Timestamp offsets are restricted to 6 hex digits
+NUM_OFFSET_DIGITS = 6
 PRECISION = 1e-5
+# raw time has units of PRECISION
+MAX_RAW_TIME = 999999999999999
 # Setting this to True will cause the internal format to always display
 # extended digits - even when the value is equivalent to the normalized form.
 # This isn't ideal during an upgrade when some servers might not understand
@@ -195,7 +204,7 @@ class BaseTimestamp:
         delta = start - EPOCH
         # This calculation is based on Python 2.7's Modules/datetimemodule.c,
         # function delta_to_microseconds(), but written in Python.
-        return cls(delta.total_seconds())
+        return cls(str(delta.total_seconds()))
 
     def ceil(self):
         """
@@ -280,7 +289,8 @@ class NormalTimestamp(BaseTimestamp):
     def _parse(self, timestamp_str, **kwargs):
         if '_' in timestamp_str:
             # note: python will cast 1.2_3 to a float, and we do not want to
-            # accidentally parse a Timestamp (with offset) as a NormalTimestamp
+            # accidentally parse a Timestamp (with a hex_part) as a
+            # NormalTimestamp
             raise ValueError('timestamp must not contain "_"')
         return float(timestamp_str)
 
@@ -297,7 +307,7 @@ class Timestamp(BaseTimestamp):
     of seconds since the epoch rounded to deca-microsecond precision, followed
     by a 16 digit hex part, e.g.:
 
-        1402464677.04188_0000000000000001
+        1402464677.04188_212345abcd000000
         <  float secs  >_<   hex part   >
 
     The fixed width of the parts ensures stable sort order.
@@ -310,6 +320,15 @@ class Timestamp(BaseTimestamp):
     is used by internal services (e.g. the reconciler). Normal client
     operations will not create a timestamp with an offset.
 
+    Modern version 2 Timestamps encode the offset in the final 6 digits of the
+    hex part. The first 10 digits of the hex part encode a randomly generated
+    "jitter" component that differentiates timestamps within the same
+    deca-microsecond. For example, a version 2 Timestamp with offset 1 has the
+    following internalized form:
+
+        1402464677.04188_212345abcd000001
+        <  float secs  >_< jitter ><off.>
+
     The hex part is not exposed to clients in responses from Swift. Instead, a
     normalized form of the timestamps is used which comprises only the
     deca-microsecond precision float part, and is identical to the form of a
@@ -317,16 +336,21 @@ class Timestamp(BaseTimestamp):
 
         1402464677.04188
 
-    Timestamps allocate the entire 16 digit hex part to the offset. For
-    example, a Timestamp with offset 1 has the following internalized form:
+    Legacy version 1 Timestamps allocated the entire 16 digit hex part to the
+    offset. For example, a version 1 Timestamp with offset 1 has the following
+    internalized form:
 
         1402464677.04188_0000000000000001
         <  float secs  >_<     offset   >
 
-    When the offset of a Timestamp is 0 it is considered insignificant and the
-    hex part is not included in the internalized form. When a Timestamp has a
-    non-zero offset the hex part will always be represented in the internalized
-    form, but is still excluded from the normalized form.
+    When the offset of a version 1 Timestamp is 0 it is considered
+    insignificant and the hex part is not included in the internalized form.
+    When a version 1 Timestamp has a non-zero offset the hex part will always
+    be represented in the internalized form, but is still excluded from the
+    normalized form.
+
+    Note: version 1 Timestamps are deprecated and supported for backwards
+    compatibility only.
 
     Timestamps with an equivalent float part will compare and order by their
     hex part.  Timestamps with a greater float part will always compare and
@@ -336,9 +360,20 @@ class Timestamp(BaseTimestamp):
     timestamps which do not include a hex part.
     """
 
-    def __init__(self, timestamp, offset=0, delta=0, check_bounds=True):
+    def __init__(self, timestamp, offset=0, delta=0, check_bounds=True,
+                 version=None):
         """
         Create a new Timestamp.
+
+        Note: the ``timestamp.generate_timestamp`` function is the recommended
+        way to create a fresh timestamp for a request.
+
+        Note: the ``timestamp.Timestamp.zero`` method should be used to create
+        a falsey timestamp that is at exactly zero time.
+
+        Note: A sequence of version 2 Timestamps created *within the same
+        deca-microsecond* is NOT guaranteed to be monotonically increasing
+        because the jitter component of the hex part is randomly generated.
 
         :param timestamp: the value may be one of:
             * a float or integer: time in seconds since the Epoch; the
@@ -358,39 +393,87 @@ class Timestamp(BaseTimestamp):
         :param check_bounds: if True (default) then a ValueError will be raised
             if the given timestamp is less than 0 or greater than the maximum
             time that can be represented by this class.
+        :param version: (int) the version of the timestamp to be generated.
+            This argument is only allowed when ``timestamp`` is a float i.e.
+            when generating a new timestamp. This should be set to 2 to
+            generate a modern Timestamp with random jitter.
         """
-        self._offset = 0
-        super().__init__(timestamp, delta=delta, check_bounds=check_bounds)
+        self.hex_part = 0
+        super().__init__(timestamp, delta=delta, check_bounds=check_bounds,
+                         version=version)
         self.increment_offset(offset)
 
-    def _create(self, timestamp, **kwargs):
+    def _create(self, timestamp, version=1, **kwargs):
+        version = version if version is not None else 1
+        if version == 1:
+            self.hex_part = 0
+        elif version == 2:
+            jitter_value = random.randint(0x000000000, 0xfffffffff)
+            jitter_value += 0x2000000000
+            # jitter is shifted to the left of the 6 offset digits
+            self.hex_part = jitter_value << (4 * NUM_OFFSET_DIGITS)
+        else:
+            raise ValueError('Invalid version')
         return float(timestamp)
 
-    def _parse(self, timestamp_str, **kwargs):
+    def _parse(self, timestamp_str, version=None, **kwargs):
+        if version is not None:
+            raise TypeError('version not allowed when parsing timestamp')
         float_str, hex_str = timestamp_str.partition('_')[::2]
         if '_' in hex_str:
             raise ValueError('invalid literal for int() with base 16: '
                              '%r' % hex_str)
         if len(hex_str) > HEX_PART_DIGITS:
-            raise ValueError('hex part too long: %r' % hex_str)
-        self.offset = int(hex_str, 16) if hex_str else 0
+            raise ValueError('hex_part too long: %r' % hex_str)
+        self.hex_part = int(hex_str, 16) if hex_str else 0
         return float(float_str)
 
     @property
-    def offset(self):
-        return self._offset
+    def _offset(self):
+        if self.hex_part < 0x2000000000000000:
+            # Previous versions of this class allowed offset to grow beyond the
+            # current limit of 0xffffff so make some allowance for larger
+            # values.
+            return self.hex_part
+        else:
+            # The upper hex digits are used for jitter so offset is constrained
+            # to the rightmost six digits.
+            return self.hex_part & 0xffffff
 
-    @offset.setter
-    def offset(self, value):
+    @_offset.setter
+    def _offset(self, value):
         if not value:
             return
         if value < 0:
             raise ValueError('offset must be non-negative')
 
-        if value > MAX_OFFSET:
+        if self.hex_part < 0x2000000000000000:
+            max_offset = 0x1fffffffffffffff
+        elif self.hex_part < 0x3000000000000000:
+            max_offset = 0xffffff
+        else:
+            # we don't know how many hex digits have been allocated to offset
+            # in a future version of this class so it is not safe to modify it
+            raise ValueError('Cannot modify offset in an unrecognised hex '
+                             'part encoding')
+
+        if value > max_offset:
             raise ValueError('offset must be less than or equal to %d'
-                             % MAX_OFFSET)
-        self._offset = value
+                             % max_offset)
+        self.hex_part = (self.hex_part & ~max_offset) + value
+
+    @property
+    def offset(self):
+        """
+        This is here for backwards compatibility only. Callers should not
+        attach any meaning to the absolute value of offset.
+        """
+        if self.hex_part >= 0x3000000000000000:
+            # we don't know how many hex digits have been allocated to offset
+            # in a future version of this class so it is not safe to return it
+            raise AttributeError('Cannot access offset in an unrecognised '
+                                 'hex_part encoding')
+        return self._offset
 
     def increment_offset(self, value):
         """
@@ -403,44 +486,61 @@ class Timestamp(BaseTimestamp):
             return
         if value < 0:
             raise ValueError('offset must be non-negative')
-        self.offset += value
-        return self.offset
+        self._offset += value
+        return self._offset
 
     @classmethod
-    def now(cls, offset=0, delta=0):
+    def now(cls, offset=0, delta=0, version=1):
         """
         Returns an instance of a Timestamp at the current time.
 
         :param offset: (int) the second internal offset vector
         :param delta: (int) deca-microsecond difference to be added to the
             current time.
+        :param version: (int) the version of the timestamp to be generated.
+            This should be set to 2 to generate a modern version 2 Timestamp
+            with random jitter.
         """
-        return cls(time.time(), offset=offset, delta=delta)
+        return cls(time.time(), offset=offset, delta=delta, version=version)
 
     def __repr__(self):
-        return INTERNAL_FORMAT % (self.timestamp, self.offset)
+        return self._internal_format(self.timestamp, self.hex_part, True)
 
     def __bool__(self):
-        return super().__bool__() or bool(self.offset)
+        return super().__bool__() or bool(self.hex_part)
+
+    def _internal_format(self, timestamp, hex_part, force_internal=False):
+        if hex_part or force_internal:
+            return INTERNAL_FORMAT % (timestamp, hex_part)
+        else:
+            return NORMAL_FORMAT % timestamp
 
     @property
     def internal(self):
-        if self.offset or FORCE_INTERNAL:
-            return INTERNAL_FORMAT % (self.timestamp, self.offset)
-        else:
-            return self.normal
+        return self._internal_format(
+            self.timestamp, self.hex_part, FORCE_INTERNAL)
 
     @property
     def short(self):
-        if self.offset or FORCE_INTERNAL:
-            return SHORT_FORMAT % (self.timestamp, self.offset)
+        # TODO:: For modern object PUT x-timestamps that always have a hex_part
+        #  whose string representation will have 16 digits, this format is
+        #  identical to the internal format. Furthermore, this format is only
+        #  used to encode object data timestamps (i.e. PUT x-timestamps) in the
+        #  encode_timestamps function. As such it has become redundant and
+        #  should be removed/deprecated.
+        if self.hex_part or FORCE_INTERNAL:
+            return SHORT_FORMAT % (self.timestamp, self.hex_part)
         else:
             return self.normal
 
     def __invert__(self):
-        if self.offset:
-            raise ValueError('Cannot invert timestamps with offsets')
-        return super().__invert__()
+        inv_raw = (MAX_RAW_TIME - self.raw) * PRECISION
+        if not self.hex_part:
+            # legacy Timestamps did not allow inversion of hex_parts
+            inv_hex_part = 0
+        else:
+            inv_hex_part = MAX_HEX_PART - self.hex_part
+        return Timestamp(self._internal_format(inv_raw, inv_hex_part))
 
     def normalized(self):
         """
@@ -456,6 +556,15 @@ class Timestamp(BaseTimestamp):
         return NormalTimestamp(self.normal)
 
 
+def timestamp2():
+    """
+    Generate a version 2 Timestamp using the current time and random jitter.
+
+    :returns: an instance of Timestamp.
+    """
+    return Timestamp.now(version=2)
+
+
 def encode_timestamps(t1, t2=None, t3=None, explicit=False):
     """
     Encode up to three timestamps into a string. Unlike a Timestamp object, the
@@ -467,13 +576,13 @@ def encode_timestamps(t1, t2=None, t3=None, explicit=False):
         <t1>[<+/-><t2 - t1>[<+/-><t3 - t2>]]
 
     i.e. if t1 = t2 = t3 then just the string representation of t1 is returned,
-    otherwise the time offsets for t2 and t3 are appended. If explicit is True
-    then the offsets for t2 and t3 are always appended even if zero.
+    otherwise the time deltas for t2 and t3 are appended. If explicit is True
+    then the deltas for t2 and t3 are always appended even if zero.
 
-    Note: any offset value in t1 will be preserved, but offsets on t2 and t3
-    are not preserved. In the anticipated use cases for this method (and the
+    Note: any hex_part value in t1 will be preserved, but hex_parts on t2 and
+    t3 are not preserved. In the anticipated use cases for this method (and the
     inverse decode_timestamps method) the timestamps passed as t2 and t3 are
-    not expected to have offsets as they will be timestamps associated with a
+    not expected to have hex_parts as they will be timestamps associated with a
     POST request. In the case where the encoding is used in a container objects
     table row, t1 could be the PUT or DELETE time but t2 and t3 represent the
     content type and metadata times (if different from the data file) i.e.
@@ -483,6 +592,8 @@ def encode_timestamps(t1, t2=None, t3=None, explicit=False):
     form = '{0}'
     values = [t1.short]
     if t2 is not None:
+        # XXX note that any hex_part that t2 or t3 might have is NOT included
+        # in the encoded combination
         t2_t1_delta = t2.raw - t1.raw
         explicit = explicit or (t2_t1_delta != 0)
         values.append(t2_t1_delta)
@@ -530,17 +641,21 @@ def decode_timestamps(encoded, explicit=False):
         t2 = t1
         delta = signs[1] * int(parts[1], 16)
         # if delta = 0 we want t2 = t3 = t1 in order to
-        # preserve any offset in t1 - only construct a distinct
+        # preserve any hex_part in t1 - only construct a distinct
         # timestamp if there is a non-zero delta.
         if delta:
-            t2 = Timestamp((t1.raw + delta) * PRECISION)
+            # we lost the original hex_part of t2 when encoding, so we have no
+            # choice other than to force it to zero when decoding
+            t2 = Timestamp(str((t1.raw + delta) * PRECISION))
     elif not explicit:
         t2 = t1
     if len(parts) > 2:
         t3 = t2
         delta = signs[2] * int(parts[2], 16)
         if delta:
-            t3 = Timestamp((t2.raw + delta) * PRECISION)
+            # we lost the original hex_part of t2 when encoding, so we have no
+            # choice other than to force it to zero when decoding
+            t3 = Timestamp(str((t2.raw + delta) * PRECISION))
     elif not explicit:
         t3 = t2
     return t1, t2, t3
@@ -593,5 +708,65 @@ def normalize_delete_at_timestamp(timestamp, high_precision=False):
     :param timestamp: unix timestamp
     :returns: normalized timestamp as a string
     """
+    # Note: high_precision is used by container_deleter and SLO async_delete.
+    # Deca-microsecond precision is considered sufficient for the
+    # high_precision format; an object that was PUT in the same
+    # deca-microsecond won't be deleted. Adding a hex_part extension to the
+    # delete timestamp won't necessarily help, because the hex_part is not
+    # guaranteed to advance monotonically within the same deca-microsecond, so
+    # the delete timestamp could still sort 'older' than a previous PUT in the
+    # same deca-microsecond.
     fmt = '%016.5f' if high_precision else '%010d'
     return fmt % min(max(0, float(timestamp)), 9999999999.99999)
+
+
+def generate_timestamp(resource_type, request_method):
+    """
+    Returns a timestamp of the appropriate type for the given resource_type and
+    request method.
+
+    This is the preferred way to create an X-Timestamp value for a request.
+
+    :param resource_type: one of 'account', 'container', 'object' or None.
+    :param request_method: a request method.
+    :returns: timestamp, an instance of BaseTimestamp.
+    """
+    # TODO: this comment is stale/wrong, but should it be true?
+    # note: always use Timestamp.now() to generate the timestamp, and then cast
+    # to a NormalTimestamp when necessary, so that tests can mock only
+    # Timestamp.now() to mock timestamps for *all request types*.
+    if (resource_type
+            and resource_type.lower() == 'object'
+            and request_method == 'PUT'):
+        return timestamp2()
+    else:
+        return NormalTimestamp.now()
+
+
+def parse_timestamp(value, resource_type, request_method):
+    """
+    Parse a timestamp string and validate it for the given resource_type and
+    request_method.
+
+    :param value: timestamp string.
+    :param resource_type: one of 'account', 'container', 'object' or None.
+    :param request_method: a request method.
+    :returns: timestamp, an instance of BaseTimestamp.
+    :raises: ValueError if the timestamp string is invalid for the given
+        resource_type and request_method.
+    """
+    if not resource_type:
+        return NormalTimestamp(value)
+    elif resource_type.lower() == 'object' and request_method == 'PUT':
+        return Timestamp(value)
+    elif resource_type.lower() == 'object' and request_method == 'DELETE':
+        # Extended timestamps are allowed on object DELETE to accommodate the
+        # reconciler deleting misplaced objects.
+        return Timestamp(value)
+    elif request_method in ('HEAD', 'GET'):
+        # Extended timestamps are allowed on HEADs and GETS to accommodate
+        # subrequests that inherit an x-timestamp from an object PUT requests
+        # e.g. a container GET for shard ranges.
+        return Timestamp(value)
+    else:
+        return NormalTimestamp(value)
