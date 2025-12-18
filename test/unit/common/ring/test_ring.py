@@ -33,12 +33,14 @@ import zlib
 from swift.common.exceptions import DevIdBytesTooSmall
 from swift.common import ring, utils
 from swift.common.ring import io, utils as ring_utils
+from test.unit import BaseUnitTestCase
 
 
-class TestRingBase(unittest.TestCase):
+class TestRingBase(BaseUnitTestCase):
     longMessage = True
 
     def setUp(self):
+        super().setUp()
         self._orig_hash_suffix = utils.HASH_PATH_SUFFIX
         self._orig_hash_prefix = utils.HASH_PATH_PREFIX
         utils.HASH_PATH_SUFFIX = b'endcap'
@@ -47,6 +49,7 @@ class TestRingBase(unittest.TestCase):
     def tearDown(self):
         utils.HASH_PATH_SUFFIX = self._orig_hash_suffix
         utils.HASH_PATH_PREFIX = self._orig_hash_prefix
+        super().tearDown()
 
 
 class TestRingData(unittest.TestCase):

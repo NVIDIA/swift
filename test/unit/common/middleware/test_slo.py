@@ -32,7 +32,8 @@ from swift.common.swob import Request, HTTPException, str_to_wsgi, \
     bytes_to_wsgi
 from swift.common.utils import quote, closing_if_possible, close_if_possible, \
     parse_content_type, iter_multipart_mime_documents, parse_mime_headers, \
-    Timestamp, md5, normalize_delete_at_timestamp
+    Timestamp, md5, normalize_delete_at_timestamp, NormalTimestamp
+from test.unit import mock_normal_timestamp_now
 from test.unit.common.middleware.helpers import FakeSwift
 
 
@@ -1626,7 +1627,7 @@ class TestSloDeleteManifest(SloTestCase):
 
     def test_handle_async_delete_whole(self):
         self.slo.allow_async_delete = True
-        now = Timestamp(time.time())
+        now = NormalTimestamp.now()
         exp_obj_cont = self.slo.expirer_config.get_expirer_container(
             int(now), 'AUTH_test', 'deltest', 'man-all-there')
         self.app.register(
@@ -1636,7 +1637,7 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/AUTH_test/deltest/man-all-there'
             '?async=true&multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE'})
-        with patch('swift.common.utils.Timestamp.now', return_value=now):
+        with mock_normal_timestamp_now(now):
             status, headers, body = self.call_slo(req)
         self.assertEqual('204 No Content', status)
         self.assertEqual(b'', body)
@@ -1660,16 +1661,17 @@ class TestSloDeleteManifest(SloTestCase):
             self.assertEqual(value, expected, msg % (header, expected, value))
 
         t_delete_at = normalize_delete_at_timestamp(now, high_precision=True)
+        t_created_at = now.normal  # DELETE's have normalized timestamps
         self.assertEqual(json.loads(self.app.call_list[1].body), [
             {'content_type': 'application/async-deleted',
-             'created_at': now.internal,
+             'created_at': t_created_at,
              'deleted': 0,
              'etag': 'd41d8cd98f00b204e9800998ecf8427e',
              'name': '%s-AUTH_test/deltest/b_2' % t_delete_at,
              'size': 0,
              'storage_policy_index': 0},
             {'content_type': 'application/async-deleted',
-             'created_at': now.internal,
+             'created_at': t_created_at,
              'deleted': 0,
              'etag': 'd41d8cd98f00b204e9800998ecf8427e',
              'name': '%s-AUTH_test/deltest/c_3' % t_delete_at,
@@ -1681,7 +1683,7 @@ class TestSloDeleteManifest(SloTestCase):
         self.slo.allow_async_delete = True
         unicode_acct = u'AUTH_test-un\u00efcode'
         wsgi_acct = bytes_to_wsgi(unicode_acct.encode('utf-8'))
-        now = Timestamp(time.time())
+        now = NormalTimestamp.now()
         exp_obj_cont = self.slo.expirer_config.get_expirer_container(
             int(now), unicode_acct, 'deltest', 'man-all-there')
         self.app.register(
@@ -1696,7 +1698,7 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/%s/deltest/man-all-there?'
             'async=1&multipart-manifest=delete&heartbeat=1' % wsgi_acct,
             environ={'REQUEST_METHOD': 'DELETE', 'swift.authorize': authorize})
-        with patch('swift.common.utils.Timestamp.now', return_value=now):
+        with mock_normal_timestamp_now(now):
             status, _, body = self.call_slo(req)
         # Every async delete should only need to make 3 requests during the
         # client request/response cycle, so no need to support heart-beating
@@ -1735,16 +1737,17 @@ class TestSloDeleteManifest(SloTestCase):
             self.assertEqual(value, expected, msg % (header, expected, value))
 
         t_delete_at = normalize_delete_at_timestamp(now, high_precision=True)
+        t_created_at = now.normal  # DELETE's have normalized timestamps
         self.assertEqual(json.loads(self.app.call_list[-2].body), [
             {'content_type': 'application/async-deleted',
-             'created_at': now.internal,
+             'created_at': t_created_at,
              'deleted': 0,
              'etag': 'd41d8cd98f00b204e9800998ecf8427e',
              'name': u'%s-%s/\N{SNOWMAN}/b_2' % (t_delete_at, unicode_acct),
              'size': 0,
              'storage_policy_index': 0},
             {'content_type': 'application/async-deleted',
-             'created_at': now.internal,
+             'created_at': t_created_at,
              'deleted': 0,
              'etag': 'd41d8cd98f00b204e9800998ecf8427e',
              'name': u'%s-%s/\N{SNOWMAN}/c_3'
@@ -1757,7 +1760,7 @@ class TestSloDeleteManifest(SloTestCase):
         self.slo.allow_async_delete = True
         unicode_acct = u'AUTH_test-un\u00efcode'
         wsgi_acct = bytes_to_wsgi(unicode_acct.encode('utf-8'))
-        now = Timestamp(time.time())
+        now = NormalTimestamp.now()
         exp_obj_cont = self.slo.expirer_config.get_expirer_container(
             int(now), unicode_acct, u'\N{SNOWMAN}', 'same-container')
         self.app.register(
@@ -1772,7 +1775,7 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/%s/\xe2\x98\x83/same-container?'
             'async=yes&multipart-manifest=delete' % wsgi_acct,
             environ={'REQUEST_METHOD': 'DELETE', 'swift.authorize': authorize})
-        with patch('swift.common.utils.Timestamp.now', return_value=now):
+        with mock_normal_timestamp_now(now):
             status, _, body = self.call_slo(req)
         self.assertEqual('204 No Content', status)
         self.assertEqual(b'', body)
@@ -1807,16 +1810,17 @@ class TestSloDeleteManifest(SloTestCase):
             self.assertEqual(value, expected, msg % (header, expected, value))
 
         t_delete_at = normalize_delete_at_timestamp(now, high_precision=True)
+        t_created_at = now.normal  # DELETE's have normalized timestamps
         self.assertEqual(json.loads(self.app.call_list[-2].body), [
             {'content_type': 'application/async-deleted',
-             'created_at': now.internal,
+             'created_at': t_created_at,
              'deleted': 0,
              'etag': 'd41d8cd98f00b204e9800998ecf8427e',
              'name': u'%s-%s/\N{SNOWMAN}/b_2' % (t_delete_at, unicode_acct),
              'size': 0,
              'storage_policy_index': 0},
             {'content_type': 'application/async-deleted',
-             'created_at': now.internal,
+             'created_at': t_created_at,
              'deleted': 0,
              'etag': 'd41d8cd98f00b204e9800998ecf8427e',
              'name': u'%s-%s/\N{SNOWMAN}/c_3' % (t_delete_at, unicode_acct),
@@ -6774,7 +6778,7 @@ class TestRespAttrs(unittest.TestCase):
         attrs = slo.RespAttrs(True, 123456789.12345,
                               'manifest-etag', 'slo-etag', 999)
         self.assertTrue(attrs.is_slo)
-        self.assertEqual(123456789.12345, attrs.timestamp)
+        self.assertEqual(123456789.12345, float(attrs.timestamp))
         self.assertIsInstance(attrs.timestamp, Timestamp)
         self.assertEqual('manifest-etag', attrs.json_md5)
         self.assertEqual('slo-etag', attrs.slo_etag)
