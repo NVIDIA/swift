@@ -35,7 +35,7 @@ from swift.common.utils import md5
 from swift.common.utils.timestamp import Timestamp
 from swift.proxy.controllers.base import get_cache_key
 from test.unit import patch_policies, FakeMemcache, mock_timestamp_now, \
-    BaseUnitTestCase
+    BaseUnitTestCase, mock_normal_timestamp_now
 from test.unit.common.middleware.helpers import FakeSwift
 
 
@@ -657,7 +657,8 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
                          (calls[0].method, calls[0].path))
         # PUT to versions
         self.assertEqual('PUT', calls[1].method)
-        ts1 = self.assert_valid_timestamp(calls[1].headers.get('X-Timestamp'))
+        ts1 = self.assert_valid_extended_timestamp(
+            calls[1].headers.get('X-Timestamp'))
         self.assertEqual(0, ts1.offset)
         exp_version = (~ts1).internal
         self.assertEqual('/v1/a/%s/%s'
@@ -667,7 +668,8 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         # symlink PUT
         self.assertEqual(('PUT', '/v1/a/c/o'),
                          (calls[2].method, calls[2].path))
-        ts2 = self.assert_valid_timestamp(calls[2].headers.get('X-Timestamp'))
+        ts2 = self.assert_valid_extended_timestamp(
+            calls[2].headers.get('X-Timestamp'))
         # XXX it's not clear why the symlink timestamp gets an offset
         self.assertEqual(1, ts2.offset)
         self.assertEqual(Timestamp(ts1, offset=1), ts2)
@@ -704,7 +706,8 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
                          (calls[0].method, calls[0].path))
         # PUT to versions
         self.assertEqual('PUT', calls[1].method)
-        ts = self.assert_valid_timestamp(calls[1].headers.get('X-Timestamp'))
+        ts = self.assert_valid_extended_timestamp(
+            calls[1].headers.get('X-Timestamp'))
         self.assertEqual(ts_req, ts)
         self.assertEqual('/v1/a/%s/%s'
                          % (self.build_container_name('c'),
@@ -713,7 +716,8 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         # symlink PUT
         self.assertEqual(('PUT', '/v1/a/c/o'),
                          (calls[2].method, calls[2].path))
-        ts = self.assert_valid_timestamp(calls[2].headers.get('X-Timestamp'))
+        ts = self.assert_valid_extended_timestamp(
+            calls[2].headers.get('X-Timestamp'))
         # XXX it's not clear why the symlink timestamp gets an offset
         self.assertEqual(1, ts.offset)
         self.assertEqual(Timestamp(ts_req, offset=1), ts)
@@ -1608,7 +1612,9 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
         self.assertEqual(1, self.app.call_count)
 
     def test_put_delete_marker_no_object_success(self):
-        ts_now = self.ts()
+        ts_now = self.normal_ts()
+        # XXX: this is anomalous: the marker version has no jitter because it
+        # is based off the DELETE request timestamp which has no jitter
         exp_version = (~ts_now).internal
         self.app.register(
             'GET', '/v1/a/c/o', swob.HTTPNotFound,
@@ -1625,7 +1631,7 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
             environ={'REQUEST_METHOD': 'DELETE',
                      'swift.cache': self.cache_version_on,
                      'CONTENT_LENGTH': '0'})
-        with mock_timestamp_now(ts_now):
+        with mock_normal_timestamp_now(ts_now):
             status, headers, body = self.call_ov(req)
         self.assertEqual(status, '404 Not Found')
         self.assertEqual(len(self.authorized), 2)
@@ -1637,10 +1643,13 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
         self.assertEqual(['GET', 'PUT', 'DELETE'], [c.method for c in calls])
         self.assertEqual('application/x-deleted;swift_versions_deleted=1',
                          calls[1].headers.get('Content-Type'))
-        self.assert_valid_timestamp(calls[1].headers.get('X-Timestamp'))
+        self.assert_valid_normal_timestamp(
+            calls[1].headers.get('X-Timestamp'))
 
     def test_delete_marker_over_object_success(self):
-        ts_now = self.ts()
+        ts_now = self.normal_ts()
+        # XXX: this is anomalous: the marker version has no jitter because it
+        # is based off the DELETE request timestamp which has no jitter
         exp_version = (~ts_now).internal
         self.app.register(
             'GET', '/v1/a/c/o', swob.HTTPOk,
@@ -1661,7 +1670,7 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
             environ={'REQUEST_METHOD': 'DELETE',
                      'swift.cache': self.cache_version_on,
                      'CONTENT_LENGTH': '0'})
-        with mock_timestamp_now(ts_now):
+        with mock_normal_timestamp_now(ts_now):
             status, headers, body = self.call_ov(req)
         self.assertEqual(status, '204 No Content')
         self.assertEqual(b'', body)
@@ -1678,10 +1687,13 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
             calls[1].path)
         self.assertEqual('application/x-deleted;swift_versions_deleted=1',
                          calls[2].headers.get('Content-Type'))
-        self.assert_valid_timestamp(calls[2].headers.get('X-Timestamp'))
+        self.assert_valid_normal_timestamp(
+            calls[2].headers.get('X-Timestamp'))
 
     def test_delete_marker_over_versioned_object_success(self):
-        ts_now = self.ts()
+        ts_now = self.normal_ts()
+        # XXX: this is anomalous: the marker version has no jitter because it
+        # is based off the DELETE request timestamp which has no jitter
         exp_version = (~ts_now).internal
         self.app.register('GET', '/v1/a/c/o', swob.HTTPOk,
                           {SYSMETA_VERSIONS_SYMLINK: 'true'}, 'passed')
@@ -1697,7 +1709,7 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
             environ={'REQUEST_METHOD': 'DELETE',
                      'swift.cache': self.cache_version_on,
                      'CONTENT_LENGTH': '0'})
-        with mock_timestamp_now(ts_now):
+        with mock_normal_timestamp_now(ts_now):
             status, headers, body = self.call_ov(req)
         self.assertEqual(status, '204 No Content')
         self.assertEqual(b'', body)
@@ -1714,7 +1726,8 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
             calls[1].path)
         self.assertEqual('application/x-deleted;swift_versions_deleted=1',
                          calls[1].headers.get('Content-Type'))
-        self.assert_valid_timestamp(calls[1].headers.get('X-Timestamp'))
+        self.assert_valid_normal_timestamp(
+            calls[1].headers.get('X-Timestamp'))
 
     def test_denied_DELETE_of_versioned_object(self):
         authorize_call = []
@@ -1753,8 +1766,11 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
                          (calls[0].method, calls[0].path))
         # PUT to versions
         self.assertEqual('PUT', calls[1].method)
-        ts1 = self.assert_valid_timestamp(calls[1].headers.get('X-Timestamp'))
-        self.assertEqual(0, ts1.offset)
+        # XXX this is anomalous: the delete marker PUT subrequest timestamp has
+        # no jitter because it is the same timestamp as the original DELETE
+        # request which is created without jitter
+        ts1 = self.assert_valid_normal_timestamp(
+            calls[1].headers.get('X-Timestamp'))
         exp_version = (~ts1).internal
         self.assertEqual('/v1/a/%s/%s'
                          % (self.build_container_name('c'),
@@ -1763,7 +1779,8 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
         # DELETE
         self.assertEqual(('DELETE', '/v1/a/c/o'),
                          (calls[2].method, calls[2].path))
-        ts2 = self.assert_valid_timestamp(calls[2].headers.get('X-Timestamp'))
+        ts2 = self.assert_valid_normal_timestamp(
+            calls[2].headers.get('X-Timestamp'))
         self.assertEqual(ts1, ts2)
 
 
