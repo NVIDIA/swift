@@ -54,7 +54,8 @@ from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import reiterate, split_path, pairs, \
     close_if_possible, closing_if_possible, config_true_value, friendly_close
 from swift.common.exceptions import InvalidTimestamp
-from swift.common.utils.timestamp import Timestamp, BaseTimestamp
+from swift.common.utils.timestamp import Timestamp, BaseTimestamp, \
+    generate_timestamp, parse_timestamp
 
 RESPONSE_REASONS = {
     100: ('Continue', ''),
@@ -1013,23 +1014,33 @@ class Request(object):
         set if not present.
 
         :raises HTTPBadRequest: if X-Timestamp is already set but not a valid
-                                :class:`~swift.common.utils.Timestamp`
-        :returns: the request's X-Timestamp header,
-                  as a :class:`~swift.common.utils.Timestamp`
+            :class:`~swift.common.utils.BaseTimestamp` that is appropriate for
+            the request type.
+        :returns: the request's X-Timestamp header, as a
+            :class:`~swift.common.utils.BaseTimestamp`
         """
-        # The container sync feature includes an x-timestamp header with
-        # requests. If present this is checked and preserved, otherwise a fresh
-        # timestamp is added.
+        # Note: this is the preferred way to add an x-timestamp header to a
+        # request.
         if 'HTTP_X_TIMESTAMP' in self.environ:
+            # The container sync feature and some middlewares set an
+            # x-timestamp header in requests. If present this is checked and
+            # preserved, otherwise a fresh timestamp is added.
             try:
-                self._timestamp = Timestamp(self.environ['HTTP_X_TIMESTAMP'])
+                self._timestamp = parse_timestamp(
+                    self.environ['HTTP_X_TIMESTAMP'],
+                    self.swift_entity_type,
+                    self.method)
             except ValueError:
+                # TODO: a 400 response might go back to the client but this is
+                #  likely caused by a middleware bug, so perhaps this should be
+                #  a 500?
                 raise HTTPBadRequest(
                     request=self, content_type='text/plain',
-                    body='X-Timestamp should be a UNIX timestamp float value; '
-                         'was %r' % self.environ['HTTP_X_TIMESTAMP'])
+                    body='Invalid X-Timestamp header: %r' %
+                         self.environ['HTTP_X_TIMESTAMP'])
         else:
-            self._timestamp = Timestamp.now()
+            self._timestamp = generate_timestamp(
+                self.swift_entity_type, self.method)
         # Always normalize it to the internal form
         self.environ['HTTP_X_TIMESTAMP'] = self._timestamp.internal
         return self._timestamp
@@ -1076,6 +1087,29 @@ class Request(object):
         _ver, entity_path = self.split_path(1, 2, rest_with_last=True)
         if entity_path is not None:
             return '/' + wsgi_to_str(entity_path)
+
+    @property
+    def swift_entity_type(self):
+        """
+        Returns the type of entity that is located by the request path.
+
+        :returns: one of 'account', 'container', 'object' or None if the entity
+            type cannot be determined.
+        """
+        # It's questionable for the swob module to be aware of swift's path
+        # structure, but there's precedence for swift-isms in swob e.g.:
+        # swift_entity_path, allow_reserved_names
+        try:
+            _, acc, cont, obj = self.split_path(1, 4, rest_with_last=True)
+        except ValueError:
+            return None
+        if obj:
+            return 'object'
+        if cont:
+            return 'container'
+        if acc:
+            return 'account'
+        return None
 
     @property
     def is_chunked(self):
