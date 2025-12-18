@@ -156,7 +156,7 @@ class TestAccountController(BaseUnitTestCase):
         user_meta_key = 'X-Account-Meta-Test'
         # allow PUTs to account...
         self.app.allow_account_management = True
-        ts = next(self.ts_iter)
+        ts = self.normal_ts()
         hdrs_in = {sys_meta_key: 'foo',
                    user_meta_key: 'bar',
                    'x-timestamp': ts.internal,
@@ -182,7 +182,7 @@ class TestAccountController(BaseUnitTestCase):
         sys_meta_key = '%stest' % get_sys_meta_prefix('account')
         sys_meta_key = sys_meta_key.title()
         user_meta_key = 'X-Account-Meta-Test'
-        ts = next(self.ts_iter)
+        ts = self.normal_ts()
         hdrs_in = {sys_meta_key: 'foo',
                    user_meta_key: 'bar',
                    'x-timestamp': ts.internal,
