@@ -678,6 +678,12 @@ class CleavingContext(object):
         return broker.get_info()['id']
 
     @classmethod
+    def _safe_load(cls, data):
+        # Pre-release downstream code persisted this obsolete field.
+        data.pop('replication_count', None)
+        return cls(**data)
+
+    @classmethod
     def load_all(cls, broker):
         """
         Returns all cleaving contexts stored in the broker's DB.
@@ -694,7 +700,8 @@ class CleavingContext(object):
             # marked for deletion
             if key.startswith("Context-") and val:
                 try:
-                    contexts.append((cls(**json.loads(val)), timestamp))
+                    data = json.loads(val)
+                    contexts.append((cls._safe_load(data), timestamp))
                 except ValueError:
                     continue
         return contexts
@@ -714,7 +721,7 @@ class CleavingContext(object):
         data = json.loads(data) if data else {}
         data['ref'] = ref
         data['max_row'] = brokers[0].get_max_row()
-        return cls(**data)
+        return cls._safe_load(data)
 
     def store(self, broker):
         """
