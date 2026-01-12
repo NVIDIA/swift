@@ -8414,6 +8414,33 @@ class TestCleavingContext(BaseTestSharder):
             ctx.delete(broker)
         self.assertEqual([], CleavingContext.load_all(broker))
 
+    def test_load_all_with_unexpected_value(self):
+        # verify that replication_count is ignored when loading all contexts
+        broker = self._make_sharding_broker()
+        db_id = broker.get_brokers()[0].get_info()['id']
+        contexts = [CleavingContext(db_id, 'c', 12, 3, 2, True, True),
+                    CleavingContext(str(uuid4()), 'd', 12, 4, 2, True, True)]
+        for ctx in contexts:
+            data = dict(ctx, replication_count='obsolete_value')
+            key = 'X-Container-Sysmeta-Shard-Context-%s' % ctx.ref
+            broker.update_metadata(
+                {key: (json.dumps(data), next(self.ts_iter).internal)})
+        persisted = broker.metadata
+        self.assertEqual(
+            'obsolete_value',
+            json.loads(persisted[key][0])['replication_count'])
+
+        # load_all returns all the contexts...
+        actual_loaded = CleavingContext.load_all(broker)
+        self.assertEqual(
+            {ctx.ref: dict(ctx) for ctx in contexts},
+            {ctx.ref: dict(ctx) for ctx, _ in actual_loaded})
+        for ctx, _ in actual_loaded:
+            self.assertNotIn('replication_count', dict(ctx))
+
+        # ...but does not modify the persisted values
+        self.assertEqual(persisted, broker.metadata)
+
     def test_delete(self):
         broker = self._make_broker()
 
@@ -8654,6 +8681,38 @@ class TestCleavingContext(BaseTestSharder):
         self.assertEqual(None, new_ctx.last_cleave_to_row)
         self.assertFalse(new_ctx.misplaced_done)
         self.assertFalse(new_ctx.cleaving_done)
+
+    def test_store_modify_attributes_load(self):
+        # verify that the obsolete replication_count attribute is ignored
+        broker = self._make_sharding_broker()
+        db_id = broker.get_brokers()[0].get_info()['id']
+        ctx = CleavingContext(db_id, 'curs', 12, 11, 2, True, True)
+        with mock_timestamp_now(next(self.ts_iter)):
+            ctx.store(broker)
+
+        key = 'X-Container-Sysmeta-Shard-Context-%s' % db_id
+        orig_data = json.loads(broker.metadata[key][0])
+        corrupted_data = dict(orig_data, replication_count='obsolete_value')
+        broker.update_metadata(
+            {key: (json.dumps(corrupted_data),
+                   next(self.ts_iter).internal)})
+        persisted = broker.metadata[key]
+
+        new_ctx = CleavingContext.load(broker)
+
+        # replication_count is removed in memory and max_row is updated to
+        # match the DB
+        exp_data = dict(orig_data, max_row=-1)
+        self.assertEqual(exp_data, dict(new_ctx))
+
+        # loading does not modify the persisted value,
+        # storing the loaded context persists the corrected schema
+        self.assertEqual(persisted, broker.metadata[key])
+
+        with mock_timestamp_now(next(self.ts_iter)):
+            new_ctx.store(broker)
+        self.assertEqual(exp_data,
+                         json.loads(broker.metadata[key][0]))
 
     def test_load_modify_store_load(self):
         broker = self._make_sharding_broker()
