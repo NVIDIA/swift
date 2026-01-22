@@ -48,6 +48,7 @@ from swift.common.storage_policy import POLICIES, ECDriverError, \
     StoragePolicy, ECStoragePolicy
 from swift.common.swob import Request, Response, wsgi_to_str, \
     date_header_format
+from test import BaseTestCase
 from test.debug_logger import debug_logger, debug_labeled_statsd_client
 from test.unit import (
     FakeRing, fake_http_connect, patch_policies, SlowBody, FakeStatus,
@@ -1097,12 +1098,11 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
     def test_HEAD_x_newest_different_timestamps(self):
         req = swob.Request.blank('/v1/a/c/o', method='HEAD',
                                  headers={'X-Newest': 'true'})
-        ts = (utils.Timestamp(t) for t in itertools.count(int(time.time())))
         if self.is_ec:
             num_expected_requests = self.replicas()
         else:
             num_expected_requests = 2 * self.replicas()
-        timestamps = [next(ts) for i in range(num_expected_requests)]
+        timestamps = [self.ts() for i in range(num_expected_requests)]
         newest_timestamp = timestamps[-1]
         random.shuffle(timestamps)
         backend_response_headers = [{
@@ -1118,12 +1118,13 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
     def test_HEAD_x_newest_with_two_vector_timestamps(self):
         req = swob.Request.blank('/v1/a/c/o', method='HEAD',
                                  headers={'X-Newest': 'true'})
-        ts = (utils.Timestamp.now(offset=offset)
-              for offset in itertools.count())
         if self.is_ec:
             num_expected_requests = self.replicas()
         else:
             num_expected_requests = 2 * self.replicas()
+        # constant float part, varying offset...
+        now = Timestamp.now()
+        ts = (Timestamp(now, offset) for offset in itertools.count())
         timestamps = [next(ts) for i in range(num_expected_requests)]
         newest_timestamp = timestamps[-1]
         random.shuffle(timestamps)
@@ -1141,7 +1142,6 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
     def test_HEAD_x_newest_with_some_missing(self):
         req = swob.Request.blank('/v1/a/c/o', method='HEAD',
                                  headers={'X-Newest': 'true'})
-        ts = (utils.Timestamp(t) for t in itertools.count(int(time.time())))
         if self.is_ec:
             request_count = self.replicas()
         else:
@@ -1440,10 +1440,16 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
     def test_POST_all_primaries_succeed(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
         primary_codes = [202] * self.replicas()
-        with mocked_http_conn(*primary_codes):
+        with mocked_http_conn(*primary_codes) as mock_conn:
             resp = req.get_response(self.app)
         self.assertEqual(202, resp.status_int,
                          'replicas = %s' % self.replicas())
+
+        timestamps = [captured['headers'].get('X-Timestamp')
+                      for captured in mock_conn.requests]
+        self.assertEqual(self.replicas(), len(timestamps))
+        self.assertEqual(1, len(set(timestamps)))
+        self.assert_valid_timestamp(timestamps[0])
 
     def test_POST_sufficient_primaries_succeed_others_404(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='POST')
@@ -1618,16 +1624,21 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
 
 @patch_policies()
 class TestReplicatedObjController(CommonObjectControllerMixin,
-                                  unittest.TestCase):
+                                  BaseTestCase):
 
     controller_cls = obj.ReplicatedObjectController
 
     def test_PUT_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT')
         req.headers['content-length'] = '0'
-        with set_http_connect(201, 201, 201):
+        with mocked_http_conn(201, 201, 201) as mock_conn:
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
+        timestamps = [captured['headers'].get('X-Timestamp')
+                      for captured in mock_conn.requests]
+        self.assertEqual(3, len(timestamps))
+        self.assertEqual(1, len(set(timestamps)))
+        self.assert_valid_timestamp(timestamps[0])
 
     def test_PUT_error_with_footers(self):
         footers_callback = make_footers_callback(b'')
@@ -3052,7 +3063,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
     fake_ring_args=[
         {'replicas': 1}, {'replicas': 4}, {'replicas': 8}, {'replicas': 15}])
 class TestReplicatedObjControllerVariousReplicas(CommonObjectControllerMixin,
-                                                 unittest.TestCase):
+                                                 BaseTestCase):
     controller_cls = obj.ReplicatedObjectController
 
     def test_DELETE_with_write_affinity(self):
@@ -3082,7 +3093,7 @@ class TestReplicatedObjControllerVariousReplicas(CommonObjectControllerMixin,
 
 @patch_policies()
 class TestReplicatedObjControllerMimePutter(BaseObjectControllerMixin,
-                                            unittest.TestCase):
+                                            BaseTestCase):
     # tests specific to PUTs using a MimePutter
     expect_headers = {
         'X-Obj-Metadata-Footer': 'yes'
@@ -3364,7 +3375,7 @@ class ECObjectControllerMixin(CommonObjectControllerMixin):
 
 
 @patch_policies(with_ec_default=True)
-class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
+class TestECObjController(ECObjectControllerMixin, BaseTestCase):
     container_info = {
         'status': 200,
         'read_acl': None,
@@ -6830,7 +6841,7 @@ class TestECFunctions(unittest.TestCase):
                  StoragePolicy(1, name='unu')],
                 fake_ring_args=[{'replicas': 28}, {}])
 class TestECDuplicationObjController(
-        ECObjectControllerMixin, unittest.TestCase):
+        ECObjectControllerMixin, BaseTestCase):
     container_info = {
         'status': 200,
         'read_acl': None,
@@ -7466,7 +7477,7 @@ class ECCommonPutterMixin(object):
 @patch_policies(with_ec_default=True)
 class TestECObjControllerMimePutter(BaseObjectControllerMixin,
                                     ECCommonPutterMixin,
-                                    unittest.TestCase):
+                                    BaseTestCase):
     # tests specific to the older PUT protocol using a MimePutter
     expect_headers = {
         'X-Obj-Metadata-Footer': 'yes',
@@ -7482,9 +7493,15 @@ class TestECObjControllerMimePutter(BaseObjectControllerMixin,
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
                                               body=b'')
         codes = [201] * self.replicas()
-        with set_http_connect(*codes, expect_headers=self.expect_headers):
+        with mocked_http_conn(*codes,
+                              expect_headers=self.expect_headers) as mock_conn:
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 201)
+        timestamps = [captured['headers'].get('X-Timestamp')
+                      for captured in mock_conn.requests]
+        self.assertEqual(self.replicas(), len(timestamps))
+        self.assertEqual(1, len(set(timestamps)))
+        self.assert_valid_timestamp(timestamps[0])
 
     def test_PUT_with_body_and_bad_etag(self):
         segment_size = self.policy.ec_segment_size

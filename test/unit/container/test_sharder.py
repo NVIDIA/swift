@@ -75,19 +75,32 @@ class BaseTestSharder(unittest.TestCase):
 
     def _make_broker(self, account='a', container='c', epoch=None,
                      device='sda', part=0, hash_=None, put_timestamp=None):
+        """
+        Make a ContainerBroker.
+
+        :param account: account name
+        :param container: container name
+        :param epoch: epoch; a Timestamp instance
+        :param device: device name
+        :param part: partition number
+        :param hash_: hash of container name
+        :param put_timestamp: put timestamp; a Timestamp instance
+        :return: a ContainerBroker instance
+        """
         hash_ = hash_ or md5(
             container.encode('utf-8'), usedforsecurity=False).hexdigest()
         datadir = os.path.join(
             self.tempdir, device, 'containers', str(part), hash_[-3:], hash_)
         if epoch:
-            filename = '%s_%s.db' % (hash_, epoch)
+            filename = '%s_%s.db' % (hash_, epoch.normal)
         else:
             filename = hash_ + '.db'
         db_file = os.path.join(datadir, filename)
         broker = ContainerBroker(
             db_file, account=account, container=container,
             logger=self.logger)
-        broker.initialize(put_timestamp=put_timestamp)
+        put_ts_str = None if put_timestamp is None else put_timestamp.internal
+        broker.initialize(put_timestamp=put_ts_str)
         return broker
 
     def _make_old_style_sharding_broker(self, account='a', container='c',
@@ -1465,6 +1478,31 @@ class TestSharder(BaseTestSharder):
                          [[o['name'] for o in objs] for objs, _, _ in yielded])
         self.assertEqual([orig_info] * 4, [info for _, _, info in yielded])
 
+    def test_fresh_db_id_has_device_suffix(self):
+        broker = self._make_broker()
+        objects = [
+            ('o%02d' % i, self.ts_encoded(), 10, 'text/plain', 'etag_a',
+             i % 2, 0) for i in range(30)]
+        for obj in objects:
+            broker.put_object(*obj)
+        broker.enable_sharding(Timestamp.now())
+        dest_ranges = [
+            ShardRange('shard/0', Timestamp.now(), upper='o09'),
+            ShardRange('shard/1', Timestamp.now(), lower='o09', upper='o19'),
+            ShardRange('shard/2', Timestamp.now(), lower='o19'),
+        ]
+        broker.merge_shard_ranges(dest_ranges)
+        self.assertTrue(broker.set_sharding_state())
+
+        # In sharding state let's confirm retiring and fresh dbs were
+        # generated correctly. They both should have the device "sda" as a
+        # a suffix, as it's in their path.
+        # First retiring broker
+        self.assertTrue(
+            broker.get_brokers()[0].get_info()['id'].endswith('sda'))
+        self.assertTrue(
+            broker.get_brokers()[1].get_info()['id'].endswith('sda'))
+
     def _check_cleave_root(self, conf=None):
         broker = self._make_broker()
         objects = [
@@ -2275,7 +2313,7 @@ class TestSharder(BaseTestSharder):
                 db_hash = hash_path(acceptor.account,
                                     acceptor.container)
                 # NB expected cleaved db name includes acceptor epoch
-                db_name = '%s_%s.db' % (db_hash, acceptor_epoch.internal)
+                db_name = '%s_%s.db' % (db_hash, acceptor_epoch.normal)
                 expected_acceptor_dbs.append(
                     os.path.join(self.tempdir, 'sda', 'containers', '0',
                                  db_hash[-3:], db_hash, db_name))
@@ -3462,6 +3500,21 @@ class TestSharder(BaseTestSharder):
             with mock.patch.object(sharder, '_append_stat') as mocked:
                 sharder._record_sharding_progress(broker, {}, None, 0.5)
         mocked.assert_not_called()
+
+    def test_sharded_record_sharding_progress_tolerates_timestamp_offset(self):
+        # CleavingContext metadata might one day have timestamps with offset,
+        # so verify they can be sorted...
+        ts_iter_with_offset = (Timestamp(float(ts) + i, offset=i)
+                               for i, ts in enumerate(self.ts_iter, start=1))
+        with mock.patch('swift.common.utils.Timestamp.now',
+                        side_effect=ts_iter_with_offset):
+            broker = self._check_complete_sharding(
+                'a', 'c', (('', 'mid'), ('mid', '')))
+
+        with self._mock_sharder() as sharder:
+            with mock.patch.object(sharder, '_append_stat') as mocked:
+                sharder._record_sharding_progress(broker, {}, None, 1234)
+        mocked.assert_called_once_with('sharding_in_progress', 'all', mock.ANY)
 
     def test_incomplete_sharding_progress_warning_log(self):
         # test to verify sharder will print warning logs if sharding has been
@@ -5377,6 +5430,10 @@ class TestSharder(BaseTestSharder):
             with self._mock_sharder(replicas=replicas) as sharder:
                 with mocked_http_conn(*resp_codes, give_send=on_send) as conn:
                     with mock_timestamp_now() as now:
+                        # we don't expect these PUTs to have offsets but it's
+                        # used here to verify that the internal format of the
+                        # Timestamp is used for X-Timestamp
+                        now.offset = 1
                         res = sharder._send_shard_ranges(
                             broker, 'a', 'c', shard_ranges)
 
@@ -5773,7 +5830,7 @@ class TestSharder(BaseTestSharder):
 
     def test_process_broker_leader_auto_shard(self):
         # verify conditions for acting as auto-shard leader
-        broker = self._make_broker(put_timestamp=next(self.ts_iter).internal)
+        broker = self._make_broker(put_timestamp=next(self.ts_iter))
         objects = [
             ['obj%3d' % i, self.ts_encoded(), i, 'text/plain',
              'etag%s' % i, 0] for i in range(10)]
@@ -5826,7 +5883,7 @@ class TestSharder(BaseTestSharder):
                 'rows_per_shard': 5,
                 'shrink_threshold': 1,
                 'auto_shard': True}
-        broker = self._make_broker(put_timestamp=next(self.ts_iter).internal)
+        broker = self._make_broker(put_timestamp=next(self.ts_iter))
         broker.delete_db(next(self.ts_iter).internal)
         self.assertTrue(broker.is_deleted())  # sanity check
         node = {'ip': '1.2.3.4', 'port': 6040, 'device': 'sda5', 'id': '2',
@@ -6038,7 +6095,7 @@ class TestSharder(BaseTestSharder):
 
     def test_audit_root_container_reset_epoch(self):
         epoch = next(self.ts_iter)
-        broker = self._make_broker(epoch=epoch.normal)
+        broker = self._make_broker(epoch=epoch)
         shard_bounds = (('', 'j'), ('j', 'k'), ('k', 's'),
                         ('s', 'y'), ('y', ''))
         shard_ranges = self._make_shard_ranges(shard_bounds,

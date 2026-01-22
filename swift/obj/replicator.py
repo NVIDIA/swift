@@ -42,7 +42,7 @@ from swift.common.http import HTTP_OK, HTTP_INSUFFICIENT_STORAGE
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.obj import ssync_sender
 from swift.obj.diskfile import get_data_dir, get_tmp_dir, DiskFileRouter, \
-    LogTraceContext, invalidate_hash
+    invalidate_hash
 from swift.common.storage_policy import POLICIES, REPL_POLICY
 from swift.common.exceptions import PartitionLockTimeout
 

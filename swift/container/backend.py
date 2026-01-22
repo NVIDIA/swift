@@ -28,7 +28,7 @@ from swift.common.constraints import CONTAINER_LISTING_LIMIT
 from swift.common.exceptions import LockTimeout
 from swift.common.utils import Timestamp, encode_timestamps, \
     decode_timestamps, extract_swift_bytes, storage_directory, hash_path, \
-    ShardRange, renamer, MD5_OF_EMPTY_STRING, mkdirs, get_db_files, \
+    ShardRange, renamer, MD5_OF_EMPTY_STRING, get_db_files, \
     parse_db_filename, make_db_file_path, split_path, RESERVED_BYTE, \
     ShardRangeList, Namespace
 from swift.common.db import DatabaseBroker, BROKER_TIMEOUT, \
@@ -591,7 +591,7 @@ class ContainerBroker(DatabaseBroker):
         :param storage_policy_index: storage policy index
         """
         if put_timestamp is None:
-            put_timestamp = Timestamp(0).internal
+            put_timestamp = Timestamp.zero().internal
         # The container_stat view is for compatibility; old versions of Swift
         # expected a container_stat table with columns "object_count" and
         # "bytes_used", but when that stuff became per-storage-policy and
@@ -2155,13 +2155,8 @@ class ContainerBroker(DatabaseBroker):
             return False
 
         info = self.get_info()
-        # The tmp_dir is cleaned up by the replicators after reclaim_age, so if
-        # we initially create the fresh DB there, we will already have cleanup
-        # covered if there is an error.
-        tmp_dir = os.path.join(self.get_device_path(), 'tmp')
-        if not os.path.exists(tmp_dir):
-            mkdirs(tmp_dir)
-        tmp_db_file = os.path.join(tmp_dir, "fresh%s.db" % str(uuid4()))
+        tmp_db_file = os.path.join(self.db_dir,
+                                   "fresh%s.db.tmp" % str(uuid4()))
         fresh_broker = ContainerBroker(tmp_db_file, self.timeout, self.logger,
                                        self.account, self.container)
         fresh_broker.initialize(info['put_timestamp'],

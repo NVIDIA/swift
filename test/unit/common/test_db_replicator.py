@@ -33,7 +33,8 @@ from swift.common.db_replicator import BrokerAnnotatedLogger
 from swift.container.backend import DATADIR
 from swift.common import db_replicator
 from swift.common.utils import (normalize_timestamp, hash_path,
-                                storage_directory, Timestamp, quote)
+                                storage_directory, Timestamp, quote,
+                                mkdirs, listdir)
 from swift.common.exceptions import DriveNotMounted
 from swift.common.swob import HTTPException
 
@@ -199,6 +200,7 @@ class FakeBroker(object):
     def __init__(self, db_file=None, account=TEST_ACCOUNT_NAME,
                  container=TEST_CONTAINER_NAME, **kwargs):
         self.db_file = db_file or __file__
+        self.db_dir = os.path.dirname(self.db_file)
         self.locked = False
         self.metadata = {}
 
@@ -1999,6 +2001,46 @@ class TestDBReplicator(unittest.TestCase):
         expected_hsh = expected_hsh.split('_', 1)[0]
         db_replicator.ReplConnection.assert_has_calls([
             mock.call(node, partition, expected_hsh, replicator.logger)])
+
+    @unit.with_tempdir
+    def test_reclaim_tmp_files(self, tmpdir):
+        db_dir = os.path.join(tmpdir, 'containers/123/bla/some_bla/localtion/')
+        mkdirs(db_dir)
+
+        # Touch some files
+        file_mtimes = {'the_db.db': 0,
+                       'somethingelse.txt': 0,
+                       'some_temp_file.tmp': 5,
+                       'another_tmp_file.db.tmp': 10,
+                       'one_last_temp.db.tmp': 5}
+        for f in file_mtimes.keys():
+            with open(os.path.join(db_dir, f), 'w'):
+                pass
+
+        # create a broker
+        broker = FakeBroker(os.path.join(db_dir, 'the_db.db'))
+        calls = []
+
+        def fake_getmtime(path, *args, **kwargs):
+            calls.append(path)
+            return file_mtimes.get(os.path.basename(path), 0)
+
+        # OK now let's try and reclaim old tmp files
+        with mock.patch('os.path.getmtime', fake_getmtime):
+            replicator = ConcreteReplicator({'reclaim_age': 10})
+            replicator._reclaim_tmp_dbs(broker, 18)
+
+        # It should only look at the tmp files and because of the mtimes only
+        # 2 of them should have been removed
+        self.assertEqual(sorted(['another_tmp_file.db.tmp',
+                                 'somethingelse.txt',
+                                 'the_db.db']),
+                         sorted(listdir(db_dir)))
+        expected_paths_called = [
+            os.path.join(db_dir, 'another_tmp_file.db.tmp'),
+            os.path.join(db_dir, 'one_last_temp.db.tmp'),
+            os.path.join(db_dir, 'some_temp_file.tmp')]
+        self.assertEqual(expected_paths_called, sorted(calls))
 
 
 class TestHandoffsOnly(unittest.TestCase):

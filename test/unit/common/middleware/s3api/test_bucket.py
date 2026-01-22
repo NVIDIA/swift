@@ -283,7 +283,12 @@ class BaseS3ApiBucket(object):
         self.assertEqual(body, b'')
         self.assertEqual(status.split()[0], '200')
         self.assertEqual(headers['Location'], '/bucket')
+        method, path, sw_headers = self.swift.calls_with_headers[0]
+        self.assertEqual('PUT', method)
+        self.assertEqual('/v1/AUTH_test/bucket', path)
+        self.assertNotIn('X-Timestamp', sw_headers)
 
+    def test_bucket_PUT_chunked_transfer(self):
         # Apparently some clients will include a chunked transfer-encoding
         # even with no body
         req = Request.blank('/bucket',
@@ -295,7 +300,12 @@ class BaseS3ApiBucket(object):
         self.assertEqual(body, b'')
         self.assertEqual(status.split()[0], '200')
         self.assertEqual(headers['Location'], '/bucket')
+        method, path, sw_headers = self.swift.calls_with_headers[0]
+        self.assertEqual('PUT', method)
+        self.assertEqual('/v1/AUTH_test/bucket', path)
+        self.assertNotIn('X-Timestamp', sw_headers)
 
+    def test_bucket_PUT_unreadable_input(self):
         with UnreadableInput(self) as fake_input:
             req = Request.blank(
                 '/bucket',
@@ -307,6 +317,10 @@ class BaseS3ApiBucket(object):
         self.assertEqual(body, b'')
         self.assertEqual(status.split()[0], '200')
         self.assertEqual(headers['Location'], '/bucket')
+        method, path, sw_headers = self.swift.calls_with_headers[0]
+        self.assertEqual('PUT', method)
+        self.assertEqual('/v1/AUTH_test/bucket', path)
+        self.assertNotIn('X-Timestamp', sw_headers)
 
     def test_bucket_PUT_with_location(self):
         self._test_bucket_PUT_with_location('CreateBucketConfiguration')
@@ -408,6 +422,10 @@ class BaseS3ApiBucket(object):
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '204')
+        method, path, sw_headers = self.swift.calls_with_headers[-1]
+        self.assertEqual('DELETE', method)
+        self.assertEqual('/v1/AUTH_test/bucket', path)
+        self.assertNotIn('X-Timestamp', sw_headers)
 
     def test_bucket_DELETE_with_empty_versioning(self):
         self.swift.register('HEAD', '/v1/AUTH_test/bucket+versioning',
