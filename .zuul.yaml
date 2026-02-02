@@ -501,16 +501,18 @@
       username: screamingfrenzy
       password: !encrypted/pkcs1-oaep
         # Updated via `zuul-client --zuul-url https://zuul.opendev.org encrypt --tenant openstack --project openstack/swift --secret-name swift-dockerhub-2026 --infile /tmp/secret --field-name password`
-        - THyWPBCU+xc8S50Syk258uDyGeCuVgCLcAw6uskY3mAegDq3Cu7fUNiENYD1HnE6gebZU
-          PRCpkOkuxNgEA8diUv3Z+9JMqTwXr7geBpWLdxuuM37QHlCSwlZRWp8V7BVqUohQnC9VM
-          HwxwiTFFGpzFa6oN2Dn5TrbxG5CH4TxAYQOIuEHh1gcU9lwwyIW3FfXwoxYuJPLwpeOyH
-          jYbkKbrXoAJ5blQk+Lpn0p1vwgK+voGiAM8GgGnPeEt0nK0IqJpekvRtBqP6X+KL+vQC8
-          6KHJ8YAVshFk2qcCd4SgMM8HzfE7T9GYPMt9sEMDUk9KpMIni3Sf9Wo0RlS2GZL9lQ1Dz
-          aRPrg9j9tnX/RfROVSepPOZes34z/ICGVRkmPNjamKCjDxAL5BYPek4yuUv36F/PobUeN
-          QCdKTmagfvo3SvKw2MjEX/ziOep/XUhYP862CCKc1aliSV6aUoijf/Sx4qZhyPbRxiMII
-          MnpvgRuLzILpRxlbyQsf3ItQwKCaYWJvVUHYXqIsQX0OGmGf00MnxWuoZQjcsJFC9NoLB
-          e2y6NcmzrJxhcPMnaTFKPydJuwzwny4srGG7F32diO7oJ8UrNyzUDXHk8nIFLmAcX0bgY
-          t1g6zjnPBUSVsYeG8yw18huIjb0CNn8GUz6AQvgAS4+73am07vBKcp+H2UmaAc=
+        # Be careful not to include any trailing newlines in the secret file! It should contain *exactly* the password: no more, no less.
+        # Note that we've seen issues with some special characters causing issues in the ansible plumbing; new passwords should probably avoid using double quotes ("), single quotes ('), and dollar signs ($).
+        - R0AnQRtM0ObjNvqQgc/E9KH1o4CeNwzPB4jUc0ji6BHjHL4zXPi1P29L1BZgc+MlG/Ps/
+          SLHTQPyUJpmrlVyFKBhvQcs+0qpeF56TqHYN1sW0j7IHHRLvfRHzKO5oarWeVWJi34PRx
+          cGdXIT3oYvwWq8D6Lr/XgBOH4eotpfxxR7IYUM7Ti07MHBiVtzZHMvV0/I/YzkaK1oZ2C
+          n5AYmII/h57YtgTpOOM5dHL3Q6qOaQ4s9nkvyia5R7aRjZW+L1MqP9UjpslGF5AXkAoI5
+          xafRwXdCC7L7cwktmvWUgH8mLjoBhVMZR9wn8IqrsrwUI0qs1QvI6N3mC+lIFTdFfDyfx
+          bJy8umeIkdZ5AmuDEstpb/PORW4q+JfRPFtxtBPxj7E5GrYC5AaBId+8/nHy0vQmcYfON
+          RT0/lQ+xTlfEkSu2PkIoQsXG1Xxdmeb+j/dG/eTlxQVCyza1DITzOfCLwwrdvHxJvez8M
+          CvUoS5q0+R+9NRvM1Pc+qTJM7GIe2MNwCn1TcClJd0tspcm2I+uxf/LhX/53qGzs94YrO
+          +ccqWd4W1ejajbIhCI9VmxhudxJfxxly17g5keJkxDH+akKg4vbg78agiS3NhIkFIiKOn
+          zQGlA92Ufvd7VnMXJvH+wzK+9RV822i0f/Vfz1aE53Xq1r0bnUPtYFiNlpgrn0=
 
 - job:
     name: swift-build-image

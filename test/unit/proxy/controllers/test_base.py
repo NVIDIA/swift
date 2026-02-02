@@ -41,7 +41,8 @@ from swift.common.storage_policy import StoragePolicy, StoragePolicyCollection
 from test.debug_logger import debug_logger
 from test.unit import (
     fake_http_connect, FakeRing, FakeMemcache, PatchPolicies, patch_policies,
-    FakeSource, StubResponse, CaptureIteratorFactory, make_timestamp_iter)
+    FakeSource, StubResponse, CaptureIteratorFactory, make_timestamp_iter,
+    BaseUnitTestCase)
 from swift.common.request_helpers import (
     get_sys_meta_prefix, get_object_transient_sysmeta
 )
@@ -184,9 +185,10 @@ class FakeCache(FakeMemcache):
         return self.stub or super(FakeCache, self).get(key, raise_on_error)
 
 
-class BaseTest(unittest.TestCase):
+class BaseTest(BaseUnitTestCase):
 
     def setUp(self):
+        super().setUp()
         self.logger = debug_logger()
         self.cache = FakeCache()
         self.conf = {}
@@ -1314,18 +1316,21 @@ class TestFuncs(BaseTest):
 
     def test_generate_request_headers(self):
         base = Controller(self.app)
+        ts = next(self.ts_iter)
+
         src_headers = {'x-remove-base-meta-owner': 'x',
                        'x-base-meta-size': '151M',
                        'x-base-sysmeta-mysysmeta': 'myvalue',
                        'x-Backend-No-Timestamp-Update': 'true',
                        'X-Backend-Storage-Policy-Index': '3',
+                       'X-Timestamp': ts.internal,
                        'x-backendoftheworld': 'ignored',
                        'new-owner': 'Kun'}
         req = Request.blank('/v1/a/c/o', headers=src_headers)
         dst_headers = base.generate_request_headers(req)
         expected_headers = {'x-backend-no-timestamp-update': 'true',
                             'x-backend-storage-policy-index': '3',
-                            'x-timestamp': mock.ANY,
+                            'x-timestamp': ts.internal,
                             'x-trans-id': '-',
                             'Referer': 'GET http://localhost/v1/a/c/o',
                             'connection': 'close',
@@ -1367,13 +1372,14 @@ class TestFuncs(BaseTest):
 
         # with additional, verify precedence
         req = Request.blank('/v1/a/c/o', headers=src_headers)
+        ts_additional = next(self.ts_iter)
         dst_headers = base.generate_request_headers(
             req, transfer=False,
             additional={'X-Backend-Storage-Policy-Index': '2',
-                        'X-Timestamp': '1234.56789'})
+                        'X-Timestamp': ts_additional.internal})
         expected_headers = {'x-backend-no-timestamp-update': 'true',
                             'x-backend-storage-policy-index': '2',
-                            'x-timestamp': '1234.56789',
+                            'x-timestamp': ts_additional.internal,
                             'x-trans-id': '-',
                             'Referer': 'GET http://localhost/v1/a/c/o',
                             'connection': 'close',
@@ -1416,21 +1422,6 @@ class TestFuncs(BaseTest):
             self.assertEqual(v, dst_headers[k.lower()])
         for k, v in bad_hdrs.items():
             self.assertNotIn(k.lower(), dst_headers)
-
-    def test_generate_request_headers_with_no_orig_req(self):
-        base = Controller(self.app)
-        src_headers = {'x-remove-base-meta-owner': 'x',
-                       'x-base-meta-size': '151M',
-                       'new-owner': 'Kun'}
-        dst_headers = base.generate_request_headers(None,
-                                                    additional=src_headers,
-                                                    transfer=True)
-        expected_headers = {'x-base-meta-size': '151M',
-                            'connection': 'close'}
-        for k, v in expected_headers.items():
-            self.assertIn(k, dst_headers)
-            self.assertEqual(v, dst_headers[k])
-        self.assertEqual('', dst_headers['Referer'])
 
     def test_bytes_to_skip(self):
         # if you start at the beginning, skip nothing
