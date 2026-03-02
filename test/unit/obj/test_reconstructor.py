@@ -5213,7 +5213,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                              self.policy)
             self.assertIn('X-Backend-Fragment-Preferences', called_header)
             self.assertEqual(
-                [{'timestamp': self.obj_timestamp.normal, 'exclude': []}],
+                [{'timestamp': self.obj_timestamp.internal, 'exclude': []}],
                 json.loads(called_header['X-Backend-Fragment-Preferences']))
             self.assertIn('X-Backend-Replication', called_header)
         # no error and warning
