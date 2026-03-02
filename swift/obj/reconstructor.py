@@ -96,6 +96,7 @@ class ResponseBucket(object):
     """
     Encapsulates fragment GET response data related to a single timestamp.
     """
+
     def __init__(self):
         # count of all responses associated with this Bucket
         self.num_responses = 0
@@ -551,7 +552,7 @@ class ObjectReconstructor(Daemon):
         headers['X-Backend-Storage-Policy-Index'] = int(policy)
         headers['X-Backend-Replication'] = 'True'
         local_timestamp = Timestamp(datafile_metadata['X-Timestamp'])
-        frag_prefs = [{'timestamp': local_timestamp.normal, 'exclude': []}]
+        frag_prefs = [{'timestamp': local_timestamp.internal, 'exclude': []}]
         headers['X-Backend-Fragment-Preferences'] = json.dumps(frag_prefs)
         path = datafile_metadata['name']
 
