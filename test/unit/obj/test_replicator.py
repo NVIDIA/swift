@@ -21,7 +21,6 @@ import os
 from unittest import mock
 from shutil import rmtree
 import pickle
-import time
 import tempfile
 from contextlib import contextmanager
 from collections import defaultdict
@@ -32,11 +31,10 @@ from eventlet import Timeout, sleep, tpool
 
 from swift.obj.diskfile import LogTraceContext
 from test.debug_logger import debug_logger
-from test.unit import (patch_policies, make_timestamp_iter, mocked_http_conn,
-                       mock_check_drive, skip_if_no_xattrs)
+from test.unit import (patch_policies, mocked_http_conn, mock_check_drive,
+                       skip_if_no_xattrs, BaseUnitTestCase)
 from swift.common import utils
-from swift.common.utils import (hash_path, mkdirs, normalize_timestamp,
-                                storage_directory)
+from swift.common.utils import hash_path, mkdirs, storage_directory
 from swift.common import ring
 from swift.common.recon import RECON_OBJECT_FILE
 from swift.obj import diskfile, replicator as object_replicator
@@ -226,9 +224,10 @@ def _create_test_rings(path, devs=None, next_part_power=None):
 
 @patch_policies([StoragePolicy(0, 'zero', False),
                 StoragePolicy(1, 'one', True)])
-class TestObjectReplicator(unittest.TestCase):
+class TestObjectReplicator(BaseUnitTestCase):
 
     def setUp(self):
+        super().setUp()
         skip_if_no_xattrs()
         utils.HASH_PATH_SUFFIX = b'endcap'
         utils.HASH_PATH_PREFIX = b''
@@ -253,7 +252,6 @@ class TestObjectReplicator(unittest.TestCase):
             timeout='300', stats_interval='1', sync_method='rsync',
             recon_cache_path=self.recon_cache)
         self._create_replicator()
-        self.ts = make_timestamp_iter()
 
     def tearDown(self):
         self.assertFalse(process_errors)
@@ -391,8 +389,7 @@ class TestObjectReplicator(unittest.TestCase):
         df = self.df_mgr.get_diskfile('sda', cur_part, 'a', 'c', 'o',
                                       policy=POLICIES[0])
         mkdirs(df._datadir)
-        f = open(os.path.join(df._datadir,
-                              normalize_timestamp(time.time()) + '.data'),
+        f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                  'wb')
         f.write(b'1234567890')
         f.close()
@@ -463,8 +460,7 @@ class TestObjectReplicator(unittest.TestCase):
         df = self.df_mgr.get_diskfile('sda', cur_part, 'a', 'c', 'o',
                                       policy=POLICIES[1])
         mkdirs(df._datadir)
-        f = open(os.path.join(df._datadir,
-                              normalize_timestamp(time.time()) + '.data'),
+        f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                  'wb')
         f.write(b'1234567890')
         f.close()
@@ -915,7 +911,7 @@ class TestObjectReplicator(unittest.TestCase):
         expected_suffix_paths = []
         for policy in POLICIES:
             # primary
-            ts = next(self.ts)
+            ts = self.ts()
             df = self.df_mgr.get_diskfile('sda', '0', 'a', 'c', 'o', policy)
             with df.create() as w:
                 w.write(b'asdf')
@@ -923,7 +919,7 @@ class TestObjectReplicator(unittest.TestCase):
                 w.commit(ts)
             expected_suffix_paths.append(os.path.dirname(df._datadir))
             # handoff
-            ts = next(self.ts)
+            ts = self.ts()
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o', policy)
             with df.create() as w:
                 w.write(b'asdf')
@@ -998,7 +994,7 @@ class TestObjectReplicator(unittest.TestCase):
         # make an object in the handoff partition
         handoff_suffix_paths = []
         for policy in POLICIES:
-            ts = next(self.ts)
+            ts = self.ts()
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o', policy)
             with df.create() as w:
                 w.write(b'asdf')
@@ -1118,7 +1114,7 @@ class TestObjectReplicator(unittest.TestCase):
         # create a real data file to trigger rsync
         df = self.df_mgr.get_diskfile('sda', '0', 'a', 'c', 'o',
                                       policy=POLICIES.legacy)
-        ts = next(self.ts)
+        ts = self.ts()
         with df.create() as w:
             w.write(b'asdf')
             w.put({'X-Timestamp': ts.internal})
@@ -1199,8 +1195,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            f = open(os.path.join(df._datadir,
-                                  normalize_timestamp(time.time()) + '.data'),
+            f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                      'wb')
             f.write(b'1234567890')
             f.close()
@@ -1229,8 +1224,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            f = open(os.path.join(df._datadir,
-                                  normalize_timestamp(time.time()) + '.data'),
+            f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                      'wb')
             f.write(b'1234567890')
             f.close()
@@ -1280,7 +1274,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            ts = normalize_timestamp(time.time())
+            ts = self.ts().internal
             f = open(os.path.join(df._datadir, ts + '.data'),
                      'wb')
             f.write(b'1234567890')
@@ -1306,8 +1300,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES[1])
             mkdirs(df._datadir)
-            f = open(os.path.join(df._datadir,
-                                  normalize_timestamp(time.time()) + '.data'),
+            f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                      'wb')
             f.write(b'1234567890')
             f.close()
@@ -1335,8 +1328,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            f = open(os.path.join(df._datadir,
-                                  normalize_timestamp(time.time()) + '.data'),
+            f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                      'wb')
             f.write(b'1234567890')
             f.close()
@@ -1371,8 +1363,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            f = open(os.path.join(df._datadir,
-                                  normalize_timestamp(time.time()) + '.data'),
+            f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                      'wb')
             f.write(b'1234567890')
             f.close()
@@ -1406,8 +1397,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            f = open(os.path.join(df._datadir,
-                                  normalize_timestamp(time.time()) + '.data'),
+            f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                      'wb')
             f.write(b'1234567890')
             f.close()
@@ -1439,8 +1429,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            f = open(os.path.join(df._datadir,
-                                  normalize_timestamp(time.time()) + '.data'),
+            f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                      'wb')
             f.write(b'1234567890')
             f.close()
@@ -1474,8 +1463,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            f = open(os.path.join(df._datadir,
-                                  normalize_timestamp(time.time()) + '.data'),
+            f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                      'wb')
             f.write(b'1234567890')
             f.close()
@@ -1591,7 +1579,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            ts = normalize_timestamp(time.time())
+            ts = self.ts().internal
             f = open(os.path.join(df._datadir, ts + '.data'),
                      'wb')
             f.write(b'0')
@@ -1639,7 +1627,7 @@ class TestObjectReplicator(unittest.TestCase):
                         mock_http_connect(200)):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
-            ts = normalize_timestamp(time.time())
+            ts = self.ts().internal
             mkdirs(df._datadir)
             f = open(os.path.join(df._datadir, ts + '.data'), 'wb')
             f.write(b'0')
@@ -1688,7 +1676,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            ts = normalize_timestamp(time.time())
+            ts = self.ts().internal
             f = open(os.path.join(df._datadir, ts + '.data'), 'wb')
             f.write(b'0')
             f.close()
@@ -1727,7 +1715,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', '1', 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            ts = normalize_timestamp(time.time())
+            ts = self.ts().internal
             f = open(os.path.join(df._datadir, ts + '.data'), 'wb')
             f.write(b'0')
             f.close()
@@ -1828,8 +1816,7 @@ class TestObjectReplicator(unittest.TestCase):
             df = self.df_mgr.get_diskfile('sda', cur_part, 'a', 'c', 'o',
                                           policy=POLICIES.legacy)
             mkdirs(df._datadir)
-            f = open(os.path.join(df._datadir,
-                                  normalize_timestamp(time.time()) + '.data'),
+            f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                      'wb')
             f.write(b'1234567890')
             f.close()
@@ -2497,8 +2484,7 @@ class TestObjectReplicator(unittest.TestCase):
         df = self.df_mgr.get_diskfile('sda', cur_part, 'a', 'c', 'o',
                                       policy=POLICIES[0])
         mkdirs(df._datadir)
-        f = open(os.path.join(df._datadir,
-                              normalize_timestamp(time.time()) + '.data'),
+        f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                  'wb')
         f.write(b'1234567890')
         f.close()
@@ -2533,8 +2519,7 @@ class TestObjectReplicator(unittest.TestCase):
         df = self.df_mgr.get_diskfile('sda', cur_part, 'a', 'c', 'o',
                                       policy=POLICIES[0])
         mkdirs(df._datadir)
-        f = open(os.path.join(df._datadir,
-                              normalize_timestamp(time.time()) + '.data'),
+        f = open(os.path.join(df._datadir, self.ts().internal + '.data'),
                  'wb')
         f.write(b'1234567890')
         f.close()

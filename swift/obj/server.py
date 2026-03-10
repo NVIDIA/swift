@@ -1454,7 +1454,6 @@ class ObjectController(BaseStorageServer):
                 return HTTPInsufficientStorage(drive=device, request=request)
             finally:
                 timing_breakdown.record('tombstone_write')
-
             self.container_update(
                 'DELETE', account, container, obj, request,
                 HeaderKeyDict({'x-timestamp': req_timestamp.internal}),

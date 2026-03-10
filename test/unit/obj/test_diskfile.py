@@ -44,7 +44,8 @@ from test.debug_logger import debug_logger
 from test.unit import (mock as unit_mock, temptree, mock_check_drive,
                        patch_policies, make_timestamp_iter,
                        DEFAULT_TEST_EC_TYPE, requires_o_tmpfile_support_in_tmp,
-                       encode_frag_archive_bodies, skip_if_no_xattrs)
+                       encode_frag_archive_bodies, skip_if_no_xattrs,
+                       BaseUnitTestCase)
 from swift.obj import diskfile
 from swift.common import utils
 from swift.common.base_storage_server import TimingBreakdown
@@ -7485,7 +7486,7 @@ class TestECDiskFile(DiskFileMixin, unittest.TestCase):
 
 
 @patch_policies(with_ec_default=True)
-class TestSuffixHashes(unittest.TestCase):
+class TestSuffixHashes(BaseUnitTestCase):
     """
     This tests all things related to hashing suffixes and therefore
     there's also few test methods for cleanup_ondisk_files as well
@@ -7520,6 +7521,7 @@ class TestSuffixHashes(unittest.TestCase):
 
     def setUp(self):
         skip_if_no_xattrs()
+        super().setUp()
         self.testdir = tempfile.mkdtemp()
         self.logger = debug_logger('suffix-hash-test')
         self.devices = os.path.join(self.testdir, 'node')
@@ -7532,14 +7534,7 @@ class TestSuffixHashes(unittest.TestCase):
             'mount_check': False,
         }
         self.df_router = diskfile.DiskFileRouter(self.conf, self.logger)
-        self._ts_iter = make_timestamp_iter()
         self.policy = None
-
-    def ts(self):
-        """
-        Timestamps - forever.
-        """
-        return next(self._ts_iter)
 
     def fname_to_ts_hash(self, fname):
         """
