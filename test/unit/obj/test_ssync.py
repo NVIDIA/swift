@@ -870,7 +870,7 @@ class FakeResponse(object):
     def getheaders(self):
         return {
             'X-Object-Sysmeta-Ec-Frag-Index': str(self.frag_index),
-            'X-Object-Sysmeta-Ec-Etag': 'the etag',
+            'X-Object-Sysmeta-Ec-Etag': 'fake-etag',
             'X-Backend-Timestamp': self.conf['timestamp'].internal
         }
 
