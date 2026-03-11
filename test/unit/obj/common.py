@@ -23,7 +23,8 @@ from test.unit import BaseUnitTestCase
 
 
 def write_diskfile(df, timestamp, data=b'test data', frag_index=None,
-                   commit=True, legacy_durable=False, extra_metadata=None):
+                   commit=True, legacy_durable=False, extra_metadata=None,
+                   ec_etag='fake-etag'):
     # Helper method to write some data and metadata to a diskfile.
     # Optionally do not commit the diskfile, or commit but using a legacy
     # durable file
@@ -34,11 +35,11 @@ def write_diskfile(df, timestamp, data=b'test data', frag_index=None,
             'X-Timestamp': timestamp.internal,
             'Content-Length': str(len(data)),
         }
-        if extra_metadata:
-            metadata.update(extra_metadata)
         if frag_index is not None:
             metadata['X-Object-Sysmeta-Ec-Frag-Index'] = str(frag_index)
-            metadata['X-Object-Sysmeta-Ec-Etag'] = 'fake-etag'
+            metadata['X-Object-Sysmeta-Ec-Etag'] = ec_etag
+        if extra_metadata:
+            metadata.update(extra_metadata)
         writer.put(metadata)
         if commit and legacy_durable:
             # simulate legacy .durable file creation
