@@ -5145,14 +5145,15 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         self.obj_path = b'/a/c/' + self.obj_name
         self.obj_timestamp = self.ts()
 
-    def _create_fragment(self, frag_index, body=b'test data'):
+    def _create_fragment(self, frag_index, body=b'test data',
+                         ec_etag='fake-etag'):
         utils.mkdirs(os.path.join(self.devices, 'sda1'))
         df_mgr = self.reconstructor._df_router[self.policy]
         obj_name = self.obj_name.decode('utf8')
         self.df = df_mgr.get_diskfile('sda1', 9, 'a', 'c', obj_name,
                                       policy=self.policy)
         write_diskfile(self.df, self.obj_timestamp, data=body,
-                       frag_index=frag_index)
+                       frag_index=frag_index, ec_etag=ec_etag)
         self.df.open()
         self.logger.clear()
         return self.df
@@ -5174,7 +5175,10 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         responses = list()
         for body in ec_archive_bodies:
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+            })
             responses.append((200, body, headers))
 
         # make a hook point at
@@ -5193,7 +5197,8 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             with mocked_http_conn(
                     *codes, body_iter=body_iter, headers=headers):
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, self._create_fragment(2, body=b''))
+                    job, node, self._create_fragment(
+                        2, body=b'', ec_etag=etag))
                 self.assertEqual(0, df.content_length)
                 fixed_body = b''.join(df.reader())
         self.assertEqual(len(fixed_body), len(broken_body))
@@ -5228,6 +5233,101 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         self.obj_timestamp = Timestamp(self.obj_timestamp, offset=1)
         self._do_test_reconstruct_fa_no_errors()
 
+    def test_reconstruct_fa_warns_on_mismatched_timestamp(self):
+        # verify that when remote fragments have a different timestamp than
+        # the local fragment, reconstruction still succeeds (old behavior)
+        # but a warning is emitted about the mismatch
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+        ec_archive_bodies.pop(1)
+
+        # all remote responses have a newer timestamp than the local fragment
+        wrong_timestamp = self.ts()
+
+        responses = list()
+        for body in ec_archive_bodies:
+            headers = get_header_frag_index(self, body)
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': wrong_timestamp.internal,
+            })
+            responses.append((200, body, headers))
+
+        codes, body_iter, headers = zip(*responses)
+        with mocked_http_conn(
+                *codes, body_iter=body_iter, headers=headers):
+            df = self.reconstructor.reconstruct_fa(
+                job, node, self._create_fragment(
+                    2, body=b'', ec_etag=etag))
+            self.assertEqual(0, df.content_length)
+
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warning_lines), warning_lines)
+        self.assertIn('Received enough fragments at bucket timestamp %s '
+                      'but local timestamp is %s, '
+                      'received etag %s but local etag is %s'
+                      % (wrong_timestamp.internal,
+                         self.obj_timestamp.internal,
+                         etag, etag),
+                      warning_lines[0])
+
+    def test_reconstruct_fa_warns_on_mismatched_etag(self):
+        # verify that when remote fragments have a matching timestamp but
+        # a different etag than the local fragment, reconstruction still
+        # succeeds (old behavior) but a warning is emitted
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+        ec_archive_bodies.pop(1)
+
+        # all remote responses have the right timestamp but a different etag
+        wrong_etag = md5(b'wrong data', usedforsecurity=False).hexdigest()
+
+        responses = list()
+        for body in ec_archive_bodies:
+            headers = get_header_frag_index(self, body)
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': wrong_etag,
+                'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+            })
+            responses.append((200, body, headers))
+
+        codes, body_iter, headers = zip(*responses)
+        with mocked_http_conn(
+                *codes, body_iter=body_iter, headers=headers):
+            # reconstruction still succeeds (old behavior)
+            df = self.reconstructor.reconstruct_fa(
+                job, node, self._create_fragment(
+                    2, body=b'', ec_etag=etag))
+            self.assertEqual(0, df.content_length)
+
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warning_lines), warning_lines)
+        self.assertIn('Received enough fragments at bucket timestamp %s '
+                      'but local timestamp is %s, '
+                      'received etag %s but local etag is %s'
+                      % (self.obj_timestamp.internal,
+                         self.obj_timestamp.internal,
+                         wrong_etag, etag),
+                      warning_lines[0])
+
     def test_reconstruct_fa_errors_works(self):
         job = {
             'partition': 0,
@@ -5246,7 +5346,10 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         base_responses = list()
         for body in ec_archive_bodies:
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+            })
             base_responses.append((200, body, headers))
 
         # since we're already missing a fragment a +2 scheme can only support
@@ -5259,7 +5362,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             with mocked_http_conn(*codes, body_iter=body_iter,
                                   headers=headers_iter):
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, self._create_fragment(2))
+                    job, node, self._create_fragment(2, ec_etag=etag))
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
                 self.assertEqual(
@@ -5282,7 +5385,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(4)
-        ts_data = self.ts()  # all frags .data timestamp
+        ts_data = self.obj_timestamp  # all frags .data timestamp
         ts_meta = self.ts()  # some frags .meta timestamp
         ts_cycle = itertools.cycle((ts_data, ts_meta))
         responses = list()
@@ -5300,7 +5403,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         with mocked_http_conn(*codes, body_iter=body_iter,
                               headers=headers_iter):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self._create_fragment(2))
+                job, node, self._create_fragment(2, ec_etag=etag))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -5325,7 +5428,10 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         base_responses = list()
         for body in ec_archive_bodies:
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+            })
             base_responses.append((200, body, headers))
 
         responses = base_responses
@@ -5346,7 +5452,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         with mocked_http_conn(*codes, body_iter=body_iter,
                               headers=headers_iter):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self._create_fragment(2))
+                job, node, self._create_fragment(2, ec_etag=etag))
             fixed_body = b''.join(df.reader())
             # ... this bad response should be ignored like any other failure
             self.assertEqual(len(fixed_body), len(broken_body))
@@ -5374,7 +5480,10 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         responses = list()
         for body in ec_archive_bodies:
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+            })
             responses.append((200, body, headers))
 
         for error in (Timeout(), 404, Exception('kaboom!')):
@@ -5385,7 +5494,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             with mocked_http_conn(*codes, body_iter=body_iter,
                                   headers=headers_iter):
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, self._create_fragment(2))
+                    job, node, self._create_fragment(2, ec_etag=etag))
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
                 self.assertEqual(
@@ -5544,20 +5653,21 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
 
         # bad response
         broken_body = ec_archive_bodies.pop(1)
-        ts = make_timestamp_iter()
+        older_timestamp = Timestamp(float(self.obj_timestamp) - 1)
         bad_headers = get_header_frag_index(self, broken_body)
         bad_headers.update({
             'X-Object-Sysmeta-Ec-Etag': 'some garbage',
-            'X-Backend-Timestamp': next(ts).internal,
+            'X-Backend-Timestamp': older_timestamp.internal,
         })
 
         # good responses
         responses = list()
-        t1 = next(ts).internal
         for body in ec_archive_bodies:
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag,
-                            'X-Backend-Timestamp': t1})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Timestamp': self.obj_timestamp.internal,
+            })
             responses.append((200, body, headers))
 
         # include the one older frag with different etag in first responses
@@ -5570,7 +5680,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self._create_fragment(2))
+                job, node, self._create_fragment(2, ec_etag=etag))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -5595,22 +5705,22 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(1)
-        ts = make_timestamp_iter()
 
         # good responses
         responses = list()
-        t0 = next(ts).internal
         for body in ec_archive_bodies:
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag,
-                            'X-Backend-Timestamp': t0})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Timestamp': self.obj_timestamp.internal,
+            })
             responses.append((200, body, headers))
 
         # sanity check before negative test
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self._create_fragment(2))
+                job, node, self._create_fragment(2, ec_etag=etag))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -5618,16 +5728,19 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 md5(broken_body, usedforsecurity=False).hexdigest())
 
         # one newer etag won't spoil the bunch
+        newer_timestamp = self.ts()
         new_index = random.randint(0, self.policy.ec_ndata - 1)
         new_headers = get_header_frag_index(self, (responses[new_index])[1])
-        new_headers.update({'X-Object-Sysmeta-Ec-Etag': 'some garbage',
-                            'X-Backend-Timestamp': next(ts).internal})
+        new_headers.update({
+            'X-Object-Sysmeta-Ec-Etag': 'some garbage',
+            'X-Backend-Timestamp': newer_timestamp.internal,
+        })
         new_response = (200, '', new_headers)
         responses[new_index] = new_response
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self._create_fragment(2))
+                job, node, self._create_fragment(2, ec_etag=etag))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -5657,14 +5770,17 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         responses = list()
         for body in ec_archive_bodies:
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+            })
             responses.append((200, body, headers))
 
         # sanity check before negative test
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self._create_fragment(2))
+                job, node, self._create_fragment(2, ec_etag=etag))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -5679,13 +5795,16 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         # always have the correct etag to reconstruct
         new_index = random.randint(1, self.policy.ec_ndata - 1)
         new_headers = get_header_frag_index(self, (responses[new_index])[1])
-        new_headers.update({'X-Object-Sysmeta-Ec-Etag': 'some garbage'})
+        new_headers.update({
+            'X-Object-Sysmeta-Ec-Etag': 'some garbage',
+            'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+        })
         new_response = (200, '', new_headers)
         responses[new_index] = new_response
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self._create_fragment(2))
+                job, node, self._create_fragment(2, ec_etag=etag))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -5881,7 +6000,10 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
 
         def make_header(body):
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+            })
             return headers
 
         responses = [(200, body, make_header(body))
@@ -5889,7 +6011,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self._create_fragment(2))
+                job, node, self._create_fragment(2, ec_etag=etag))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -6490,7 +6612,8 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 *codes, body_iter=body_iter, headers=headers,
                 timestamps=[self.obj_timestamp.internal] * len(codes)):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self._create_fragment(0, body=b''))
+                job, node, self._create_fragment(
+                    0, body=b'', ec_etag=etag))
             self.assertEqual(0, df.content_length)
             fixed_body = b''.join(df.reader())
         self.assertEqual(len(fixed_body), len(broken_body))
@@ -6524,7 +6647,10 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
 
         def make_header(body):
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+            })
             return headers
 
         responses = [(200, body, make_header(body))
@@ -6532,7 +6658,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
             df = self.reconstructor.reconstruct_fa(
-                job, node, self._create_fragment(2))
+                job, node, self._create_fragment(2, ec_etag=etag))
             fixed_body = b''.join(df.reader())
             self.assertEqual(len(fixed_body), len(broken_body))
             self.assertEqual(
@@ -6591,7 +6717,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             with mocked_http_conn(
                     *codes, body_iter=body_iter, headers=headers) as mock_conn:
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, self._create_fragment(2))
+                    job, node, self._create_fragment(2, ec_etag=etag))
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
                 self.assertEqual(
@@ -6643,7 +6769,10 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
 
         def make_header(body):
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+            })
             return headers
 
         def test_invalid_ec_frag_index_header(invalid_frag_index):
@@ -6658,7 +6787,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             with mocked_http_conn(
                     *codes, body_iter=body_iter, headers=headers) as mock_conn:
                 df = self.reconstructor.reconstruct_fa(
-                    job, node, self._create_fragment(2))
+                    job, node, self._create_fragment(2, ec_etag=etag))
                 fixed_body = b''.join(df.reader())
                 self.assertEqual(len(fixed_body), len(broken_body))
                 self.assertEqual(
@@ -6756,11 +6885,16 @@ class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
         self.fabricated_ring = FabricatedRing(replicas=28, devices=56)
 
     def _test_reconstruct_with_duplicate_frags_no_errors(self, index):
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+
         utils.mkdirs(os.path.join(self.devices, 'sda1'))
         df_mgr = self.reconstructor._df_router[self.policy]
         df = df_mgr.get_diskfile('sda1', 9, 'a', 'c', 'o',
                                  policy=self.policy)
-        write_diskfile(df, self.ts(), data=b'', frag_index=2)
+        obj_timestamp = self.ts()
+        write_diskfile(df, obj_timestamp, data=b'', frag_index=2,
+                       ec_etag=etag)
         df.open()
 
         job = {
@@ -6770,9 +6904,6 @@ class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
         part_nodes = self.policy.object_ring.get_part_nodes(0)
         node = part_nodes[index]
         node['backend_index'] = self.policy.get_backend_index(node['index'])
-
-        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
-        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
 
         broken_body = ec_archive_bodies.pop(index)
@@ -6780,7 +6911,10 @@ class TestObjectReconstructorECDuplicationFactor(TestObjectReconstructor):
         responses = list()
         for body in ec_archive_bodies:
             headers = get_header_frag_index(self, body)
-            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': obj_timestamp.internal,
+            })
             responses.append((200, body, headers))
 
         # make a hook point at
