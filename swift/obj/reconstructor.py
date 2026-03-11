@@ -96,6 +96,7 @@ class ResponseBucket(object):
     """
     Encapsulates fragment GET response data related to a single timestamp.
     """
+
     def __init__(self):
         # count of all responses associated with this Bucket
         self.num_responses = 0
@@ -106,6 +107,8 @@ class ResponseBucket(object):
         self.durable = False
         # etag of the first response associated with the Bucket
         self.etag = None
+        # the data timestamp associated with responses in this Bucket
+        self.timestamp = None
 
 
 class RebuildingECDiskFileStream(object):
@@ -460,6 +463,8 @@ class ObjectReconstructor(Daemon):
 
         bucket = buckets[timestamp]
         bucket.num_responses += 1
+        if bucket.timestamp is None:
+            bucket.timestamp = timestamp
         if bucket.etag is None:
             bucket.etag = etag
         elif bucket.etag != etag:
@@ -653,6 +658,7 @@ class ObjectReconstructor(Daemon):
             raise df._quarantine(
                 df._data_file, "Invalid fragment #%s" % df._frag_index)
         local_timestamp = Timestamp(datafile_metadata['X-Timestamp'])
+        local_etag = datafile_metadata.get('X-Object-Sysmeta-Ec-Etag')
         path = datafile_metadata['name']
 
         buckets = defaultdict(ResponseBucket)  # map timestamp -> Bucket
@@ -662,7 +668,20 @@ class ObjectReconstructor(Daemon):
         useful_bucket = self._make_fragment_requests(
             job, node, df, buckets, error_responses)
 
+        full_path = _full_path(node, partition, path, policy)
         if useful_bucket:
+            if (useful_bucket.timestamp != local_timestamp
+                    or useful_bucket.etag != local_etag):
+                self.logger.warning(
+                    'Received enough fragments at bucket timestamp %s '
+                    'but local timestamp is %s, '
+                    'received etag %s but local etag is %s '
+                    'for %s frag#%s' %
+                    (useful_bucket.timestamp.internal,
+                     local_timestamp.internal,
+                     useful_bucket.etag,
+                     local_etag,
+                     full_path, fi_to_rebuild))
             frag_indexes = list(useful_bucket.useful_responses.keys())
             self.logger.debug('Reconstruct frag #%s with frag indexes %s'
                               % (fi_to_rebuild, frag_indexes))
@@ -672,7 +691,6 @@ class ObjectReconstructor(Daemon):
             return RebuildingECDiskFileStream(datafile_metadata, fi_to_rebuild,
                                               rebuilt_fragment_iter)
 
-        full_path = _full_path(node, partition, path, policy)
         for timestamp, bucket in sorted(buckets.items()):
             self.logger.error(
                 'Unable to get enough responses (%s/%s from %s ok responses) '
