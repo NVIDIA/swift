@@ -38,6 +38,9 @@ from test.unit import patch_policies, encode_frag_archive_bodies, \
     skip_if_no_xattrs, quiet_eventlet_exceptions, make_timestamp_iter
 
 
+FAKE_ETAG = 'fake-etag'
+
+
 class TestBaseSsync(BaseTest):
     """
     Provides a framework to test end to end interactions between sender and
@@ -46,6 +49,7 @@ class TestBaseSsync(BaseTest):
     traffic for subsequent verification of the protocol. Assertions are made
     about the final state of the sender and receiver diskfiles.
     """
+
     def setUp(self):
         skip_if_no_xattrs()
         super(TestBaseSsync, self).setUp()
@@ -140,7 +144,7 @@ class TestBaseSsync(BaseTest):
                                                 frag_index=frag_index)
             if policy.policy_type == EC_POLICY:
                 metadata['X-Object-Sysmeta-Ec-Frag-Index'] = str(frag_index)
-                metadata['X-Object-Sysmeta-Ec-Etag'] = 'fake-etag'
+                metadata['X-Object-Sysmeta-Ec-Etag'] = FAKE_ETAG
             df = self._make_diskfile(
                 device=self.device, partition=self.partition, account='a',
                 container='c', obj=obj_name, body=object_data,
@@ -870,7 +874,7 @@ class FakeResponse(object):
     def getheaders(self):
         return {
             'X-Object-Sysmeta-Ec-Frag-Index': str(self.frag_index),
-            'X-Object-Sysmeta-Ec-Etag': 'the etag',
+            'X-Object-Sysmeta-Ec-Etag': FAKE_ETAG,
             'X-Backend-Timestamp': self.conf['timestamp'].internal
         }
 
