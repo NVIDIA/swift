@@ -110,6 +110,18 @@ class ResponseBucket(object):
         # the data timestamp associated with responses in this Bucket
         self.timestamp = None
 
+    def set_default(self, timestamp, etag):
+        if self.timestamp is None:
+            self.timestamp = timestamp
+        if self.etag is None:
+            self.etag = etag
+
+    def matches(self, timestamp, etag):
+        return self.timestamp == timestamp and self.etag == etag
+
+    def is_useful(self, policy):
+        return len(self.useful_responses) >= policy.ec_ndata
+
 
 class RebuildingECDiskFileStream(object):
     """
@@ -462,12 +474,9 @@ class ObjectReconstructor(Daemon):
             return None
 
         bucket = buckets[timestamp]
+        bucket.set_default(timestamp, etag)
         bucket.num_responses += 1
-        if bucket.timestamp is None:
-            bucket.timestamp = timestamp
-        if bucket.etag is None:
-            bucket.etag = etag
-        elif bucket.etag != etag:
+        if bucket.etag != etag:
             self.logger.error('Mixed Etag (%s, %s) for %s frag#%s',
                               etag, bucket.etag,
                               _full_path(node, partition, path, policy),
@@ -535,8 +544,9 @@ class ObjectReconstructor(Daemon):
         :param df: an instance of :class:`~swift.obj.diskfile.BaseDiskFile`.
         :param buckets: dict of per-timestamp buckets for ok responses.
         :param error_responses: dict of per-status lists of error responses.
-        :return: A per-timestamp with sufficient responses, or None if
-            there is no such bucket.
+        :return: A bucket of at least ec_ndata responses that match the
+            timestamp and EC-etag of the local diskfile (``df``) data file,
+            or None if there is no such bucket.
         """
         policy = job['policy']
         partition = job['partition']
@@ -556,6 +566,7 @@ class ObjectReconstructor(Daemon):
         headers['X-Backend-Storage-Policy-Index'] = int(policy)
         headers['X-Backend-Replication'] = 'True'
         local_timestamp = Timestamp(datafile_metadata['X-Timestamp'])
+        local_etag = datafile_metadata.get('X-Object-Sysmeta-Ec-Etag')
         frag_prefs = [{'timestamp': local_timestamp.internal, 'exclude': []}]
         headers['X-Backend-Fragment-Preferences'] = json.dumps(frag_prefs)
         path = datafile_metadata['name']
@@ -586,7 +597,9 @@ class ObjectReconstructor(Daemon):
             bucket = self._handle_fragment_response(
                 node, policy, partition, fi_to_rebuild, path, buckets,
                 error_responses, resp)
-            if bucket and len(bucket.useful_responses) >= policy.ec_ndata:
+            if (bucket
+                    and bucket.is_useful(policy)
+                    and bucket.matches(local_timestamp, local_etag)):
                 useful_bucket = bucket
                 break
 
@@ -610,7 +623,9 @@ class ObjectReconstructor(Daemon):
                 bucket = self._handle_fragment_response(
                     node, policy, partition, fi_to_rebuild, path, buckets,
                     error_responses, resp)
-                if bucket and len(bucket.useful_responses) >= policy.ec_ndata:
+                if (bucket
+                        and bucket.is_useful(policy)
+                        and bucket.matches(local_timestamp, local_etag)):
                     useful_bucket = bucket
                     self.logger.debug(
                         'Reconstructing frag from handoffs, node_count=%d'
@@ -668,20 +683,7 @@ class ObjectReconstructor(Daemon):
         useful_bucket = self._make_fragment_requests(
             job, node, df, buckets, error_responses)
 
-        full_path = _full_path(node, partition, path, policy)
         if useful_bucket:
-            if (useful_bucket.timestamp != local_timestamp
-                    or useful_bucket.etag != local_etag):
-                self.logger.warning(
-                    'Received enough fragments at bucket timestamp %s '
-                    'but local timestamp is %s, '
-                    'received etag %s but local etag is %s '
-                    'for %s frag#%s' %
-                    (useful_bucket.timestamp.internal,
-                     local_timestamp.internal,
-                     useful_bucket.etag,
-                     local_etag,
-                     full_path, fi_to_rebuild))
             frag_indexes = list(useful_bucket.useful_responses.keys())
             self.logger.debug('Reconstruct frag #%s with frag indexes %s'
                               % (fi_to_rebuild, frag_indexes))
@@ -691,14 +693,31 @@ class ObjectReconstructor(Daemon):
             return RebuildingECDiskFileStream(datafile_metadata, fi_to_rebuild,
                                               rebuilt_fragment_iter)
 
-        for timestamp, bucket in sorted(buckets.items()):
-            self.logger.error(
-                'Unable to get enough responses (%s/%s from %s ok responses) '
-                'to reconstruct %s %s frag#%s with ETag %s and timestamp %s' %
-                (len(bucket.useful_responses), policy.ec_ndata,
-                 bucket.num_responses,
-                 'durable' if bucket.durable else 'non-durable',
-                 full_path, fi_to_rebuild, bucket.etag, timestamp.internal))
+        full_path = _full_path(node, partition, path, policy)
+        for _, bucket in sorted(buckets.items()):
+            if (bucket.is_useful(policy)
+                    and not bucket.matches(local_timestamp, local_etag)):
+                self.logger.error(
+                    'Received enough responses (%s/%s from %s ok responses) '
+                    'but not reconstructing %s %s frag#%s, '
+                    'bucket timestamp: %s, local timestamp: %s, '
+                    'bucket etag: %s, local etag: %s (mismatch)' %
+                    (len(bucket.useful_responses), policy.ec_ndata,
+                     bucket.num_responses,
+                     'durable' if bucket.durable else 'non-durable',
+                     full_path, fi_to_rebuild,
+                     bucket.timestamp.internal, local_timestamp.internal,
+                     bucket.etag, local_etag))
+            else:
+                self.logger.error(
+                    'Unable to get enough responses (%s/%s from %s ok '
+                    'responses) to reconstruct %s %s frag#%s with ETag '
+                    '%s and timestamp %s' %
+                    (len(bucket.useful_responses), policy.ec_ndata,
+                     bucket.num_responses,
+                     'durable' if bucket.durable else 'non-durable',
+                     full_path, fi_to_rebuild, bucket.etag,
+                     bucket.timestamp.internal))
 
         if error_responses:
             durable = buckets[local_timestamp].durable
