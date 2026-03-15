@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import os
 import unittest
 import uuid
 import random
@@ -27,38 +28,14 @@ from swift.common.internal_client import UnexpectedResponse
 from swift.common.manager import Manager
 from swift.common.storage_policy import POLICIES, EC_POLICY
 from swift.common.swob import wsgi_to_str, str_to_wsgi
-from swift.common.utils import md5, Timestamp
-from swift.obj.reconstructor import ObjectReconstructor
+from swift.common.utils import md5, node_to_string, Timestamp
+from swift.obj.reconstructor import _get_partners, ObjectReconstructor
 from test.probe.brain import BrainSplitter
 from test.probe.common import (Body as ProbeBody, ECProbeTest,
                                ENABLED_POLICIES)
 
 from swift.common import direct_client
-
 from swiftclient import client, ClientException
-
-
-class Body(object):
-
-    def __init__(self, total=3.5 * 2 ** 20):
-        self.total = int(total)
-        self.hasher = md5(usedforsecurity=False)
-        self.size = 0
-        self.chunk = b'test' * 16 * 2 ** 10
-
-    @property
-    def etag(self):
-        return self.hasher.hexdigest()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.size > self.total:
-            raise StopIteration()
-        self.size += len(self.chunk)
-        self.hasher.update(self.chunk)
-        return self.chunk
 
 
 class TestReconstructorRebuild(ECProbeTest):
@@ -643,6 +620,133 @@ class TestReconstructorRebuild(ECProbeTest):
         self.assertEqual(self.etag, etag)
         self.assertEqual(durable_timestamp,
                          headers.get('X-Backend-Data-Timestamp'))
+
+    def test_rebuild_refuses_mismatched_timestamp_on_overwrite(self):
+        # Verify the reconstructor refuses to rebuild a fragment when peer
+        # responses are at a different timestamp than the local fragment,
+        # using an object which is overwritten while some nodes are
+        # temporarily unreachable.
+        #
+        # Scenario (EC 4+2, 6 primary nodes, S = random stale node,
+        #           F = fail node and S's left partner):
+        #   1. PUT object data v1 at T1 — all 6 nodes have T1 fragments and
+        #      are durable.
+        #   2. Kill node S's drive so it misses the next write.
+        #   3. PUT v2 at T2 — all nodes except S get T2 (durable), node S
+        #      still has stale T1.
+        #   4. Revive node S, then delete node F's partition (needs rebuild).
+        #   5. Run stale node S's reconstructor only.
+        #
+        # When stale node reconstructor tries to rebuild fail node's missing
+        # fragment. It sends fragment preferences requesting T1, but T2-holding
+        # nodes respond with T2, so the T2 response bucket accumulates ec_ndata
+        # responses.
+
+        # pick a random stale node and use its left partner as the fail node
+        num_nodes = len(self.onodes)
+        stale_node_idx = random.randrange(num_nodes)
+        stale_node = self.onodes[stale_node_idx]
+        partners = _get_partners(stale_node_idx, self.onodes)
+        fail_node = partners[0]
+        fail_node_idx = self.onodes.index(fail_node)
+
+        # setUp already PUT object v1, all nodes have T1 durable fragments
+        # record v1 data timestamp and EC etag for later comparison
+        v1_ec_etag = self.etag
+        v1_ts = self.frag_headers[stale_node['index']][
+            'X-Backend-Data-Timestamp']
+
+        # kill the stale node's drive so it misses the v2 overwrite
+        stale_device_path = self.device_dir(stale_node)
+        self.kill_drive(stale_device_path)
+
+        # PUT v2 with different data but the SAME size as v1. To reproduce a
+        # corrupted rebuild, v2 size has to be same or larger than v1 size.
+        # Otherwise, the reconstructor would build a corrupted fragment (T2
+        # data wrapped in T1 metadata) and later failed at the wire level due
+        # to a content-length mismatch.
+        v1_size = int(ProbeBody().length)
+        v2_data = os.urandom(v1_size)
+        self.assertEqual(len(v2_data), v1_size)
+        v2_ec_etag = client.put_object(
+            self.url, self.token, self.container_name, self.object_name,
+            contents=v2_data)
+        self.assertNotEqual(v1_ec_etag, v2_ec_etag,
+                            'v2 must have different content than v1')
+
+        # revive stale node — it still has v1 at T1
+        self.revive_drive(stale_device_path)
+
+        # sanity: stale node still has v1
+        stale_hdrs, _ = self.direct_get(stale_node, self.opart)
+        etag = stale_hdrs['X-Object-Sysmeta-Ec-Etag']
+        self.assertEqual(v1_ts, stale_hdrs['X-Backend-Data-Timestamp'],
+                         'Stale node should still have v1 data timestamp')
+        self.assertEqual(v1_ec_etag, etag,
+                         'Direct get should return v1 data')
+
+        # sanity: other nodes have v2 (different data timestamp)
+        v2_ts = None
+        for i, node in enumerate(self.onodes):
+            if i == stale_node_idx:
+                continue
+            hdrs, _ = self.direct_get(node, self.opart)
+            v2_ts = hdrs['X-Backend-Data-Timestamp']
+            etag = hdrs['X-Object-Sysmeta-Ec-Etag']
+            self.assertNotEqual(v1_ts, v2_ts,
+                                'Node %s should have v2, not v1'
+                                % self._format_node(node))
+            self.assertEqual(v2_ec_etag, etag,
+                             'Direct get should return v2 data')
+
+        # delete the fail node's partition so it needs rebuilding
+        self.break_nodes(self.onodes, self.opart, [fail_node_idx], [])
+        self.assert_direct_get_fails(fail_node, self.opart, 404)
+
+        # Run only the stale node's device reconstructor. If we ran on all
+        # devices, a T2-holding node would be more likely to successfully
+        # rebuild fail node first, and reconstructor on stale node wouldn't be
+        # called and no mismatch error would be logged.
+        stale_conf_index = self.config_number(stale_node)
+        reconstructor = self.run_custom_daemon(
+            ObjectReconstructor, 'object-reconstructor', stale_conf_index,
+            {}, devices=stale_node['device'])
+        error_lines = reconstructor.logger.get_lines_for_level('error')
+
+        # Without the fix: the reconstructor would accept the T2 bucket,
+        # rebuild a fragment from T2 data, then stamp it with the local T1
+        # metadata, producing a corrupt fragment on disk.
+        # With the fix: bucket.matches(local_timestamp=T1) fails because
+        # the bucket is at T2. Reconstruction is refused and the fail node
+        # should NOT have been rebuilt.
+        self.assert_direct_get_fails(fail_node, self.opart, 404)
+
+        # proxy GET should still return v2 from the T2 nodes
+        headers, etag = self.proxy_get()
+        self.assertEqual(v2_ec_etag, etag,
+                         'Proxy GET should return v2 data')
+
+        # verify the exact mismatch error was logged by the stale node
+        fi_to_rebuild = self.policy.get_backend_index(fail_node['index'])
+        full_path = '%s/%s/%s policy#%d' % (
+            node_to_string(fail_node, replication=True),
+            self.opart,
+            '/'.join((self.account,
+                      self.container_name.decode('utf8'),
+                      self.object_name.decode('utf8'))),
+            int(self.policy))
+        num_t2_responses = num_nodes - 2
+        expected_mismatch = (
+            'Received enough responses (%s/%s from %s ok responses) '
+            'but not reconstructing %s %s frag#%s, '
+            'bucket timestamp: %s, local timestamp: %s, '
+            'bucket etag: %s, local etag: %s (mismatch)'
+            % (num_t2_responses, self.policy.ec_ndata,
+               num_t2_responses,
+               'durable', full_path, fi_to_rebuild,
+               Timestamp(v2_ts).internal, Timestamp(v1_ts).internal,
+               v2_ec_etag, v1_ec_etag))
+        self.assertIn(expected_mismatch, error_lines)
 
 
 class TestReconstructorRebuildReconcilerOffset(ECProbeTest):
