@@ -10,18 +10,22 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from io import StringIO
 import os
+import socket
 import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
-from unittest.mock import patch
+from http.client import HTTPException
+from io import StringIO
 from unittest import mock
+from unittest.mock import patch
 
 from swift.cli import dispersion, dispersion_populate, dispersion_report
+from swift.common.concurrency import Timeout
 from swift.common.exceptions import ClientException
 from test.unit import patch_policies
+from swift.common.prom_metrics import get_prometheus_client, metric_key
 
 
 def make_nodes(count=3):
@@ -72,6 +76,59 @@ class TestGetErrorLog(unittest.TestCase):
         dispersion_report.notfound = []
         dispersion_report.json_output = False
         dispersion_report.debug = False
+
+    def _make_exc(self, status):
+        exc = mock.Mock()
+        exc.http_status = status
+        exc.http_host = '10.0.0.1'
+        exc.http_port = 6200
+        exc.http_device = 'sda'
+        return exc
+
+    def test_bumps_errors_counter_by_status(self):
+        prom_client = get_prometheus_client({})
+        for status in (507, 404, 507):
+            dispersion_report.record_error(
+                prom_client, 'swift_dispersion_object_errors',
+                {'policy': 0}, self._make_exc(status))
+        self.assertEqual(
+            prom_client._stats[metric_key(
+                'swift_dispersion_object_errors',
+                {'status': '507', 'policy': '0'})], 2)
+        self.assertEqual(
+            prom_client._stats[metric_key(
+                'swift_dispersion_object_errors',
+                {'status': '404', 'policy': '0'})], 1)
+
+    def test_container_errors_get_their_own_metric_without_a_policy(self):
+        # Swift has one container ring, so a container error carries no
+        # policy label. It must not increment the object counter.
+        prom_client = get_prometheus_client({})
+        dispersion_report.record_error(
+            prom_client, 'swift_dispersion_container_errors', {},
+            self._make_exc(507))
+        self.assertEqual(
+            prom_client._stats,
+            {metric_key('swift_dispersion_container_errors',
+                        {'status': '507'}): 1})
+
+    def test_non_http_errors_are_counted_by_reason(self):
+        for exc, reason in (
+                (Timeout(), 'timeout'),
+                (socket.timeout(), 'timeout'),
+                (ConnectionRefusedError(), 'connection_error'),
+                (socket.error('reset'), 'connection_error'),
+                (HTTPException('bad status line'), 'http_exception'),
+                (ValueError('?'), 'other'),
+                (ClientException('x'), 'other')):
+            prom_client = get_prometheus_client({})
+            dispersion_report.record_error(
+                prom_client, 'swift_dispersion_object_errors',
+                {'policy': 0}, exc)
+            self.assertEqual(
+                {metric_key('swift_dispersion_object_errors',
+                            {'policy': '0', 'status': reason}): 1},
+                prom_client._stats, repr(exc))
 
     def test_unmounted_device_is_reported_once_across_loggers(self):
         """Test unmounted devices are reported once per report run."""
@@ -127,7 +184,6 @@ class TestGetErrorLog(unittest.TestCase):
 
 
 class TestMissingString(unittest.TestCase):
-    """Tests for the missing_string function"""
 
     def test_single_partition_single_copy_missing(self):
         result = dispersion_report.missing_string(1, 1, 3)
@@ -149,6 +205,27 @@ class TestMissingString(unittest.TestCase):
         result = dispersion_report.missing_string(2, 3, 3)
         self.assertEqual(
             result, '!!! There were 2 partitions missing all copies.')
+
+    def test_one_copy_remaining(self):
+        result = dispersion_report.missing_string(1, 2, 3)
+        self.assertEqual(result, '! There was 1 partition missing 2 copies.')
+
+    def test_multiple_partitions(self):
+        result = dispersion_report.missing_string(5, 1, 3)
+        self.assertEqual(result, 'There were 5 partitions missing 1 copy.')
+
+    def test_single_partition(self):
+        result = dispersion_report.missing_string(1, 1, 3)
+        self.assertEqual(result, 'There was 1 partition missing 1 copy.')
+
+    def test_single_missing_copy(self):
+        result = dispersion_report.missing_string(2, 1, 3)
+        self.assertEqual(result, 'There were 2 partitions missing 1 copy.')
+
+    def test_multiple_missing_copies(self):
+        result = dispersion_report.missing_string(2, 2, 3)
+        self.assertEqual(
+            result, '! There were 2 partitions missing 2 copies.')
 
 
 class TestContainerDispersionNames(unittest.TestCase):
@@ -241,9 +318,19 @@ class TestGenerateReport(unittest.TestCase):
         stack.enter_context(patch.object(dispersion_report, 'GreenPool'))
         stack.enter_context(patch.object(dispersion_report, 'Pool'))
         stack.enter_context(patch.object(dispersion_report, 'Ring'))
-        stack.enter_context(patch(
-            'swiftclient.get_auth',
-            return_value=('http://example.com/v1/AUTH_acct', 'tk')))
+        # Patch the get_auth name where generate_report will look it up
+        # (in swift.cli.dispersion_report) so tests don't require the
+        # external swiftclient package to be installed.
+        # Ensure importing 'swiftclient.get_auth' inside generate_report
+        # succeeds even if the external 'swiftclient' package is not
+        # installed in this test environment. Create a fake module and
+        # insert it into sys.modules for the duration of the test.
+        import types
+        fake_swiftclient = types.ModuleType('swiftclient')
+        fake_swiftclient.get_auth = lambda *a, **k: (
+            'http://example.com/v1/AUTH_acct', 'tk')
+        stack.enter_context(
+            patch.dict('sys.modules', {'swiftclient': fake_swiftclient}))
         return stack
 
     def _base_conf(self):
@@ -274,6 +361,59 @@ class TestGenerateReport(unittest.TestCase):
         self.assertTrue(self.mock_container_dispersion_report.called)
         self.assertTrue(self.mock_object_dispersion_report.called)
 
+    def test_generate_report_without_metrics_filename_does_not_fail(self):
+        conf = self._base_conf()
+        with self.mock_report_functions():
+            result = dispersion_report.generate_report(conf)
+        self.assertEqual(
+            result, {'container': {}, 'object': {}})
+
+    @staticmethod
+    def _record_one_metric(*args):
+        """Record a metric on the prom_client that generate_report gives."""
+        args[-1].record('swift_dispersion_container_copies_found', 3)
+        return {}
+
+    def _main(self, tmpdir, *args, **conf):
+        conf_file = os.path.join(tmpdir, 'dispersion.conf')
+        with open(conf_file, 'w') as f:
+            f.write('[dispersion]\n')
+            for item in dict(self._base_conf(), **conf).items():
+                f.write('%s = %s\n' % item)
+        with self.mock_report_functions(), \
+                patch.object(sys, 'argv', [
+                    'swift-dispersion-report'] + list(args) + [conf_file]), \
+                patch.object(dispersion_report.patcher, 'monkey_patch'), \
+                patch.object(dispersion_report.hubs.get_hub(),
+                             'debug_exceptions', False):
+            self.mock_container_dispersion_report.side_effect = \
+                self._record_one_metric
+            dispersion_report.main()
+
+    def test_metrics_are_written_when_filename_is_configured(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(tmpdir, 'dispersion.prom')
+            self._main(tmpdir, metrics_filename=filename)
+            with open(filename) as metrics_file:
+                written = metrics_file.read()
+        self.assertEqual(
+            'swift_dispersion_container_copies_found 3\n', written)
+
+    def test_unwritable_metrics_file_exits_after_the_report(self):
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch.object(sys, 'stdout', out), \
+                patch.object(dispersion_report, 'stdout', out), \
+                patch.object(out, 'flush') as mock_flush, \
+                self.assertRaises(SystemExit) as caught:
+            self._main(tmpdir, '--dump-json',
+                       metrics_filename='/nonexistent-dir/dispersion.prom')
+        self.assertEqual('{"container": {}, "object": {}}\n', out.getvalue())
+        mock_flush.assert_called_once_with()
+        self.assertIn(
+            'ERROR: unable to write metrics to '
+            '/nonexistent-dir/dispersion.prom', str(caught.exception))
+
     def test_neither_report_exits(self):
         conf = dict(self._base_conf(),
                     container_report='no', object_report='no')
@@ -285,9 +425,12 @@ class TestGenerateReport(unittest.TestCase):
 
     def test_dump_json_sets_global(self):
         conf = dict(self._base_conf(), dump_json='yes')
-        with self.mock_report_functions():
+        out = StringIO()
+        with self.mock_report_functions(), \
+                patch.object(sys, 'stdout', out):
             dispersion_report.generate_report(conf)
         self.assertTrue(dispersion_report.json_output)
+        self.assertEqual('', out.getvalue())
 
     def test_unknown_policy_exits(self):
         conf = self._base_conf()
@@ -320,7 +463,7 @@ class TestGenerateReport(unittest.TestCase):
             dispersion_report.generate_report(conf)
         self.assertFalse(self.mock_container_dispersion_report.called)
         self.assertEqual(
-            self.mock_object_dispersion_report.call_args[0][-1].name,
+            self.mock_object_dispersion_report.call_args[0][-2].name,
             'unu')
 
 
@@ -1057,7 +1200,8 @@ class TestContainerDispersionReport(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             dispersion_report.container_dispersion_report(
                 make_coropool(), make_connpool(containers=[]),
-                'AUTH_test', make_ring(), 3, False)
+                'AUTH_test', make_ring(), 3, False,
+                get_prometheus_client({}))
         self.assertIn('ERROR: No canonical container', str(caught.exception))
 
     @mock.patch('swift.common.direct_client.retry')
@@ -1072,7 +1216,7 @@ class TestContainerDispersionReport(unittest.TestCase):
                     containers=[{'name': 'dispersion_1'},
                                 {'name': 'dispersion_0_2'},
                                 {'name': 'dispersion_1_3'}]),
-                'AUTH_test', ring, 3, False)
+                'AUTH_test', ring, 3, False, get_prometheus_client({}))
 
         ring.get_nodes.assert_called_once_with('AUTH_test', 'dispersion_1')
         self.assertEqual(3, mock_retry.call_count)
@@ -1092,9 +1236,49 @@ class TestContainerDispersionReport(unittest.TestCase):
             dispersion_report.container_dispersion_report(
                 make_coropool(), make_connpool(
                     containers=[{'name': 'dispersion_1'}]),
-                'AUTH_test', make_ring(), 3, False)
+                'AUTH_test', make_ring(), 3, False,
+                get_prometheus_client({}))
 
         self.assertEqual('', err.getvalue())
+
+    @mock.patch('swift.common.direct_client.sleep')
+    @mock.patch('swift.common.direct_client.direct_head_container')
+    def test_retried_connection_error_counted_once_per_request(
+            self, mock_head, mock_sleep):
+        mock_head.side_effect = ConnectionRefusedError()
+        prom_client = get_prometheus_client({})
+        with patch.object(sys, 'stderr', StringIO()):
+            dispersion_report.container_dispersion_report(
+                make_coropool(),
+                make_connpool(containers=[{'name': 'dispersion_1'}]),
+                'AUTH_test', make_ring(nodes=make_nodes(3)), 2, False,
+                prom_client)
+        self.assertEqual(9, mock_head.call_count)
+        self.assertEqual(
+            {metric_key('swift_dispersion_container_errors',
+                        {'status': 'connection_error'}): 3},
+            {k: v for k, v in prom_client._stats.items()
+             if 'errors' in k[0]})
+
+    @mock.patch('swift.common.direct_client.sleep')
+    @mock.patch('swift.common.direct_client.direct_head_container')
+    def test_retried_server_error_counted_once_per_request(
+            self, mock_head, mock_sleep):
+        mock_head.side_effect = ClientException('boom', http_status=503)
+        prom_client = get_prometheus_client({})
+        with patch.object(sys, 'stderr', StringIO()):
+            dispersion_report.container_dispersion_report(
+                make_coropool(),
+                make_connpool(containers=[{'name': 'dispersion_1'}]),
+                'AUTH_test', make_ring(nodes=make_nodes(3)), 2, False,
+                prom_client)
+        # 3 nodes x (1 try + 2 retries) HEADs, but only 3 failed requests
+        self.assertEqual(9, mock_head.call_count)
+        self.assertEqual(
+            {metric_key('swift_dispersion_container_errors',
+                        {'status': '503'}): 3},
+            {k: v for k, v in prom_client._stats.items()
+             if 'errors' in k[0]})
 
     @mock.patch('swift.common.direct_client.retry')
     def test_all_copies_found(self, mock_retry):
@@ -1104,7 +1288,8 @@ class TestContainerDispersionReport(unittest.TestCase):
                       {'name': 'dispersion_0_2'}]
         result = dispersion_report.container_dispersion_report(
             make_coropool(), make_connpool(containers=containers),
-            'AUTH_test', make_ring(nodes=nodes), 3, False)
+            'AUTH_test', make_ring(nodes=nodes), 3, False,
+            get_prometheus_client({}))
         self.assertEqual(result['copies_found'], result['copies_expected'])
         self.assertEqual(result['pct_found'], 100.0)
         self.assertEqual(result['retries'], 0)
@@ -1113,11 +1298,41 @@ class TestContainerDispersionReport(unittest.TestCase):
     def test_missing_copies_tracked(self, mock_retry):
         mock_retry.side_effect = Exception('node down')
         containers = [{'name': 'dispersion_1'}]
+        prom_client = get_prometheus_client({})
         result = dispersion_report.container_dispersion_report(
             make_coropool(), make_connpool(containers=containers),
-            'AUTH_test', make_ring(nodes=make_nodes(3)), 3, False)
+            'AUTH_test', make_ring(nodes=make_nodes(3)), 3, False,
+            prom_client)
         self.assertEqual(result['copies_found'], 0)
         self.assertIn('missing_3', result)
+        self.assertEqual(
+            prom_client._stats[metric_key(
+                'swift_dispersion_container_partitions_missing',
+                {'missing_copies': '3'})], 1)
+
+    @mock.patch('swift.common.direct_client.retry')
+    def test_records_metrics_to_prom_client_for_container(self, mock_retry):
+        mock_retry.return_value = (1, None)
+        prom_client = get_prometheus_client({})
+        nodes = make_nodes(3)
+        containers = [{'name': 'dispersion_1'}]
+        dispersion_report.container_dispersion_report(
+            make_coropool(), make_connpool(containers=containers),
+            'AUTH_test', make_ring(nodes=nodes), 3, False, prom_client)
+        # Swift has one container ring, so none of these carry a policy
+        # label. Compare the whole dict. An extra label then fails the test.
+        expected_container = {
+            metric_key('swift_dispersion_container_copies_found', {}): 3.0,
+            metric_key('swift_dispersion_container_copies_expected', {}): 3.0,
+            metric_key('swift_dispersion_container_retries', {}): 0.0,
+            metric_key(
+                'swift_dispersion_container_samples_listed', {}): 1.0,
+            metric_key(
+                'swift_dispersion_container_distinct_partitions', {}): 1.0,
+        }
+        actual_container = {k: float(v)
+                            for k, v in prom_client._stats.items()}
+        self.assertEqual(actual_container, expected_container)
 
     @mock.patch('swift.common.direct_client.retry')
     def test_obsolete_only_population_warns_and_exits_without_backend_checks(
@@ -1129,7 +1344,8 @@ class TestContainerDispersionReport(unittest.TestCase):
                     make_coropool(), make_connpool(containers=[
                         {'name': 'dispersion_0_1'},
                         {'name': 'dispersion_7_2'}]),
-                    'AUTH_test', make_ring(), 3, False)
+                    'AUTH_test', make_ring(), 3, False,
+                    get_prometheus_client({}))
         self.assertIn('WARNING: Ignoring 2 obsolete container', err.getvalue())
         self.assertIn('ERROR: No canonical container', str(caught.exception))
         mock_retry.assert_not_called()
@@ -1155,8 +1371,48 @@ class TestObjectDispersionReport(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             dispersion_report.object_dispersion_report(
                 make_coropool(), make_connpool(objects=[]),
-                'AUTH_test', make_ring(), 3, False, self._policy())
+                'AUTH_test', make_ring(), 3, False, self._policy(),
+                get_prometheus_client({}))
         self.assertIn('ERROR: No canonical object', str(caught.exception))
+
+    @mock.patch('swift.common.direct_client.sleep')
+    @mock.patch('swift.common.direct_client.direct_head_object')
+    def test_retried_connection_error_counted_once_per_request(
+            self, mock_head, mock_sleep):
+        mock_head.side_effect = ConnectionRefusedError()
+        prom_client = get_prometheus_client({})
+        with patch.object(sys, 'stderr', StringIO()):
+            dispersion_report.object_dispersion_report(
+                make_coropool(),
+                make_connpool(objects=[{'name': 'dispersion_1'}]),
+                'AUTH_test', make_ring(nodes=make_nodes(3)), 2, False,
+                self._policy(), prom_client)
+        self.assertEqual(9, mock_head.call_count)
+        self.assertEqual(
+            {metric_key('swift_dispersion_object_errors',
+                        {'status': 'connection_error', 'policy': '0'}): 3},
+            {k: v for k, v in prom_client._stats.items()
+             if 'errors' in k[0]})
+
+    @mock.patch('swift.common.direct_client.sleep')
+    @mock.patch('swift.common.direct_client.direct_head_object')
+    def test_retried_server_error_counted_once_per_request(
+            self, mock_head, mock_sleep):
+        mock_head.side_effect = ClientException('boom', http_status=503)
+        prom_client = get_prometheus_client({})
+        with patch.object(sys, 'stderr', StringIO()):
+            dispersion_report.object_dispersion_report(
+                make_coropool(),
+                make_connpool(objects=[{'name': 'dispersion_1'}]),
+                'AUTH_test', make_ring(nodes=make_nodes(3)), 2, False,
+                self._policy(), prom_client)
+        # 3 nodes x (1 try + 2 retries) HEADs, but only 3 failed requests
+        self.assertEqual(9, mock_head.call_count)
+        self.assertEqual(
+            {metric_key('swift_dispersion_object_errors',
+                        {'status': '503', 'policy': '0'}): 3},
+            {k: v for k, v in prom_client._stats.items()
+             if 'errors' in k[0]})
 
     @mock.patch('swift.common.direct_client.retry')
     def test_all_copies_found(self, mock_retry):
@@ -1166,7 +1422,8 @@ class TestObjectDispersionReport(unittest.TestCase):
                    {'name': 'dispersion_2'}]
         result = dispersion_report.object_dispersion_report(
             make_coropool(), make_connpool(objects=objects),
-            'AUTH_test', make_ring(nodes=nodes), 3, False, self._policy())
+            'AUTH_test', make_ring(nodes=nodes), 3, False, self._policy(),
+            get_prometheus_client({}))
         self.assertEqual(result['copies_found'], result['copies_expected'])
         self.assertEqual(result['pct_found'], 100.0)
 
@@ -1174,12 +1431,17 @@ class TestObjectDispersionReport(unittest.TestCase):
     def test_missing_copies_tracked(self, mock_retry):
         mock_retry.side_effect = Exception('node down')
         objects = [{'name': 'dispersion_1'}]
+        prom_client = get_prometheus_client({})
         result = dispersion_report.object_dispersion_report(
             make_coropool(), make_connpool(objects=objects),
             'AUTH_test', make_ring(nodes=make_nodes(3)), 3, False,
-            self._policy())
+            self._policy(), prom_client)
         self.assertEqual(result['copies_found'], 0)
         self.assertIn('missing_3', result)
+        self.assertEqual(
+            prom_client._stats[metric_key(
+                'swift_dispersion_object_partitions_missing',
+                {'policy': '0', 'missing_copies': '3'})], 1)
 
     @mock.patch('swift.common.direct_client.retry')
     def test_policy_zero_reports_canonical_samples_and_warns_about_old_names(
@@ -1204,7 +1466,7 @@ class TestObjectDispersionReport(unittest.TestCase):
         with patch.object(sys, 'stderr', err):
             result = dispersion_report.object_dispersion_report(
                 make_coropool(), connpool, 'AUTH_test', ring, 3, False,
-                self._policy())
+                self._policy(), get_prometheus_client({}))
 
         conn.get_container.assert_called_once_with(
             'dispersion_objects', prefix='dispersion_', full_listing=True)
@@ -1233,7 +1495,7 @@ class TestObjectDispersionReport(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 dispersion_report.object_dispersion_report(
                     make_coropool(), connpool, 'AUTH_test', make_ring(),
-                    3, False, self._policy())
+                    3, False, self._policy(), get_prometheus_client({}))
         self.assertIn('WARNING: Ignoring 1 obsolete object', err.getvalue())
         self.assertIn('ERROR: No canonical object', str(caught.exception))
         conn.get_container.assert_called_once_with(
@@ -1251,7 +1513,7 @@ class TestObjectDispersionReport(unittest.TestCase):
         with patch.object(sys, 'stderr', err):
             result = dispersion_report.object_dispersion_report(
                 make_coropool(), connpool, 'AUTH_test', make_ring(),
-                3, False, self._policy('ec', 7))
+                3, False, self._policy('ec', 7), get_prometheus_client({}))
         self.assertEqual(3, result['copies_expected'])
         self.assertEqual('', err.getvalue())
         self.assertEqual(['dispersion_objects_7'] * 3,
