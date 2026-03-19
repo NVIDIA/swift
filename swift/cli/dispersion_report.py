@@ -30,6 +30,7 @@ from swift.common.exceptions import ClientException
 from swift.common.utils import compute_eta, get_time_units, \
     config_true_value, node_to_string
 from swift.common.storage_policy import POLICIES
+from swift.common.prom_metrics import get_prometheus_client
 from swift.cli.dispersion import (
     container_dispersion_names, object_dispersion_container,
     object_dispersion_names, obsolete_container_dispersion_names,
@@ -43,10 +44,14 @@ debug = False
 insecure = False
 
 
-def get_error_log(prefix):
+def get_error_log(prefix, prom_client, error_metric, labels):
 
     def error_log(msg_or_exc):
+        global debug, unmounted, notfound
         if hasattr(msg_or_exc, 'http_status'):
+            status_labels = dict(labels)
+            status_labels['status'] = str(msg_or_exc.http_status)
+            prom_client.increment(error_metric, status_labels)
             identifier = '%s:%s/%s' % (msg_or_exc.http_host,
                                        msg_or_exc.http_port,
                                        msg_or_exc.http_device)
@@ -63,14 +68,16 @@ def get_error_log(prefix):
                 print('ERROR: %s returned a 404' % (identifier), file=stderr)
                 stderr.flush()
         if not hasattr(msg_or_exc, 'http_status') or \
-                msg_or_exc.http_status not in (404, 507):
+                (hasattr(msg_or_exc, 'http_status') and
+                 msg_or_exc.http_status not in (404, 507)):
             print('ERROR: %s: %s' % (prefix, msg_or_exc), file=stderr)
             stderr.flush()
     return error_log
 
 
 def container_dispersion_report(coropool, connpool, account, container_ring,
-                                retries, output_missing_partitions):
+                                retries, output_missing_partitions,
+                                prom_client):
     with connpool.item() as conn:
         account_listing = conn.get_account(
             prefix='dispersion_', full_listing=True)[1]
@@ -91,7 +98,9 @@ def container_dispersion_report(coropool, connpool, account, container_ring,
     def direct(container, part, nodes):
         found_count = 0
         for node in nodes:
-            error_log = get_error_log(node_to_string(node))
+            error_log = get_error_log(
+                node_to_string(node), prom_client,
+                'swift_dispersion_container_errors', {})
             try:
                 attempts, _junk = direct_client.retry(
                     direct_client.direct_head_container, node, part, account,
@@ -139,6 +148,26 @@ def container_dispersion_report(coropool, connpool, account, container_ring,
     value = 100.0 * copies_found / copies_expected
     elapsed, elapsed_unit = get_time_units(time() - begun)
     container_copies_missing.pop(0, None)
+
+    # Swift has one container ring, so these metrics carry no policy label.
+    prom_client.record('swift_dispersion_container_copies_found',
+                       copies_found)
+    prom_client.record('swift_dispersion_container_copies_expected',
+                       copies_expected)
+    # To get swift_dispersion_container_pct_found,
+    # compute it as copies_found / copies_expected.
+    prom_client.record('swift_dispersion_container_retries',
+                       retries_done[0])
+    prom_client.record('swift_dispersion_container_partitions_queried',
+                       containers_queried[0])
+    prom_client.record('swift_dispersion_container_distinct_partitions',
+                       distinct_partitions)
+    for missing_copies, num_parts in container_copies_missing.items():
+        prom_client.record(
+            'swift_dispersion_container_partitions_missing',
+            num_parts,
+            {'missing_copies': str(missing_copies)})
+
     if not json_output:
         print('\r\x1B[KQueried %d containers for dispersion reporting, '
               '%d%s, %d retries' % (containers_listed, round(elapsed),
@@ -167,7 +196,8 @@ def container_dispersion_report(coropool, connpool, account, container_ring,
 
 
 def object_dispersion_report(coropool, connpool, account, object_ring,
-                             retries, output_missing_partitions, policy):
+                             retries, output_missing_partitions, policy,
+                             prom_client):
     container = object_dispersion_container(policy.idx)
     with connpool.item() as conn:
         account_listing = conn.get_account(
@@ -204,7 +234,9 @@ def object_dispersion_report(coropool, connpool, account, object_ring,
     def direct(container, obj, part, nodes):
         found_count = 0
         for node in nodes:
-            error_log = get_error_log(node_to_string(node))
+            error_log = get_error_log(
+                node_to_string(node), prom_client,
+                'swift_dispersion_object_errors', {'policy': int(policy)})
             try:
                 attempts, _junk = direct_client.retry(
                     direct_client.direct_head_object, node, part, account,
@@ -252,6 +284,27 @@ def object_dispersion_report(coropool, connpool, account, object_ring,
     copies_expected = object_copies_expected[0]
     value = 100.0 * copies_found / copies_expected
     elapsed, elapsed_unit = get_time_units(time() - begun)
+    object_copies_missing.pop(0, None)
+
+    labels = {'policy': int(policy)}
+    prom_client.record('swift_dispersion_object_copies_found',
+                       copies_found, labels)
+    prom_client.record('swift_dispersion_object_copies_expected',
+                       copies_expected, labels)
+    # To get swift_dispersion_object_pct_found,
+    # compute it as copies_found / copies_expected.
+    prom_client.record('swift_dispersion_object_retries',
+                       retries_done[0], labels)
+    prom_client.record('swift_dispersion_object_partitions_queried',
+                       objects_queried[0], labels)
+    prom_client.record('swift_dispersion_object_distinct_partitions',
+                       distinct_partitions, labels)
+    for missing_copies, num_parts in object_copies_missing.items():
+        prom_client.record(
+            'swift_dispersion_object_partitions_missing',
+            num_parts,
+            dict(labels, missing_copies=str(missing_copies)))
+
     if not json_output:
         print('\r\x1B[KQueried %d objects for dispersion reporting, '
               '%d%s, %d retries' % (objects_listed, round(elapsed),
@@ -390,6 +443,9 @@ def generate_report(conf, policy_name=None):
         policy = POLICIES.get_by_name(policy_name)
         if policy is None:
             exit('Unable to find policy: %s' % policy_name)
+
+    prom_client = get_prometheus_client(conf)
+
     if not json_output:
         print('Using storage policy: %s ' % policy.name)
 
@@ -446,12 +502,24 @@ def generate_report(conf, policy_name=None):
     if container_report:
         output['container'] = container_dispersion_report(
             coropool, connpool, account, container_ring, retries,
-            conf.get('partitions'))
+            conf.get('partitions'), prom_client)
     if object_report:
         output['object'] = object_dispersion_report(
             coropool, connpool, account, object_ring, retries,
-            conf.get('partitions'), policy)
+            conf.get('partitions'), policy, prom_client)
 
+    if prom_client.filename:
+        # A metrics file that cannot be written must not stop the report.
+        try:
+            prom_client.write_all_stats()
+        except OSError as err:
+            print('ERROR: unable to write metrics to %s: %s' % (
+                prom_client.filename, err), file=stderr)
+            stderr.flush()
+    else:
+        # No filename configured. Return structured metrics so callers and
+        # tests can inspect metrics without a file.
+        output['metrics'] = prom_client.get_all_stats_data()
     return output
 
 
