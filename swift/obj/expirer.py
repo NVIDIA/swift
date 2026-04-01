@@ -32,10 +32,11 @@ from swift.common import utils
 from swift.common.middleware.s3api.utils import sysmeta_header as \
     s3_sysmeta_header
 from swift.common.utils import get_logger, dump_recon_cache, split_path, \
-    Timestamp, config_true_value, normalize_delete_at_timestamp, \
-    RateLimitedIterator, md5, non_negative_float, non_negative_int, \
-    parse_content_type, parse_options, config_positive_int_value, \
-    last_modified_date_to_timestamp
+    config_true_value, RateLimitedIterator, md5, non_negative_float, \
+    non_negative_int, parse_content_type, parse_options, \
+    config_positive_int_value
+from swift.common.utils.timestamp import Timestamp, NormalTimestamp, \
+    last_modified_date_to_timestamp, normalize_delete_at_timestamp
 from swift.common.http import HTTP_NOT_FOUND, HTTP_CONFLICT, \
     HTTP_PRECONDITION_FAILED
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
@@ -540,7 +541,7 @@ class ObjectExpirer(Daemon):
                 unexpected_task_containers['count'] += 1
                 if unexpected_task_containers['count'] < 5:
                     unexpected_task_containers['examples'].append(c['name'])
-            if task_container_int > Timestamp.now():
+            if task_container_int > NormalTimestamp.now():
                 break
             container_list.append(task_container_int)
 
@@ -694,7 +695,7 @@ class ObjectExpirer(Daemon):
             delay_reaping = self.get_delay_reaping(target_account,
                                                    target_container)
 
-            if delete_timestamp > Timestamp.now():
+            if delete_timestamp > NormalTimestamp.now():
                 # we shouldn't yield ANY more objects that can't reach
                 # the expiration date yet.
                 break
@@ -705,8 +706,8 @@ class ObjectExpirer(Daemon):
                 self.logger.increment('tasks.skipped')
                 continue
 
-            if delete_timestamp > Timestamp(time() - delay_reaping) \
-                    and not is_async:
+            if delete_timestamp > NormalTimestamp.now(
+                    delta=-1e5 * delay_reaping) and not is_async:
                 # we shouldn't yield the object during the delay
                 self.logger.increment('tasks.delayed')
                 continue

@@ -8751,9 +8751,8 @@ class TestObjectController(BaseUnitTestCase):
         # update because we didn't assign those headers to our stub request!
         async_pendings = gather_async_pendings()
         self.assertEqual(
-            [('PUT', '.expiring_objects', task_timestamp_ts)],
-            [(u['op'], u['account'], Timestamp(
-                u['headers']['X-Timestamp']))
+            [('PUT', '.expiring_objects', task_timestamp_ts.normal)],
+            [(u['op'], u['account'], u['headers']['X-Timestamp'])
              for u in async_pendings])
 
         # before the expirer gets a chance to do anything DELETE it!
@@ -8769,11 +8768,10 @@ class TestObjectController(BaseUnitTestCase):
         async_pendings = gather_async_pendings()
         self.assertEqual(2, len(async_pendings))
         self.assertEqual({
-            ('PUT', '.expiring_objects', task_timestamp_ts),
-            ('DELETE', '.expiring_objects', user_deleted_at),
+            ('PUT', '.expiring_objects', task_timestamp_ts.normal),
+            ('DELETE', '.expiring_objects', user_deleted_at.normal),
         }, {
-            (u['op'], u['account'], Timestamp(
-                u['headers']['X-Timestamp']))
+            (u['op'], u['account'], u['headers']['X-Timestamp'])
             for u in async_pendings
         })
 
@@ -8781,8 +8779,8 @@ class TestObjectController(BaseUnitTestCase):
         req = Request.blank('/sda1/p/a/c/o', method='HEAD')
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 404)
-        self.assertEqual(user_deleted_at,
-                         Timestamp(resp.headers['X-Backend-Timestamp']))
+        self.assertEqual(user_deleted_at.normal,
+                         resp.headers['X-Backend-Timestamp'])
         # this should be sufficient to say that the task is stale
         self.assertGreater(Timestamp(resp.headers['X-Backend-Timestamp']),
                            task_timestamp_ts)

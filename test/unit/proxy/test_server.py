@@ -75,6 +75,7 @@ from swift.common.utils import hash_path, storage_directory, \
     ShardRange, parse_content_type, parse_mime_headers, \
     iter_multipart_mime_documents, public, mkdirs, NullLogger, md5, \
     node_to_string, NamespaceBoundList
+from swift.common.utils.timestamp import NormalTimestamp
 from swift.common.wsgi import loadapp, ConfigString
 from swift.common.http_protocol import SwiftHttpProtocol
 from swift.container.backend import NOTFOUND, UNSHARDED, SHARDING, SHARDED, \
@@ -4439,7 +4440,7 @@ class TestReplicatedObjectController(
                             'x-backend-sharding-state': sharding_state,
                             'X-Backend-Record-Type': 'shard'}
             shard_range = utils.ShardRange(
-                '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u')
+                '.shards_a/c_shard', NormalTimestamp.now(), 'l', 'u')
             body = json.dumps([dict(shard_range)]).encode('ascii')
             with mocked_http_conn(*status_codes, headers=resp_headers,
                                   body=body) as fake_conn:
@@ -4531,11 +4532,11 @@ class TestReplicatedObjectController(
                             'X-Backend-Record-Type': 'shard'}
             shard_ranges = [
                 utils.ShardRange(
-                    '.shards_a/c_not_used', utils.Timestamp.now(), '', 'l'),
+                    '.shards_a/c_not_used', NormalTimestamp.now(), '', 'l'),
                 utils.ShardRange(
-                    '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u'),
+                    '.shards_a/c_shard', NormalTimestamp.now(), 'l', 'u'),
                 utils.ShardRange(
-                    '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
+                    '.shards_a/c_nope', NormalTimestamp.now(), 'u', ''),
             ]
             body = json.dumps([
                 dict(shard_range)
@@ -4647,11 +4648,11 @@ class TestReplicatedObjectController(
             self.app.logger.clear()  # clean capture state
             shard_ranges = [
                 utils.ShardRange(
-                    '.shards_a/c_not_used', utils.Timestamp.now(), '', 'l'),
+                    '.shards_a/c_not_used', NormalTimestamp.now(), '', 'l'),
                 utils.ShardRange(
-                    '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u'),
+                    '.shards_a/c_shard', NormalTimestamp.now(), 'l', 'u'),
                 utils.ShardRange(
-                    '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
+                    '.shards_a/c_nope', NormalTimestamp.now(), 'u', ''),
             ]
             cache = FakeMemcache()
             cache.set(
@@ -4751,11 +4752,11 @@ class TestReplicatedObjectController(
             self.app.logger.clear()  # clean capture state
             shard_ranges = [
                 utils.ShardRange(
-                    '.shards_a/c_not_used', utils.Timestamp.now(), '', 'l'),
+                    '.shards_a/c_not_used', NormalTimestamp.now(), '', 'l'),
                 utils.ShardRange(
-                    '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u'),
+                    '.shards_a/c_shard', NormalTimestamp.now(), 'l', 'u'),
                 utils.ShardRange(
-                    '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
+                    '.shards_a/c_nope', NormalTimestamp.now(), 'u', ''),
             ]
             cache = FakeMemcache()
             infocache = {
@@ -4856,11 +4857,11 @@ class TestReplicatedObjectController(
             self.app.statsd.clear()
             cached_shard_ranges = [
                 utils.ShardRange(
-                    '.shards_a/c_nope', utils.Timestamp.now(), '', 'l'),
+                    '.shards_a/c_nope', NormalTimestamp.now(), '', 'l'),
                 utils.ShardRange(
-                    '.shards_a/c_uhn_uh', utils.Timestamp.now(), 'l', 'u'),
+                    '.shards_a/c_uhn_uh', NormalTimestamp.now(), 'l', 'u'),
                 utils.ShardRange(
-                    '.shards_a/c_no_way', utils.Timestamp.now(), 'u', ''),
+                    '.shards_a/c_no_way', NormalTimestamp.now(), 'u', ''),
             ]
             cache = FakeMemcache()
             cache.set('shard-updating-v2/a/c',
@@ -4915,11 +4916,11 @@ class TestReplicatedObjectController(
                             'X-Backend-Record-Type': 'shard'}
             shard_ranges = [
                 utils.ShardRange(
-                    '.shards_a/c_not_used', utils.Timestamp.now(), '', 'l'),
+                    '.shards_a/c_not_used', NormalTimestamp.now(), '', 'l'),
                 utils.ShardRange(
-                    '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u'),
+                    '.shards_a/c_shard', NormalTimestamp.now(), 'l', 'u'),
                 utils.ShardRange(
-                    '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
+                    '.shards_a/c_nope', NormalTimestamp.now(), 'u', ''),
             ]
             body = json.dumps([
                 dict(shard_range)
@@ -5089,11 +5090,11 @@ class TestReplicatedObjectController(
                             'X-Backend-Record-Type': 'shard'}
             shard_ranges = [
                 utils.ShardRange(
-                    '.shards_a/c_not_used', utils.Timestamp.now(), '', 'l'),
+                    '.shards_a/c_not_used', NormalTimestamp.now(), '', 'l'),
                 utils.ShardRange(
-                    '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u'),
+                    '.shards_a/c_shard', NormalTimestamp.now(), 'l', 'u'),
                 utils.ShardRange(
-                    '.shards_a/c_nope', utils.Timestamp.now(), 'u', ''),
+                    '.shards_a/c_nope', NormalTimestamp.now(), 'u', ''),
             ]
             body = json.dumps([
                 dict(shard_range)

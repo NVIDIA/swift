@@ -723,9 +723,9 @@ class TestExpirerRebalance(unittest.TestCase):
             fd.write('[object-expirer]')
 
         with mock.patch('sys.stdout', new=StringIO()) as mock_stdout, \
-            mock.patch.object(expirer_rebalancer.ExpirerRebalancer,
-                              'get_task_containers_to_migrate') as mock_get:
-            mock_get.side_effect = Exception('test error')
+                mock.patch.object(expirer_rebalancer.ExpirerRebalancer,
+                                  'get_task_containers_to_migrate',
+                                  side_effect=Exception('test error')):
             ret = expirer_rebalancer.main([conf_path])
 
         self.assertEqual(1, ret)
@@ -734,12 +734,16 @@ class TestExpirerRebalance(unittest.TestCase):
 
         with mock.patch('sys.stdout', new=StringIO()) as mock_stdout, \
             mock.patch.object(expirer_rebalancer.ExpirerRebalancer,
-                              'run_workers') as mock_run_workers:
+                              'get_task_containers_to_migrate',
+                              return_value=['a container']), \
+                mock.patch.object(expirer_rebalancer.ExpirerRebalancer,
+                                  'run_workers') as mock_run_workers:
             mock_run_workers.return_value = {'failed_tasks': 1}
             ret = expirer_rebalancer.main([conf_path])
 
         self.assertEqual(1, ret)
-        self.assertEqual('done with errors, please check logs.\n',
+        self.assertEqual('failed_tasks 1\n'
+                         'done with errors, please check logs.\n',
                          mock_stdout.getvalue())
 
     def test_main(self):

@@ -38,11 +38,12 @@ from swift.common.constraints import \
 from swift.common.db import chexor, dict_factory, get_db_connection, \
     DatabaseBroker, DatabaseConnectionError, DatabaseAlreadyExists, \
     GreenDBConnection, PICKLE_PROTOCOL, zero_like, TombstoneReclaimer
-from swift.common.utils import mkdirs, Timestamp, md5
+from swift.common.utils import mkdirs, Timestamp, md5, NormalTimestamp
 from swift.common.exceptions import LockTimeout, DatabasePragmaException
 from swift.common.swob import HTTPException
 
-from test.unit import make_timestamp_iter, generate_db_path, BaseUnitTestCase
+from test.unit import make_timestamp_iter, generate_db_path, \
+    BaseUnitTestCase, mock_normal_timestamp_now
 
 
 class TestHelperFunctions(unittest.TestCase):
@@ -287,7 +288,7 @@ class ExampleBroker(DatabaseBroker):
         INSERT INTO test_stat (
             account, created_at, id, put_timestamp, status_changed_at, status)
         VALUES (?, ?, ?, ?, ?, ?);
-        """, (self.account, Timestamp.now().internal, str(uuid4()),
+        """, (self.account, NormalTimestamp.now().internal, str(uuid4()),
               put_timestamp, put_timestamp, ''))
 
     def merge_items(self, item_list):
@@ -366,8 +367,7 @@ class TestExampleBroker(TestDbBase):
     def test_initialize(self):
         broker = self.broker_class(self.db_path, account='a', container='c')
         put_timestamp = self.ts()
-        created_at = self.ts()
-        with patch('swift.common.db.Timestamp.now', return_value=created_at):
+        with mock_normal_timestamp_now() as created_at:
             broker.initialize(put_timestamp.internal)
         info = broker.get_info()
         self.assertEqual(info['created_at'], created_at.internal)
@@ -378,8 +378,7 @@ class TestExampleBroker(TestDbBase):
 
     def test_initialize_default_put_timestamp(self):
         broker = self.broker_class(self.db_path, account='a', container='c')
-        created_at = self.ts()
-        with patch('swift.common.db.Timestamp.now', return_value=created_at):
+        with mock_normal_timestamp_now() as created_at:
             broker.initialize()
         info = broker.get_info()
         self.assertEqual(info['created_at'], created_at.internal)
@@ -470,9 +469,7 @@ class TestExampleBroker(TestDbBase):
                         Timestamp(virgin_status_changed_at))
         # recreate
         recreate_timestamp = self.ts().internal
-        status_changed_at = Timestamp.now()
-        with patch('swift.common.db.Timestamp.now',
-                   return_value=status_changed_at):
+        with mock_normal_timestamp_now() as status_changed_at:
             broker.merge_timestamps(created_at, recreate_timestamp, '0')
         self.assertFalse(broker.is_deleted())
         info = broker.get_info()
@@ -561,9 +558,8 @@ class TestExampleBroker(TestDbBase):
 
     def test_get_info(self):
         broker = self.broker_class(self.db_path, account='test', container='c')
-        created_at = Timestamp.now()
         put_timestamp = self.ts()
-        with patch('swift.common.db.Timestamp.now', return_value=created_at):
+        with mock_normal_timestamp_now() as created_at:
             broker.initialize(put_timestamp.internal,
                               storage_policy_index=int(self.policy))
         info = broker.get_info()
@@ -618,8 +614,7 @@ class TestExampleBroker(TestDbBase):
     def test_status_changed_at(self):
         broker = self.broker_class(self.db_path, account='test', container='c')
         put_timestamp = self.ts().internal
-        created_at = Timestamp.now()
-        with patch('swift.common.db.Timestamp.now', return_value=created_at):
+        with mock_normal_timestamp_now() as created_at:
             broker.initialize(put_timestamp,
                               storage_policy_index=int(self.policy))
         self.assertEqual(broker.get_info()['status_changed_at'],

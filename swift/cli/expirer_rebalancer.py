@@ -398,7 +398,7 @@ def main(args=None):
             args.start_day_offset, args.num_days)
     except Exception as e:
         expirer_rebalancer.logger.exception(
-            'Failed to get expirering task containers: %s', e)
+            'Failed to get expiring task containers: %s', e)
         print(err_msg)
         return 1
 
