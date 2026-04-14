@@ -503,11 +503,12 @@ class ObjectContext(ObjectVersioningContext):
             drain_and_close(get_resp)
             return get_resp
 
-        # if there's an existing object, then copy it to
-        # X-Versions-Location
+        # if there's an existing object, then copy it to the versions container
         ts_source = get_resp.headers.get(
-            'x-timestamp',
-            str(parse_date_header(get_resp.headers['last-modified'])))
+            'x-backend-timestamp',
+            get_resp.headers.get('x-timestamp',
+                                 str(parse_date_header(
+                                     get_resp.headers['last-modified']))))
         vers_obj_name = self._build_versions_object_name(
             object_name, ts_source)
 
@@ -1169,9 +1170,12 @@ class ContainerContext(ObjectVersioningContext):
 
         params = dict(req.params)
         if 'marker' in params:
-            if params.get('version_marker') in ('null', None):
+            if 'version_marker' not in params:
                 params['marker'] = self._build_versions_object_prefix(
-                    params['marker']) + ':'  # just past all numbers
+                    params['marker']) + ':'  # just past all timestamps
+            elif params['version_marker'] == 'null':
+                params['marker'] = self._build_versions_object_prefix(
+                    params['marker'])  # just before all timestamps
             else:
                 try:
                     ts = Timestamp(params.pop('version_marker'))

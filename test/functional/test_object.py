@@ -339,8 +339,7 @@ class TestObject(unittest.TestCase):
         ts_after = time.time()
         if resp.status == 400:
             # shunt_inbound_x_timestamp must be false
-            self.assertIn(
-                'X-Timestamp should be a UNIX timestamp float value', body)
+            self.assertIn('Invalid X-Timestamp header: ', body)
         else:
             self.assertEqual(resp.status, 201)
             self.assertEqual(body, b'')
@@ -372,8 +371,7 @@ class TestObject(unittest.TestCase):
         ts_after = time.time()
         if resp.status == 400:
             # shunt_inbound_x_timestamp must be false
-            self.assertIn(
-                'X-Timestamp should be a UNIX timestamp float value', body)
+            self.assertIn('Invalid X-Timestamp header: ', body)
         else:
             self.assertEqual(resp.status, 201)
             self.assertEqual(body, b'')

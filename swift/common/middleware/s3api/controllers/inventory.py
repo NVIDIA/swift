@@ -111,8 +111,7 @@ class InventoryConfiguration(object):
                 errors.append(
                     'Destination/S3BucketDestination/Format must be Parquet')
             if conf.inventory_id != DEFAULT_INVENTORY_ID:
-                errors.append(
-                    'Id must be 0')
+                errors.append('Id must be %s' % DEFAULT_INVENTORY_ID)
             if conf.include_versions != 'Current':
                 errors.append('IncludedObjectVersions must be Current')
             if errors:
@@ -174,9 +173,6 @@ def add_sysmeta_header(req, config):
 
 
 class InventoryController(Controller):
-    def __init__(self, app, conf, logger, **kwargs):
-        super(InventoryController, self).__init__(app, conf, logger, **kwargs)
-
     def check_allowed_path(self, req):
         path = '/'.join([req.access_key, req.container_name])
         for allowed in self.conf.s3_inventory_allowed_paths:
@@ -193,7 +189,6 @@ class InventoryController(Controller):
 
     def check_req(self, req):
         if not (req.conf.s3_inventory_enabled and req.is_bucket_request):
-            # Handle Object ACL
             raise S3NotImplemented()
 
     def config_from_sysmeta(self, req, inventory_id):

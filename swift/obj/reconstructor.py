@@ -595,7 +595,9 @@ class ObjectReconstructor(Daemon):
             pile.spawn(self._get_response, primary_node, policy, partition,
                        path, headers)
 
-        useful_bucket = None
+        # A matching bucket is one that is_useful AND matches the local
+        # timestamp/etag
+        matching_bucket = None
         for resp in pile:
             bucket = self._handle_fragment_response(
                 node, policy, partition, fi_to_rebuild, path, buckets,
@@ -603,7 +605,7 @@ class ObjectReconstructor(Daemon):
             if (bucket
                     and bucket.is_useful(policy)
                     and bucket.matches(local_timestamp, local_etag)):
-                useful_bucket = bucket
+                matching_bucket = bucket
                 break
 
         # Once all rebuild nodes have responded, if we have a quarantine
@@ -612,7 +614,7 @@ class ObjectReconstructor(Daemon):
         # common case is all 404 responses so we use some concurrency to get an
         # outcome faster at the risk of some unnecessary requests in the
         # uncommon case.
-        if (not useful_bucket and
+        if (not matching_bucket and
                 self._is_quarantine_candidate(
                     policy, buckets, error_responses, df)):
             node_count = primary_node_count
@@ -629,7 +631,7 @@ class ObjectReconstructor(Daemon):
                 if (bucket
                         and bucket.is_useful(policy)
                         and bucket.matches(local_timestamp, local_etag)):
-                    useful_bucket = bucket
+                    matching_bucket = bucket
                     self.logger.debug(
                         'Reconstructing frag from handoffs, node_count=%d'
                         % node_count)
@@ -649,7 +651,7 @@ class ObjectReconstructor(Daemon):
                 # optimistically wait for any remaining responses in case a
                 # useful bucket is assembled.
 
-        return useful_bucket
+        return matching_bucket
 
     def reconstruct_fa(self, job, node, df):
         """
@@ -683,14 +685,14 @@ class ObjectReconstructor(Daemon):
         error_responses = defaultdict(list)  # map status code -> response list
 
         # don't try and fetch a fragment from the node we're rebuilding to
-        useful_bucket = self._make_fragment_requests(
+        matching_bucket = self._make_fragment_requests(
             job, node, df, buckets, error_responses)
 
-        if useful_bucket:
-            frag_indexes = list(useful_bucket.useful_responses.keys())
+        if matching_bucket:
+            frag_indexes = list(matching_bucket.useful_responses.keys())
             self.logger.debug('Reconstruct frag #%s with frag indexes %s'
                               % (fi_to_rebuild, frag_indexes))
-            responses = list(useful_bucket.useful_responses.values())
+            responses = list(matching_bucket.useful_responses.values())
             rebuilt_fragment_iter = self.make_rebuilt_fragment_iter(
                 responses[:policy.ec_ndata], path, policy, fi_to_rebuild)
             return RebuildingECDiskFileStream(datafile_metadata, fi_to_rebuild,

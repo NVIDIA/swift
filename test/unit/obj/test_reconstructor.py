@@ -5516,6 +5516,94 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 wrong_etag, etag)],
             error_lines)
 
+    def test_reconstruct_fa_two_buckets_both_error_messages(self):
+        # Verify that when there are two buckets, one at the wrong timestamp
+        # with enough responses and one at the local timestamp with too few,
+        # then we get both error messages: "mismatch" for the wrong bucket and
+        # "Unable to get enough responses" for the local bucket.
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+        ec_archive_bodies.pop(1)
+
+        wrong_timestamp = self.ts()
+        wrong_etag = md5(b'wrong data', usedforsecurity=False).hexdigest()
+
+        # Build responses: ec_ndata unique bodies at the wrong timestamp
+        # (enough), ec_nparity - 1 unique bodies at the local timestamp
+        # (not enough). With ec_duplication_factor > 1, extra duplicate
+        # bodies also go to the wrong bucket.
+        fi_to_rebuild = node['backend_index']
+        n_unique = self.policy.ec_n_unique_fragments - 1
+        responses = list()
+        num_wrong = self.policy.ec_ndata
+        num_right = n_unique - num_wrong
+        wrong_fis = set()
+        right_fis = set()
+        for i, body in enumerate(ec_archive_bodies):
+            headers = get_header_frag_index(self, body)
+            fi = headers['X-Object-Sysmeta-Ec-Frag-Index']
+            if num_wrong <= i < n_unique:
+                headers.update({
+                    'X-Object-Sysmeta-Ec-Etag': etag,
+                    'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+                })
+                if fi != fi_to_rebuild:
+                    right_fis.add(fi)
+            else:
+                headers.update({
+                    'X-Object-Sysmeta-Ec-Etag': wrong_etag,
+                    'X-Backend-Data-Timestamp': wrong_timestamp.internal,
+                })
+                if fi != fi_to_rebuild:
+                    wrong_fis.add(fi)
+            responses.append((200, body, headers))
+        wrong_useful = len(wrong_fis)
+        wrong_total = len(ec_archive_bodies) - num_right
+        right_useful = len(right_fis)
+        right_total = num_right
+
+        codes, body_iter, headers = zip(*responses)
+        with mocked_http_conn(
+                *codes, body_iter=body_iter, headers=headers):
+            self.assertRaises(DiskFileError,
+                              self.reconstructor.reconstruct_fa,
+                              job, node, self._create_fragment(
+                                  2, body=b'', ec_etag=etag))
+
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(2, len(error_lines), error_lines)
+
+        full_path = '10.0.0.1:1001/sdb/0%s policy#0' % \
+            self.obj_path.decode('utf8')
+        # bucket at wrong timestamp has enough responses
+        self.assertIn(
+            'Received enough responses (%s/%s from %s ok responses) '
+            'but not reconstructing non-durable %s frag#1, '
+            'bucket timestamp: %s, local timestamp: %s, '
+            'bucket etag: %s, local etag: %s (mismatch)'
+            % (wrong_useful, self.policy.ec_ndata, wrong_total,
+               full_path,
+               wrong_timestamp.internal, self.obj_timestamp.internal,
+               wrong_etag, etag),
+            error_lines)
+        # bucket at local timestamp does not have enough
+        self.assertIn(
+            'Unable to get enough responses (%s/%s from %s ok '
+            'responses) to reconstruct non-durable %s frag#1 with ETag '
+            '%s and timestamp %s'
+            % (right_useful, self.policy.ec_ndata, right_total,
+               full_path, etag, self.obj_timestamp.internal),
+            error_lines)
+
     def test_reconstruct_fa_skips_wrong_etag_finds_right(self):
         # Verify that when a wrong-etag bucket (at a different timestamp)
         # fills to ec_ndata, the reconstructor keeps processing remaining
@@ -6912,35 +7000,38 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
         etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
-        ec_archive_bodies.pop(1)
+        ec_archive_bodies.pop(1)  # frag#1 is being rebuilt
 
         wrong_timestamp = self.ts()
-        wrong_etag = md5(b'wrong data', usedforsecurity=False).hexdigest()
+        wrong_data = (b'different' * self.policy.ec_segment_size)[:-333]
+        wrong_etag = md5(wrong_data, usedforsecurity=False).hexdigest()
+        wrong_ec_archive_bodies = encode_frag_archive_bodies(
+            self.policy, wrong_data)
+        wrong_ec_archive_bodies.pop(1)
 
         # just one 200 from a primary (frag#0 at local_timestamp), then 404s
         # for all other primaries, then handoff 200s at the wrong
         # timestamp/etag
         responses = list()
-        for i, body in enumerate(ec_archive_bodies):
+        # first primary returns frag#0 at local timestamp
+        frag0_body = ec_archive_bodies[0]
+        frag0_headers = get_header_frag_index(self, frag0_body)
+        frag0_headers.update({
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Backend-Data-Timestamp': self.obj_timestamp.internal,
+        })
+        responses.append((200, frag0_body, frag0_headers))
+        # frag#1 is being rebuilt; remaining primaries all return 404
+        num_other_primaries = self.policy.object_ring.replicas - 2
+        responses.extend(((404, None, None),) * num_other_primaries)
+        # handoffs return frags at a different timestamp/etag
+        for body in wrong_ec_archive_bodies:
             headers = get_header_frag_index(self, body)
-            if i == 0:
-                # first primary returns frag at local timestamp
-                headers.update({
-                    'X-Object-Sysmeta-Ec-Etag': etag,
-                    'X-Backend-Data-Timestamp':
-                        self.obj_timestamp.internal,
-                })
-                responses.append((200, body, headers))
-                # frag#1 is being rebuilt; insert 404s for remaining primaries
-                responses.extend(
-                    ((404, None, None),) * self.policy.object_ring.replicas)
-            else:
-                # handoffs return frags at a different timestamp/etag
-                headers.update({
-                    'X-Object-Sysmeta-Ec-Etag': wrong_etag,
-                    'X-Backend-Data-Timestamp': wrong_timestamp.internal,
-                })
-                responses.append((200, body, headers))
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': wrong_etag,
+                'X-Backend-Data-Timestamp': wrong_timestamp.internal,
+            })
+            responses.append((200, body, headers))
 
         codes, body_iter, headers = zip(*responses)
         with mocked_http_conn(
@@ -6957,7 +7048,14 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         full_path = '10.0.0.1:1001/sdb/0%s policy#0' % \
             self.obj_path.decode('utf8')
         fi_to_rebuild = self.policy.get_backend_index(node['index'])
-        num_handoff_frags = len(ec_archive_bodies) - 1
+        num_handoff_frags = len(wrong_ec_archive_bodies)
+        # With ec_duplication_factor > 1, duplicate frag indices are
+        # deduplicated in useful_responses, so count unique indices
+        num_handoff_useful = len(set(
+            get_header_frag_index(self, body)[
+                'X-Object-Sysmeta-Ec-Frag-Index']
+            for body in wrong_ec_archive_bodies
+        ) - {fi_to_rebuild})
 
         # bucket at local timestamp has only 1 response
         self.assertIn(
@@ -6973,7 +7071,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             'but not reconstructing non-durable %s frag#%s, '
             'bucket timestamp: %s, local timestamp: %s, '
             'bucket etag: %s, local etag: %s (mismatch)'
-            % (num_handoff_frags, self.policy.ec_ndata,
+            % (num_handoff_useful, self.policy.ec_ndata,
                num_handoff_frags, full_path, fi_to_rebuild,
                wrong_timestamp.internal, self.obj_timestamp.internal,
                wrong_etag, etag),
@@ -6982,7 +7080,7 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
         self.assertIn(
             'Unable to get enough responses (%s x 404 error responses) '
             'to reconstruct non-durable %s frag#%s'
-            % (self.policy.object_ring.replicas, full_path, fi_to_rebuild),
+            % (num_other_primaries, full_path, fi_to_rebuild),
             error_lines)
 
     def test_reconstruct_fa_finds_duplicate_does_not_fail(self):
@@ -7229,6 +7327,63 @@ class TestReconstructFragmentArchiveECDuplicationFactor(
         self.assertIsInstance(cm.exception, DiskFileError)
         self._assert_diskfile_not_quarantined()
         self._verify_error_lines(2, other_responses, 1)
+
+    def test_reconstruct_fa_wrong_bucket_first_finds_match_in_duplicates(self):
+        # With ec_duplication_factor=2 (EC 10+4, 28 nodes), each unique frag
+        # index is stored on two primary nodes. When all first-copy nodes
+        # respond at a wrong timestamp, the wrong bucket fills to ec_ndata
+        # first. Verify the loop does NOT break early and instead continues
+        # processing duplicate-copy responses at the correct timestamp,
+        # which assemble a matching bucket and allow reconstruction.
+        job = {
+            'partition': 0,
+            'policy': self.policy,
+        }
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+        broken_body = ec_archive_bodies.pop(1)
+        # Total 27 bodies:
+        #   [0..12]  first copies:  frag indices 0, 2, 3, ..., 13
+        #   [13]     duplicate of frag index 0
+        #   [14]     duplicate of frag index 1 (== fi_to_rebuild, skipped)
+        #   [15..26] duplicates of frag indices 2, 3, ..., 13
+
+        wrong_timestamp = self.ts()
+        n_unique = self.policy.ec_n_unique_fragments
+
+        responses = list()
+        for i, body in enumerate(ec_archive_bodies):
+            headers = get_header_frag_index(self, body)
+            headers.update({'X-Object-Sysmeta-Ec-Etag': etag})
+            if i < n_unique - 1:
+                # first copies with wrong timestamp
+                headers['X-Backend-Data-Timestamp'] = \
+                    wrong_timestamp.internal
+            else:
+                # duplicate copies with correct timestamp
+                headers['X-Backend-Data-Timestamp'] = \
+                    self.obj_timestamp.internal
+            responses.append((200, body, headers))
+
+        codes, body_iter, headers_iter = zip(*responses)
+        with mocked_http_conn(
+                *codes, body_iter=body_iter, headers=headers_iter):
+            df = self.reconstructor.reconstruct_fa(
+                job, node, self._create_fragment(
+                    2, body=b'', ec_etag=etag))
+            fixed_body = b''.join(df.reader())
+            self.assertEqual(len(fixed_body), len(broken_body))
+            self.assertEqual(
+                md5(fixed_body, usedforsecurity=False).hexdigest(),
+                md5(broken_body, usedforsecurity=False).hexdigest())
+
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
 
 
 @patch_policies([ECStoragePolicy(0, name='ec', is_default=True,
