@@ -503,6 +503,48 @@ class ObjectReconstructor(Daemon):
 
         return bucket
 
+    def _has_useful_newer_durable_bucket(
+            self, policy, buckets, local_timestamp):
+        return any(
+            bucket.timestamp is not None
+            and bucket.timestamp > local_timestamp
+            and bucket.durable
+            and bucket.is_useful(policy)
+            for bucket in buckets.values())
+
+    def _has_local_newer_mismatch(self, policy, buckets,
+                                  local_timestamp, local_etag):
+        # Detect the "local fragment is newer than the peer quorum" case:
+        # at least one peer agrees with the local timestamp/etag, at least one
+        # useful mismatched bucket is older than the local fragment, and no
+        # useful, durable bucket is newer.
+        # Handoffs may carry the missing local-version fragments because
+        # newer writes can land on handoffs during transient primary
+        # unavailability. If any useful, durable bucket is *newer* than local,
+        # the local version is obsolete and we should not spend handoff
+        # requests trying to rebuild it. A non-durable newer bucket may be
+        # from an incomplete write, so it does not make the local version
+        # obsolete.
+        local_bucket = buckets.get(local_timestamp)
+        if (not local_bucket
+                or not local_bucket.useful_responses
+                or not local_bucket.matches(local_timestamp, local_etag)):
+            # require positive evidence that the local version exists on
+            # at least one peer before chasing handoffs
+            return False
+        if self._has_useful_newer_durable_bucket(
+                policy, buckets, local_timestamp):
+            return False
+        found_older_useful_mismatch = False
+        for bucket in buckets.values():
+            if not bucket.is_useful(policy):
+                continue
+            if bucket.matches(local_timestamp, local_etag):
+                continue
+            if bucket.timestamp < local_timestamp:
+                found_older_useful_mismatch = True
+        return found_older_useful_mismatch
+
     def _is_quarantine_candidate(self, policy, buckets, error_responses, df):
         # This condition is deliberately strict because it determines if
         # more requests will be issued and ultimately if the fragment
@@ -615,41 +657,112 @@ class ObjectReconstructor(Daemon):
         if (not matching_bucket and
                 self._is_quarantine_candidate(
                     policy, buckets, error_responses, df)):
-            node_count = primary_node_count
-            handoff_iter = itertools.islice(ring.get_more_nodes(partition),
-                                            max_node_count - node_count)
-            for handoff_node in itertools.islice(handoff_iter, concurrency):
-                node_count += 1
-                pile.spawn(self._get_response, handoff_node, policy, partition,
-                           path, headers)
-            for resp in pile:
-                bucket = self._handle_fragment_response(
-                    node, policy, partition, fi_to_rebuild, path, buckets,
-                    error_responses, resp)
-                if (bucket
-                        and bucket.is_useful(policy)
-                        and bucket.matches(local_timestamp, local_etag)):
-                    matching_bucket = bucket
-                    self.logger.debug(
-                        'Reconstructing frag from handoffs, node_count=%d'
-                        % node_count)
-                    break
-                elif self._is_quarantine_candidate(
-                        policy, buckets, error_responses, df):
-                    try:
-                        handoff_node = next(handoff_iter)
-                        node_count += 1
-                        pile.spawn(self._get_response, handoff_node, policy,
-                                   partition, path, headers)
-                    except StopIteration:
-                        pass
-                # else: this frag is no longer a quarantine candidate, so we
-                # could break right here and ignore any remaining responses,
-                # but given that we may have actually found another frag we'll
-                # optimistically wait for any remaining responses in case a
-                # useful bucket is assembled.
+            matching_bucket, node_count = self._search_handoffs(
+                node, policy, partition, fi_to_rebuild, path, headers,
+                ring, pile, buckets, error_responses,
+                primary_node_count, max_node_count, concurrency,
+                local_timestamp, local_etag,
+                should_spawn_more=lambda: self._is_quarantine_candidate(
+                    policy, buckets, error_responses, df))
+            if matching_bucket:
+                self.logger.debug(
+                    'Reconstructing frag from handoffs, node_count=%d'
+                    % node_count)
+        elif (not matching_bucket and
+                self._has_local_newer_mismatch(
+                    policy, buckets, local_timestamp, local_etag)):
+            # Primaries returned a useful bucket older than the local
+            # fragment, with too few responses at the local timestamp to
+            # reconstruct. Search handoffs for the missing local-version
+            # fragments. Acceptance still requires bucket.matches(local_*),
+            # so an older quorum on handoffs cannot be used to rebuild.
+            self.logger.debug(
+                'Searching handoffs for matching local-newer rebuild '
+                'bucket for %s frag#%s, local timestamp: %s, '
+                'local etag: %s',
+                _full_path(node, partition, path, policy),
+                fi_to_rebuild, local_timestamp.internal, local_etag)
+            matching_bucket, node_count = self._search_handoffs(
+                node, policy, partition, fi_to_rebuild, path, headers,
+                ring, pile, buckets, error_responses,
+                primary_node_count, max_node_count, concurrency,
+                local_timestamp, local_etag,
+                should_spawn_more=lambda: True,
+                should_abort=lambda: (
+                    self._has_useful_newer_durable_bucket(
+                        policy, buckets, local_timestamp)))
+            if matching_bucket:
+                self.logger.debug(
+                    'Reconstructing frag from handoffs after '
+                    'local-newer mismatch, node_count=%d' % node_count)
 
         return matching_bucket
+
+    def _search_handoffs(
+            self, node, policy, partition, fi_to_rebuild, path, headers,
+            ring, pile, buckets, error_responses,
+            primary_node_count, max_node_count, concurrency,
+            local_timestamp, local_etag,
+            should_spawn_more, should_abort=None):
+        """
+        Spawn handoff fragment requests on the shared ``pile`` and
+        process responses until a matching rebuild bucket is assembled
+        or all outstanding requests are drained.
+
+        An initial batch of up to ``concurrency`` handoff requests is
+        spawned. Thereafter, each non-matching response triggers one
+        more handoff request if ``should_spawn_more()`` returns True
+        and a handoff node is still available, up to a total of
+        ``max_node_count - primary_node_count`` handoffs.
+
+        :param pile: the :class:`GreenAsyncPile` already used for the
+            primary requests; further handoff requests will be spawned
+            on it.
+        :param should_spawn_more: zero-arg callable invoked after each
+            non-matching response; returning True spawns one more
+            handoff request if any remain.
+        :param should_abort: optional zero-arg callable invoked after each
+            response; returning True stops the handoff search without
+            accepting a matching bucket.
+        :returns: a ``(bucket, node_count)`` tuple, where ``bucket`` is
+            a matching bucket if one is assembled from handoff
+            responses (otherwise None), and ``node_count`` is the
+            total number of nodes (primaries + handoffs) for which a
+            request was spawned.
+        """
+        node_count = primary_node_count
+        handoff_iter = itertools.islice(ring.get_more_nodes(partition),
+                                        max_node_count - node_count)
+        for handoff_node in itertools.islice(handoff_iter, concurrency):
+            node_count += 1
+            pile.spawn(self._get_response, handoff_node, policy, partition,
+                       path, headers)
+        for resp in pile:
+            bucket = self._handle_fragment_response(
+                node, policy, partition, fi_to_rebuild, path, buckets,
+                error_responses, resp)
+            if should_abort and should_abort():
+                return None, node_count
+            if (bucket
+                    and bucket.is_useful(policy)
+                    and bucket.matches(local_timestamp, local_etag)):
+                return bucket, node_count
+            if should_spawn_more():
+                try:
+                    handoff_node = next(handoff_iter)
+                    node_count += 1
+                    pile.spawn(self._get_response, handoff_node, policy,
+                               partition, path, headers)
+                except StopIteration:
+                    pass
+            # If we didn't spawn another request (either because
+            # should_spawn_more() said no - e.g. the frag is no longer
+            # a quarantine candidate - or because handoff_iter is
+            # exhausted), we could break right here and ignore any
+            # remaining responses, but given that we may have actually
+            # found another frag we'll optimistically wait for any
+            # remaining responses in case a useful bucket is assembled.
+        return None, node_count
 
     def reconstruct_fa(self, job, node, df):
         """
