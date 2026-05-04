@@ -47,7 +47,7 @@ from test.debug_logger import debug_logger
 from test.unit import (patch_policies, mocked_http_conn, FabricatedRing,
                        make_timestamp_iter, DEFAULT_TEST_EC_TYPE,
                        encode_frag_archive_bodies, quiet_eventlet_exceptions,
-                       skip_if_no_xattrs, BaseUnitTestCase)
+                       skip_if_no_xattrs, BaseUnitTestCase, FakeStatus)
 from test.unit.obj.common import write_diskfile
 
 
@@ -5436,6 +5436,12 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
                 self.obj_timestamp.internal, self.obj_timestamp.internal,
                 wrong_etag, etag)],
             error_lines)
+        # when peers return a useful bucket at the SAME timestamp but a
+        # different etag, the local-newer handoff search must not trigger
+        debug_lines = self.logger.get_lines_for_level('debug')
+        self.assertFalse(
+            any('local-newer' in line for line in debug_lines),
+            debug_lines)
 
     def test_reconstruct_fa_two_buckets_both_error_messages(self):
         # Verify that when there are two buckets, one at the wrong timestamp
@@ -7003,6 +7009,377 @@ class TestReconstructFragmentArchive(BaseTestObjectReconstructor):
             'to reconstruct non-durable %s frag#%s'
             % (num_other_primaries, full_path, fi_to_rebuild),
             error_lines)
+
+    def _local_newer_setup(self):
+        # Setup for the local-newer tests: a custom 2+3 EC policy with
+        # enough fabricated devices to provide handoffs (devices > replicas).
+        custom_policy = ECStoragePolicy(
+            99, name='test-ec-2-3', ec_type=DEFAULT_TEST_EC_TYPE,
+            ec_ndata=2, ec_nparity=3, ec_segment_size=4096)
+        custom_policy.object_ring = FabricatedRing(
+            replicas=5, devices=10, nodes=10)
+        df_mgr = custom_policy.get_diskfile_manager(
+            self.conf, self.logger)
+        self.reconstructor._df_router.policy_to_manager[
+            int(custom_policy)] = df_mgr
+        return custom_policy, df_mgr
+
+    def test_has_local_newer_mismatch_requires_durable_newer_bucket(self):
+        custom_policy, _df_mgr = self._local_newer_setup()
+        older_timestamp = self.obj_timestamp
+        local_timestamp = self.ts()
+        newer_timestamp = self.ts()
+        local_etag = 'local-etag'
+
+        def make_bucket(timestamp, etag, frag_indexes, durable=False):
+            bucket = object_reconstructor.ResponseBucket()
+            bucket.set_default(timestamp, etag)
+            bucket.useful_responses = {
+                fi: object() for fi in frag_indexes}
+            bucket.num_responses = len(frag_indexes)
+            bucket.durable = durable
+            return bucket
+
+        buckets = {
+            older_timestamp: make_bucket(
+                older_timestamp, 'older-etag', (0, 2)),
+            local_timestamp: make_bucket(
+                local_timestamp, local_etag, (3,)),
+            newer_timestamp: make_bucket(
+                newer_timestamp, 'newer-etag', (0, 2)),
+        }
+
+        # A useful but non-durable newer bucket may represent an incomplete
+        # write, so the local version is still worth looking for.
+        self.assertTrue(self.reconstructor._has_local_newer_mismatch(
+            custom_policy, buckets, local_timestamp, local_etag))
+
+        # Once that useful newer bucket is known durable, local is obsolete.
+        buckets[newer_timestamp].durable = True
+        self.assertFalse(self.reconstructor._has_local_newer_mismatch(
+            custom_policy, buckets, local_timestamp, local_etag))
+
+    def test_reconstruct_fa_local_newer_finds_match_on_handoffs(self):
+        # Verify that when primaries return a useful bucket at an older
+        # timestamp and only a small number of frags at the local (newer)
+        # timestamp, the reconstructor searches handoffs for matching
+        # local-version frags and succeeds when enough are found.
+        custom_policy, df_mgr = self._local_newer_setup()
+
+        job = {'partition': 0, 'policy': custom_policy}
+        part_nodes = custom_policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = custom_policy.get_backend_index(node['index'])
+        fi_to_rebuild = node['backend_index']
+
+        test_data = (b'rebuild' * custom_policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(
+            custom_policy, test_data)
+        broken_body = ec_archive_bodies[fi_to_rebuild]
+
+        # local timestamp must be newer than the peer-quorum timestamp
+        older_timestamp = self.obj_timestamp
+        self.obj_timestamp = self.ts()
+        older_etag = md5(b'older', usedforsecurity=False).hexdigest()
+
+        # 4 primary peer responses (node[1] is the rebuild target):
+        # 3 frags at the older timestamp form a useful older bucket,
+        # 1 frag at the local (newer) timestamp is not enough on its own.
+        primary_responses = []
+        for fi in (0, 2, 4):
+            primary_responses.append(
+                (200, ec_archive_bodies[fi],
+                 {'X-Object-Sysmeta-Ec-Frag-Index': fi,
+                  'X-Object-Sysmeta-Ec-Etag': older_etag,
+                  'X-Backend-Data-Timestamp': older_timestamp.internal}))
+        primary_responses.append(
+            (200, ec_archive_bodies[3],
+             {'X-Object-Sysmeta-Ec-Frag-Index': 3,
+              'X-Object-Sysmeta-Ec-Etag': etag,
+              'X-Backend-Data-Timestamp': self.obj_timestamp.internal}))
+
+        # 4 handoff requests are spawned (concurrency=4). The first returns
+        # frag#0 at the local timestamp/etag, which combined with the
+        # primary frag#3 fills the local bucket and ends the search; the
+        # rest are 404 to satisfy the in-flight requests.
+        handoff_responses = [
+            (200, ec_archive_bodies[0],
+             {'X-Object-Sysmeta-Ec-Frag-Index': 0,
+              'X-Object-Sysmeta-Ec-Etag': etag,
+              'X-Backend-Data-Timestamp': self.obj_timestamp.internal}),
+            (404, None, None),
+            (404, None, None),
+            (404, None, None),
+        ]
+        responses = primary_responses + handoff_responses
+
+        # local diskfile at the newer timestamp/etag
+        utils.mkdirs(os.path.join(self.devices, 'sda1'))
+        df = df_mgr.get_diskfile(
+            'sda1', 9, 'a', 'c', self.obj_name.decode('utf8'),
+            policy=custom_policy)
+        write_diskfile(df, self.obj_timestamp, data=b'',
+                       frag_index=2,
+                       extra_metadata={'X-Object-Sysmeta-Ec-Etag': etag})
+        df.open()
+        self.logger.clear()
+
+        codes, body_iter, headers_iter = zip(*responses)
+        with mocked_http_conn(
+                *codes, body_iter=body_iter, headers=headers_iter):
+            result_df = self.reconstructor.reconstruct_fa(job, node, df)
+            fixed_body = b''.join(result_df.reader())
+        self.assertEqual(len(fixed_body), len(broken_body))
+        self.assertEqual(
+            md5(fixed_body, usedforsecurity=False).hexdigest(),
+            md5(broken_body, usedforsecurity=False).hexdigest())
+
+        self.assertFalse(self.logger.get_lines_for_level('error'))
+        self.assertFalse(self.logger.get_lines_for_level('warning'))
+        debug_lines = self.logger.get_lines_for_level('debug')
+        self.assertTrue(
+            any('Reconstructing frag from handoffs after local-newer '
+                'mismatch' in line for line in debug_lines),
+            debug_lines)
+
+    def test_reconstruct_fa_local_newer_handoffs_still_older(self):
+        # Verify that when primaries return a useful bucket at an older
+        # timestamp and only a small number of frags at the local (newer)
+        # timestamp, the reconstructor searches handoffs for matching
+        # local-version frags and fails when enough are not found.
+        custom_policy, df_mgr = self._local_newer_setup()
+
+        job = {'partition': 0, 'policy': custom_policy}
+        part_nodes = custom_policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = custom_policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * custom_policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(
+            custom_policy, test_data)
+
+        older_timestamp = self.obj_timestamp
+        self.obj_timestamp = self.ts()
+        older_etag = md5(b'older', usedforsecurity=False).hexdigest()
+
+        primary_responses = []
+        for fi in (0, 2, 4):
+            primary_responses.append(
+                (200, ec_archive_bodies[fi],
+                 {'X-Object-Sysmeta-Ec-Frag-Index': fi,
+                  'X-Object-Sysmeta-Ec-Etag': older_etag,
+                  'X-Backend-Data-Timestamp': older_timestamp.internal}))
+        primary_responses.append(
+            (200, ec_archive_bodies[3],
+             {'X-Object-Sysmeta-Ec-Frag-Index': 3,
+              'X-Object-Sysmeta-Ec-Etag': etag,
+              'X-Backend-Data-Timestamp': self.obj_timestamp.internal}))
+
+        # handoffs only have older frags (or 404) - never enough at local.
+        # The local-newer search walks all available handoffs (5 with
+        # devices=10, replicas=5), spawning more after each non-match.
+        handoff_responses = [
+            (200, ec_archive_bodies[0],
+             {'X-Object-Sysmeta-Ec-Frag-Index': 0,
+              'X-Object-Sysmeta-Ec-Etag': older_etag,
+              'X-Backend-Data-Timestamp': older_timestamp.internal}),
+            (404, None, None),
+            (404, None, None),
+            (404, None, None),
+            (404, None, None),
+        ]
+        responses = primary_responses + handoff_responses
+
+        utils.mkdirs(os.path.join(self.devices, 'sda1'))
+        df = df_mgr.get_diskfile(
+            'sda1', 9, 'a', 'c', self.obj_name.decode('utf8'),
+            policy=custom_policy)
+        write_diskfile(df, self.obj_timestamp, data=b'',
+                       frag_index=2,
+                       extra_metadata={'X-Object-Sysmeta-Ec-Etag': etag})
+        df.open()
+        self.logger.clear()
+
+        codes, body_iter, headers_iter = zip(*responses)
+        with mocked_http_conn(
+                *codes, body_iter=body_iter, headers=headers_iter):
+            self.assertRaises(DiskFileError,
+                              self.reconstructor.reconstruct_fa,
+                              job, node, df)
+
+        # the reconstructor refuses to rebuild and logs the mismatch
+        debug_lines = self.logger.get_lines_for_level('debug')
+        self.assertTrue(
+            any('local-newer' in line for line in debug_lines),
+            debug_lines)
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertTrue(
+            any('mismatch' in line for line in error_lines),
+            error_lines)
+
+    def _do_test_reconstruct_fa_handoffs_find_newer(
+            self, newer_is_durable):
+        custom_policy, df_mgr = self._local_newer_setup()
+
+        job = {'partition': 0, 'policy': custom_policy}
+        part_nodes = custom_policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = custom_policy.get_backend_index(node['index'])
+        fi_to_rebuild = node['backend_index']
+
+        older_data = (b'older--' * custom_policy.ec_segment_size)[:-777]
+        local_data = (b'local--' * custom_policy.ec_segment_size)[:-777]
+        newer_data = (b'newer--' * custom_policy.ec_segment_size)[:-777]
+        older_etag = md5(
+            older_data, usedforsecurity=False).hexdigest()
+        local_etag = md5(
+            local_data, usedforsecurity=False).hexdigest()
+        newer_etag = md5(
+            newer_data, usedforsecurity=False).hexdigest()
+        older_bodies = encode_frag_archive_bodies(
+            custom_policy, older_data)
+        local_bodies = encode_frag_archive_bodies(
+            custom_policy, local_data)
+        newer_bodies = encode_frag_archive_bodies(
+            custom_policy, newer_data)
+        broken_body = local_bodies[fi_to_rebuild]
+
+        older_timestamp = self.obj_timestamp
+        local_timestamp = self.ts()
+        newer_timestamp = self.ts()
+        self.obj_timestamp = local_timestamp
+
+        # Primaries have a useful older bucket and one peer fragment that
+        # matches the local version, so the local-newer handoff search starts.
+        primary_responses = []
+        for fi in (0, 2, 4):
+            primary_responses.append(
+                (200, older_bodies[fi],
+                 {'X-Object-Sysmeta-Ec-Frag-Index': fi,
+                  'X-Object-Sysmeta-Ec-Etag': older_etag,
+                  'X-Backend-Data-Timestamp': older_timestamp.internal}))
+        primary_responses.append(
+            (200, local_bodies[3],
+             {'X-Object-Sysmeta-Ec-Frag-Index': 3,
+              'X-Object-Sysmeta-Ec-Etag': local_etag,
+              'X-Backend-Data-Timestamp': local_timestamp.internal}))
+
+        newer_headers = []
+        for fi in (0, 2):
+            headers = {
+                'X-Object-Sysmeta-Ec-Frag-Index': fi,
+                'X-Object-Sysmeta-Ec-Etag': newer_etag,
+                'X-Backend-Data-Timestamp': newer_timestamp.internal,
+            }
+            if newer_is_durable:
+                headers['X-Backend-Durable-Timestamp'] = \
+                    newer_timestamp.internal
+            newer_headers.append(headers)
+
+        # The first two handoffs form a useful T3 bucket. The matching T2
+        # response is deliberately slower, so T3 is observed before T2 can
+        # complete the local bucket.
+        handoff_responses = [
+            (200, newer_bodies[0], newer_headers[0]),
+            (200, newer_bodies[2], newer_headers[1]),
+            (FakeStatus(200, response_sleep=0.01), local_bodies[0],
+             {'X-Object-Sysmeta-Ec-Frag-Index': 0,
+              'X-Object-Sysmeta-Ec-Etag': local_etag,
+              'X-Backend-Data-Timestamp': local_timestamp.internal}),
+            (404, None, None),
+        ]
+        if not newer_is_durable:
+            # Continuing the search gives the speculative fifth handoff
+            # request time to connect; the durable case aborts before then.
+            handoff_responses.append((404, None, None))
+        responses = primary_responses + handoff_responses
+
+        utils.mkdirs(os.path.join(self.devices, 'sda1'))
+        df = df_mgr.get_diskfile(
+            'sda1', 9, 'a', 'c', self.obj_name.decode('utf8'),
+            policy=custom_policy)
+        write_diskfile(
+            df, local_timestamp, data=b'', frag_index=2,
+            extra_metadata={'X-Object-Sysmeta-Ec-Etag': local_etag})
+        df.open()
+        self.logger.clear()
+
+        codes, body_iter, headers_iter = zip(*responses)
+        with mocked_http_conn(
+                *codes, body_iter=body_iter, headers=headers_iter):
+            if newer_is_durable:
+                self.assertRaises(
+                    DiskFileError, self.reconstructor.reconstruct_fa,
+                    job, node, df)
+            else:
+                result_df = self.reconstructor.reconstruct_fa(job, node, df)
+                fixed_body = b''.join(result_df.reader())
+                self.assertEqual(len(fixed_body), len(broken_body))
+                self.assertEqual(
+                    md5(fixed_body, usedforsecurity=False).hexdigest(),
+                    md5(broken_body, usedforsecurity=False).hexdigest())
+
+        debug_lines = self.logger.get_lines_for_level('debug')
+        rebuilt_from_handoffs = any(
+            'Reconstructing frag from handoffs after local-newer mismatch'
+            in line for line in debug_lines)
+        if newer_is_durable:
+            self.assertFalse(rebuilt_from_handoffs, debug_lines)
+            error_lines = self.logger.get_lines_for_level('error')
+            self.assertTrue(any(
+                'Received enough responses' in line
+                and 'durable' in line
+                and 'bucket timestamp: %s' % newer_timestamp.internal in line
+                for line in error_lines), error_lines)
+        else:
+            self.assertTrue(rebuilt_from_handoffs, debug_lines)
+            self.assertFalse(self.logger.get_lines_for_level('error'))
+            self.assertFalse(self.logger.get_lines_for_level('warning'))
+
+    def test_reconstruct_fa_local_newer_handoffs_find_durable_newer(self):
+        self._do_test_reconstruct_fa_handoffs_find_newer(True)
+
+    def test_reconstruct_fa_local_newer_handoffs_find_non_durable_newer(self):
+        self._do_test_reconstruct_fa_handoffs_find_newer(False)
+
+    def test_reconstruct_fa_bucket_newer_does_not_trigger_local_newer(self):
+        # When the peer quorum is at a NEWER timestamp than the local
+        # fragment, the local-newer handoff search must not trigger; the
+        # existing safe-refusal behavior is preserved.
+        job = {'partition': 0, 'policy': self.policy}
+        part_nodes = self.policy.object_ring.get_part_nodes(0)
+        node = part_nodes[1]
+        node['backend_index'] = self.policy.get_backend_index(node['index'])
+
+        test_data = (b'rebuild' * self.policy.ec_segment_size)[:-777]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = encode_frag_archive_bodies(self.policy, test_data)
+        ec_archive_bodies.pop(1)
+
+        newer_timestamp = self.ts()  # newer than self.obj_timestamp
+        responses = list()
+        for body in ec_archive_bodies:
+            headers = get_header_frag_index(self, body)
+            headers.update({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Data-Timestamp': newer_timestamp.internal,
+            })
+            responses.append((200, body, headers))
+
+        codes, body_iter, headers = zip(*responses)
+        with mocked_http_conn(*codes, body_iter=body_iter, headers=headers):
+            self.assertRaises(DiskFileError,
+                              self.reconstructor.reconstruct_fa,
+                              job, node, self._create_fragment(
+                                  2, body=b'', ec_etag=etag))
+
+        # no local-newer handoff search took place
+        debug_lines = self.logger.get_lines_for_level('debug')
+        self.assertFalse(
+            any('local-newer' in line for line in debug_lines),
+            debug_lines)
 
     def test_reconstruct_fa_finds_duplicate_does_not_fail(self):
         job = {
