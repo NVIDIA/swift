@@ -70,24 +70,43 @@ class BaseTimestamp:
     and _parse methods to return a float timestamp value.
     """
     def __init__(self, timestamp, delta=0, check_bounds=True, **kwargs):
+        """
+        :param timestamp: the value may be one of:
+            * a float or integer: time in seconds since the Epoch.
+            * another instance of a BaseTimestamp whose internal form can be
+              parsed by the subclass being constructed.
+            * a string or bytes value that can be parsed by the subclass being
+              constructed.
+            * any other type whose string representation can be parsed by the
+              subclass being constructed.
+
+        :param delta: deca-microsecond difference to be added to the
+            ``timestamp`` value; should be an integer value.
+        :param check_bounds: if True (default) then a ValueError will be raised
+            if the given timestamp is less than 0 or greater than the maximum
+            time that can be represented by this class.
+        """
         if isinstance(timestamp, (float, int)):
             float_timestamp = self._create(timestamp, **kwargs)
         else:
-            if isinstance(timestamp, bytes):
+            if isinstance(timestamp, str):
+                timestamp_str = timestamp
+            elif isinstance(timestamp, bytes):
                 timestamp_str = timestamp.decode('ascii')
             elif isinstance(timestamp, BaseTimestamp):
                 timestamp_str = timestamp.internal
             else:
                 timestamp_str = str(timestamp)
             float_timestamp = self._parse(timestamp_str, **kwargs)
-        self.raw = int(round(float_timestamp / PRECISION))
+        raw = int(round(float_timestamp / PRECISION))
         # add delta
         if delta:
-            self.raw = self.raw + delta
-            if self.raw <= 0:
+            if raw + delta < 0:
                 raise ValueError(
-                    'delta must be greater than %d' % (-1 * self.raw))
-        self.timestamp = round(float(self.raw * PRECISION), 5)
+                    'delta must be greater than %d' % (-1 * raw - 1))
+            raw += delta
+
+        self.timestamp = round(float(raw * PRECISION), 5)
         if check_bounds:
             self._check_bounds()
 
@@ -102,6 +121,10 @@ class BaseTimestamp:
             raise ValueError('timestamp cannot be negative')
         if self.timestamp >= 10000000000:
             raise ValueError('timestamp too large')
+
+    @property
+    def raw(self):
+        return int(round(self.timestamp / PRECISION))
 
     @classmethod
     def now(cls, delta=0):
@@ -118,7 +141,7 @@ class BaseTimestamp:
         return cls(0.0)
 
     def __repr__(self):
-        return self.normal
+        return self.internal
 
     # TODO: do we need to be so brittle on the base class?
     def __str__(self):
@@ -267,16 +290,17 @@ class NormalTimestamp(BaseTimestamp):
         """
         Create a new NormalTimestamp.
 
-        :param timestamp: time in seconds since the Epoch, may be any of:
+        :param timestamp: the value may be one of:
+            * a float or integer: time in seconds since the Epoch; the
+              Timestamp constructed will be in the deca-microsecond described
+              by the value.
+            * another instance of a NormalTimestamp.
+            * a string or bytes representation of a float, or any other type
+              whose string representation can be cast to a float. The string
+              must not container underscores.
 
-            * a float or integer
-            * a string or bytes representation of a float that must not contain
-              underscores
-            * any other type that can be cast to a float including another
-            * instance of BaseTimestamp
-
-        :param delta: (int) deca-microsecond difference to be added to the
-            ``timestamp`` value.
+        :param delta: deca-microsecond difference to be added to the
+            ``timestamp`` value; should be an integer value.
         :param check_bounds: if True (default) then a ValueError will be raised
             if the given timestamp is less than 0 or greater than the maximum
             time that can be represented by this class.
@@ -321,8 +345,9 @@ class Timestamp(BaseTimestamp):
     operations will not create a timestamp with an offset.
 
     Modern version 2 Timestamps encode the offset in the final 6 digits of the
-    hex part. The first 10 digits of the hex part encode a randomly generated
-    "jitter" component that differentiates timestamps within the same
+    hex part. The first 10 digits of the hex part are composed of a leading
+    version digit '2' and 9 digits of randomly generated "jitter" component.
+    The jitter component differentiates timestamps within the same
     deca-microsecond. For example, a version 2 Timestamp with offset 1 has the
     following internalized form:
 
@@ -379,17 +404,17 @@ class Timestamp(BaseTimestamp):
             * a float or integer: time in seconds since the Epoch; the
               Timestamp constructed will be in the deca-microsecond described
               by the value.
-            * a string or bytes representation of a Timestamp
-            * another instance of a Timestamp (the hex part is preserved when
-              present).
+            * another instance of a BaseTimestamp (the hex part is preserved
+              when present).
+            * a string or bytes representation of a Timestamp.
             * any other type that can be cast to a string and parsed as a
-              Timestamp, including another instance of BaseTimestamp.
+              Timestamp.
 
         :param offset: (int) the internal offset vector. When ``timestamp`` is
             a float this value initialises the offset, otherwise this value
             will be added to any existing offset of the parsed ``timestamp``.
-        :param delta: (int) deca-microsecond difference to be added to the
-            ``timestamp`` value
+        :param delta: deca-microsecond difference to be added to the
+            ``timestamp`` value; should be an integer value.
         :param check_bounds: if True (default) then a ValueError will be raised
             if the given timestamp is less than 0 or greater than the maximum
             time that can be represented by this class.
@@ -401,7 +426,12 @@ class Timestamp(BaseTimestamp):
         self.hex_part = 0
         super().__init__(timestamp, delta=delta, check_bounds=check_bounds,
                          version=version)
-        self.increment_offset(offset)
+        if offset:
+            # only increment_offset when explicitly setting non-zero offset
+            # because otherwise it will raise an exception when constructing an
+            # inverted timestamp; an inverted timestamp hex_part indicates an
+            # unknown version whose offset cannot be modified.
+            self.increment_offset(offset)
 
     def _create(self, timestamp, version=1, **kwargs):
         version = version if version is not None else 1
@@ -429,65 +459,75 @@ class Timestamp(BaseTimestamp):
         return float(float_str)
 
     @property
-    def _offset(self):
+    def version(self):
+        """
+        Return the version of the timestamp.
+
+        :return: an int representing the version, or None if a parsed timestamp
+            has an unrecognised version.
+        """
         if self.hex_part < 0x2000000000000000:
+            return 1
+        elif self.hex_part < 0x3000000000000000:
+            return 2
+        else:
+            return None
+
+    @property
+    def offset(self):
+        if self.version == 1:
             # Previous versions of this class allowed offset to grow beyond the
             # current limit of 0xffffff so make some allowance for larger
             # values.
             return self.hex_part
-        else:
+        elif self.version == 2:
             # The upper hex digits are used for jitter so offset is constrained
             # to the rightmost six digits.
             return self.hex_part & 0xffffff
-
-    @_offset.setter
-    def _offset(self, value):
-        if not value:
-            return
-        if value < 0:
-            raise ValueError('offset must be non-negative')
-
-        if self.hex_part < 0x2000000000000000:
-            max_offset = 0x1fffffffffffffff
-        elif self.hex_part < 0x3000000000000000:
-            max_offset = 0xffffff
         else:
-            # we don't know how many hex digits have been allocated to offset
-            # in a future version of this class so it is not safe to modify it
-            raise ValueError('Cannot modify offset in an unrecognised hex '
-                             'part encoding')
-
-        if value > max_offset:
-            raise ValueError('offset must be less than or equal to %d'
-                             % max_offset)
-        self.hex_part = (self.hex_part & ~max_offset) + value
-
-    @property
-    def offset(self):
-        """
-        This is here for backwards compatibility only. Callers should not
-        attach any meaning to the absolute value of offset.
-        """
-        if self.hex_part >= 0x3000000000000000:
             # we don't know how many hex digits have been allocated to offset
             # in a future version of this class so it is not safe to return it
             raise AttributeError('Cannot access offset in an unrecognised '
                                  'hex_part encoding')
-        return self._offset
+
+    @offset.setter
+    def offset(self, value):
+        if not value:
+            return
+        if not isinstance(value, int):
+            raise TypeError('offset must be an int')
+        if value < 0:
+            raise ValueError('offset must be non-negative')
+        if self.version == 1:
+            max_offset = 0x1fffffffffffffff
+        elif self.version == 2:
+            max_offset = 0xffffff
+        else:
+            # we don't know how many hex digits have been allocated to offset
+            # in a future version of this class so it is not safe to modify it
+            raise AttributeError('Cannot access offset in an unrecognised '
+                                 'hex_part encoding')
+        if value > max_offset:
+            raise ValueError('offset must be less than or equal to %d'
+                             % max_offset)
+
+        self.hex_part = (self.hex_part & ~max_offset) + value
 
     def increment_offset(self, value):
         """
         Increment the offset of the timestamp by the given value.
 
-        :raises ValueError: if value is negative or if the resulting offset
-            would exceed the maximum supported offset.
+        :param value: (int) increment to the second internal offset vector.
+        :raises ValueError: if value is not a whole number, or if the
+            resulting offset would exceed the maximum supported offset.
+        :raises AttributeError: if the Timestamp version is unknown.
         """
         if not value:
-            return
+            return self.offset
         if value < 0:
-            raise ValueError('offset must be non-negative')
-        self._offset += value
-        return self._offset
+            raise ValueError('value must be non-negative')
+        self.offset += value
+        return self.offset
 
     @classmethod
     def now(cls, offset=0, delta=0, version=1):
@@ -563,19 +603,6 @@ def timestamp2():
     :returns: an instance of Timestamp.
     """
     return Timestamp.now(version=2)
-
-    def normalized(self):
-        """
-        Get a NormalTimestamp clone of this Timestamp without any hex
-        extension.
-
-        Normalized timestamps have less differentiation from each other than
-        extended timestamps; only use this method if you understand the
-        implication of that loss of differentiation.
-
-        :returns: an instance of NormalTimestamp.
-        """
-        return NormalTimestamp(self.normal)
 
 
 def encode_timestamps(t1, t2=None, t3=None, explicit=False):
@@ -659,7 +686,7 @@ def decode_timestamps(encoded, explicit=False):
         if delta:
             # we lost the original hex_part of t2 when encoding, so we have no
             # choice other than to force it to zero when decoding
-            t2 = Timestamp(str((t1.raw + delta) * PRECISION))
+            t2 = Timestamp(t1.normal, delta=delta)
     elif not explicit:
         t2 = t1
     if len(parts) > 2:
@@ -668,7 +695,7 @@ def decode_timestamps(encoded, explicit=False):
         if delta:
             # we lost the original hex_part of t2 when encoding, so we have no
             # choice other than to force it to zero when decoding
-            t3 = Timestamp(str((t2.raw + delta) * PRECISION))
+            t3 = Timestamp(t2.normal, delta=delta)
     elif not explicit:
         t3 = t2
     return t1, t2, t3

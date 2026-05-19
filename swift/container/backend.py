@@ -22,7 +22,7 @@ from uuid import uuid4
 
 from urllib.parse import unquote
 import sqlite3
-from eventlet import tpool
+from swift.common.concurrency import tpool
 
 from swift.common.constraints import CONTAINER_LISTING_LIMIT
 from swift.common.exceptions import LockTimeout
@@ -2073,7 +2073,7 @@ class ContainerBroker(DatabaseBroker):
         Updates this broker's own shard range with the given epoch, sets its
         state to SHARDING and persists it in the DB.
 
-        :param epoch: a :class:`~swift.utils.common.NormalTimestamp`
+        :param epoch: a :class:`~swift.utils.common.timestamp.NormalTimestamp`
         :return: the broker's updated own shard range.
         """
         own_shard_range = self.get_own_shard_range()

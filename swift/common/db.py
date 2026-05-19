@@ -26,13 +26,14 @@ import errno
 import pickle  # nosec: B403
 from tempfile import mkstemp
 
-from eventlet import sleep, Timeout
+from swift.common.concurrency import sleep, Timeout
 import sqlite3
 
 from swift.common.constraints import MAX_META_COUNT, MAX_META_OVERALL_SIZE, \
     check_utf8
-from swift.common.utils import Timestamp, NormalTimestamp, \
-    renamer, mkdirs, lock_parent_directory, fallocate, md5
+from swift.common.utils import renamer, mkdirs, lock_parent_directory, \
+    fallocate, md5
+from swift.common.utils.timestamp import Timestamp, NormalTimestamp
 from swift.common.exceptions import LockTimeout, DatabaseException, \
     DatabasePragmaException
 from swift.common.swob import HTTPBadRequest
@@ -1122,19 +1123,20 @@ class DatabaseBroker(object):
             if 'no such column: updated_at' not in str(err):
                 raise
 
-    def _reclaim_metadata(self, conn, timestamp):
+    def _reclaim_metadata(self, conn, age_timestamp):
         """
-        Removes any empty metadata values older than the timestamp using the
+        Removes any empty metadata values older than age_timestamp using the
         given database connection. This function will not call commit on the
         conn, but will instead return True if the database needs committing.
         This function was created as a worker to limit transactions and commits
         from other related functions.
 
         :param conn: Database connection to reclaim metadata within.
-        :param timestamp: (float) Empty metadata items last updated before this
-                          timestamp will be removed.
+        :param age_timestamp: (float) Empty metadata items last updated before
+            age_timestamp will be removed.
         :returns: True if conn.commit() should be called
         """
+        age_timestamp = NormalTimestamp(age_timestamp)
         try:
             row = conn.execute('SELECT metadata FROM %s_stat' %
                                self.db_type).fetchone()
@@ -1146,7 +1148,8 @@ class DatabaseBroker(object):
                 md = json.loads(md)
                 keys_to_delete = []
                 for key, (value, value_timestamp) in md.items():
-                    if value == '' and value_timestamp < str(timestamp):
+                    if (value == ''
+                            and Timestamp(value_timestamp) < age_timestamp):
                         keys_to_delete.append(key)
                 if keys_to_delete:
                     for key in keys_to_delete:

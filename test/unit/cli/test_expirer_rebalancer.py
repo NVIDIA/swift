@@ -13,7 +13,7 @@
 import os
 import tempfile
 from collections import defaultdict
-import functools
+import contextlib
 import json
 import itertools
 import logging
@@ -107,6 +107,21 @@ class TestExpirerRebalance(unittest.TestCase):
         args.conf = self.conf
         args.logger = self.logger
         return args
+
+    def _patch_internal_client_ctx(self):
+        @contextlib.contextmanager
+        def mock_internal_client_ctx(rebalancer):
+            yield InternalClient(
+                rebalancer.internal_client_conf_path,
+                'expirer-rebalancer',
+                rebalancer.retries,
+                use_replication_network=True,
+                global_conf={'log_name': 'expirer-rebalancer-ic'},
+                app=self.fake_swift)
+
+        return mock.patch.object(
+            expirer_rebalancer.BaseRebalancer, 'internal_client_ctx',
+            mock_internal_client_ctx)
 
     def _run_move_task_object(self, obj, resp, args_str=''):
         target_task_container = self.expirer_config.get_expirer_container(
@@ -287,15 +302,13 @@ class TestExpirerRebalance(unittest.TestCase):
         # a for-realzy ExpirerRebalancer uses a mp.Queue here, but this test is
         # in eventlet land and the interface is compatible
         result_q = expirer_rebalancer.eventlet.Queue()
-        fake_swift_ic = functools.partial(InternalClient, app=self.fake_swift)
 
         moved_tasks = []
 
         def capture_task_object(args, target_task_container, orig_task_info):
             moved_tasks.append((target_task_container, orig_task_info))
 
-        with mock.patch.object(expirer_rebalancer, 'InternalClient',
-                               fake_swift_ic), \
+        with self._patch_internal_client_ctx(), \
                 mock.patch.object(expirer_rebalancer.RebalancerWorker,
                                   '_move_task_object', capture_task_object):
             expirer_rebalancer.process_task_containers(
@@ -388,7 +401,6 @@ class TestExpirerRebalance(unittest.TestCase):
         # a for-realzy ExpirerRebalancer uses a mp.Queue here, but this test is
         # in eventlet land and the interface is compatible
         result_q = expirer_rebalancer.eventlet.Queue()
-        fake_swift_ic = functools.partial(InternalClient, app=self.fake_swift)
 
         def exploding_move_task_object(args, target_task_container,
                                        orig_task_info):
@@ -402,8 +414,7 @@ class TestExpirerRebalance(unittest.TestCase):
             "last_modified": "2024-10-17T18:10:07.076510",
             'rebalance_day_delta': 0,
         }]
-        with mock.patch.object(expirer_rebalancer, 'InternalClient',
-                               fake_swift_ic), \
+        with self._patch_internal_client_ctx(), \
                 mock.patch.object(expirer_rebalancer.RebalancerWorker,
                                   '_move_task_object',
                                   exploding_move_task_object):
@@ -446,7 +457,6 @@ class TestExpirerRebalance(unittest.TestCase):
         # a for-realzy ExpirerRebalancer uses a mp.Queue here, but this test is
         # in eventlet land and the interface is compatible
         result_q = expirer_rebalancer.eventlet.Queue()
-        fake_swift_ic = functools.partial(InternalClient, app=self.fake_swift)
 
         args.logger.setLevel(logging.DEBUG)
         stub_task_containers = [{
@@ -456,8 +466,7 @@ class TestExpirerRebalance(unittest.TestCase):
             "last_modified": "2024-10-17T18:10:07.076510",
             'rebalance_day_delta': 0,
         }]
-        with mock.patch.object(expirer_rebalancer, 'InternalClient',
-                               fake_swift_ic), \
+        with self._patch_internal_client_ctx(), \
                 mock.patch.object(expirer_rebalancer.RebalancerWorker,
                                   '_move_task_object'):
             expirer_rebalancer.process_task_containers(
@@ -571,15 +580,13 @@ class TestExpirerRebalance(unittest.TestCase):
         # a for-realzy ExpirerRebalancer uses a mp.Queue here, but this test is
         # in eventlet land and the interface is compatible
         result_q = expirer_rebalancer.eventlet.Queue()
-        fake_swift_ic = functools.partial(InternalClient, app=self.fake_swift)
 
         moved_tasks = []
 
         def capture_task_object(args, target_task_container, orig_task_info):
             moved_tasks.append((target_task_container, orig_task_info))
 
-        with mock.patch.object(expirer_rebalancer, 'InternalClient',
-                               fake_swift_ic), \
+        with self._patch_internal_client_ctx(), \
                 mock.patch.object(expirer_rebalancer.RebalancerWorker,
                                   '_move_task_object', capture_task_object):
             expirer_rebalancer.process_task_containers(
@@ -769,12 +776,10 @@ class TestExpirerRebalance(unittest.TestCase):
         self.fake_swift.register_next_response(
             'GET', '/v1/.expiring_objects', HTTPOk, {},
             json.dumps([]))
-        fake_swift_ic = functools.partial(InternalClient, app=self.fake_swift)
         conf_path = os.path.join(self.testdir, 'object-expirer.conf')
         with open(conf_path, 'w') as fd:
             fd.write('[object-expirer]')
-        with mock.patch.object(expirer_rebalancer, 'InternalClient',
-                               fake_swift_ic), \
+        with self._patch_internal_client_ctx(), \
             mock.patch.object(expirer_rebalancer.ExpirerRebalancer,
                               'run_workers') as mock_run_workers:
             mock_run_workers.return_value = {}

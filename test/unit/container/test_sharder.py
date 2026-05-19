@@ -16,7 +16,7 @@ import json
 import random
 import argparse
 
-import eventlet
+from swift.common.concurrency import eventlet
 import os
 import shutil
 from contextlib import contextmanager
@@ -9413,7 +9413,7 @@ class TestCleavingContext(BaseTestSharder):
 
         self.assertEqual(
             1, len(old_broker.get_objects()))
-        now = next(self.ts_iter).internal
+        now = float(self.ts())
         broker.get_brokers()[0].reclaim(now, now)
         self.assertFalse(old_broker.get_objects())
 
@@ -9525,7 +9525,7 @@ class TestCleavingContext(BaseTestSharder):
 
         self.assertEqual(
             1, len(old_broker.get_objects()))
-        now = next(self.ts_iter).internal
+        now = float(self.normal_ts())
         broker.get_brokers()[0].reclaim(now, now)
         self.assertFalse(old_broker.get_objects())
 
@@ -10706,8 +10706,8 @@ class TestContainerSharderConf(BaseUnitTestCase):
         assert_ok({'expansion_limit': 100000001})
 
     def test_combine_shard_ranges(self):
-        this = ShardRange('a/o', self.normal_ts().normal)
-        that = ShardRange('a/o', self.normal_ts().normal)
+        this = ShardRange('a/o', self.normal_ts())
+        that = ShardRange('a/o', self.normal_ts())
         actual = combine_shard_ranges([dict(this)], [dict(that)])
         self.assertEqual([dict(that)], [dict(sr) for sr in actual])
         actual = combine_shard_ranges([dict(that)], [dict(this)])
@@ -10733,15 +10733,15 @@ class TestContainerSharderConf(BaseUnitTestCase):
         actual = combine_shard_ranges([dict(that)], [dict(this)])
         self.assertEqual([dict(expected)], [dict(sr) for sr in actual])
 
-        this = ShardRange('a/o', self.normal_ts().normal)
-        that = ShardRange('a/o', self.normal_ts().normal, deleted=True)
+        this = ShardRange('a/o', self.normal_ts())
+        that = ShardRange('a/o', self.normal_ts(), deleted=True)
         actual = combine_shard_ranges([dict(this)], [dict(that)])
         self.assertFalse(actual, [dict(sr) for sr in actual])
         actual = combine_shard_ranges([dict(that)], [dict(this)])
         self.assertFalse(actual, [dict(sr) for sr in actual])
 
-        this = ShardRange('a/o', self.normal_ts().normal, deleted=True)
-        that = ShardRange('a/o', self.normal_ts().normal)
+        this = ShardRange('a/o', self.normal_ts(), deleted=True)
+        that = ShardRange('a/o', self.normal_ts())
         actual = combine_shard_ranges([dict(this)], [dict(that)])
         self.assertEqual([dict(that)], [dict(sr) for sr in actual])
         actual = combine_shard_ranges([dict(that)], [dict(this)])

@@ -28,7 +28,7 @@ from shutil import rmtree
 from tempfile import mkdtemp
 from xml.dom import minidom
 
-from eventlet import spawn, Timeout
+from swift.common.concurrency import spawn, Timeout
 import json
 from urllib.parse import quote
 
@@ -39,7 +39,7 @@ from swift.common.swob import (Request, WsgiBytesIO, HTTPNoContent,
 import swift.container
 from swift.container import server as container_server
 from swift.common import constraints
-from swift.common.utils.timestamp import Timestamp, NormalTimestamp
+from swift.common.utils.timestamp import Timestamp
 from swift.common.utils import (mkdirs, public, replication,
                                 storage_directory, lock_parent_directory,
                                 ShardRange, RESERVED_STR, Namespace)
@@ -1811,6 +1811,18 @@ class TestContainerController(BaseUnitTestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 404)
 
+    def test_DELETE_container_x_backend_storage_policy_index_ignored(self):
+        # X-Backend-Storage-Policy-Index isn't relevant when deleting the
+        # container itself
+        self._populate_container('/sda1/p/a/c')
+        req = Request.blank(
+            '/sda1/p/a/c',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={'X-Timestamp': self.ts().internal,
+                     'X-Backend-Storage-Policy-Index': 'bad'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 204)
+
     def test_GET_with_override_deleted_ignored_for_objects(self):
         self._populate_and_delete_container('/sda1/p/a/c')
         # the override-deleted header is ignored for object records
@@ -2145,6 +2157,19 @@ class TestContainerController(BaseUnitTestCase):
             'X-Timestamp': next(ts)})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 404)
+
+    def test_DELETE_object_invalid_x_backend_storage_policy_index(self):
+        req = Request.blank(
+            '/sda1/p/a/c', method='PUT', headers={
+                'X-Timestamp': self.ts().internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 201)
+        req = Request.blank(
+            '/sda1/p/a/c/o', method='DELETE', headers={
+                'X-Backend-Storage-Policy-Index': 'bad',
+                'X-Timestamp': self.ts().internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 400)
 
     def test_object_update_with_offset(self):
         # create container
@@ -2851,7 +2876,7 @@ class TestContainerController(BaseUnitTestCase):
 
     def test_PUT_GET_shard_ranges(self):
         # make a container
-        sts_now = NormalTimestamp.now()
+        normal_ts_now = self.normal_ts()
         ts_put = self.ts()
         headers = {'X-Timestamp': ts_put.internal}
         req = Request.blank('/sda1/p/a/c', method='PUT', headers=headers)
@@ -2912,7 +2937,7 @@ class TestContainerController(BaseUnitTestCase):
             req = Request.blank('/sda1/p/%s?format=json%s' %
                                 (path, params), method='GET',
                                 headers={'X-Backend-Record-Type': 'shard'})
-            with mock_normal_timestamp_now(sts_now):
+            with mock_normal_timestamp_now(normal_ts_now):
                 resp = req.get_response(self.controller)
             self.assertEqual(resp.status_int, 200)
             self.assertEqual(resp.content_type, 'application/json')
@@ -2936,7 +2961,7 @@ class TestContainerController(BaseUnitTestCase):
             req = Request.blank('/sda1/p/%s?format=json%s' %
                                 (path, params), method='GET',
                                 headers=req_headers)
-            with mock_normal_timestamp_now(sts_now):
+            with mock_normal_timestamp_now(normal_ts_now):
                 resp = req.get_response(self.controller)
             self.assertEqual(resp.status_int, 200)
             self.assertEqual(resp.content_type, 'application/json')
@@ -2991,7 +3016,7 @@ class TestContainerController(BaseUnitTestCase):
 
         # listing shards don't cover entire namespace so expect an extra filler
         extra_shard_range = ShardRange(
-            'a/c', sts_now, shard_ranges[2].upper, ShardRange.MAX, 0, 0,
+            'a/c', normal_ts_now, shard_ranges[2].upper, ShardRange.MAX, 0, 0,
             state=ShardRange.ACTIVE)
         expected = shard_ranges[:3] + [extra_shard_range]
         check_shard_GET(expected, 'a/c', params='&states=listing')
@@ -3005,7 +3030,7 @@ class TestContainerController(BaseUnitTestCase):
             params='&states=listing&reverse=true&end_marker=pickle')
         # updating shards don't cover entire namespace so expect a filler
         extra_shard_range = ShardRange(
-            'a/c', sts_now, shard_ranges[3].upper, ShardRange.MAX, 0, 0,
+            'a/c', normal_ts_now, shard_ranges[3].upper, ShardRange.MAX, 0, 0,
             state=ShardRange.ACTIVE)
         expected = shard_ranges[1:4] + [extra_shard_range]
         check_shard_GET(expected, 'a/c', params='&states=updating')
@@ -3014,7 +3039,7 @@ class TestContainerController(BaseUnitTestCase):
         # when no listing shard ranges cover the requested namespace range then
         # filler is for entire requested namespace
         extra_shard_range = ShardRange(
-            'a/c', sts_now, 'treacle', ShardRange.MAX, 0, 0,
+            'a/c', normal_ts_now, 'treacle', ShardRange.MAX, 0, 0,
             state=ShardRange.ACTIVE)
         check_shard_GET([extra_shard_range], 'a/c',
                         params='&states=listing&marker=treacle')
@@ -3022,7 +3047,7 @@ class TestContainerController(BaseUnitTestCase):
             [extra_shard_range], 'a/c',
             params='&states=listing&reverse=true&end_marker=treacle')
         extra_shard_range = ShardRange(
-            'a/c', sts_now, 'treacle', 'walnut', 0, 0,
+            'a/c', normal_ts_now, 'treacle', 'walnut', 0, 0,
             state=ShardRange.ACTIVE)
         params = '&states=listing&marker=treacle&end_marker=walnut'
         check_shard_GET([extra_shard_range], 'a/c', params=params)
@@ -3132,8 +3157,8 @@ class TestContainerController(BaseUnitTestCase):
         # params and return listing shard ranges for entire namespace if
         # X-Backend-Override-Shard-Name-Filter == 'sharded'
         self.assertTrue(broker.set_sharded_state())
-        sts_now = self.normal_ts()
-        with mock_normal_timestamp_now(sts_now):
+        normal_ts_now = self.normal_ts()
+        with mock_normal_timestamp_now(normal_ts_now):
             extra_shard_range = broker.get_own_shard_range()
         extra_shard_range.lower = shard_ranges[2].upper
         extra_shard_range.upper = ShardRange.MAX
@@ -5836,10 +5861,11 @@ class TestContainerController(BaseUnitTestCase):
         self.assertEqual(200, resp.status_int)
         self.assertEqual([], json.loads(resp.body))
         self.assertEqual('shard', resp.headers.get('x-backend-record-type'))
-        self.assertEqual(ts_created.normal,
+        self.assertEqual(ts_created.internal,
                          resp.headers.get('X-Backend-Timestamp'))
-        self.assertEqual(Timestamp.zero().normal,
+        self.assertEqual(Timestamp.zero().internal,
                          resp.headers.get('X-Backend-Delete-Timestamp'))
+        # the request timestamp is normalized for the container DB initialize
         self.assertEqual(ts.normal,
                          resp.headers.get('X-Backend-Put-Timestamp'))
         self.assertEqual(ts.normal,
@@ -5861,10 +5887,11 @@ class TestContainerController(BaseUnitTestCase):
         # check the db timestamps...
         req = Request.blank(backend_path, method='HEAD')
         resp = req.get_response(self.controller)
-        self.assertEqual(ts_created.normal,
+        self.assertEqual(ts_created.internal,
                          resp.headers.get('X-Backend-Timestamp'))
-        self.assertEqual(Timestamp.zero().normal,
+        self.assertEqual(Timestamp.zero().internal,
                          resp.headers.get('X-Backend-Delete-Timestamp'))
+        # the request timestamp is normalized for the container DB initialize
         self.assertEqual(ts.normal,
                          resp.headers.get('X-Backend-Put-Timestamp'))
         self.assertEqual(ts.normal,

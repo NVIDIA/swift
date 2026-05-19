@@ -272,7 +272,7 @@ class BaseS3ApiMultiUpload(object):
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
 
-        status, haeaders, body = self.call_s3api(req)
+        status, headers, body = self.call_s3api(req)
 
         self.assertEqual(status.split()[0], '200')
         elem = fromstring(body, 'ListMultipartUploadsResult')
@@ -294,7 +294,7 @@ class BaseS3ApiMultiUpload(object):
                             environ={'REQUEST_METHOD': 'GET'},
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
-        status, haeaders, body = self.call_s3api(req)
+        status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '404')
         self.assertEqual(self._get_error_code(body), 'NoSuchBucket')
 
@@ -2133,37 +2133,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                              'x-object-sysmeta-s3api-has-content-type': 'yes',
                              'x-object-sysmeta-s3api-content-type':
                                  'baz/quux',
-                             'X-Backend-Timestamp': marker_timestamp.normal},
-                            None)
-        req = Request.blank('/bucket/object?uploadId=X',
-                            environ={'REQUEST_METHOD': 'POST'},
-                            headers={'Authorization': 'AWS test:tester:hmac',
-                                     'Date': self.get_date_header(skew=100), },
-                            body=XML)
-        with mock_normal_timestamp_now(past_time):
-            status, headers, body = self.call_s3api(req)
-        self.assertEqual(status.split()[0], '503')
-        self.assertEqual('ServiceUnavailable', self._get_error_code(body))
-
-    def test_object_multipart_upload_complete_marker_uses_normal_timestamp(
-            self):
-        # Verify that the future-marker check uses NormalTimestamp.now()
-        # (not Timestamp.now()). We mock NormalTimestamp.now() to a time in
-        # the past so that the marker appears to be in the future relative to
-        # the mock, triggering a 503. If the production code were using
-        # unmocked Timestamp.now(), the marker would be in the past and no
-        # error would occur.
-        marker_timestamp = Timestamp.now()
-        past_time = NormalTimestamp(float(marker_timestamp) - 10)
-        segment_bucket = '/v1/AUTH_test/bucket+segments'
-        self.swift.register('HEAD', segment_bucket + '/object/X',
-                            swob.HTTPOk,
-                            {'x-object-meta-foo': 'bar',
-                             'content-type': 'application/directory',
-                             'x-object-sysmeta-s3api-has-content-type': 'yes',
-                             'x-object-sysmeta-s3api-content-type':
-                                 'baz/quux',
-                             'X-Backend-Timestamp': marker_timestamp.normal},
+                             'X-Backend-Timestamp': marker_timestamp.internal},
                             None)
         req = Request.blank('/bucket/object?uploadId=X',
                             environ={'REQUEST_METHOD': 'POST'},

@@ -26,8 +26,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from errno import ENOENT, ENOTEMPTY, ENOTDIR
 
-from eventlet.green import subprocess
-from eventlet import Timeout, sleep, tpool
+from swift.common.concurrency import subprocess, Timeout, sleep
 
 from swift.obj.diskfile import LogTraceContext
 from test.debug_logger import debug_logger

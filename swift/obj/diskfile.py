@@ -51,8 +51,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from datetime import timedelta
 
-from eventlet import Timeout, tpool, sleep
-from eventlet.hubs import trampoline
+from swift.common.concurrency import Timeout, tpool, trampoline
 from pyeclib.ec_iface import ECDriverError, ECInvalidFragmentMetadata, \
     ECBadFragmentChecksum, ECInvalidParameter
 
@@ -91,12 +90,25 @@ DROP_CACHE_WINDOW = 1024 * 1024
 # They should be lowercase.
 RESERVED_DATAFILE_META = {'content-length', 'deleted', 'etag'}
 DATAFILE_SYSTEM_META = {'x-static-large-object'}
+COLLISION_METADATA_KEYS = (
+    'X-Timestamp',
+    'ETag',
+    'X-Object-Sysmeta-Ec-Etag',
+)
 DATADIR_BASE = 'objects'
 ASYNCDIR_BASE = 'async_pending'
 TMP_BASE = 'tmp'
 MIN_TIME_UPDATE_AUDITOR_STATUS = 60
 # This matches rsync tempfiles, like ".<timestamp>.data.Xy095a"
 RE_RSYNC_TEMPFILE = re.compile(r'^\..*\.([a-zA-Z0-9_]){6}$')
+
+
+def _collision_metadata(metadata):
+    return {
+        key: metadata[key]
+        for key in COLLISION_METADATA_KEYS
+        if key in metadata
+    }
 
 
 def get_data_dir(policy_or_index):
@@ -2188,9 +2200,16 @@ class BaseDiskFileWriter(object):
             with open(target_path, 'rb') as f:
                 existing_metadata = read_metadata(f)
             if existing_metadata != metadata:
+                emeta, meta = [
+                    _collision_metadata(m)
+                    for m in (existing_metadata, metadata)]
+                op = '==' if emeta == meta else '!='
+                emeta, meta = [
+                    json.dumps(m, sort_keys=True)
+                    for m in (emeta, meta)]
                 raise FileExistsError(
-                    'Conflicting pre-existing metadata: %r != %r (on disk)' % (
-                        metadata, existing_metadata))
+                    'Conflicting pre-existing metadata:'
+                    ' %s %s %s (incoming)' % (emeta, op, meta))
 
     def _finalize_put(self, metadata, target_path, cleanup,
                       logger_thread_locals):

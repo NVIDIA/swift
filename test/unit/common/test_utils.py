@@ -28,11 +28,7 @@ from test.unit import temptree, with_tempdir, TestableMemcacheRing, \
 
 import contextlib
 import errno
-import eventlet
-import eventlet.debug
-import eventlet.event
-import eventlet.green.threading
-import eventlet.patcher
+from swift.common.concurrency import eventlet
 import grp
 import logging
 import os
@@ -2166,7 +2162,7 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertRaises(OSError, utils.makedirs_count, temppath)
 
     def test_find_namespace(self):
-        ts = NormalTimestamp.now().normal
+        ts = NormalTimestamp.now().internal
         start = utils.ShardRange('a/-a', ts, '', 'a')
         atof = utils.ShardRange('a/a-f', ts, 'a', 'f')
         ftol = utils.ShardRange('a/f-l', ts, 'f', 'l')
@@ -5951,7 +5947,7 @@ class TestShardName(unittest.TestCase):
 
     def test_timestamp(self):
         # a Timestamp with no jitter is OK
-        ts = Timestamp(Timestamp.now().normal)
+        ts = Timestamp.now()
         sr = utils.ShardName.create('a', 'root', 'parent', ts, 1)
         self.assertEqual(ts, sr.timestamp)
 
@@ -7129,7 +7125,7 @@ class TestShardRange(BaseUnitTestCase, BaseNamespaceShardRange):
             "ShardRange<%r to %r as of %s, (100, 1000) as of %s, "
             "active as of %s>"
             % ('l', 'u',
-               ts.normal, meta_ts.normal, state_ts.normal), str(sr))
+               ts.internal, meta_ts.internal, state_ts.internal), str(sr))
 
     def test_copy(self):
         sr = utils.ShardRange('a/c', self.normal_ts(), 'x', 'y', 99, 99000,

@@ -45,22 +45,15 @@ import glob
 import itertools
 import stat
 
-import eventlet
-import eventlet.debug
-import eventlet.greenthread
-import eventlet.patcher
-import eventlet.semaphore
+from swift.common.concurrency import (
+    eventlet, GreenPool, sleep, Timeout, Event, socket
+)
 try:
     import importlib.metadata
     pkg_resources = None
 except ImportError:
     # python < 3.8
     import pkg_resources
-from eventlet import GreenPool, sleep, Timeout
-from eventlet.event import Event
-from eventlet.green import socket
-import eventlet.hubs
-import eventlet.queue
 
 import pickle  # nosec: B403
 from configparser import (ConfigParser, NoSectionError,
@@ -143,6 +136,10 @@ from swift.common.utils.timestamp import (  # noqa
     last_modified_date_to_timestamp,
     normalize_delete_at_timestamp
 )
+# NormalTimestamp is imported here because it is used in this module. However,
+# it is not intended to be imported *from* this module into other modules in
+# the way that Timestamp historically has been.
+from swift.common.utils.timestamp import NormalTimestamp
 from swift.common.utils.ipaddrs import (  # noqa
     is_valid_ip,
     is_valid_ipv4,
@@ -828,9 +825,8 @@ def renamer(old, new, fsync=True):
 def link_fd_to_path(fd, target_path, dirs_created=0, retries=2, fsync=True):
     """
     Creates a link to file descriptor at target_path specified. This method
-    does not close the fd for you. Unlike rename, as linkat() cannot
-    overwrite target_path if it exists, and will raise OSError with
-    errno.EEXIST.
+    does not close the fd for you.  Unlike rename, linkat() cannot overwrite
+    target_path if it exists.
 
     Attempts to fix / hide race conditions like empty object directories
     being removed by backend processes during uploads, by retrying.
@@ -842,6 +838,8 @@ def link_fd_to_path(fd, target_path, dirs_created=0, retries=2, fsync=True):
     :param retries: number of retries to make
     :param fsync: fsync on containing directory of target_path and also all
                   the newly created directories.
+    :raises: IOError if linkat fails w/ ENOENT ``retries`` times or other
+             errors like EEXIST
     """
     dirpath = os.path.dirname(target_path)
     attempts = 0

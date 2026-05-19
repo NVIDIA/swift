@@ -19,7 +19,8 @@ Pluggable Back-end for Account Server
 
 import sqlite3
 
-from swift.common.utils import Timestamp, NormalTimestamp, RESERVED_BYTE
+from swift.common.utils import RESERVED_BYTE
+from swift.common.utils.timestamp import Timestamp, NormalTimestamp
 from swift.common.db import DatabaseBroker, zero_like
 
 DATADIR = 'accounts'

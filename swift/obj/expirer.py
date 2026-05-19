@@ -21,8 +21,7 @@ from optparse import OptionParser
 from os.path import join
 from collections import defaultdict, deque
 
-from eventlet import sleep, Timeout
-from eventlet.greenpool import GreenPool
+from swift.common.concurrency import sleep, Timeout, GreenPool
 
 from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common.daemon import Daemon, run_daemon
@@ -707,7 +706,7 @@ class ObjectExpirer(Daemon):
                 continue
 
             if delete_timestamp > NormalTimestamp.now(
-                    delta=-1e5 * delay_reaping) and not is_async:
+                    delta=int(-1e5 * delay_reaping)) and not is_async:
                 # we shouldn't yield the object during the delay
                 self.logger.increment('tasks.delayed')
                 continue

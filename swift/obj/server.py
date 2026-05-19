@@ -25,16 +25,15 @@ import time
 import traceback
 import socket
 
-from eventlet import sleep, wsgi, Timeout, tpool
-from eventlet.greenthread import spawn
+from swift.common.concurrency import sleep, wsgi, Timeout, tpool, spawn
 
 from swift.common.utils import public, get_logger, \
     config_true_value, config_percent_value, \
     replication, normalize_delete_at_timestamp, \
     get_log_line, Timestamp, parse_mime_headers, \
     iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads, \
-    config_auto_int_value, split_path, get_redirect_data, \
-    normalize_timestamp, md5, parse_options, CooperativeIterator
+    config_auto_int_value, split_path, get_redirect_data, md5, parse_options, \
+    CooperativeIterator
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_object_creation, \
     valid_timestamp, check_utf8, AUTO_CREATE_ACCOUNT_PREFIX
@@ -1174,9 +1173,7 @@ class ObjectController(BaseStorageServer):
         timing_stats_labels['container'] = container
         timing_stats_labels['policy'] = int(policy)
 
-        request.headers.setdefault('X-Timestamp',
-                                   normalize_timestamp(time.time()))
-        req_timestamp = valid_timestamp(request)
+        req_timestamp = request.ensure_x_timestamp()
         frag_prefs = safe_json_loads(
             request.headers.get('X-Backend-Fragment-Preferences'))
         x_backend_open_expired = config_true_value(
@@ -1266,9 +1263,7 @@ class ObjectController(BaseStorageServer):
         timing_stats_labels['container'] = container
         timing_stats_labels['policy'] = int(policy)
 
-        request.headers.setdefault('X-Timestamp',
-                                   normalize_timestamp(time.time()))
-        req_timestamp = valid_timestamp(request)
+        req_timestamp = request.ensure_x_timestamp()
         frag_prefs = safe_json_loads(
             request.headers.get('X-Backend-Fragment-Preferences'))
         x_backend_open_expired = config_true_value(

@@ -21,7 +21,7 @@ import random
 import re
 from tempfile import mkdtemp
 from shutil import rmtree
-from eventlet import Timeout
+from swift.common.concurrency import Timeout
 
 from swift.common.db_auditor import DatabaseAuditor
 from swift.common.exceptions import DatabaseException

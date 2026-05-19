@@ -36,7 +36,7 @@ import random
 from copy import deepcopy
 from types import SimpleNamespace
 
-from eventlet.timeout import Timeout
+from swift.common.concurrency import Timeout
 
 from swift.common.memcached import MemcacheConnectionError
 from swift.common.utils.timestamp import generate_timestamp

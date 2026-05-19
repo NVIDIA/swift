@@ -33,8 +33,10 @@ from collections import defaultdict
 from contextlib import contextmanager
 from textwrap import dedent
 
-from eventlet import sleep, spawn, wsgi, Timeout, tpool, greenthread
-from eventlet.green.http import client as http_client
+from swift.common.concurrency import (
+    sleep, spawn, wsgi, Timeout, tpool, greenthread,
+    green_http_client as http_client
+)
 
 from swift import __version__ as swift_version
 from swift.common.http import is_success
@@ -45,14 +47,15 @@ from test.debug_logger import debug_logger, FakeStatsdClient, \
 from test.unit import mocked_http_conn, \
     make_timestamp_iter, DEFAULT_TEST_EC_TYPE, skip_if_no_xattrs, \
     connect_tcp, readuntil2crlfs, patch_policies, encode_frag_archive_bodies, \
-    mock_check_drive, FakeRing, BaseUnitTestCase, \
+    mock_check_drive, FakeRing, BaseUnitTestCase, mock_normal_timestamp_now, \
     requires_o_tmpfile_support_in_tmp
 from swift.obj import server as object_server
 from swift.obj import updater, diskfile
 from swift.common import utils, bufferedhttp, http_protocol
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import hash_path, mkdirs, NullLogger, \
-    storage_directory, public, replication, encode_timestamps, Timestamp, md5
+    storage_directory, public, replication, encode_timestamps, md5
+from swift.common.utils.timestamp import Timestamp, NormalTimestamp
 from swift.common import constraints
 from swift.common.request_helpers import get_reserved_name
 from swift.common.statsd_client import LabeledStatsdClient
@@ -1909,15 +1912,42 @@ class TestObjectController(BaseUnitTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 409)
 
+    def _parse_conflicting_metadata_log(self, error_log):
+        line = [line for line in error_log.splitlines() if line][-1]
+        prefix = 'FileExistsError: Conflicting pre-existing metadata: '
+        suffix = ' (incoming)'
+        self.assertTrue(line.startswith(prefix), line)
+        self.assertTrue(line.endswith(suffix), line)
+        metadata_comparison = line[len(prefix):-len(suffix)]
+        decoder = json.JSONDecoder()
+        # raw_decode will consume one json object and stop:
+        # https://docs.python.org/3/library/json.html#json.JSONDecoder.raw_decode
+        emeta, end = decoder.raw_decode(metadata_comparison)
+        op, metadata_comparison = metadata_comparison[end:].split(None, 1)
+        self.assertIn(op, ('==', '!='))
+        meta, end = decoder.raw_decode(metadata_comparison)
+        self.assertEqual('', metadata_comparison[end:].strip())
+        return emeta, op, meta
+
     @requires_o_tmpfile_support_in_tmp
-    def test_PUT_timestamp_collision_linkat_race(self):
+    def test_PUT_timestamp_collision_linkat_race_filtered_metadata_mismatch(
+            self):
         t0 = self.ts()
+        etag = '0b4c12d7e0a73840c1c4f148fda3b037'
         req = Request.blank(
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
             headers={'X-Timestamp': t0.internal,
                      'Content-Length': '6',
                      'Content-Type': 'application/octet-stream',
-                     'If-None-Match': 'notthere'})
+                     'If-None-Match': 'notthere',
+                     'X-Object-Meta-Secret': 'incoming-user-metadata',
+                     'X-Object-Sysmeta-Crypto-Body-Meta':
+                         'incoming-encrypted-metadata',
+                     'X-Object-Sysmeta-Crypto-Etag':
+                         'incoming-encrypted-etag',
+                     'X-Object-Transient-Sysmeta-Crypto-Meta':
+                         'incoming-transient-crypto-metadata',
+                     'X-Object-Sysmeta-Ec-Etag': 'incoming-ec-etag'})
         req.body = 'VERIFY'
         orig_linkat = diskfile.link_fd_to_path
         calls = []
@@ -1931,11 +1961,73 @@ class TestObjectController(BaseUnitTestCase):
 
         with mock.patch('swift.obj.diskfile.link_fd_to_path', race_linkat):
             resp = req.get_response(self.object_controller)
+        error_log = self.logger.records['ERROR'][0]
         self.assertEqual(resp.status_int, 500)
-        self.assertIn('linkat: File exists', self.logger.records['ERROR'][0])
-        self.assertIn('FileExistsError: Conflicting pre-existing metadata',
-                      self.logger.records['ERROR'][0])
-        self.assertEqual([mock.ANY], calls)
+        self.assertIn('linkat: File exists', error_log)
+        emeta, op, meta = self._parse_conflicting_metadata_log(error_log)
+        self.assertEqual('!=', op)
+        self.assertEqual({}, emeta)
+        self.assertEqual({
+            'X-Timestamp': t0.internal,
+            'ETag': etag,
+            'X-Object-Sysmeta-Ec-Etag': 'incoming-ec-etag',
+        }, meta)
+        expected_file_path = os.path.join(
+            self.testdir, 'sda1',
+            storage_directory('objects', 'p', hash_path('a', 'c', 'o')),
+            '%s.data' % t0.internal)
+        self.assertEqual([expected_file_path], calls)
+
+    @requires_o_tmpfile_support_in_tmp
+    def test_PUT_timestamp_collision_linkat_race_filtered_metadata_match(self):
+        t0 = self.ts()
+        etag = '0b4c12d7e0a73840c1c4f148fda3b037'
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': t0.internal,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'If-None-Match': 'notthere',
+                     'X-Object-Meta-Secret': 'incoming-user-metadata',
+                     'X-Object-Sysmeta-Ec-Etag': 'same-ec-etag'})
+        req.body = 'VERIFY'
+        orig_linkat = diskfile.link_fd_to_path
+        calls = []
+
+        def race_linkat(fd, target_path, *args, **kwargs):
+            calls.append(target_path)
+            with open(target_path, 'w') as f:
+                f.write('VERIFY')
+                diskfile.write_metadata(f, {
+                    'X-Timestamp': t0.internal,
+                    'Content-Type': 'application/octet-stream',
+                    'Content-Length': '6',
+                    'ETag': etag,
+                    'name': '/a/c/o',
+                    'X-Object-Meta-Secret': 'existing-user-metadata',
+                    'X-Object-Sysmeta-Ec-Etag': 'same-ec-etag',
+                })
+            return orig_linkat(fd, target_path, *args, **kwargs)
+
+        with mock.patch('swift.obj.diskfile.link_fd_to_path', race_linkat):
+            resp = req.get_response(self.object_controller)
+        error_log = self.logger.records['ERROR'][0]
+        self.assertEqual(resp.status_int, 500)
+        self.assertIn('linkat: File exists', error_log)
+        emeta, op, meta = self._parse_conflicting_metadata_log(error_log)
+        self.assertEqual('==', op)
+        expected = {
+            'X-Timestamp': t0.internal,
+            'ETag': etag,
+            'X-Object-Sysmeta-Ec-Etag': 'same-ec-etag',
+        }
+        self.assertEqual(expected, emeta)
+        self.assertEqual(expected, meta)
+        expected_file_path = os.path.join(
+            self.testdir, 'sda1',
+            storage_directory('objects', 'p', hash_path('a', 'c', 'o')),
+            '%s.data' % t0.internal)
+        self.assertEqual([expected_file_path], calls)
 
     @requires_o_tmpfile_support_in_tmp
     def test_PUT_timestamp_collision_linkat_race_metadata_match(self):
@@ -1968,7 +2060,11 @@ class TestObjectController(BaseUnitTestCase):
             resp = req.get_response(self.object_controller)
         # N.B. probably makes more sense to return 202 or something else?
         self.assertEqual(resp.status_int, 201)
-        self.assertEqual([mock.ANY], calls)
+        expected_file_path = os.path.join(
+            self.testdir, 'sda1',
+            storage_directory('objects', 'p', hash_path('a', 'c', 'o')),
+            '%s.data' % t0.internal)
+        self.assertEqual([expected_file_path], calls)
 
     def _update_delete_at_headers(self, headers, a='a', c='c', o='o',
                                   node_count=1):
@@ -3968,6 +4064,27 @@ class TestObjectController(BaseUnitTestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(resp.headers['X-Backend-Timestamp'],
                          utils.Timestamp(timestamp).internal)
+
+    def test_GET_invalid_timestamp(self):
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'X-Timestamp': 'bad'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 400)
+        self.assertEqual(
+            b"Invalid X-Timestamp header: 'bad'",
+            resp.body)
+
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'X-Timestamp': '1234567890.12345_0000000000000001_1'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 400)
+        self.assertEqual(
+            b"Invalid X-Timestamp header: "
+            b"'1234567890.12345_0000000000000001_1'",
+            resp.body)
 
     def test_GET_range_zero_byte_object(self):
         timestamp = self.ts().internal
@@ -7988,6 +8105,42 @@ class TestObjectController(BaseUnitTestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(b'TEST', resp.body)
+
+    def test_GET_but_expired_server_provides_x_timestamp(self):
+        # Verify that object server provides x-timestamp if it is missing from
+        # the GET request
+        ts_now = self.ts()
+        delete_at_seconds = int(ts_now) + 100
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers=self._update_delete_at_headers({
+                'X-Timestamp': ts_now.internal,
+                'X-Delete-At': delete_at_seconds,
+                'Content-Length': '4',
+                'Content-Type': 'application/octet-stream'}))
+        req.body = 'TEST'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # not yet expired...
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'},
+            headers={})
+        ts_req = NormalTimestamp(float(ts_now), delta=99 * 1e5)
+        with mock_normal_timestamp_now(ts_req):
+            resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(ts_req, req.timestamp)
+
+        # expired...
+        req = Request.blank(
+            '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'},
+            headers={})
+        ts_req = NormalTimestamp(float(ts_now), delta=101 * 1e5)
+        with mock_normal_timestamp_now(ts_req):
+            resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(ts_req, req.timestamp)
 
     def test_HEAD_but_expired(self):
         # We have an object that expires in the future

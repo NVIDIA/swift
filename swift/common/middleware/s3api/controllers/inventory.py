@@ -15,6 +15,7 @@
 import json
 
 from swift.common.utils import public, config_true_value
+from time import time
 
 from swift.common.middleware.s3api.controllers.base import Controller
 from swift.common.middleware.s3api.etree import fromstring, \
@@ -167,7 +168,9 @@ def check_config_id(req, config=None):
 
 def add_sysmeta_header(req, config):
     config_data = config.to_dict()
-    config_data['modified_time'] = float(req.timestamp)
+    # note: S3Request.timestamp is *not* the x-timestamp; the request will
+    # typically not yet have an x-timestamp header, so use time()
+    config_data['modified_time'] = time()
     key = 'X-Container-Sysmeta-Inventory-%s-Config' % config.inventory_id
     req.headers[key] = json.dumps(config_data)
 

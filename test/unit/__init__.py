@@ -27,9 +27,9 @@ import itertools
 from numbers import Number
 from tempfile import NamedTemporaryFile
 import time
-import eventlet
-from eventlet import greenpool, debug as eventlet_debug
-from eventlet.green import socket
+from swift.common.concurrency import (
+    eventlet, greenpool, debug as eventlet_debug, socket
+)
 from tempfile import mkdtemp, mkstemp, gettempdir
 from shutil import rmtree
 import signal
@@ -1182,11 +1182,11 @@ def make_normal_timestamp_iter():
 
 
 @contextmanager
-def mock_timestamp_now(now=None, klass=Timestamp):
+def mock_timestamp_now(now=None):
     if now is None:
-        now = klass.now(version=2)
+        now = Timestamp.now(version=2)
     with mocklib.patch.object(
-            klass, 'now', classmethod(lambda *args, **kwargs: now)):
+            Timestamp, 'now', classmethod(lambda *args, **kwargs: now)):
         yield now
 
 

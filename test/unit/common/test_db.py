@@ -30,7 +30,7 @@ import time
 import random
 from unittest.mock import patch, MagicMock
 
-from eventlet.timeout import Timeout
+from swift.common.concurrency import Timeout
 
 import swift.common.db
 from swift.common.constraints import \
@@ -38,7 +38,8 @@ from swift.common.constraints import \
 from swift.common.db import chexor, dict_factory, get_db_connection, \
     DatabaseBroker, DatabaseConnectionError, DatabaseAlreadyExists, \
     GreenDBConnection, PICKLE_PROTOCOL, zero_like, TombstoneReclaimer
-from swift.common.utils import mkdirs, Timestamp, md5, NormalTimestamp
+from swift.common.utils import mkdirs, md5
+from swift.common.utils.timestamp import Timestamp, NormalTimestamp
 from swift.common.exceptions import LockTimeout, DatabasePragmaException
 from swift.common.swob import HTTPException
 

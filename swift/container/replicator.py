@@ -16,7 +16,7 @@
 import os
 import json
 from collections import defaultdict
-from eventlet import Timeout
+from swift.common.concurrency import Timeout
 import optparse
 from random import choice
 
@@ -32,7 +32,8 @@ from swift.common.storage_policy import POLICIES
 from swift.common.swob import HTTPOk, HTTPAccepted
 from swift.common.http import is_success
 from swift.common.utils import majority_size, get_db_files, parse_options, \
-    node_to_string, NormalTimestamp
+    node_to_string
+from swift.common.utils.timestamp import NormalTimestamp
 
 
 def check_merge_own_shard_range(shards, broker, logger, source):

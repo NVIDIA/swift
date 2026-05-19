@@ -651,11 +651,19 @@ class TestReconstructorRebuild(ECProbeTest):
         fail_node = partners[0]
         fail_node_idx = self.onodes.index(fail_node)
 
-        # setUp already PUT object v1, all nodes have T1 durable fragments
-        # record v1 data timestamp and EC etag for later comparison
-        v1_ec_etag = self.etag
+        # setUp already PUT object v1, all nodes have T1 durable fragments.
+        # Record v1 data timestamp and the on-disk EC etag for later
+        # comparison. Read X-Object-Sysmeta-Ec-Etag from a fragment rather
+        # than relying on the proxy's response etag (self.etag): when
+        # encryption is enabled, the sysmeta etag is the ciphertext etag
+        # but the proxy returns the plaintext etag.
+        v1_ec_etag = self.frag_headers[stale_node['index']][
+            'X-Object-Sysmeta-Ec-Etag']
         v1_ts = self.frag_headers[stale_node['index']][
             'X-Backend-Data-Timestamp']
+        # Also remember the proxy-visible (plaintext) etag for the
+        # client-level proxy GET assertion below.
+        v1_obj_etag = self.etag
 
         # kill the stale node's drive so it misses the v2 overwrite
         stale_device_path = self.device_dir(stale_node)
@@ -669,10 +677,10 @@ class TestReconstructorRebuild(ECProbeTest):
         v1_size = int(ProbeBody().length)
         v2_data = os.urandom(v1_size)
         self.assertEqual(len(v2_data), v1_size)
-        v2_ec_etag = client.put_object(
+        v2_obj_etag = client.put_object(
             self.url, self.token, self.container_name, self.object_name,
             contents=v2_data)
-        self.assertNotEqual(v1_ec_etag, v2_ec_etag,
+        self.assertNotEqual(v1_obj_etag, v2_obj_etag,
                             'v2 must have different content than v1')
 
         # revive stale node — it still has v1 at T1
@@ -686,8 +694,11 @@ class TestReconstructorRebuild(ECProbeTest):
         self.assertEqual(v1_ec_etag, etag,
                          'Direct get should return v1 data')
 
-        # sanity: other nodes have v2 (different data timestamp)
+        # sanity: other nodes have v2 (different data timestamp); capture
+        # v2's on-disk EC etag from the first v2 primary and require the
+        # others to match it.
         v2_ts = None
+        v2_ec_etag = None
         for i, node in enumerate(self.onodes):
             if i == stale_node_idx:
                 continue
@@ -697,8 +708,15 @@ class TestReconstructorRebuild(ECProbeTest):
             self.assertNotEqual(v1_ts, v2_ts,
                                 'Node %s should have v2, not v1'
                                 % _format_node(node))
-            self.assertEqual(v2_ec_etag, etag,
-                             'Direct get should return v2 data')
+            if v2_ec_etag is None:
+                v2_ec_etag = etag
+            else:
+                self.assertEqual(v2_ec_etag, etag,
+                                 'All v2 primaries should report the same '
+                                 'X-Object-Sysmeta-Ec-Etag')
+        self.assertNotEqual(v1_ec_etag, v2_ec_etag,
+                            'v2 must have a different on-disk EC etag '
+                            'than v1')
 
         # delete the fail node's partition so it needs rebuilding
         self.break_nodes(self.onodes, self.opart, [fail_node_idx], [])
@@ -722,9 +740,11 @@ class TestReconstructorRebuild(ECProbeTest):
         # should NOT have been rebuilt.
         self.assert_direct_get_fails(fail_node, self.opart, 404)
 
-        # proxy GET should still return v2 from the T2 nodes
+        # proxy GET should still return v2 from the T2 nodes. The proxy
+        # returns the plaintext etag, so compare against v2_obj_etag
+        # (which equals v2_ec_etag when encryption is disabled).
         headers, etag = self.proxy_get()
-        self.assertEqual(v2_ec_etag, etag,
+        self.assertEqual(v2_obj_etag, etag,
                          'Proxy GET should return v2 data')
 
         # verify the exact mismatch error was logged by the stale node
@@ -818,7 +838,7 @@ class TestReconstructorRebuildReconcilerOffset(ECProbeTest):
             'Container nodes should disagree about policy, got %r'
             % found_policy_indexes)
 
-        # Verify object exists on replication policy nodes
+        # Verify object exists on other policy nodes
         other_ring = POLICIES.get_object_ring(
             int(self.other_policy), '/etc/swift')
         other_part, other_nodes = other_ring.get_nodes(
@@ -844,13 +864,20 @@ class TestReconstructorRebuildReconcilerOffset(ECProbeTest):
                 for (node, exc) in failures.items()
             ]))
 
-        expected_etag = '"%s"' % self.obj_etag
-        expected_count = self.other_policy.object_ring.replica_count
         self.assertEqual(
-            Counter(resp['Etag'] for resp in found_on_other.values()),
-            {expected_etag: expected_count},
+            len({
+                resp.get(
+                    'X-Object-Sysmeta-Ec-Etag',
+                    resp['Etag'],
+                ) for resp in found_on_other.values()
+            }),
+            1,
             'Other policy nodes should agree about obj meta, got %r'
             % found_on_other)
+
+        # External clients shouldn't notice any difference
+        headers, actual_etag = self.proxy_get()
+        self.assertEqual(self.obj_etag, actual_etag)
 
         # Run replicators/updaters to converge
         self.get_to_final_state()
@@ -967,23 +994,34 @@ class TestReconstructorRebuildReconcilerOffset(ECProbeTest):
         durable_frags = {}
         non_durable_frags = {}
         dev_frag_etags = defaultdict(list)
+        ec_durable_etag = None
+        ec_nondurable_etag = None
         for node in self.ec_nodes:
             node_key = _format_node(node)
             # this is the original (durable) fragment
             headers, etag = self.direct_get(node, self.ec_part)
             self.assertEqual(etag, self.frag_etags[node_key])
-            self.assertEqual(headers['X-Object-Sysmeta-Ec-Etag'],
-                             self.obj_etag)
+            if ec_durable_etag is None:
+                self.assertIsNotNone(headers['X-Object-Sysmeta-Ec-Etag'])
+                ec_durable_etag = headers['X-Object-Sysmeta-Ec-Etag']
+            else:
+                self.assertEqual(headers['X-Object-Sysmeta-Ec-Etag'],
+                                 ec_durable_etag)
             self.assertEqual(headers['X-Backend-Data-Timestamp'],
                              headers['X-Backend-Durable-Timestamp'])
             self.assertIn('X-Backend-Durable-Timestamp', headers)
             durable_frags[node_key] = headers
             dev_frag_etags[node_key].append(etag)
+
             # this is the new (non-durable) ProbeBody
             headers, etag = self.direct_get(
                 node, self.ec_part, require_durable=False)
-            self.assertEqual(headers['X-Object-Sysmeta-Ec-Etag'],
-                             v2_body.etag)
+            if ec_nondurable_etag is None:
+                self.assertIsNotNone(headers['X-Object-Sysmeta-Ec-Etag'])
+                ec_nondurable_etag = headers['X-Object-Sysmeta-Ec-Etag']
+            else:
+                self.assertEqual(headers['X-Object-Sysmeta-Ec-Etag'],
+                                 ec_nondurable_etag)
             self.assertGreater(
                 Timestamp(headers['X-Backend-Data-Timestamp']),
                 Timestamp(headers['X-Backend-Durable-Timestamp']))

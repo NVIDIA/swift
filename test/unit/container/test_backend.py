@@ -923,7 +923,7 @@ class TestContainerBroker(test_db.TestDbBase):
         broker.reclaim(older.normal, newer.normal)
         assert_row_count(5)
         self._assert_shard_ranges(broker, shard_ranges[2:], include_own=True)
-        broker.reclaim(older.normal, self.normal_ts().normal)
+        broker.reclaim(older.internal, self.normal_ts().internal)
         assert_row_count(4)
         self._assert_shard_ranges(broker, shard_ranges[3:], include_own=True)
 
@@ -933,13 +933,14 @@ class TestContainerBroker(test_db.TestDbBase):
                                  account='test_account',
                                  container='test_container')
         # create it
-        broker.initialize(start.internal, POLICIES.default.idx)
+        with mock_normal_timestamp_now(self.normal_ts()) as created_at:
+            broker.initialize(start.internal, POLICIES.default.idx)
         info, is_deleted = broker.get_info_is_deleted()
         self.assertEqual(is_deleted, broker.is_deleted())
         self.assertEqual(is_deleted, False)  # sanity
         self.assertEqual(info, broker.get_info())
         self.assertEqual(info['put_timestamp'], start.internal)
-        self.assertTrue(Timestamp(info['created_at']) >= start)
+        self.assertEqual(info['created_at'], created_at.internal)
         self.assertEqual(info['delete_timestamp'], '0')
         if self.__class__ in (
                 TestContainerBrokerBeforeMetadata,
@@ -961,7 +962,7 @@ class TestContainerBroker(test_db.TestDbBase):
         self.assertEqual(is_deleted, broker.is_deleted())
         self.assertEqual(info, broker.get_info())
         self.assertEqual(info['put_timestamp'], start.internal)
-        self.assertTrue(Timestamp(info['created_at']) >= start)
+        self.assertEqual(info['created_at'], created_at.internal)
         self.assertEqual(info['delete_timestamp'], delete_timestamp)
         self.assertEqual(info['status_changed_at'], delete_timestamp)
 
@@ -973,7 +974,7 @@ class TestContainerBroker(test_db.TestDbBase):
         self.assertEqual(is_deleted, broker.is_deleted())
         self.assertEqual(info, broker.get_info())
         self.assertEqual(info['put_timestamp'], start.internal)
-        self.assertTrue(Timestamp(info['created_at']) >= start)
+        self.assertEqual(info['created_at'], created_at.internal)
         self.assertEqual(info['delete_timestamp'], delete_timestamp)
         self.assertEqual(info['status_changed_at'], delete_timestamp)
 
@@ -1220,12 +1221,12 @@ class TestContainerBroker(test_db.TestDbBase):
         broker.initialize(Timestamp('1').internal, 0)
 
         # Stash these for later
-        old_put_timestamp = self.normal_ts()
-        old_delete_timestamp = self.normal_ts()
+        old_put_timestamp = self.normal_ts().internal
+        old_delete_timestamp = self.normal_ts().internal
 
         # Create initial object
-        timestamp = self.normal_ts()
-        meta_timestamp = self.normal_ts()
+        timestamp = self.normal_ts().internal
+        meta_timestamp = self.normal_ts().internal
         broker.merge_shard_ranges(
             ShardRange('"a/{<shardrange \'&\' name>}"', timestamp,
                        'low', 'up', meta_timestamp=meta_timestamp))
@@ -1336,8 +1337,8 @@ class TestContainerBroker(test_db.TestDbBase):
                 "SELECT reported FROM shard_range").fetchone()[0], 1)
 
         # Put new event
-        timestamp = self.normal_ts()
-        meta_timestamp = self.normal_ts()
+        timestamp = self.normal_ts().internal
+        meta_timestamp = self.normal_ts().internal
         broker.merge_shard_ranges(
             ShardRange('"a/{<shardrange \'&\' name>}"', timestamp,
                        'lower', 'upper', 1, 2, meta_timestamp=meta_timestamp))
@@ -1419,7 +1420,7 @@ class TestContainerBroker(test_db.TestDbBase):
                 "SELECT bytes_used FROM shard_range").fetchone()[0], 2)
 
         # Put new delete event
-        timestamp = self.normal_ts()
+        timestamp = self.normal_ts().internal
         broker.merge_shard_ranges(
             ShardRange('"a/{<shardrange \'&\' name>}"', timestamp,
                        'lower', 'upper', meta_timestamp=meta_timestamp,
@@ -1435,8 +1436,8 @@ class TestContainerBroker(test_db.TestDbBase):
                 "SELECT deleted FROM shard_range").fetchone()[0], 1)
 
         # Put new event
-        timestamp = self.normal_ts()
-        meta_timestamp = self.normal_ts()
+        timestamp = self.normal_ts().internal
+        meta_timestamp = self.normal_ts().internal
         broker.merge_shard_ranges(
             ShardRange('"a/{<shardrange \'&\' name>}"', timestamp,
                        'lowerer', 'upperer', 3, 4,
@@ -1463,10 +1464,10 @@ class TestContainerBroker(test_db.TestDbBase):
                 "SELECT bytes_used FROM shard_range").fetchone()[0], 4)
 
         # We'll use this later
-        in_between_timestamp = self.normal_ts()
+        in_between_timestamp = self.normal_ts().internal
 
         # New update event, meta_timestamp increases
-        meta_timestamp = self.normal_ts()
+        meta_timestamp = self.normal_ts().internal
         broker.merge_shard_ranges(
             ShardRange('"a/{<shardrange \'&\' name>}"', timestamp,
                        'lowerer', 'upperer', 3, 4,
@@ -1525,7 +1526,7 @@ class TestContainerBroker(test_db.TestDbBase):
                                  container='c')
         broker.initialize(Timestamp('1').internal, 0)
         # put shard range
-        broker.merge_shard_ranges(ShardRange('a/o', self.normal_ts().normal))
+        broker.merge_shard_ranges(ShardRange('a/o', self.normal_ts().internal))
         with broker.get() as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM shard_range "
@@ -1535,7 +1536,7 @@ class TestContainerBroker(test_db.TestDbBase):
                 "WHERE deleted = 1").fetchone()[0], 0)
 
         # delete shard range
-        broker.merge_shard_ranges(ShardRange('a/o', self.normal_ts().normal,
+        broker.merge_shard_ranges(ShardRange('a/o', self.normal_ts().internal,
                                              deleted=1))
         with broker.get() as conn:
             self.assertEqual(conn.execute(
@@ -4870,7 +4871,7 @@ class TestContainerBroker(test_db.TestDbBase):
         self.assertEqual(dict(own_sr), dict(actual))
 
         # still in table after reclaim_age
-        broker.reclaim(self.normal_ts().normal, self.normal_ts().normal)
+        broker.reclaim(self.normal_ts().internal, self.normal_ts().internal)
         actual = broker.get_own_shard_range()
         self.assertEqual(dict(own_sr), dict(actual))
 
@@ -5957,7 +5958,7 @@ def premetadata_create_container_info_table(self, conn, put_timestamp,
         UPDATE container_stat
         SET account = ?, container = ?, created_at = ?, id = ?,
             put_timestamp = ?
-    ''', (self.account, self.container, Timestamp.now().internal,
+    ''', (self.account, self.container, NormalTimestamp.now().internal,
           str(uuid4()), put_timestamp))
 
 
@@ -6034,7 +6035,7 @@ def prexsync_create_container_info_table(self, conn, put_timestamp,
         UPDATE container_stat
         SET account = ?, container = ?, created_at = ?, id = ?,
             put_timestamp = ?
-    ''', (self.account, self.container, Timestamp.now().internal,
+    ''', (self.account, self.container, NormalTimestamp.now().internal,
           str(uuid4()), put_timestamp))
 
 
@@ -6153,7 +6154,7 @@ def prespi_create_container_info_table(self, conn, put_timestamp,
         UPDATE container_stat
         SET account = ?, container = ?, created_at = ?, id = ?,
             put_timestamp = ?
-    ''', (self.account, self.container, Timestamp.now().internal,
+    ''', (self.account, self.container, NormalTimestamp.now().internal,
           str(uuid4()), put_timestamp))
 
 
@@ -7081,7 +7082,7 @@ class TestUpdateNewItemFromExisting(unittest.TestCase):
 class TestModuleFunctions(BaseUnitTestCase):
     def setUp(self):
         super(TestModuleFunctions, self).setUp()
-        self.ts_str = [self.normal_ts().normal for _ in range(10)]
+        self.ts_str = [self.normal_ts().internal for _ in range(10)]
 
     def test_merge_shards_existing_none(self):
         data = dict(ShardRange('a/o', self.ts_str[1]), reported=True)
@@ -7250,8 +7251,8 @@ class TestModuleFunctions(BaseUnitTestCase):
 
     def test_sift_shard_ranges(self):
         existing_shards = {}
-        sr1 = dict(ShardRange('a/o', self.normal_ts().normal))
-        sr2 = dict(ShardRange('a/o2', self.normal_ts().normal))
+        sr1 = dict(ShardRange('a/o', self.normal_ts().internal))
+        sr2 = dict(ShardRange('a/o2', self.normal_ts().internal))
         new_shard_ranges = [sr1, sr2]
 
         # first empty existing shards will just add the shards
@@ -7265,7 +7266,7 @@ class TestModuleFunctions(BaseUnitTestCase):
         # if there is a newer version in the existing shards then it won't be
         # added to to_add
         existing_shards['a/o'] = dict(
-            ShardRange('a/o', self.normal_ts().normal))
+            ShardRange('a/o', self.normal_ts().internal))
         to_add, to_delete = sift_shard_ranges(new_shard_ranges,
                                               existing_shards)
         self.assertEqual([sr2], list(to_add))
@@ -7273,7 +7274,7 @@ class TestModuleFunctions(BaseUnitTestCase):
 
         # But if a newer version is in new_shard_ranges then the old will be
         # added to to_delete and new is added to to_add.
-        sr1['timestamp'] = self.normal_ts().normal
+        sr1['timestamp'] = self.normal_ts().internal
         to_add, to_delete = sift_shard_ranges(new_shard_ranges,
                                               existing_shards)
         self.assertEqual(2, len(to_add))

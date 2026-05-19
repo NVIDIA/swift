@@ -18,8 +18,8 @@ import time
 from random import random
 
 from collections import defaultdict
-from eventlet import Timeout
 from math import pow
+from swift.common.concurrency import Timeout
 
 import swift.common.db
 from swift.common.utils import get_logger, audit_location_generator, \

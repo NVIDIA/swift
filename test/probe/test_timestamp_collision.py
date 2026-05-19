@@ -21,6 +21,7 @@ import os
 import random
 
 from swift.common import internal_client, direct_client
+from swift.common.manager import Manager
 from swift.common.utils import Timestamp, hash_path
 from swift.obj.diskfile import _read_file_metadata
 
@@ -79,15 +80,14 @@ class FragZipper(object):
 
         if fi in self.sent[other_id]:
             # request that sent this fragment wins this fragment
-            self.win[my_id].add(fi)
-            self.lose[other_id].add(fi)
-        else:
             self.lose[my_id].add(fi)
             self.win[other_id].add(fi)
+        else:
+            self.win[my_id].add(fi)
+            self.lose[other_id].add(fi)
 
         # check if request should wait
-        if (len(self.win[my_id]) > len(self.win[other_id]) or
-                len(self.lose[my_id]) > len(self.lose[other_id])):
+        if len(self.sent[my_id]) > len(self.sent[other_id]):
             if not self.waiting:  # prevent both requests from waiting
                 e = self.waiting = event.Event()
                 print(my_id, 'waiting', self.sent)
@@ -105,25 +105,20 @@ class TestECCollision(ECProbeTest):
 
     def setUp(self):
         super(TestECCollision, self).setUp()
-        # XXX I doubt there's a *good* reason _make_name returns bytes
+        # There doesn't seem to be a *good* reason _make_name returns bytes
         self.container_name = self.container_name.decode('utf8')
         self.object_name = self.object_name.decode('utf8')
-        # XXX better to use random names each test; hit different parts
-        self.container_name = 'badtest'
-        self.object_name = 'badnews'
         self.swift = internal_client.InternalClient(
             '/etc/swift/internal-client.conf', 'probe-test', 1)
         self.swift.create_container(
             self.account, self.container_name,
             headers={'x-storage-policy': self.policy.name})
 
-    def map_data_file_to_node(self):
+    def map_data_files_to_nodes(self, part, nodes):
         hpath = hash_path(self.account, self.container_name, self.object_name)
-        p, nodes = self.policy.object_ring.get_nodes(
-            self.account, self.container_name, self.object_name)
         file_to_node = {}
         for node in nodes:
-            part_dir = self.storage_dir(node, part=p)
+            part_dir = self.storage_dir(node, part=part)
             data_dir = os.path.join(part_dir, hpath[-3:], hpath)
             try:
                 files = os.listdir(data_dir)
@@ -135,6 +130,11 @@ class TestECCollision(ECProbeTest):
                 path = os.path.join(data_dir, f)
                 file_to_node[path] = node
         return file_to_node
+
+    def map_data_files_to_primary_nodes(self):
+        part, nodes = self.policy.object_ring.get_nodes(
+            self.account, self.container_name, self.object_name)
+        return self.map_data_files_to_nodes(part, nodes)
 
     def do_upload(self, contents, headers):
         self.swift.upload_object(BytesIO(contents), self.account,
@@ -190,7 +190,7 @@ class TestECCollision(ECProbeTest):
             # let the first thread run up to commit
             ready.wait()
             # we should have a bunch of non-durable
-            orig_df2node = self.map_data_file_to_node()
+            orig_df2node = self.map_data_files_to_primary_nodes()
             self.assertEqual(self.policy.ec_n_unique_fragments,
                              len(orig_df2node))
             # nothing is durable
@@ -208,7 +208,7 @@ class TestECCollision(ECProbeTest):
             with self.assertRaises(internal_client.UnexpectedResponse) as ctx:
                 self.do_upload(contents, headers)
             self.assertEqual(503, ctx.exception.resp.status_int)
-            df2node = self.map_data_file_to_node()
+            df2node = self.map_data_files_to_primary_nodes()
             self.assertEqual(self.policy.ec_n_unique_fragments, len(df2node))
             # nothing is durable yet
             self.assertEqual(0, len(self._collect_durable_files(df2node)))
@@ -225,7 +225,7 @@ class TestECCollision(ECProbeTest):
             # let the first one finish now
             proceed.send(None)
             gt.wait()
-        new_df2node = self.map_data_file_to_node()
+        new_df2node = self.map_data_files_to_primary_nodes()
         # all durable
         self.assertEqual(self.policy.ec_n_unique_fragments,
                          len(self._collect_durable_files(new_df2node)))
@@ -283,10 +283,15 @@ class TestECCollision(ECProbeTest):
 
         def safe_upload(contents, headers):
             try:
-                resp = self.do_upload(contents, headers)
+                self.do_upload(contents, headers)
             except internal_client.UnexpectedResponse as e:
-                resp = e.resp
-            results.append(resp)
+                results.append(e.resp.status_int)
+            else:
+                # do_upload wraps InternalClient.upload_object which returns
+                # None on success; which only happens if you revert the change.
+                # We leave the unexpected sentinal here instead of assertRaises
+                # so it's easier to see the problematic results w/o this fix.
+                results.append(True)
 
         with mock.patch.object(ECObjectController, '_transfer_data',
                                patched_transfer_data), \
@@ -308,14 +313,9 @@ class TestECCollision(ECProbeTest):
                 self.fail('probably deadlock because of bugs '
                           '(or huge contents?); check logs')
 
-        df2node = self.map_data_file_to_node()
+        df2node = self.map_data_files_to_primary_nodes()
         self.assertEqual(self.policy.ec_n_unique_fragments, len(df2node))
-        # nothing is durable
-        self.assertEqual(0, len(self._collect_durable_files(df2node)))
-        # both responses were errors
-        self.assertEqual([503, 503], [r.status_int for r in results])
 
-        # metadata is all mixed up!
         counts = defaultdict(int)
         metadata = self._collect_datafile_metadata(df2node, ['foo', 'bar'])
         foo_keys = self._meta_keys('foo')
@@ -328,6 +328,12 @@ class TestECCollision(ECProbeTest):
                 self.assertTrue(any(key in m for key in bar_keys))
                 counts['bar'] += 1
                 self.assertFalse(any(key in m for key in foo_keys))
+
+        # nothing is durable
+        self.assertEqual(0, len(self._collect_durable_files(df2node)), counts)
+        # both responses were errors
+        self.assertEqual([503, 503], results)
+        # metadata is all mixed up!
         # OMM I get all of these scenarios!?  I wonder if there's a way to make
         # this more stable?
         self.assertIn(counts, [
@@ -336,35 +342,47 @@ class TestECCollision(ECProbeTest):
             {'foo': 2, 'bar': 4},
         ])
 
-    def test_overlap_writes_to_handoffs(self):
-        contents = b'a' * 97
+    def test_overlap_to_handoffs_collapses_to_unreadable(self):
+        old_contents = b'a' * 97
+        new_contents = b'b' * 97
         now = Timestamp.now()
         headers = {
             'x-timestamp': now.internal,
         }
-        self.do_upload(contents, headers)
+        self.do_upload(old_contents, headers)
         # check data files on disk
-        df2node = self.map_data_file_to_node()
+        part, primary_nodes = self.policy.object_ring.get_nodes(
+            self.account, self.container_name, self.object_name)
+        df2node = self.map_data_files_to_nodes(part, primary_nodes)
         self.assertEqual(self.policy.object_ring.replica_count,
                          len(df2node))
-        # save one file and delete the rest
-        save_file = random.choice(list(df2node.keys()))
-        save_device = self.device_dir(df2node[save_file])
-        self.kill_drive(save_device)
-        for f in df2node:
-            if f == save_file:
-                continue
-            os.unlink(f)
+        # Save more old frags than parity can tolerate
+        num_saved = self.policy.ec_nparity + 1
 
-        # re-upload with same timestamp (add some metadata)
-        headers['x-object-meta-foo'] = 'bar'
-        self.do_upload(contents, headers)
-        self.revive_drive(save_device)
+        save_files = set(random.sample(list(df2node.keys()), num_saved))
+        save_devices = [self.device_dir(df2node[f]) for f in save_files]
+        killed_devices = []
+        try:
+            for save_device in save_devices:
+                self.kill_drive(save_device)
+                killed_devices.append(save_device)
+            for f in df2node:
+                if f in save_files:
+                    continue
+                os.unlink(f)
+
+            # Re-upload different contents with the same timestamp (and some
+            # metadata) so the saved primaries disagree with the handoffs.
+            headers['x-object-meta-foo'] = 'bar'
+            self.do_upload(new_contents, headers)
+        finally:
+            for save_device in killed_devices:
+                self.revive_drive(save_device)
 
         # files on disk look exactly the same (!!)
-        new_df2node = self.map_data_file_to_node()
+        new_df2node = self.map_data_files_to_nodes(part, primary_nodes)
         self.assertEqual(df2node, new_df2node)
-        # but the save_file metadata persists!
+        # but the save_files' old metadata persists
         counts = defaultdict(int)
         metadata = self._collect_datafile_metadata(df2node, ['foo'])
         foo_keys = self._meta_keys('foo')
@@ -372,10 +390,27 @@ class TestECCollision(ECProbeTest):
             if any(key in m for key in foo_keys):
                 counts['foo'] += 1
             else:
-                # safe_file had no metadata
+                # save_files had no metadata
                 self.assertEqual({}, m)
                 counts[None] += 1
-        self.assertEqual(counts, {'foo': 5, None: 1})
+        self.assertEqual(counts, {
+            'foo': self.policy.object_ring.replica_count - num_saved,
+            None: num_saved,
+        })
+        # there is some handoffs ...
+        handoff_nodes = list(self.policy.object_ring.get_more_nodes(part))
+        handoff_df2node = self.map_data_files_to_nodes(part, handoff_nodes)
+        self.assertEqual(2, len(handoff_df2node))
+
+        self.reconstructor.once()
+        #  ... hope they weren't useful!?
+        self.assertFalse(self.map_data_files_to_nodes(part, handoff_nodes))
+
+        Manager(['proxy-server']).restart()  # clear error cache
+        with self.assertRaises(internal_client.UnexpectedResponse) as ctx:
+            self.swift.get_object(self.account, self.container_name,
+                                  self.object_name)
+        self.assertEqual(503, ctx.exception.resp.status_int)
 
 
 class TestReplicatedCollision(ReplProbeTest):
@@ -517,33 +552,54 @@ class TestReplicatedCollision(ReplProbeTest):
         sorted_statuses = [sorted(statuses) for statuses in captured_statuses]
         self.assertEqual(sorted_statuses, [[201, 201, 500], [201, 500, 500]])
 
-        head_responses = []
         p, nodes = self.policy.object_ring.get_nodes(
             self.account, self.container_name, self.object_name)
-        for node in nodes:
-            metadata = direct_client.direct_head_object(
-                node, p, self.account, self.container_name,
-                self.object_name)
-            head_responses.append(metadata)
-        self.assertEqual(len(head_responses),
-                         self.policy.object_ring.replica_count)
-        color_counts = Counter([
-            resp['X-Object-Meta-Color']
-            for resp in head_responses
-        ])
-        if color_counts == {None: 3}:
-            # encryption enabled.
-            color_counts = Counter([
-                resp['X-Object-Transient-Sysmeta-Crypto-Meta-Color']
+
+        def direct_head_responses():
+            return [
+                direct_client.direct_head_object(
+                    node, p, self.account, self.container_name,
+                    self.object_name)
+                for node in nodes
+            ]
+
+        def color_counts(head_responses):
+            counts = Counter([
+                resp['X-Object-Meta-Color']
                 for resp in head_responses
             ])
-            self.assertEqual({1, 2}, set(color_counts.values()))
-        else:
+            if counts == {None: self.policy.object_ring.replica_count}:
+                # encryption enabled.
+                counts = Counter([
+                    resp['X-Object-Transient-Sysmeta-Crypto-Meta-Color']
+                    for resp in head_responses
+                ])
+            return counts
+
+        head_responses = direct_head_responses()
+        self.assertEqual(len(head_responses),
+                         self.policy.object_ring.replica_count)
+        initial_color_counts = color_counts(head_responses)
+        if set(initial_color_counts) == {'blue', 'red'}:
             # encryption disabled.
-            self.assertEqual({'blue': 1, 'red': 2}, color_counts)
+            self.assertEqual({'blue': 1, 'red': 2}, initial_color_counts)
+        else:
+            # encryption enabled.
+            self.assertEqual({1, 2}, set(initial_color_counts.values()))
+
         # This is an unreconcilable state, three replicas might have different
         # data because of different encryption ivs, but because it's replicated
         # it's at least readable.
         self.assertEqual(
-            {str(now.normal): 3},
+            {now.internal: 3},
             Counter([resp['X-Timestamp'] for resp in head_responses]))
+        _, _, body_iter = self.swift.get_object(
+            self.account, self.container_name, self.object_name)
+        self.assertEqual(contents, b''.join(body_iter))
+
+        self.replicators.once()
+        head_responses = direct_head_responses()
+        self.assertEqual(len(head_responses),
+                         self.policy.object_ring.replica_count)
+        # the metadata remains inconsistent
+        self.assertEqual(initial_color_counts, color_counts(head_responses))

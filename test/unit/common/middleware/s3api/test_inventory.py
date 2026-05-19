@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+from unittest import mock
 
 from swift.common.middleware.s3api.controllers.inventory import \
     InventoryConfiguration
@@ -20,7 +21,6 @@ from swift.common.swob import Request, HTTPNoContent, HTTPNotFound
 from swift.common.middleware.s3api.etree import fromstring, tostring, \
     DocumentInvalid
 from swift.common.utils import list_from_csv
-from test.unit import mock_timestamp_now
 from test.unit.common.middleware.s3api import S3ApiTestCase
 
 # conforms to schema but using unsupported fields and values
@@ -466,16 +466,20 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual([], self.swift.calls_with_headers)
 
     def test_PUT_enable_inventory(self):
+        ts_now = self.ts()
         self.s3api.conf['s3_inventory_enabled'] = 'yes'
         self.swift.register(
             'POST', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
 
-        req = Request.blank('/bucket?inventory&id=0',
-                            environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'Authorization': 'AWS test:tester:hmac',
-                                     'Date': self.get_date_header()},
-                            body=SUPPORTED_XML)
-        with mock_timestamp_now() as ts:
+        req = Request.blank(
+            '/bucket?inventory&id=0',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(float(ts_now), skew=-10)},
+            body=SUPPORTED_XML)
+        ts_plus = float(ts_now) + 1.0
+        with mock.patch('swift.common.middleware.s3api.controllers.'
+                        'inventory.time', return_value=ts_plus):
             status, headers, body = self.call_s3api(req)
         self.assertEqual('204', status.split()[0])
 
@@ -486,7 +490,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             'period': 'Daily',
             'source': 's3api',
             'dest_container': 'destination-bucket',
-            'modified_time': int(ts),
+            'modified_time': ts_plus,
             'enabled': True,
             'deleted': False,
         }
@@ -495,6 +499,45 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual(
             exp_config,
             json.loads(actual_hdrs['X-Container-Sysmeta-Inventory-0-Config']))
+        self.assertNotIn('X-Timestamp', actual_hdrs)
+
+    def test_PUT_enable_inventory_with_x_timestamp(self):
+        # verify that even if x-timestamp is present then it won't be used for
+        # config modified_time
+        self.s3api.conf['s3_inventory_enabled'] = 'yes'
+        self.swift.register(
+            'POST', '/v1/AUTH_test/bucket', HTTPNoContent, {}, None)
+
+        req = Request.blank(
+            '/bucket?inventory&id=0',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(skew=-10)},
+            body=SUPPORTED_XML)
+        ts_now = req.ensure_x_timestamp()
+        ts_plus = float(ts_now) + 1.0
+        with mock.patch('swift.common.middleware.s3api.controllers.'
+                        'inventory.time', return_value=ts_plus):
+            status, headers, body = self.call_s3api(req)
+        self.assertEqual('204', status.split()[0])
+
+        calls = self.swift.calls_with_headers
+        self.assertEqual(1, len(calls), calls)
+        self.assertEqual(calls[0][0], 'POST')
+        exp_config = {
+            'period': 'Daily',
+            'source': 's3api',
+            'dest_container': 'destination-bucket',
+            'modified_time': ts_plus,
+            'enabled': True,
+            'deleted': False,
+        }
+        actual_hdrs = calls[0][2]
+        self.assertIn('X-Container-Sysmeta-Inventory-0-Config', actual_hdrs)
+        self.assertEqual(
+            exp_config,
+            json.loads(actual_hdrs['X-Container-Sysmeta-Inventory-0-Config']))
+        self.assertEqual(ts_now.internal, actual_hdrs.get('X-Timestamp'))
 
     def test_PUT_enable_inventory_abbreviated_dest_bucket(self):
         self.s3api.conf['s3_inventory_enabled'] = 'yes'
@@ -506,12 +549,16 @@ class TestS3ApiInventory(S3ApiTestCase):
         xml.find('./Destination/S3BucketDestination/Bucket').text = 'd-bucket'
         body = tostring(xml)
 
-        req = Request.blank('/bucket?inventory&id=0',
-                            environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'Authorization': 'AWS test:tester:hmac',
-                                     'Date': self.get_date_header()},
-                            body=body)
-        with mock_timestamp_now() as ts:
+        ts_now = self.ts()
+        req = Request.blank(
+            '/bucket?inventory&id=0',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(float(ts_now))},
+            body=body)
+        ts_plus = float(ts_now) + 1.0
+        with mock.patch('swift.common.middleware.s3api.controllers.'
+                        'inventory.time', return_value=ts_plus):
             status, headers, body = self.call_s3api(req)
         self.assertEqual('204', status.split()[0])
 
@@ -522,7 +569,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             'period': 'Daily',
             'source': 's3api',
             'dest_container': 'd-bucket',
-            'modified_time': int(ts),
+            'modified_time': ts_plus,
             'enabled': True,
             'deleted': False,
         }
@@ -531,6 +578,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual(
             exp_config,
             json.loads(actual_hdrs['X-Container-Sysmeta-Inventory-0-Config']))
+        self.assertNotIn('X-Timestamp', actual_hdrs)
 
     def test_PUT_disable_inventory(self):
         self.s3api.conf['s3_inventory_enabled'] = 'yes'
@@ -541,12 +589,16 @@ class TestS3ApiInventory(S3ApiTestCase):
         xml.find('./IsEnabled').text = 'false'
         body = tostring(xml)
 
-        req = Request.blank('/bucket?inventory&id=0',
-                            environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'Authorization': 'AWS test:tester:hmac',
-                                     'Date': self.get_date_header()},
-                            body=body)
-        with mock_timestamp_now() as ts:
+        ts_now = self.ts()
+        req = Request.blank(
+            '/bucket?inventory&id=0',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(float(ts_now))},
+            body=body)
+        ts_plus = float(ts_now) + 1.0
+        with mock.patch('swift.common.middleware.s3api.controllers.'
+                        'inventory.time', return_value=ts_plus):
             status, headers, body = self.call_s3api(req)
         self.assertEqual('204', status.split()[0])
 
@@ -557,7 +609,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             'period': 'Daily',
             'source': 's3api',
             'dest_container': 'destination-bucket',
-            'modified_time': int(ts),
+            'modified_time': ts_plus,
             'enabled': False,
             'deleted': False,
         }
@@ -566,6 +618,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual(
             exp_config,
             json.loads(actual_hdrs['X-Container-Sysmeta-Inventory-0-Config']))
+        self.assertNotIn('X-Timestamp', actual_hdrs)
 
     def test_PUT_missing_fields(self):
         self.s3api.conf['s3_inventory_enabled'] = 'yes'
@@ -574,8 +627,7 @@ class TestS3ApiInventory(S3ApiTestCase):
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()},
                             body=INVALID_XML)
-        with mock_timestamp_now():
-            status, headers, body = self.call_s3api(req)
+        status, headers, body = self.call_s3api(req)
         self.assertEqual('400', status.split()[0])
         self.assertEqual([], self.swift.calls_with_headers)
         self.assertEqual(
@@ -601,12 +653,16 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.swift.register(
             'HEAD', '/v1/AUTH_test/bucket', HTTPNoContent, resp_headers, None)
 
-        req = Request.blank('/bucket?inventory&id=0',
-                            environ={'REQUEST_METHOD': 'DELETE'},
-                            headers={'Authorization': 'AWS test:tester:hmac',
-                                     'Date': self.get_date_header()},
-                            body=None)
-        with mock_timestamp_now() as ts:
+        ts_now = self.ts()
+        req = Request.blank(
+            '/bucket?inventory&id=0',
+            environ={'REQUEST_METHOD': 'DELETE'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(float(ts_now))},
+            body=None)
+        ts_plus = float(ts_now) + 1.0
+        with mock.patch('swift.common.middleware.s3api.controllers.'
+                        'inventory.time', return_value=ts_plus):
             status, headers, body = self.call_s3api(req)
         self.assertEqual('204', status.split()[0])
 
@@ -617,7 +673,7 @@ class TestS3ApiInventory(S3ApiTestCase):
             'period': 'Daily',
             'source': 's3api',
             'dest_container': 'destination-bucket',
-            'modified_time': int(ts),
+            'modified_time': ts_plus,
             'enabled': False,
             'deleted': True,
         }
@@ -626,6 +682,7 @@ class TestS3ApiInventory(S3ApiTestCase):
         self.assertEqual(
             exp_config,
             json.loads(actual_hdrs['X-Container-Sysmeta-Inventory-0-Config']))
+        self.assertNotIn('X-Timestamp', actual_hdrs)
 
         # non-existent config
         self.swift.register(
@@ -636,8 +693,7 @@ class TestS3ApiInventory(S3ApiTestCase):
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()},
                             body=None)
-        with mock_timestamp_now() as ts:
-            status, headers, body = self.call_s3api(req)
+        status, headers, body = self.call_s3api(req)
         self.assertEqual('404', status.split()[0])
         self.assertIn(b'The specified configuration does not exist.', body)
 
