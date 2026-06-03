@@ -19,14 +19,18 @@ import unittest
 
 from swift.common.middleware.s3api.s3checksum import \
     ChecksummingInput, get_checksum_hasher, validate_checksum_value, \
-    normalize_checksum_algorithm
+    normalize_checksum_algorithm, checksum_algorithm_from_header, \
+    checksum_header_from_algorithm, checksum_sysmeta_headers, \
+    normalize_checksum_mode, checksum_sysmeta_to_response_headers, \
+    checksum_sysmeta_values
 from swift.common.middleware.s3api.exception import \
     S3InputChecksumMismatch, S3InputChecksumTrailerInvalid
+from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import checksum
 
 
 class TestChecksummingInput(unittest.TestCase):
-    def test_matching_checksum(self):
+    def test_checksum_value(self):
         body = b'123456789'
         expected_checksum = base64.b64encode(
             checksum.crc32(body).digest()).decode('ascii')
@@ -37,8 +41,13 @@ class TestChecksummingInput(unittest.TestCase):
             BytesIO(body), len(body), checksum.crc32(),
             'x-amz-checksum-crc32', checksum_source)
 
+        self.assertEqual('x-amz-checksum-crc32', wrapped.checksum_key)
+        self.assertEqual('CRC32', wrapped.algorithm)
+        self.assertIsNone(wrapped.checksum_value)
         self.assertEqual(b'1234', wrapped.read(4))
+        self.assertIsNone(wrapped.checksum_value)
         self.assertEqual(b'56789', wrapped.read())
+        self.assertEqual(expected_checksum, wrapped.checksum_value)
         self.assertFalse(wrapped.wsgi_input.closed)
 
     def test_mismatched_checksum(self):
@@ -81,6 +90,7 @@ class TestChecksummingInput(unittest.TestCase):
             'x-amz-checksum-crc32', checksum_source)
 
         self.assertEqual(b'', wrapped.read())
+        self.assertEqual(expected_checksum, wrapped.checksum_value)
         self.assertFalse(wrapped.wsgi_input.closed)
 
     def test_missing_checksum_source(self):
@@ -171,6 +181,77 @@ class TestModuleFunctions(unittest.TestCase):
         # note: the normalize function does not *validate* the value; S3
         # rejects hyphenated spellings with InvalidRequest
         self.assertEqual('CRC-32', normalize_checksum_algorithm('crc-32'))
+
+    def test_normalize_checksum_mode(self):
+        self.assertIsNone(normalize_checksum_mode(None))
+        self.assertEqual('ENABLED', normalize_checksum_mode('enabled'))
+
+    def test_checksum_sysmeta_headers(self):
+        sysmeta_headers = checksum_sysmeta_headers(
+            'crc32', 'DUoRhQ==', 'FULL_OBJECT')
+        self.assertEqual(HeaderKeyDict({
+            'x-object-sysmeta-s3api-checksum-algorithm':
+                'CRC32',
+            'x-object-sysmeta-s3api-checksum-value': 'DUoRhQ==',
+            'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+        }), sysmeta_headers)
+        self.assertEqual(('CRC32', 'DUoRhQ==', 'FULL_OBJECT'),
+                         checksum_sysmeta_values(sysmeta_headers))
+
+    def test_checksum_sysmeta_to_response_headers(self):
+        for algorithm, value in (
+            ('CRC32', 'DUoRhQ=='),
+            ('SHA256',
+                'ZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQy'
+                'N2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NQ=='),
+        ):
+            with self.subTest(algorithm=algorithm):
+                sysmeta = {
+                    'x-object-sysmeta-s3api-checksum-algorithm': algorithm,
+                    'x-object-sysmeta-s3api-checksum-value': value,
+                    'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+                }
+                self.assertEqual({
+                    'x-amz-checksum-type': 'FULL_OBJECT',
+                    'x-amz-checksum-' + algorithm.lower(): value,
+                }, checksum_sysmeta_to_response_headers(sysmeta))
+
+    def test_checksum_sysmeta_to_response_headers_missing_sysmeta(self):
+        for missing in ('type', 'algorithm', 'value'):
+            with self.subTest(missing=missing):
+                sysmeta = {
+                    'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+                    'x-object-sysmeta-s3api-checksum-value': 'DUoRhQ==',
+                    'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+                }
+                del sysmeta['x-object-sysmeta-s3api-checksum-' + missing]
+                self.assertEqual(
+                    {}, checksum_sysmeta_to_response_headers(sysmeta))
+
+    def test_checksum_header_from_algorithm(self):
+        self.assertEqual(
+            'x-amz-checksum-crc32', checksum_header_from_algorithm('crc32'))
+        self.assertEqual(
+            'x-amz-checksum-crc-32', checksum_header_from_algorithm('crc-32'))
+
+    def test_checksum_algorithm_from_header(self):
+        self.assertEqual(
+            'CRC32', checksum_algorithm_from_header(
+                'x-amz-checksum-crc32'))
+
+    def test_checksum_sysmeta_headers_without_type(self):
+        self.assertEqual(HeaderKeyDict({
+            'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+            'x-object-sysmeta-s3api-checksum-value': 'DUoRhQ==',
+        }), checksum_sysmeta_headers(
+            'CRC32', 'DUoRhQ==', None))
+
+    def test_checksum_sysmeta_headers_without_value(self):
+        self.assertEqual(HeaderKeyDict({
+            'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+            'x-object-sysmeta-s3api-checksum-type': 'COMPOSITE',
+        }), checksum_sysmeta_headers(
+            'CRC32', None, checksum_type='COMPOSITE'))
 
 
 if __name__ == '__main__':
