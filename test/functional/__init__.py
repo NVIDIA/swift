@@ -456,6 +456,7 @@ def _load_s3api(proxy_conf_file, swift_conf_file, **kwargs):
             "tempauth",
             "s3api tempauth")
         conf.set('filter:s3api', 's3_acl', 'true')
+        conf.set('filter:s3api', 'allow_store_checksums', 'true')
 
         conf.set('filter:versioned_writes', 'allow_object_versioning', 'true')
 

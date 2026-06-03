@@ -25,6 +25,7 @@ from time import mktime
 from zlib import crc32
 
 import boto3
+import botocore.httpchecksum
 
 import test.functional as tf
 from swift.common import utils, swob
@@ -114,15 +115,34 @@ class TestS3ApiObjectBoto3(S3ApiBaseBoto3):
         self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
         self.assertEqual(body, resp['Body'].read())
 
-    def test_put_chunked_sha256(self):
+    def test_put_chunked_with_checksum(self):
         body = b'abcd' * 8192
-        resp = self.conn.put_object(Bucket=self.bucket, Key='obj', Body=body,
-                                    ContentEncoding='aws-chunked',
-                                    ChecksumAlgorithm='SHA256')
-        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
-        resp = self.conn.get_object(Bucket=self.bucket, Key='obj')
-        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
-        self.assertEqual(body, resp['Body'].read())
+        for algorithm, checksum in (
+                ('SHA256', 'xgFRoLJOSXY9aKHICdKgVgT5vvYiEa/qFfRCaRGwNAc='),
+                ('SHA1', 'X/kfSEDXCTAVPEEmyHnxEbTEL/A='),
+                ('CRC32', '/2Bcwg=='),
+                ('CRC32C', 'zzKqVA=='),
+                ('CRC64NVME', 'K2dThsT8i8o=')):
+            with self.subTest(algorithm=algorithm):
+                if algorithm.lower() not in (
+                        botocore.httpchecksum._SUPPORTED_CHECKSUM_ALGORITHMS):
+                    self.skipTest('botocore cannot %s (run '
+                                  '`pip install -U boto3 botocore[crt]`)'
+                                  % algorithm)
+                resp = self.conn.put_object(
+                    Bucket=self.bucket, Key='obj', Body=body,
+                    ContentEncoding='aws-chunked', ChecksumAlgorithm=algorithm)
+                self.assertEqual(
+                    200, resp['ResponseMetadata']['HTTPStatusCode'])
+                resp = self.conn.get_object(Bucket=self.bucket, Key='obj',
+                                            ChecksumMode='ENABLED')
+                self.assertEqual(
+                    200, resp['ResponseMetadata']['HTTPStatusCode'])
+                self.assertEqual(body, resp['Body'].read())
+                # Check the stored checksum when the cluster enables storage.
+                if tf.cluster_info['s3api'].get('allow_store_checksums'):
+                    self.assertEqual(checksum, resp['Checksum' + algorithm])
+                    self.assertEqual('FULL_OBJECT', resp['ChecksumType'])
 
     def test_put_object_request_timeout(self):
         if not tf.in_process:
