@@ -21,6 +21,7 @@ import time
 
 import boto3
 from botocore.exceptions import ClientError
+import requests
 import urllib.parse
 
 from swift.common.utils import config_true_value, readconf
@@ -158,6 +159,35 @@ def skip_if_s3_acl_tests_disabled(func):
     def wrapper(*args, **kwargs):
         if not is_s3_acl_tests_enabled():
             raise unittest.SkipTest('s3_acl_tests_enabled is false')
+        return func(*args, **kwargs)
+    return wrapper
+
+
+@functools.lru_cache()
+def get_cluster_info():
+    endpoint = get_opt('endpoint')
+    if not endpoint:
+        return {}
+    try:
+        resp = requests.get(
+            urllib.parse.urljoin(endpoint, '/info'),
+            verify=get_opt('ca_cert', True), timeout=10)
+        resp.raise_for_status()
+        info = resp.json()
+    except (requests.RequestException, ValueError):
+        # Other S3 services may not expose Swift capabilities.
+        return {}
+    return info if isinstance(info, dict) else {}
+
+
+def skip_if_checksum_persistence_disabled(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        s3api_info = get_cluster_info().get('s3api')
+        if s3api_info is not None and not s3api_info.get(
+                'allow_store_checksums', False):
+            raise unittest.SkipTest(
+                'This test requires allow_store_checksums=true')
         return func(*args, **kwargs)
     return wrapper
 

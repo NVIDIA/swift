@@ -23,8 +23,8 @@ from swift.common.utils import config_true_value
 from swift.common.request_helpers import get_sys_meta_prefix, is_sys_meta
 
 from swift.common.middleware.s3api.utils import snake_to_camel, \
-    s3api_sysmeta_header, convert_swift_to_s3_cipher, \
-    is_swift3_sysmeta, is_s3api_sysmeta
+    s3api_sysmeta_header, convert_swift_to_s3_cipher, is_swift3_sysmeta, \
+    is_s3api_sysmeta
 from swift.common.middleware.s3api.etree import Element, SubElement, tostring
 from swift.common.middleware.versioned_writes.object_versioning import \
     DELETE_MARKER_CONTENT_TYPE
@@ -129,6 +129,8 @@ class S3Response(S3ResponseBase, swob.Response):
 
     def __init__(self, *args, **kwargs):
         swob.Response.__init__(self, *args, **kwargs)
+        # s3api_sysmeta_headers holds x-[object|container]-sysmeta-s3api-
+        # headers, including the registered checksum value.
         self.s3api_sysmeta_headers = swob.HeaderKeyDict()
         self.sysmeta_headers = self.s3api_sysmeta_headers  # backwards compat
         # Used for pure swift header handling at the request layer

@@ -28,6 +28,8 @@ Amazon S3 operations
 +------------------------------------------------+------------------+--------------+
 | `PUT Object Copy`_                             | Core-API         | Yes          |
 +------------------------------------------------+------------------+--------------+
+| `Object checksums`_                            | Core-API         | Partial      |
++------------------------------------------------+------------------+--------------+
 | `DELETE Object`_                               | Core-API         | Yes          |
 +------------------------------------------------+------------------+--------------+
 | `Initiate Multipart Upload`_                   | Core-API         | Yes          |
@@ -87,6 +89,50 @@ Amazon S3 operations
 | `Bucket accelerate`_                           | CDN Integration  | No           |
 +------------------------------------------------+------------------+--------------+
 
+Object checksum support
+-----------------------
+
+A subset of the AWS checksum feature is implemented, including:
+
+* Validation of an ``x-amz-checksum-*`` value supplied with `PUT Object`_,
+  `Upload Part`_, and `Delete Multiple Objects`_ requests using CRC32, CRC32C,
+  CRC64NVME, SHA1 or SHA256 algorithms. This covers both a checksum header on a
+  fixed-length body and a checksum trailer on a SigV4 ``aws-chunked`` body.
+
+* Optional persistence of a validated checksum for a `PUT Object`_ request.
+  Set ``allow_store_checksums = true`` in ``[filter:s3api]`` to enable it.
+  The default is ``false``. When enabled, the checksum header is returned
+  with the `PUT Object`_ response along with
+  ``x-amz-checksum-type: FULL_OBJECT``. S3API registers the checksum value as
+  :ref:`sensitive sysmeta <sensitive_sysmeta>` even when persistence is off.
+  Before you enable it, upgrade all applicable proxy and internal applications
+  that read, write, or copy these objects. Keep S3API registration and COPY
+  cleanup in each applicable process. Drain old workers, then enable the
+  option and reload the applications. Disabling the option stops new checksum
+  writes. Existing checksum reads, decryption, and COPY protection continue.
+
+* Return of a checksum header with a `GET Object`_ or `HEAD Object`_ response
+  when the client sends ``x-amz-checksum-mode: ENABLED`` and the checksum has
+  previously been persisted. Any other value for the ``x-amz-checksum-mode``
+  header is rejected with ``InvalidRequest``. Note that a checksum header will
+  not be returned for objects stored prior to checksum persistence support, nor
+  for a multipart upload.
+
+The following checksum features, and any not mentioned above, are not yet
+supported:
+
+* Validation of an ``x-amz-checksum-*`` value supplied with a
+  `Complete Multipart Upload`_ request.
+
+* Persistence of a validated checksum for `Complete Multipart Upload`_ and
+  `Upload Part`_ requests.
+
+* Re-calculation of checksum values during `PUT Object Copy`_ and
+  `Upload Part Copy`_ requests.
+
+* Inclusion of the per-object checksum algorithm and type in bucket listing
+  responses.
+
 ----
 
 .. _GET Object: http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTObjectGET.html
@@ -122,6 +168,9 @@ Amazon S3 operations
 
 .. Versioning
 .. _Versioning: http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTBucketGETversioningStatus.html
+
+.. Object checksums
+.. _Object checksums: https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html
 
 
 .. Lifecycle

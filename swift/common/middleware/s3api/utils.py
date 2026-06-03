@@ -56,6 +56,7 @@ def s3api_sysmeta_header(resource, name):
 
 
 def is_s3api_sysmeta(server_type, name):
+    """Return True for object or container sysmeta in the s3api namespace."""
     return name.lower().startswith(
         get_sys_meta_prefix(server_type) + 's3api-')
 
@@ -384,6 +385,7 @@ class Config(dict):
         'force_swift_request_proxy_log': False,
         'dns_compliant_bucket_names': True,
         'allow_multipart_uploads': True,
+        'allow_store_checksums': False,
         'allow_no_owner': False,
         'allowable_clock_skew': 900,
         'ratelimit_as_client_error': False,

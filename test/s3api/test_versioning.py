@@ -21,7 +21,8 @@ import io
 
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import md5
-from test.s3api import BaseS3TestCase
+from test.s3api import (BaseS3TestCase,
+                        skip_if_checksum_persistence_disabled)
 
 
 def retry(f, timeout=10):
@@ -198,6 +199,78 @@ class TestObjectVersioning(BaseS3TestCase):
             'Size': len(obj_data),
             'StorageClass': 'STANDARD',
         }], objs)
+
+    @skip_if_checksum_persistence_disabled
+    def test_checksum_metadata_on_object_versions(self):
+        obj_name = self.create_name('versioned-checksum-object')
+        obj_body = b'123456789'
+
+        first_put_resp = self.client.put_object(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            Body=obj_body,
+            ChecksumCRC32='y/Q5Jg==')
+        self.assertEqual(
+            200, first_put_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual('y/Q5Jg==', first_put_resp['ChecksumCRC32'])
+        self.assertEqual('FULL_OBJECT', first_put_resp['ChecksumType'])
+        first_version_id = first_put_resp['VersionId']
+
+        second_put_resp = self.client.put_object(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            Body=obj_body,
+            ChecksumSHA256=(
+                'FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU='))
+        self.assertEqual(
+            200, second_put_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(
+            'FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU=',
+            second_put_resp['ChecksumSHA256'])
+        self.assertEqual('FULL_OBJECT', second_put_resp['ChecksumType'])
+        second_version_id = second_put_resp['VersionId']
+        self.assertNotEqual(first_version_id, second_version_id)
+
+        first_head_resp = self.client.head_object(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            VersionId=first_version_id,
+            ChecksumMode='ENABLED')
+        self.assertEqual(
+            200, first_head_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(first_version_id, first_head_resp['VersionId'])
+        self.assertEqual('y/Q5Jg==', first_head_resp['ChecksumCRC32'])
+        self.assertEqual('FULL_OBJECT', first_head_resp['ChecksumType'])
+        self.assertNotIn('ChecksumSHA256', first_head_resp)
+
+        second_head_resp = self.client.head_object(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            VersionId=second_version_id,
+            ChecksumMode='ENABLED')
+        self.assertEqual(
+            200, second_head_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(second_version_id, second_head_resp['VersionId'])
+        self.assertEqual(
+            'FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU=',
+            second_head_resp['ChecksumSHA256'])
+        self.assertEqual('FULL_OBJECT', second_head_resp['ChecksumType'])
+        self.assertNotIn('ChecksumCRC32', second_head_resp)
+
+        # A version-unaware HEAD follows the latest-version symlink. It must
+        # expose only the checksum belonging to that latest target.
+        latest_head_resp = self.client.head_object(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            ChecksumMode='ENABLED')
+        self.assertEqual(
+            200, latest_head_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(second_version_id, latest_head_resp['VersionId'])
+        self.assertEqual(
+            'FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU=',
+            latest_head_resp['ChecksumSHA256'])
+        self.assertEqual('FULL_OBJECT', latest_head_resp['ChecksumType'])
+        self.assertNotIn('ChecksumCRC32', latest_head_resp)
 
     def test_delete_versioned_objects(self):
         etags = []

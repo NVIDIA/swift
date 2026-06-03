@@ -27,6 +27,8 @@ from swift.common.registry import get_swift_info
 from swift.common.middleware.versioned_writes.object_versioning import \
     DELETE_MARKER_CONTENT_TYPE
 from swift.common.middleware.s3api.acl_handlers import ObjectAclHandler
+from swift.common.middleware.s3api.s3checksum import \
+    normalize_checksum_mode, checksum_sysmeta_to_response_headers
 from swift.common.middleware.s3api.utils import S3Timestamp, \
     s3api_sysmeta_header, swift3_object_sysmeta_header
 from swift.common.middleware.s3api.controllers.base import Controller
@@ -149,6 +151,15 @@ class ObjectController(Controller):
             if 'response-' + key in req.params:
                 resp.headers[key] = req.params['response-' + key]
 
+        if (normalize_checksum_mode(req.headers.get('x-amz-checksum-mode'))
+                == 'ENABLED'
+                and 'range' not in req.headers
+                and part_number is None
+                and resp.status_int == HTTP_OK):
+            resp.headers.update(
+                checksum_sysmeta_to_response_headers(
+                    resp.s3api_sysmeta_headers))
+
         return resp
 
     @public
@@ -184,11 +195,22 @@ class ObjectController(Controller):
                                   req.headers['X-Amz-Copy-Source-Range'],
                                   'Illegal copy header')
 
+        if 'X-Amz-Copy-Source' not in req.headers:
+            # note: checksum re-calculation while copying is not yet supported
+            req.enable_checksum_persistence()
         req.check_copy_source(self.app)
         if not req.headers.get('Content-Type'):
             # can't setdefault because it can be None for some reason
             req.headers['Content-Type'] = 'binary/octet-stream'
         resp = req.get_response(self.app)
+        # Swift does not echo newly persisted sysmeta headers in PUT responses,
+        # so inject the checksum response headers based on the sysmeta sent
+        # with the request. The request will have this sysmeta if
+        # req.enable_checksum_persistence was called.
+        if req.checksum_sysmeta_footers:
+            resp.headers.update(
+                checksum_sysmeta_to_response_headers(
+                    req.checksum_sysmeta_footers))
 
         if 'X-Amz-Copy-Source' in req.headers:
             last_modified_ts = S3Timestamp(

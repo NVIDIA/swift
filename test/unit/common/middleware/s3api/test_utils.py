@@ -52,6 +52,20 @@ class TestS3ApiUtils(unittest.TestCase):
         self.assertEqual('x-container-sysmeta-s3api-foo',
                          utils.s3api_sysmeta_header('container', 'foo'))
 
+    def test_is_s3api_sysmeta(self):
+        self.assertTrue(utils.is_s3api_sysmeta(
+            'object', 'x-object-sysmeta-s3api-etag'))
+        self.assertTrue(utils.is_s3api_sysmeta(
+            'object', 'x-object-sysmeta-s3api-checksum-value'))
+        # server type is taken from a title-cased header by callers
+        self.assertTrue(utils.is_s3api_sysmeta(
+            'Object', 'X-Object-Sysmeta-S3Api-Checksum-Value'))
+        # another middleware's sysmeta is not s3api's
+        self.assertFalse(utils.is_s3api_sysmeta(
+            'object', 'x-object-sysmeta-sensitive-other-value'))
+        self.assertFalse(utils.is_s3api_sysmeta(
+            'container', 'x-container-sysmeta-other-foo'))
+
     def test_swift3_object_sysmeta_header(self):
         self.assertEqual('x-object-sysmeta-swift3-etag',
                          utils.swift3_object_sysmeta_header('etag'))
@@ -348,6 +362,7 @@ class TestS3ApiUtils(unittest.TestCase):
             'X-Object-Sysmeta-Swift3-Etag': 'swift3-etag',
             'X-Object-Sysmeta-S3api-Upload-Id': 'my-upload-id',
             'X-Object-Sysmeta-S3api-Other': 'also removed',
+            'X-Object-Sysmeta-S3Api-Checksum-Value': 'also removed',
             'X-Object-Sysmeta-Slo-Etag': 'slo-etag',
             'X-Object-Sysmeta-Slo-Size': 'slo-size',
             'X-Object-Sysmeta-Future': 'Unknown',
@@ -530,6 +545,7 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(conf.force_swift_request_proxy_log)
         self.assertTrue(conf.dns_compliant_bucket_names)
         self.assertTrue(conf.allow_multipart_uploads)
+        self.assertFalse(conf.allow_store_checksums)
         self.assertFalse(conf.allow_no_owner)
         self.assertEqual(900, conf.allowable_clock_skew)
         self.assertFalse(conf.ratelimit_as_client_error)
@@ -543,6 +559,7 @@ class TestConfig(unittest.TestCase):
         del conf.force_swift_request_proxy_log
         del conf.dns_compliant_bucket_names
         del conf.allow_multipart_uploads
+        del conf.allow_store_checksums
         del conf.allow_no_owner
         del conf.allowable_clock_skew
         del conf.ratelimit_as_client_error

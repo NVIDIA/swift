@@ -220,8 +220,13 @@ S3 API cross-compatibility tests
 
 The cross-compatibility tests in directory `test/s3api` are intended to verify
 that the Swift S3 API behaves in the same way as the AWS S3 API. They should
-pass when run against either a Swift endpoint (with S3 API enabled) or an AWS
-S3 endpoint.
+pass when run against either a Swift endpoint or an AWS S3 endpoint. For a
+Swift endpoint, enable S3 API and set ``allow_store_checksums = true`` in the
+proxy's ``[filter:s3api]`` section to run the checksum storage tests. Those
+tests are skipped if ``allow_store_checksums`` is false or omitted from the
+proxy configuration. The S3API tests read this setting from ``/info``. If the
+endpoint does not expose the S3API settings at all (e.g. an AWS S3 endpoint),
+these tests run.
 
 To run against an AWS S3 endpoint, the `/etc/swift/test.conf` file must be
 edited to provide AWS key IDs and secrets. Alternatively, an AWS CLI style

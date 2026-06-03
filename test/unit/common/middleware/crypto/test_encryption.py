@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+import email.utils
 import hashlib
 import hmac
 import json
@@ -26,15 +27,18 @@ from swift.common.middleware import crypto
 from swift.common.middleware.crypto import keymaster
 from swift.common.middleware.crypto.crypto_utils import (
     load_crypto_meta, Crypto)
+from swift.common.middleware.s3api.s3api import \
+    filter_factory as s3api_filter_factory
 from swift.common.ring import Ring
 from swift.common.swob import Request, str_to_wsgi
-from swift.common.utils import MD5_OF_EMPTY_STRING
-from swift.obj import diskfile
+from swift.common.utils import checksum, MD5_OF_EMPTY_STRING
+from swift.obj import diskfile, server as object_server
 
 from test.debug_logger import debug_logger
 from test.unit import skip_if_no_xattrs
 from test.unit.common.middleware.crypto.crypto_helpers import (
     md5hex, encrypt, TEST_KEYMASTER_CONF)
+from test.unit.common.middleware.s3api import FakeAuthApp
 from test.unit.helpers import setup_servers, teardown_servers
 
 SENSITIVE_HEADER = 'X-Object-Sysmeta-Test-Digest'
@@ -298,6 +302,159 @@ class TestCryptoPipelineChanges(unittest.TestCase):
         self.assertEqual(MD5_OF_EMPTY_STRING, resp.headers['Etag'])
         self.assertEqual('bar', resp.headers.get('x-object-meta-foo'))
         self.assertEqual(SENSITIVE_VALUE, resp.headers.get(SENSITIVE_HEADER))
+
+    def test_s3_checksum_with_crypto_pipeline(self):
+        container_name = uuid.uuid4().hex
+        container_path = 'http://foo:8080/v1/a/' + container_name
+        req = Request.blank(
+            container_path, method='PUT',
+            headers={'X-Storage-Policy': 'one'})
+        resp = req.get_response(self.proxy_app)
+        self.assertEqual('201 Created', resp.status)
+
+        class ExistingAccountAuthApp(FakeAuthApp):
+            def _update_s3_path_info(self, env):
+                super()._update_s3_path_info(env)
+                env['PATH_INFO'] = env['PATH_INFO'].replace(
+                    '/v1/AUTH_test', '/v1/a', 1)
+
+        auth_app = ExistingAccountAuthApp(self.crypto_app)
+        auth_app._pipeline_final_app = self.proxy_app
+        s3_app = s3api_filter_factory(
+            {}, auth_pipeline_check='false', allow_no_owner='true',
+            allow_store_checksums='true')(
+                auth_app)
+        s3_app.logger = self.proxy_app.logger
+
+        encrypted_checksum_header = (
+            'X-Object-Sysmeta-Crypto-Sysmeta-S3Api-Checksum-Value')
+        internal_checksum_headers = (
+            encrypted_checksum_header,
+            'X-Object-Sysmeta-S3api-Checksum-Value',
+            'X-Object-Sysmeta-S3api-Checksum-Algorithm',
+            'X-Object-Sysmeta-S3api-Checksum-Type')
+        object_controller = object_server.ObjectController
+        for body in (self.plaintext, b''):
+            with self.subTest(body=body):
+                s3_app.conf.allow_store_checksums = True
+                checksum_value = base64.b64encode(
+                    checksum.crc32(body).digest()).decode('ascii')
+                auth_headers = {
+                    'Authorization': 'AWS test:tester:hmac',
+                    'Date': email.utils.formatdate(),
+                }
+                s3_path = '/%s/o-%s' % (container_name, len(body))
+                object_path = container_path + '/o-%s' % len(body)
+                checksum_headers = {
+                    'X-Amz-Checksum-Crc32': checksum_value,
+                    'X-Amz-Sdk-Checksum-Algorithm': 'CRC32',
+                }
+                put_headers = dict(auth_headers)
+                put_headers.update(checksum_headers)
+                req = Request.blank(
+                    s3_path, method='PUT', body=body,
+                    headers=put_headers)
+                with mock.patch.object(
+                        object_controller, '_get_request_metadata',
+                        autospec=True,
+                        side_effect=object_controller._get_request_metadata
+                ) as get_metadata:
+                    resp = req.get_response(s3_app)
+                self.assertEqual('200 OK', resp.status)
+                self.assertTrue(get_metadata.call_args_list)
+                backend_req = get_metadata.call_args_list[0][0][1]
+                # The checksum headers reach the object server in clear text
+                # even with encryption enabled. With these test settings, the
+                # headers are not stored. The checksum value sysmeta is
+                # encrypted.
+                self.assertEqual(checksum_headers, {
+                    header: backend_req.headers[header]
+                    for header in checksum_headers})
+                self.assertEqual(
+                    checksum_value, resp.headers['X-Amz-Checksum-Crc32'])
+                self.assertEqual(
+                    'FULL_OBJECT', resp.headers['X-Amz-Checksum-Type'])
+
+                # Check that checksum and crypto sysmeta survived the footer
+                # callback chain. A zero-byte object has no body crypto meta.
+                req = Request.blank(object_path, method='GET')
+                encrypted_resp = req.get_response(self.proxy_app)
+                self.assertEqual('200 OK', encrypted_resp.status)
+                if body:
+                    self.assertNotEqual(body, encrypted_resp.body)
+                    self.assertIn(
+                        'X-Object-Sysmeta-Crypto-Body-Meta',
+                        encrypted_resp.headers)
+                else:
+                    self.assertEqual(body, encrypted_resp.body)
+                    self.assertNotIn(
+                        'X-Object-Sysmeta-Crypto-Body-Meta',
+                        encrypted_resp.headers)
+                self.assertIn(
+                    'X-Object-Sysmeta-Crypto-Meta', encrypted_resp.headers)
+                self.assertEqual(
+                    'CRC32',
+                    encrypted_resp.headers[
+                        'X-Object-Sysmeta-S3Api-Checksum-Algorithm'])
+                self.assertEqual(
+                    'FULL_OBJECT',
+                    encrypted_resp.headers[
+                        'X-Object-Sysmeta-S3Api-Checksum-Type'])
+                # The checksum value is in the crypto namespace.
+                self.assertNotIn('X-Object-Sysmeta-S3api-Checksum-Value',
+                                 encrypted_resp.headers)
+                self.assertIn(encrypted_checksum_header,
+                              encrypted_resp.headers)
+                self.assertNotEqual(
+                    checksum_value,
+                    encrypted_resp.headers[
+                        encrypted_checksum_header])
+
+                # Check the stored metadata on the first captured replica.
+                device, partition, account, container, obj = \
+                    backend_req.split_path(5, 5, True)
+                policy = storage_policy.POLICIES.get_by_name('one')
+                conf = {'devices': self._test_context['testdir'],
+                        'mount_check': 'false'}
+                df_mgr = diskfile.DiskFileRouter(conf, debug_logger())[policy]
+                df = df_mgr.get_diskfile(device, partition, account, container,
+                                         obj, policy=policy)
+                with df.open():
+                    metadata = {key.lower(): value for key, value
+                                in df.get_metadata().items()}
+                self.assertFalse([k for k in metadata
+                                  if k.startswith('x-amz-')])
+                self.assertNotIn('x-object-sysmeta-s3api-checksum-value',
+                                 metadata)
+                self.assertNotIn(checksum_value, metadata.values())
+                self.assertIn(encrypted_checksum_header.lower(), metadata)
+                self.assertNotEqual(
+                    checksum_value,
+                    metadata[encrypted_checksum_header.lower()])
+
+                # Check decryption with persistence enabled and disabled.
+                req_headers = dict(auth_headers)
+                req_headers['X-Amz-Checksum-Mode'] = 'ENABLED'
+                for enabled in (True, False):
+                    s3_app.conf.allow_store_checksums = enabled
+                    for method in ('HEAD', 'GET'):
+                        with self.subTest(
+                                persistence_enabled=enabled,
+                                method=method):
+                            req = Request.blank(
+                                s3_path, method=method, headers=req_headers)
+                            resp = req.get_response(s3_app)
+                            self.assertEqual('200 OK', resp.status)
+                            self.assertEqual(
+                                body if method == 'GET' else b'', resp.body)
+                            self.assertEqual(
+                                checksum_value,
+                                resp.headers['X-Amz-Checksum-Crc32'])
+                            self.assertEqual(
+                                'FULL_OBJECT',
+                                resp.headers['X-Amz-Checksum-Type'])
+                            for hdr in internal_checksum_headers:
+                                self.assertNotIn(hdr, resp.headers)
 
     def test_write_with_crypto_read_with_crypto_different_root_secrets(self):
         root_secret = self.crypto_app.root_secret

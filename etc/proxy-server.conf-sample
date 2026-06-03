@@ -642,6 +642,10 @@ user_test5_tester5 = testing5 service
 
 [filter:s3api]
 use = egg:swift#s3api
+# Write a validated checksum on a new PUT Object. The default is false.
+# Enable only after all proxy and internal applications that read, write, or
+# copy these objects have the checksum code and old workers have drained.
+# allow_store_checksums = false
 
 # s3api setup:
 #

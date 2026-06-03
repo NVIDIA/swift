@@ -15,9 +15,14 @@
 
 from hashlib import sha1, sha256
 
+from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.middleware.s3api.exception import \
     S3InputChecksumMismatch, S3InputChecksumTrailerInvalid
+from swift.common.middleware.s3api.utils import s3api_sysmeta_header
 from swift.common.utils import checksum, InputProxy, strict_b64decode
+
+
+CHECKSUM_TYPE_FULL_OBJECT = 'FULL_OBJECT'
 
 
 CHECKSUMS_BY_HEADER = {
@@ -29,11 +34,30 @@ CHECKSUMS_BY_HEADER = {
 }
 
 
+def normalize_checksum_mode(mode):
+    """Return an uppercase x-amz-checksum-mode value."""
+    if mode is not None:
+        mode = mode.upper()
+    return mode
+
+
 def normalize_checksum_algorithm(algorithm):
     """Return a normalized S3 checksum algorithm name."""
     # Only case is insignificant: S3 rejects hyphenated spellings such as
     # SHA-256 and CRC-32C with InvalidRequest.
     return algorithm.strip().upper()
+
+
+def checksum_header_from_algorithm(algorithm):
+    """Return the canonical checksum header for an S3 algorithm."""
+    return 'x-amz-checksum-%s' % normalize_checksum_algorithm(
+        algorithm).lower()
+
+
+def checksum_algorithm_from_header(checksum_header):
+    """Return the normalized S3 algorithm from a checksum header."""
+    return normalize_checksum_algorithm(
+        checksum_header[len('x-amz-checksum-'):])
 
 
 def get_checksum_hasher(header):
@@ -51,6 +75,45 @@ def validate_checksum_value(checksum_hasher, b64digest):
         b64digest,
         exact_size=checksum_hasher.digest_size,
     )
+
+
+def checksum_sysmeta_headers(checksum_algorithm, checksum_value,
+                             checksum_type):
+    """Return s3api sysmeta headers for given checksum metadata.
+
+    :return: a HeaderKeyDict; keys with value None are omitted.
+    """
+    return HeaderKeyDict({
+        s3api_sysmeta_header('object', 'checksum-algorithm'):
+            normalize_checksum_algorithm(checksum_algorithm),
+        # The registered value is encrypted when encryption is enabled.
+        s3api_sysmeta_header('object', 'checksum-value'):
+            checksum_value,
+        s3api_sysmeta_header('object', 'checksum-type'): checksum_type,
+    })
+
+
+def checksum_sysmeta_values(sysmeta_headers):
+    """Return the checksum algorithm, value, and type from object sysmeta."""
+    return (
+        sysmeta_headers.get(
+            s3api_sysmeta_header('object', 'checksum-algorithm')),
+        sysmeta_headers.get(
+            s3api_sysmeta_header('object', 'checksum-value')),
+        sysmeta_headers.get(
+            s3api_sysmeta_header('object', 'checksum-type')),
+    )
+
+
+def checksum_sysmeta_to_response_headers(sysmeta_headers):
+    """Translate complete checksum sysmeta into S3 response headers."""
+    checksum_algorithm, checksum_value, checksum_type = \
+        checksum_sysmeta_values(sysmeta_headers)
+    if all([checksum_algorithm, checksum_value, checksum_type]):
+        checksum_header = checksum_header_from_algorithm(checksum_algorithm)
+        return {checksum_header: checksum_value,
+                'x-amz-checksum-type': checksum_type}
+    return {}
 
 
 class ChecksummingInput(InputProxy):
@@ -74,8 +137,14 @@ class ChecksummingInput(InputProxy):
         super().__init__(wsgi_input)
         self._expected_length = content_length
         self._checksum_hasher = checksum_hasher
-        self._checksum_key = checksum_key
+        self.checksum_key = checksum_key
         self._checksum_source = checksum_source
+        self.checksum_value = None
+
+    @property
+    def algorithm(self):
+        """Return the S3 checksum algorithm."""
+        return checksum_algorithm_from_header(self.checksum_key)
 
     def chunk_update(self, chunk, eof, *args, **kwargs):
         """Update and validate the checksum as input chunks are consumed."""
@@ -88,15 +157,17 @@ class ChecksummingInput(InputProxy):
             error = eof
         elif self.bytes_received == self._expected_length:
             # Lazy fetch checksum value because it may have come in trailers.
-            b64digest = self._checksum_source.get(self._checksum_key)
+            b64digest = self._checksum_source.get(self.checksum_key)
             try:
                 expected_raw_checksum = validate_checksum_value(
                     self._checksum_hasher, b64digest)
             except ValueError:
                 # Header values were validated before reading the body, so an
                 # invalid value here must have come from a trailer.
-                raise S3InputChecksumTrailerInvalid(self._checksum_key)
+                raise S3InputChecksumTrailerInvalid(self.checksum_key)
             error = self._checksum_hasher.digest() != expected_raw_checksum
+            if not error:
+                self.checksum_value = b64digest
         else:
             # The underlying wsgi.Input stops reading at content-length so we
             # do not expect to reach this clause, but just in case...

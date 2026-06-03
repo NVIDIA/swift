@@ -61,6 +61,14 @@
     value: true
   become: true
 
+- name: Enable S3 checksum persistence
+  ini_file:
+    path: /etc/swift/proxy-server.conf
+    section: filter:s3api
+    option: allow_store_checksums
+    value: true
+  become: true
+
 - name: "Configure s3token: auth_url"
   ini_file:
     path: /etc/swift/proxy-server.conf

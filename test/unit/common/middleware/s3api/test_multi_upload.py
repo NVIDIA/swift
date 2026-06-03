@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, quote, quote_plus
 
 from swift.common import swob
 from swift.common.swob import Request, parse_date_header
-from swift.common.utils import json, md5
+from swift.common.utils import checksum, json, md5
 from swift.common.utils.timestamp import Timestamp, NormalTimestamp
 
 from test.unit import FakeMemcache, patch_policies, mock_normal_timestamp_now
@@ -777,6 +777,42 @@ class BaseS3ApiMultiUpload(object):
                             body='part object')
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
+
+    def test_object_upload_part_checksum_not_persisted_or_echoed(self):
+        # FULL_OBJECT checksum sysmeta is a whole-object concept; an MPU part
+        # upload must not persist or echo it (that stays out of scope until
+        # composite/part checksums are implemented).
+        part_body = b'part object body'
+        crc = base64.b64encode(checksum.crc32(part_body).digest())
+        req = Request.blank(
+            '/bucket/object?partNumber=1&uploadId=X',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={
+                'Authorization':
+                    'AWS4-HMAC-SHA256 '
+                    'Credential=test:tester/%s/us-east-1/s3/aws4_request, '
+                    'SignedHeaders=host;x-amz-date, '
+                    'Signature=hmac' % (
+                        self.get_v4_amz_date_header().split('T', 1)[0]),
+                'x-amz-date': self.get_v4_amz_date_header(),
+                'x-amz-checksum-crc32': crc,
+                'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+                'Date': self.get_date_header()},
+            body=part_body)
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200')
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        self.assertNotIn('x-amz-checksum-type', headers)
+
+        call = self.swift.call_list[-1]
+        self.assertEqual(
+            '/v1/AUTH_test/bucket+segments/object/X/1', call.path)
+        self.assertNotIn('swift.callback.update_footers', call.env)
+        for key in ('X-Object-Sysmeta-S3Api-Checksum-Algorithm',
+                    'X-Object-Sysmeta-S3Api-Checksum-Value',
+                    'X-Object-Sysmeta-S3Api-Checksum-Type'):
+            self.assertNotIn(key, call.headers)
+            self.assertNotIn(key, call.footers)
 
     def test_object_list_parts_error(self):
         req = Request.blank('/bucket/object?uploadId=invalid',

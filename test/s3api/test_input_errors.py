@@ -29,7 +29,8 @@ from urllib.parse import urlsplit, urlunsplit, quote
 from swift.common import bufferedhttp
 from swift.common.utils.ipaddrs import parse_socket_string
 
-from test.s3api import BaseS3TestCaseWithBucket, get_opt, get_s3_client
+from test.s3api import (BaseS3TestCaseWithBucket, get_opt, get_s3_client,
+                        skip_if_checksum_persistence_disabled)
 
 
 def _hmac(key, message, digest):
@@ -2482,14 +2483,19 @@ class TestV4AuthHeaders(InputErrorsMixin, BaseS3TestCaseWithBucket):
                 'x-amz-decoded-content-length': str(len(TEST_BODY))})
         self.assertOK(resp)
 
-    def test_strm_unsgnd_pyld_trl_with_trailer_ok(self):
+    def _put_unsigned_payload_with_crc32_trailer(
+            self, trailer='x-amz-checksum-crc32', checksum=None):
+        """PUT unsigned aws-chunked TEST_BODY with a CRC32 trailer."""
+        if checksum is None:
+            checksum = _crc32(TEST_BODY)
         chunked_body = b''.join(
             b'%x\r\n%s\r\n' % (len(chunk), chunk)
             for chunk in [TEST_BODY, b''])[:-2]
-        chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {_crc32(TEST_BODY)}\r\n',
-        ]).encode('ascii')
-        resp = self.conn.make_request(
+        # Replace the final empty line with the CRC32 trailer.
+        chunked_body += (
+            f'x-amz-checksum-crc32: {checksum}\r\n'
+        ).encode('ascii')
+        return self.conn.make_request(
             self.bucket_name,
             'test-obj',
             method='PUT',
@@ -2498,178 +2504,92 @@ class TestV4AuthHeaders(InputErrorsMixin, BaseS3TestCaseWithBucket):
                 'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
                 'content-encoding': 'aws-chunked',
                 'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': 'x-amz-checksum-crc32'})
+                'x-amz-trailer': trailer})
+
+    def test_strm_unsgnd_pyld_trl_with_trailer_ok(self):
+        resp = self._put_unsigned_payload_with_crc32_trailer()
         self.assertOK(resp)
 
-    def test_strm_unsgnd_pyld_trl_with_comma_in_trailer_ok(self):
-        chunked_body = b''.join(
-            b'%x\r\n%s\r\n' % (len(chunk), chunk)
-            for chunk in [TEST_BODY, b''])[:-2]
-        chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {_crc32(TEST_BODY)}\r\n',
-        ]).encode('ascii')
+    @skip_if_checksum_persistence_disabled
+    def test_strm_unsgnd_pyld_trl_with_trailer_persistence(self):
+        expected_checksum = _crc32(TEST_BODY)
+        resp = self._put_unsigned_payload_with_crc32_trailer()
+        self.assertOK(resp)
+        self.assertEqual(
+            expected_checksum, resp.headers.get('x-amz-checksum-crc32'))
+        self.assertEqual(
+            'FULL_OBJECT', resp.headers.get('x-amz-checksum-type'))
+
+        # Read the stored checksum with checksum mode enabled.
+        checksum_mode_headers = {
+            'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+            'x-amz-checksum-mode': 'ENABLED',
+        }
         resp = self.conn.make_request(
             self.bucket_name,
             'test-obj',
-            method='PUT',
-            body=chunked_body,
-            headers={
-                'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-                'content-encoding': 'aws-chunked',
-                'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': 'x-amz-checksum-crc32,'})
+            method='HEAD',
+            headers=checksum_mode_headers)
+        self.assertOK(resp)
+        self.assertEqual(
+            expected_checksum, resp.headers.get('x-amz-checksum-crc32'))
+        self.assertEqual(
+            'FULL_OBJECT', resp.headers.get('x-amz-checksum-type'))
+
+        resp = self.conn.make_request(
+            self.bucket_name,
+            'test-obj',
+            method='GET',
+            headers=checksum_mode_headers)
+        self.assertOK(resp, TEST_BODY)
+        self.assertEqual(
+            expected_checksum, resp.headers.get('x-amz-checksum-crc32'))
+        self.assertEqual(
+            'FULL_OBJECT', resp.headers.get('x-amz-checksum-type'))
+
+    def test_strm_unsgnd_pyld_trl_with_comma_in_trailer_ok(self):
+        resp = self._put_unsigned_payload_with_crc32_trailer(
+            trailer='x-amz-checksum-crc32,')
         self.assertOK(resp)
 
     def test_strm_unsgnd_pyld_trl_with_commas_in_trailer_1(self):
-        chunked_body = b''.join(
-            b'%x\r\n%s\r\n' % (len(chunk), chunk)
-            for chunk in [TEST_BODY, b''])[:-2]
-        chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {_crc32(TEST_BODY)}\r\n',
-        ]).encode('ascii')
-        resp = self.conn.make_request(
-            self.bucket_name,
-            'test-obj',
-            method='PUT',
-            body=chunked_body,
-            headers={
-                'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-                'content-encoding': 'aws-chunked',
-                'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': ', x-amz-checksum-crc32, ,'})
+        resp = self._put_unsigned_payload_with_crc32_trailer(
+            trailer=', x-amz-checksum-crc32, ,')
         self.assertUnsupportedTrailerHeader(resp)
 
     def test_strm_unsgnd_pyld_trl_with_commas_in_trailer_2(self):
-        chunked_body = b''.join(
-            b'%x\r\n%s\r\n' % (len(chunk), chunk)
-            for chunk in [TEST_BODY, b''])[:-2]
-        chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {_crc32(TEST_BODY)}\r\n',
-        ]).encode('ascii')
-        resp = self.conn.make_request(
-            self.bucket_name,
-            'test-obj',
-            method='PUT',
-            body=chunked_body,
-            headers={
-                'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-                'content-encoding': 'aws-chunked',
-                'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': ', x-amz-checksum-crc32'})
+        resp = self._put_unsigned_payload_with_crc32_trailer(
+            trailer=', x-amz-checksum-crc32')
         self.assertUnsupportedTrailerHeader(resp)
 
     def test_strm_unsgnd_pyld_trl_with_commas_in_trailer_3(self):
-        chunked_body = b''.join(
-            b'%x\r\n%s\r\n' % (len(chunk), chunk)
-            for chunk in [TEST_BODY, b''])[:-2]
-        chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {_crc32(TEST_BODY)}\r\n',
-        ]).encode('ascii')
-        resp = self.conn.make_request(
-            self.bucket_name,
-            'test-obj',
-            method='PUT',
-            body=chunked_body,
-            headers={
-                'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-                'content-encoding': 'aws-chunked',
-                'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': ',x-amz-checksum-crc32'})
+        resp = self._put_unsigned_payload_with_crc32_trailer(
+            trailer=',x-amz-checksum-crc32')
         self.assertUnsupportedTrailerHeader(resp)
 
     def test_strm_unsgnd_pyld_trl_with_commas_in_trailer_4(self):
-        chunked_body = b''.join(
-            b'%x\r\n%s\r\n' % (len(chunk), chunk)
-            for chunk in [TEST_BODY, b''])[:-2]
-        chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {_crc32(TEST_BODY)}\r\n',
-        ]).encode('ascii')
-        resp = self.conn.make_request(
-            self.bucket_name,
-            'test-obj',
-            method='PUT',
-            body=chunked_body,
-            headers={
-                'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-                'content-encoding': 'aws-chunked',
-                'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': 'x-amz-checksum-crc32,,'})
+        resp = self._put_unsigned_payload_with_crc32_trailer(
+            trailer='x-amz-checksum-crc32,,')
         self.assertOK(resp)
 
     def test_strm_unsgnd_pyld_trl_with_commas_in_trailer_5(self):
-        chunked_body = b''.join(
-            b'%x\r\n%s\r\n' % (len(chunk), chunk)
-            for chunk in [TEST_BODY, b''])[:-2]
-        chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {_crc32(TEST_BODY)}\r\n',
-        ]).encode('ascii')
-        resp = self.conn.make_request(
-            self.bucket_name,
-            'test-obj',
-            method='PUT',
-            body=chunked_body,
-            headers={
-                'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-                'content-encoding': 'aws-chunked',
-                'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': 'x-amz-checksum-crc32, ,'})
+        resp = self._put_unsigned_payload_with_crc32_trailer(
+            trailer='x-amz-checksum-crc32, ,')
         self.assertUnsupportedTrailerHeader(resp)
 
     def test_strm_unsgnd_pyld_trl_with_commas_in_trailer_6(self):
-        chunked_body = b''.join(
-            b'%x\r\n%s\r\n' % (len(chunk), chunk)
-            for chunk in [TEST_BODY, b''])[:-2]
-        chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {_crc32(TEST_BODY)}\r\n',
-        ]).encode('ascii')
-        resp = self.conn.make_request(
-            self.bucket_name,
-            'test-obj',
-            method='PUT',
-            body=chunked_body,
-            headers={
-                'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-                'content-encoding': 'aws-chunked',
-                'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': 'x-amz-checksum-crc32, '})
+        resp = self._put_unsigned_payload_with_crc32_trailer(
+            trailer='x-amz-checksum-crc32, ')
         self.assertOK(resp)
 
     def test_strm_unsgnd_pyld_trl_with_trailer_checksum_mismatch(self):
-        chunked_body = b''.join(
-            b'%x\r\n%s\r\n' % (len(chunk), chunk)
-            for chunk in [TEST_BODY, b''])[:-2]
-        chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {_crc32(b"not the body")}\r\n',
-        ]).encode('ascii')
-        resp = self.conn.make_request(
-            self.bucket_name,
-            'test-obj',
-            method='PUT',
-            body=chunked_body,
-            headers={
-                'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-                'content-encoding': 'aws-chunked',
-                'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': 'x-amz-checksum-crc32'})
+        resp = self._put_unsigned_payload_with_crc32_trailer(
+            checksum=_crc32(b'not the body'))
         self.assertBadChecksumDigest(resp, 'CRC32', _crc32(b'not the body'))
 
     def test_strm_unsgnd_pyld_trl_with_trailer_checksum_invalid(self):
-        chunked_body = b''.join(
-            b'%x\r\n%s\r\n' % (len(chunk), chunk)
-            for chunk in [TEST_BODY, b''])[:-2]
-        chunked_body += ''.join([
-            f'x-amz-checksum-crc32: {"not-base-64"}\r\n',
-        ]).encode('ascii')
-        resp = self.conn.make_request(
-            self.bucket_name,
-            'test-obj',
-            method='PUT',
-            body=chunked_body,
-            headers={
-                'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-                'content-encoding': 'aws-chunked',
-                'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': 'x-amz-checksum-crc32'})
+        resp = self._put_unsigned_payload_with_crc32_trailer(
+            checksum='not-base-64')
         self.assertEqual(resp.status_code, 400, resp.content)
         self.assertIn(b'<Code>InvalidRequest</Code>', resp.content)
         self.assertIn(b'<Message>Value for x-amz-checksum-crc32 trailing '
