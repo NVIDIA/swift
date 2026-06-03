@@ -29,6 +29,14 @@
     value: false
   become: true
 
+- name: Turn on s3_checksum_persistence_tests_enabled in test.conf (for Keystone tests)
+  ini_file:
+    path: /etc/swift/test.conf
+    section: s3api_test
+    option: s3_checksum_persistence_tests_enabled
+    value: true
+  become: true
+
 - name: Set storage_domain in test/sample.conf (for tempauth tests)
   ini_file:
     path: "{{ ansible_env.HOME }}/{{ zuul.project.src_dir }}/../swift/test/sample.conf"
@@ -45,6 +53,14 @@
     value: false
   become: true
 
+- name: Turn on s3_checksum_persistence_tests_enabled in test/sample.conf (for tempauth tests)
+  ini_file:
+    path: "{{ ansible_env.HOME }}/{{ zuul.project.src_dir }}/../swift/test/sample.conf"
+    section: s3api_test
+    option: s3_checksum_persistence_tests_enabled
+    value: true
+  become: true
+
 - name: Enable object versioning
   ini_file:
     path: /etc/swift/proxy-server.conf
@@ -58,6 +74,14 @@
     path: /etc/swift/proxy-server.conf
     section: filter:s3api
     option: force_swift_request_proxy_log
+    value: true
+  become: true
+
+- name: Enable S3 checksum persistence
+  ini_file:
+    path: /etc/swift/proxy-server.conf
+    section: filter:s3api
+    option: allow_store_checksums
     value: true
   become: true
 
