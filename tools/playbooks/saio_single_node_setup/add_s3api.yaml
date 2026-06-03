@@ -22,6 +22,14 @@
           replace: "container_sync s3api tempauth"
       become: true
 
+    - name: Enable S3 checksum persistence
+      ini_file:
+          path: "/etc/swift/proxy-server.conf"
+          section: "filter:s3api"
+          option: "allow_store_checksums"
+          value: "true"
+      become: true
+
     - name: Set s3_acl option
       ini_file:
           path: "/etc/swift/proxy-server.conf"

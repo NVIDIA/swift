@@ -14,18 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import hashlib
 from io import BytesIO
 from unittest import mock
 from uuid import uuid4
 
 from swift.common import direct_client, registry
+from swift.common.swob import normalize_etag
+from swift.common.utils import md5
 from swiftclient import client
 
 from test.probe.common import ReplProbeTest
+from test.s3api import get_s3_client
 
 
 class TestSensitiveSysmeta(ReplProbeTest):
-
     def test_sensitive_sysmeta_storage_matches_encryption(self):
         container = 'container-%s' % uuid4()
         obj = 'object-%s' % uuid4()
@@ -91,3 +95,73 @@ class TestSensitiveSysmeta(ReplProbeTest):
         metadata = internal_client.get_object_metadata(
             self.account, container, obj)
         self.assertEqual(value, metadata.get(header.lower()), metadata)
+
+    def test_s3api_checksum_sysmeta_encryption(self):
+        if not self.cluster_info.get('s3api', {}).get(
+                'allow_store_checksums', False):
+            self.skipTest('This test requires allow_store_checksums=true')
+        bucket = self._make_name('bucket-').decode()
+        obj = self._make_name('object-').decode()
+        body = b'object body'
+
+        s3 = get_s3_client()
+        client.put_container(
+            self.url, self.token, bucket,
+            headers={'X-Storage-Policy': self.policy.name})
+        s3.put_object(Bucket=bucket, Key=obj, Body=body,
+                      ChecksumAlgorithm='SHA256')
+
+        head_resp = s3.head_object(Bucket=bucket, Key=obj,
+                                   ChecksumMode='ENABLED')
+        etag = head_resp['ETag'].strip('"')
+        checksum_value = head_resp['ChecksumSHA256']
+        self.assertEqual(md5(body, usedforsecurity=False).hexdigest(), etag)
+        self.assertEqual(
+            base64.b64encode(hashlib.sha256(body).digest()).decode('ascii'),
+            checksum_value)
+
+        encrypted_etag_header = \
+            'X-Object-Sysmeta-Crypto-Etag'
+        checksum_header = 'X-Object-Sysmeta-S3Api-Checksum-Value'
+        encrypted_checksum_header = \
+            'X-Object-Sysmeta-Crypto-Sysmeta-S3Api-Checksum-Value'
+        crypto_meta_header = 'X-Object-Sysmeta-Crypto-Meta'
+        is_encrypted_etag = []
+        is_encrypted_checksum = []
+        has_crypto_meta = []
+        part, nodes = self.object_ring.get_nodes(self.account, bucket, obj)
+        for node in nodes:
+            headers, stored_body = direct_client.direct_get_object(
+                node, part, self.account, bucket, obj,
+                headers={'X-Backend-Storage-Policy-Index':
+                         str(int(self.policy))})
+            encrypted_etag = headers.get(encrypted_etag_header)
+            is_encrypted_etag.append(bool(encrypted_etag))
+            encrypted_checksum = headers.get(encrypted_checksum_header)
+            clear_value = headers.get(checksum_header)
+            self.assertNotEqual(bool(encrypted_checksum), bool(clear_value))
+            is_encrypted_checksum.append(bool(encrypted_checksum))
+            crypto_meta = headers.get(crypto_meta_header)
+            has_crypto_meta.append(bool(crypto_meta))
+            if encrypted_checksum:
+                # encryption is enabled: the etag and checksum are not stored
+                # in the clear, and the stored values reveal nothing
+                self.assertIsNone(clear_value)
+                self.assertNotEqual(body, stored_body)
+                self.assertNotIn(checksum_value, encrypted_checksum)
+                self.assertNotIn(normalize_etag(etag), encrypted_etag)
+                # etag should also be encrypted
+                self.assertNotEqual(normalize_etag(etag),
+                                    normalize_etag(headers['etag']))
+            else:
+                self.assertIsNone(encrypted_checksum)
+                self.assertIsNone(encrypted_etag)
+                self.assertEqual(body, stored_body)
+                self.assertEqual(checksum_value, clear_value)
+                self.assertEqual(normalize_etag(etag),
+                                 normalize_etag(headers['etag']))
+
+        self.assertTrue(all(is_encrypted_checksum)
+                        or not any(is_encrypted_checksum))
+        self.assertEqual(is_encrypted_checksum, has_crypto_meta)
+        self.assertEqual(is_encrypted_checksum, is_encrypted_etag)

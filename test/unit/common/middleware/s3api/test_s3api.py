@@ -145,6 +145,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             'force_swift_request_proxy_log': True,
             'dns_compliant_bucket_names': False,
             'allow_multipart_uploads': False,
+            'allow_store_checksums': True,
             'allow_no_owner': True,
             'allowable_clock_skew': 300,
             'auth_pipeline_check': False,
@@ -1183,15 +1184,40 @@ class TestS3ApiMiddleware(S3ApiTestCase):
 
     @mock.patch.object(registry, '_sensitive_headers', set())
     @mock.patch.object(registry, '_sensitive_params', set())
+    @mock.patch.object(registry, '_sensitive_sysmeta_names', set())
     def test_registered_sensitive_info(self):
         self.assertFalse(registry.get_sensitive_headers())
         self.assertFalse(registry.get_sensitive_params())
+        self.assertFalse(registry._sensitive_sysmeta_names)
         filter_factory(self.conf)
         sensitive = registry.get_sensitive_headers()
         self.assertIn('authorization', sensitive)
         sensitive = registry.get_sensitive_params()
         self.assertIn('X-Amz-Signature', sensitive)
         self.assertIn('Signature', sensitive)
+        self.assertEqual(
+            {'x-object-sysmeta-s3api-checksum-value'},
+            registry._sensitive_sysmeta_names)
+        for suffix in ('algorithm', 'type'):
+            self.assertFalse(registry.is_sensitive_sysmeta(
+                'x-object-sysmeta-s3api-checksum-' + suffix))
+
+    @mock.patch.object(registry, '_swift_info', dict())
+    @mock.patch.object(registry, '_sensitive_sysmeta_names', set())
+    def test_checksum_persistence_config(self):
+        for configured, expected in ((None, False), ('false', False),
+                                     ('true', True)):
+            with self.subTest(configured=configured):
+                conf = ({} if configured is None else
+                        {'allow_store_checksums': configured})
+                registry._sensitive_sysmeta_names.clear()
+                app = filter_factory(conf)(self.app)
+                self.assertIs(expected,
+                              app.conf.allow_store_checksums)
+                self.assertIs(expected, registry.get_swift_info()['s3api'][
+                    'allow_store_checksums'])
+                self.assertTrue(registry.is_sensitive_sysmeta(
+                    'x-object-sysmeta-s3api-checksum-value'))
 
     @mock.patch.object(registry, '_swift_info', dict())
     def test_registered_defaults(self):
@@ -1200,6 +1226,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         swift_info = registry.get_swift_info()
         self.assertTrue('s3api' in swift_info)
         registered_keys = [
+            'allow_store_checksums',
             'max_bucket_listing', 'max_parts_listing', 'max_upload_part_num',
             'max_multi_delete_objects', 'allow_multipart_uploads',
             'min_segment_size', 's3_acl', 's3_inventory_enabled']

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import binascii
 import io
 import unittest
@@ -28,11 +29,13 @@ from swift.common import swob
 from swift.common.statsd_client import LabelsMap
 from swift.common.storage_policy import StoragePolicy
 from swift.common.swob import Request, parse_date_header
+from swift.common.middleware import copy
 from swift.common.middleware.proxy_logging import ProxyLoggingMiddleware
 from test.unit import patch_policies
 
 from test.unit.common.middleware.s3api import S3ApiTestCase, S3ApiTestCaseAcl
-from swift.common.middleware.s3api.s3request import SigV4Request
+from swift.common.middleware.s3api.s3request import (
+    ChecksummingInput, SigV4Request)
 from swift.common.middleware.s3api.subresource import ACL, User, encode_acl, \
     Owner, Grant
 from swift.common.middleware.s3api.etree import fromstring
@@ -40,7 +43,7 @@ from swift.common.middleware.s3api.utils import S3Timestamp, \
     s3api_sysmeta_header
 from swift.common.middleware.versioned_writes.object_versioning import \
     DELETE_MARKER_CONTENT_TYPE
-from swift.common.utils import md5
+from swift.common.utils import checksum, md5
 
 
 class BaseS3ApiObj(object):
@@ -139,6 +142,210 @@ class BaseS3ApiObj(object):
 
     def test_object_HEAD(self):
         self._test_object_GETorHEAD('HEAD')
+
+    def test_object_GETorHEAD_with_checksum_mode(self):
+        swift_headers = dict(self.response_headers, **{
+            'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+            'x-object-sysmeta-s3api-checksum-value': 'AAAAAA==',
+            'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+        })
+        for method in ('GET', 'HEAD'):
+            for mode in ('ENABLED', 'enabled'):
+                for enabled in (True, False):
+                    with self.subTest(method=method, mode=mode,
+                                      persistence_enabled=enabled):
+                        self.s3api.conf.allow_store_checksums = enabled
+                        self.swift.register(
+                            method, '/v1/AUTH_test/bucket/object',
+                            swob.HTTPOk, swift_headers, self.object_body)
+                        req = Request.blank(
+                            '/bucket/object', method=method,
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header(),
+                                     'x-amz-checksum-mode': mode})
+
+                        status, headers, body = self.call_s3api(req)
+
+                        self.assertEqual('200', status.split()[0])
+                        self.assertEqual('AAAAAA==',
+                                         headers['x-amz-checksum-crc32'])
+                        self.assertEqual('FULL_OBJECT',
+                                         headers['x-amz-checksum-type'])
+                        self.assertEqual(
+                            self.object_body if method == 'GET' else b'', body)
+
+    def test_object_GETorHEAD_checksum_mode_range_omits_checksum(self):
+        swift_headers = dict(self.response_headers, **{
+            'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+            'x-object-sysmeta-s3api-checksum-value': 'AAAAAA==',
+            'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+        })
+        for method in ('GET', 'HEAD'):
+            with self.subTest(method=method):
+                self.swift.register(
+                    method, '/v1/AUTH_test/bucket/object',
+                    swob.HTTPOk, swift_headers, self.object_body)
+                req = Request.blank(
+                    '/bucket/object', method=method,
+                    headers={'Authorization': 'AWS test:tester:hmac',
+                             'Date': self.get_date_header(),
+                             'Range': 'bytes=0-3',
+                             'x-amz-checksum-mode': 'ENABLED'})
+
+                status, headers, body = self.call_s3api(req)
+
+                self.assertEqual('206', status.split()[0])
+                self.assertEqual(b'hell' if method == 'GET' else b'', body)
+                self.assertNotIn('x-amz-checksum-crc32', headers)
+                self.assertNotIn('x-amz-checksum-type', headers)
+
+    def test_object_GETorHEAD_checksum_mode_part_number_omits_checksum(self):
+        swift_headers = dict(self.response_headers, **{
+            'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+            'x-object-sysmeta-s3api-checksum-value': 'AAAAAA==',
+            'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+        })
+        for method in ('GET', 'HEAD'):
+            with self.subTest(method=method):
+                self.swift.register(
+                    method, '/v1/AUTH_test/bucket/object?part-number=1',
+                    swob.HTTPOk, swift_headers, self.object_body)
+                req = Request.blank(
+                    '/bucket/object', method=method,
+                    params={'partNumber': '1'},
+                    headers={'Authorization': 'AWS test:tester:hmac',
+                             'Date': self.get_date_header(),
+                             'x-amz-checksum-mode': 'ENABLED'})
+
+                status, headers, body = self.call_s3api(req)
+
+                self.assertEqual('206', status.split()[0])
+                self.assertEqual('bytes 0-4/5', headers['content-range'])
+                self.assertEqual('5', headers['content-length'])
+                self.assertNotIn('x-amz-checksum-crc32', headers)
+                self.assertNotIn('x-amz-checksum-type', headers)
+                self.assertEqual(
+                    self.object_body if method == 'GET' else b'', body)
+
+    def test_object_GET_checksum_mode_enabled_not_modified_omits_checksum(
+            self):
+        for header, value in (
+                ('If-None-Match', '"%s"' % self.etag),
+                ('If-Modified-Since', 'Mon, 21 Sep 2015 12:00:00 GMT')):
+            swift_headers = dict(self.response_headers)
+            swift_headers.update({
+                'x-object-sysmeta-s3api-checksum-algorithm':
+                    'CRC32',
+                'x-object-sysmeta-s3api-checksum-value':
+                    'AAAAAA==',
+                'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+            })
+            self.swift.register(
+                'GET', '/v1/AUTH_test/bucket/object',
+                swob.HTTPOk, swift_headers, self.object_body)
+            req = Request.blank(
+                '/bucket/object',
+                environ={'REQUEST_METHOD': 'GET'},
+                headers={'Authorization': 'AWS test:tester:hmac',
+                         'Date': self.get_date_header(),
+                         header: value,
+                         'x-amz-checksum-mode': 'ENABLED'})
+
+            status, headers, body = self.call_s3api(req)
+
+            self.assertEqual(status.split()[0], '304')
+            self.assertEqual(b'', body)
+            self.assertNotIn('x-amz-checksum-crc32', headers)
+            self.assertNotIn('x-amz-checksum-type', headers)
+
+    def test_object_GETorHEAD_checksum_mode_missing_omits_checksum(self):
+        swift_headers = dict(self.response_headers, **{
+            'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+            'x-object-sysmeta-s3api-checksum-value': 'AAAAAA==',
+            'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+        })
+        for method in ('GET', 'HEAD'):
+            with self.subTest(method=method):
+                self.swift.register(
+                    method, '/v1/AUTH_test/bucket/object',
+                    swob.HTTPOk, swift_headers, self.object_body)
+                req = Request.blank(
+                    '/bucket/object', method=method,
+                    headers={'Authorization': 'AWS test:tester:hmac',
+                             'Date': self.get_date_header()})
+
+                status, headers, body = self.call_s3api(req)
+
+                self.assertEqual('200', status.split()[0])
+                self.assertNotIn('x-amz-checksum-crc32', headers)
+                self.assertNotIn('x-amz-checksum-type', headers)
+                self.assertEqual(
+                    self.object_body if method == 'GET' else b'', body)
+
+    def test_object_GETorHEAD_checksum_mode_incomplete_sysmeta(self):
+        for method in ('GET', 'HEAD'):
+            for missing in ('all', 'algorithm', 'value', 'type'):
+                with self.subTest(method=method, missing=missing):
+                    sysmeta = {
+                        'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+                        'x-object-sysmeta-s3api-checksum-value': 'AAAAAA==',
+                        'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+                    }
+                    if missing == 'all':
+                        sysmeta.clear()
+                    else:
+                        del sysmeta[
+                            'x-object-sysmeta-s3api-checksum-' + missing]
+                    swift_headers = dict(self.response_headers, **sysmeta)
+                    self.swift.register(
+                        method, '/v1/AUTH_test/bucket/object',
+                        swob.HTTPOk, swift_headers, self.object_body)
+                    req = Request.blank(
+                        '/bucket/object', method=method,
+                        headers={'Authorization': 'AWS test:tester:hmac',
+                                 'Date': self.get_date_header(),
+                                 'x-amz-checksum-mode': 'ENABLED'})
+
+                    status, headers, body = self.call_s3api(req)
+
+                    self.assertEqual('200', status.split()[0])
+                    self.assertNotIn('x-amz-checksum-crc32', headers)
+                    self.assertNotIn('x-amz-checksum-type', headers)
+                    self.assertEqual(
+                        self.object_body if method == 'GET' else b'', body)
+
+    def test_object_GET_checksum_mode_invalid(self):
+        req = Request.blank(
+            '/bucket/object',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(),
+                     'x-amz-checksum-mode': 'I love Azure Blob Storage!'})
+        swift_calls = len(self.swift.calls_with_headers)
+
+        status, _headers, body = self.call_s3api(req)
+
+        self.assertEqual(status.split()[0], '400')
+        self.assertEqual(self._get_error_code(body), 'InvalidRequest')
+        self.assertEqual(
+            self._get_error_message(body),
+            'Value for x-amz-checksum-mode header is invalid.')
+        self.assertEqual(swift_calls, len(self.swift.calls_with_headers))
+
+    def test_object_HEAD_checksum_mode_invalid(self):
+        req = Request.blank(
+            '/bucket/object',
+            environ={'REQUEST_METHOD': 'HEAD'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(),
+                     'x-amz-checksum-mode': 'I love Azure Blob Storage!'})
+        swift_calls = len(self.swift.calls_with_headers)
+
+        status, _headers, body = self.call_s3api(req)
+
+        self.assertEqual(status.split()[0], '400')
+        self.assertEqual(b'', body)
+        self.assertEqual(swift_calls, len(self.swift.calls_with_headers))
 
     def _do_test_object_GETorHEAD_conditional(self, method, req_headers,
                                               resp_headers=None):
@@ -1153,6 +1360,8 @@ class BaseS3ApiObj(object):
         # setting
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        self.assertNotIn('x-amz-checksum-type', headers)
         # Check that s3api returns an etag header.
         self.assertEqual(headers['etag'],
                          '"%s"' % self.response_headers['etag'])
@@ -1167,6 +1376,127 @@ class BaseS3ApiObj(object):
         # UNSIGNED-PAYLOAD
         self.assertEqual(req.environ['swift.access_logging']['user_id'],
                          'test:tester')
+
+        call = self.swift.call_list[-1]
+        self.assertNotIn('swift.callback.update_footers', call.env)
+        for key in ('x-object-sysmeta-s3api-checksum-algorithm',
+                    'x-object-sysmeta-s3api-checksum-value',
+                    'x-object-sysmeta-s3api-checksum-type'):
+            self.assertNotIn(key, call.headers)
+            self.assertNotIn(key, call.footers)
+
+    def test_object_PUT_v4_checksum_sysmeta(self):
+        crc = base64.b64encode(checksum.crc32(self.object_body).digest())
+        exp_checksum = crc.decode('ascii')
+        req = Request.blank(
+            '/bucket/object',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={
+                'Authorization':
+                    'AWS4-HMAC-SHA256 '
+                    'Credential=test:tester/%s/us-east-1/s3/aws4_request, '
+                    'SignedHeaders=host;x-amz-date, '
+                    'Signature=hmac' % (
+                        self.get_v4_amz_date_header().split('T', 1)[0]),
+                'x-amz-date': self.get_v4_amz_date_header(),
+                'x-amz-checksum-crc32': crc,
+                'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+                'Date': self.get_date_header()},
+            body=self.object_body)
+        req.content_type = 'text/plain'
+
+        status, headers, _body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200')
+        self.assertEqual({
+            'x-amz-checksum-crc32': exp_checksum,
+            'x-amz-checksum-type': 'FULL_OBJECT',
+        }, {
+            'x-amz-checksum-crc32': headers['x-amz-checksum-crc32'],
+            'x-amz-checksum-type': headers['x-amz-checksum-type'],
+        })
+
+        call = self.swift.call_list[-1]
+        self.assertIn('swift.callback.update_footers', call.env)
+        self.assertNotIn(
+            'x-object-sysmeta-s3api-checksum-value', call.headers)
+        self.assertNotIn(
+            'x-object-sysmeta-s3api-checksum-algorithm', call.headers)
+        self.assertNotIn(
+            'x-object-sysmeta-s3api-checksum-type', call.headers)
+        self.assertEqual({
+            'X-Object-Sysmeta-S3Api-Checksum-Value': exp_checksum,
+            'X-Object-Sysmeta-S3Api-Checksum-Algorithm': 'CRC32',
+            'X-Object-Sysmeta-S3Api-Checksum-Type': 'FULL_OBJECT',
+        }, call.footers)
+
+    def test_object_PUT_v4_checksum_disabled(self):
+        self.s3api.conf.allow_store_checksums = False
+        crc = base64.b64encode(checksum.crc32(self.object_body).digest())
+        req = Request.blank(
+            '/bucket/object', method='PUT', body=self.object_body,
+            headers={
+                'Authorization':
+                    'AWS4-HMAC-SHA256 '
+                    'Credential=test:tester/%s/us-east-1/s3/aws4_request, '
+                    'SignedHeaders=host;x-amz-date, '
+                    'Signature=hmac' % self.get_v4_amz_date_header().split(
+                        'T', 1)[0],
+                'x-amz-date': self.get_v4_amz_date_header(),
+                'x-amz-checksum-crc32': crc,
+                'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+                'Date': self.get_date_header()})
+
+        status, headers, _body = self.call_s3api(req)
+        self.assertEqual('200', status.split()[0])
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        self.assertNotIn('x-amz-checksum-type', headers)
+        call = self.swift.call_list[-1]
+        self.assertNotIn('swift.callback.update_footers', call.env)
+        self.assertFalse(call.footers)
+        self.assertEqual(self.object_body, self.swift.uploaded[
+            '/v1/AUTH_test/bucket/object'][1])
+
+    def test_object_PUT_v4_checksum_mismatch_no_sysmeta_or_response_headers(
+            self):
+        self._test_object_PUT_v4_checksum_mismatch()
+
+    def test_object_PUT_v4_checksum_mismatch_with_persistence_disabled(self):
+        self.s3api.conf.allow_store_checksums = False
+        self._test_object_PUT_v4_checksum_mismatch()
+        self.assertNotIn('swift.callback.update_footers',
+                         self.swift.call_list[-1].env)
+
+    def _test_object_PUT_v4_checksum_mismatch(self):
+        crc = base64.b64encode(checksum.crc32(b'not the body').digest())
+        req = Request.blank(
+            '/bucket/object',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={
+                'Authorization':
+                    'AWS4-HMAC-SHA256 '
+                    'Credential=test:tester/%s/us-east-1/s3/aws4_request, '
+                    'SignedHeaders=host;x-amz-date, '
+                    'Signature=hmac' % (
+                        self.get_v4_amz_date_header().split('T', 1)[0]),
+                'x-amz-date': self.get_v4_amz_date_header(),
+                'x-amz-checksum-crc32': crc,
+                'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+                'Date': self.get_date_header()},
+            body=self.object_body)
+        req.content_type = 'text/plain'
+
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '400')
+        self.assertEqual(self._get_error_code(body), 'BadDigest')
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        self.assertNotIn('x-amz-checksum-type', headers)
+        self.assertNotIn('/v1/AUTH_test/bucket/object', self.swift.uploaded)
+        call = self.swift.call_list[-1]
+        self.assertFalse(call.footers)
+        for key in ('x-object-sysmeta-s3api-checksum-algorithm',
+                    'x-object-sysmeta-s3api-checksum-value',
+                    'x-object-sysmeta-s3api-checksum-type'):
+            self.assertNotIn(key, call.headers)
 
     def _test_object_PUT_copy(self, head_resp, put_header=None,
                               src_path='/some/source'):
@@ -1205,6 +1535,38 @@ class BaseS3ApiObj(object):
 
         req.content_type = 'text/plain'
         return self.call_s3api(req)
+
+    def _register_object_copy_source(self, source_body, checksum_value=None):
+        """Register a source object and enable the real copy middleware."""
+        account = 'test:tester'
+        grants = [Grant(User(account), 'FULL_CONTROL')]
+
+        head_headers = encode_acl(
+            'object', ACL(Owner(account, account), grants))
+        head_headers.update({'last-modified': self.last_modified})
+        self.swift.register(
+            'HEAD', '/v1/AUTH_test/some/source',
+            swob.HTTPOk, head_headers, None)
+
+        source_headers = {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': str(len(source_body)),
+            'Etag': md5(source_body, usedforsecurity=False).hexdigest(),
+            'last-modified': self.last_modified,
+        }
+        if checksum_value is not None:
+            source_headers.update({
+                'X-Object-Sysmeta-S3Api-Checksum-Value': checksum_value,
+                'X-Object-Sysmeta-S3Api-Checksum-Algorithm': 'CRC32',
+                'X-Object-Sysmeta-S3Api-Checksum-Type': 'FULL_OBJECT',
+            })
+        self.swift.register(
+            'GET', '/v1/AUTH_test/some/source',
+            swob.HTTPOk, source_headers, source_body)
+
+        # Exercise the real server-side copy behavior between S3API and the
+        # final fake Swift application.
+        self.app.app = copy.filter_factory({})(self.swift)
 
     def test_object_PUT_copy(self):
         def do_test(src_path):
@@ -1369,6 +1731,63 @@ class BaseS3ApiObj(object):
 
         self.assertEqual('412', status.split()[0])
         self.assertEqual('PreconditionFailed', self._get_error_code(body))
+
+    def test_object_PUT_copy_checksum_not_persisted_or_echoed(self):
+        crc = base64.b64encode(checksum.crc32(b'').digest())
+        status, headers, _body = self._test_object_PUT_copy(
+            swob.HTTPOk, put_header={
+                'Content-Length': '0',
+                'X-Amz-Checksum-Crc32': crc})
+
+        self.assertEqual(status.split()[0], '200')
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        self.assertNotIn('x-amz-checksum-type', headers)
+        call = self.swift.call_list[-1]
+        self.assertNotIn('swift.callback.update_footers', call.env)
+        for key in ('x-object-sysmeta-s3api-checksum-algorithm',
+                    'x-object-sysmeta-s3api-checksum-value',
+                    'x-object-sysmeta-s3api-checksum-type'):
+            self.assertNotIn(key, call.headers)
+            self.assertNotIn(key, call.footers)
+
+    def test_object_PUT_copy_without_source_checksum_does_not_create_checksum(
+            self):
+        self._test_object_PUT_copy_omits_checksum(
+            b'a source without checksum metadata')
+
+    def test_object_PUT_copy_source_checksum_removed_when_disabled(self):
+        self.s3api.conf.allow_store_checksums = False
+        source_body = b'a source with checksum metadata'
+        checksum_value = base64.b64encode(
+            checksum.crc32(source_body).digest()).decode('ascii')
+        self._test_object_PUT_copy_omits_checksum(source_body, checksum_value)
+
+    def _test_object_PUT_copy_omits_checksum(
+            self, source_body, checksum_value=None):
+        self._register_object_copy_source(source_body, checksum_value)
+        status, headers, body = self._call_object_copy('/some/source', {})
+
+        # A copy does not compute a new checksum or keep the source checksum.
+        self.assertEqual('200', status.split()[0])
+        self.assertNotIn('x-amz-checksum-type', headers)
+        elem = fromstring(body, 'CopyObjectResult')
+        self.assertIsNone(elem.find('ChecksumCRC32'))
+        self.assertIsNone(elem.find('ChecksumType'))
+        put_call = self.swift.call_list[-1]
+        self.assertEqual(source_body, put_call.body)
+        self.assertNotIsInstance(
+            put_call.req.environ['wsgi.input'], ChecksummingInput)
+        self.assertNotIn('swift.callback.update_footers',
+                         put_call.req.environ)
+        self.assertEqual({}, dict(put_call.footers))
+
+        uploaded_headers, uploaded_body = self.swift.uploaded[
+            '/v1/AUTH_test/bucket/object']
+        self.assertEqual(source_body, uploaded_body)
+        for key in ('x-object-sysmeta-s3api-checksum-algorithm',
+                    'x-object-sysmeta-s3api-checksum-value',
+                    'x-object-sysmeta-s3api-checksum-type'):
+            self.assertNotIn(key, uploaded_headers)
 
     def test_object_PUT_copy_metadata_replace(self):
         status, headers, body = \

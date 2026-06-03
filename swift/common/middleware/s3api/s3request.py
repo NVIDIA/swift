@@ -45,7 +45,9 @@ from swift.common.request_helpers import check_path_header, \
     update_etag_is_at_value
 
 from swift.common.middleware.s3api.s3checksum import CHECKSUMS_BY_HEADER, \
-    ChecksummingInput, get_checksum_hasher, validate_checksum_value
+    ChecksummingInput, get_checksum_hasher, validate_checksum_value, \
+    normalize_checksum_mode, checksum_sysmeta_headers, \
+    CHECKSUM_TYPE_FULL_OBJECT
 from swift.common.middleware.s3api.controllers import ServiceController, \
     ObjectController, AclController, MultiObjectDeleteController, \
     LocationController, LoggingStatusController, PartController, \
@@ -1035,12 +1037,16 @@ class S3Request(swob.Request):
         self.conf = conf or Config()
         self.location = self.conf.location
         self._signing_timestamp = None
+        self.checksumming_input = None
+        self.checksum_sysmeta_footers = None
         self.access_key, self.signature = self._parse_auth_info()
         self.bucket_in_host = parse_host(self.environ,
                                          self.conf.storage_domains)
         self.container_name, self.object_name = _parse_path(
             self, self.bucket_in_host, self.conf.dns_compliant_bucket_names)
         self._validate_headers()
+        if self.method in ('GET', 'HEAD') and self.is_object_request:
+            self._validate_checksum_mode_header()
         if isinstance(self, SigV4Mixin):
             # this is a deliberate but only partial shift away from the
             # 'inherit and override from mixin' pattern towards a 'compose
@@ -1546,15 +1552,66 @@ class S3Request(swob.Request):
 
         return checksum_hasher, checksum_header, checksum_trailer
 
+    def _validate_checksum_mode_header(self):
+        """Validate the checksum mode requested for object reads."""
+        checksum_mode = normalize_checksum_mode(
+            self.headers.get('x-amz-checksum-mode'))
+        if checksum_mode is None or checksum_mode == 'ENABLED':
+            return
+        raise InvalidRequest(
+            'Value for x-amz-checksum-mode header is invalid.')
+
     def _install_checksumming_input_wrapper(
             self, checksum_hasher, checksum_key, checksum_source):
-        self.environ['wsgi.input'] = ChecksummingInput(
+        """
+        Install and return the input wrapper that validates the checksum.
+        """
+        checksumming_input = ChecksummingInput(
             self.environ['wsgi.input'],
             self.content_length,
             checksum_hasher,
             checksum_key,
-            checksum_source
+            checksum_source,
         )
+        self.environ['wsgi.input'] = checksumming_input
+        self.checksumming_input = checksumming_input
+        return checksumming_input
+
+    def enable_checksum_persistence(self):
+        """
+        Enable checksum persistence if this S3Request has a checksum that can
+        be persisted.
+        """
+        # Only add a footer callback when persistence is on and this request
+        # has a checksum to validate.
+        if self.conf.allow_store_checksums and \
+                self.checksumming_input is not None:
+            self._install_checksum_footers_callback(self.checksumming_input)
+
+    def _install_checksum_footers_callback(self, checksumming_input):
+        """
+        Install a callback to persist checksum metadata after validation.
+        If checksum validation fails, the PUT fails before a matching checksum
+        is recorded, so no checksum sysmeta is persisted. If validation is
+        successful, sysmeta is attached to the uploaded whole-object body.
+
+        :param checksumming_input: The wrapper validating the request body.
+        """
+        original_callback = self.environ.get('swift.callback.update_footers')
+
+        def update_footers(footers):
+            """Persist checksum sysmeta after the body validates."""
+            if original_callback:
+                original_callback(footers)
+            if checksumming_input.checksum_value:
+                sysmeta_headers = checksum_sysmeta_headers(
+                    checksumming_input.algorithm,
+                    checksumming_input.checksum_value,
+                    CHECKSUM_TYPE_FULL_OBJECT)
+                footers.update(sysmeta_headers)
+                self.checksum_sysmeta_footers = sysmeta_headers
+
+        self.environ['swift.callback.update_footers'] = update_footers
 
     def _validate_headers(self):
         if 'CONTENT_LENGTH' in self.environ:

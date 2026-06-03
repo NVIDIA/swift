@@ -20,13 +20,35 @@ from unittest import SkipTest
 
 from swift.common.utils import base64_str
 from swift.common.utils.checksum import crc32, crc32c
-from test.s3api import BaseS3TestCaseWithBucket
+from test.s3api import (BaseS3TestCaseWithBucket,
+                        skip_if_checksum_persistence_disabled)
 
 TEST_BODY = b'123456789'
 
 
 def boto_at_least(*version):
     return tuple(int(x) for x in botocore.__version__.split('.')) >= version
+
+
+def inject_invalid_checksum_mode(params, **kwargs):
+    """Inject an invalid checksum mode into a botocore request."""
+    params['headers']['x-amz-checksum-mode'] = 'INVALID'
+
+
+def inject_lowercase_checksum_mode(params, **kwargs):
+    """Inject a lowercase checksum mode into a botocore request."""
+    params['headers']['x-amz-checksum-mode'] = 'enabled'
+
+
+def capture_prepared_headers(captured):
+    """Return a botocore before-send callback that saves request headers."""
+    def capture(request, **kwargs):
+        captured.update({
+            key.lower(): (value.decode('ascii')
+                          if isinstance(value, bytes) else value)
+            for key, value in request.headers.items()
+        })
+    return capture
 
 
 class ObjectChecksumMixin(object):
@@ -36,7 +58,6 @@ class ObjectChecksumMixin(object):
         super().setUpClass()
         cls.client = cls.get_s3_client(1)
         cls.use_tls = cls.client._endpoint.host.startswith('https:')
-        cls.CHECKSUM_HDR = 'x-amz-checksum-' + cls.ALGORITHM.lower()
 
     def assert_error(self, resp, err_code, err_msg, obj_name, **extra):
         self.assertEqual(400, resp['ResponseMetadata']['HTTPStatusCode'])
@@ -50,6 +71,28 @@ class ObjectChecksumMixin(object):
         resp = caught.exception.response
         self.assertEqual(404, resp['ResponseMetadata']['HTTPStatusCode'])
 
+    def _assert_checksum_response(self, resp):
+        """Check a successful response and its checksum headers."""
+        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        headers = resp['ResponseMetadata']['HTTPHeaders']
+        self.assertEqual(self.EXPECTED, headers.get(self.CHECKSUM_HDR))
+        self.assertEqual('FULL_OBJECT', headers.get('x-amz-checksum-type'))
+        self.assertEqual(self.EXPECTED, resp[self.CHECKSUM_FIELD])
+        self.assertEqual('FULL_OBJECT', resp['ChecksumType'])
+
+    def _assert_checksum_persistence(self, obj_name):
+        """Check HEAD and GET for an object's stored checksum."""
+        for method, read_object in (
+                ('HEAD', self.client.head_object),
+                ('GET', self.client.get_object)):
+            with self.subTest(method=method):
+                resp = read_object(Bucket=self.bucket_name, Key=obj_name,
+                                   ChecksumMode='ENABLED')
+                self._assert_checksum_response(resp)
+                if method == 'GET':
+                    self.assertEqual(TEST_BODY, resp['Body'].read())
+
+    @skip_if_checksum_persistence_disabled
     def test_let_sdk_compute(self):
         obj_name = self.create_name(self.ALGORITHM + '-sdk')
         resp = self.client.put_object(
@@ -58,8 +101,10 @@ class ObjectChecksumMixin(object):
             Body=TEST_BODY,
             ChecksumAlgorithm=self.ALGORITHM,
         )
-        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self._assert_checksum_response(resp)
+        self._assert_checksum_persistence(obj_name)
 
+    @skip_if_checksum_persistence_disabled
     def test_good_checksum(self):
         obj_name = self.create_name(self.ALGORITHM + '-with-algo-header')
         resp = self.client.put_object(
@@ -69,8 +114,10 @@ class ObjectChecksumMixin(object):
             ChecksumAlgorithm=self.ALGORITHM,
             **{'Checksum' + self.ALGORITHM: self.EXPECTED}
         )
-        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self._assert_checksum_response(resp)
+        self._assert_checksum_persistence(obj_name)
 
+    @skip_if_checksum_persistence_disabled
     def test_good_checksum_no_algorithm_header(self):
         obj_name = self.create_name(self.ALGORITHM + '-no-algo-header')
         resp = self.client.put_object(
@@ -79,7 +126,71 @@ class ObjectChecksumMixin(object):
             Body=TEST_BODY,
             **{'Checksum' + self.ALGORITHM: self.EXPECTED}
         )
-        self.assertEqual(200, resp['ResponseMetadata']['HTTPStatusCode'])
+        self._assert_checksum_response(resp)
+        self._assert_checksum_persistence(obj_name)
+
+        for operation, read_object in (
+                ('GetObject', self.client.get_object),
+                ('HeadObject', self.client.head_object)):
+            with self.subTest(operation=operation):
+                event_name = 'before-call.s3.' + operation
+                self.client.meta.events.register(
+                    event_name, inject_lowercase_checksum_mode)
+                try:
+                    lowercase_resp = read_object(
+                        Bucket=self.bucket_name, Key=obj_name,
+                        ChecksumMode='ENABLED')
+                finally:
+                    self.client.meta.events.unregister(
+                        event_name, inject_lowercase_checksum_mode)
+                self._assert_checksum_response(lowercase_resp)
+                if operation == 'GetObject':
+                    self.assertEqual(TEST_BODY, lowercase_resp['Body'].read())
+
+                range_resp = read_object(
+                    Bucket=self.bucket_name, Key=obj_name,
+                    Range='bytes=0-3', ChecksumMode='ENABLED')
+                self.assertEqual(
+                    206, range_resp['ResponseMetadata']['HTTPStatusCode'])
+                if operation == 'GetObject':
+                    self.assertEqual(TEST_BODY[:4], range_resp['Body'].read())
+                self.assertEqual('bytes 0-3/9', range_resp['ContentRange'])
+                self.assertEqual(4, range_resp['ContentLength'])
+                range_headers = range_resp['ResponseMetadata']['HTTPHeaders']
+                self.assertNotIn(self.CHECKSUM_HDR, range_headers)
+                self.assertNotIn('x-amz-checksum-type', range_headers)
+                self.assertNotIn(self.CHECKSUM_FIELD, range_resp)
+                self.assertNotIn('ChecksumType', range_resp)
+
+                self.client.meta.events.register(
+                    event_name, inject_invalid_checksum_mode)
+                try:
+                    for request_kwargs in ({}, {'Range': 'bytes=0-3'}):
+                        with self.subTest(range=request_kwargs.get('Range')):
+                            with self.assertRaises(
+                                    botocore.exceptions.ClientError) as caught:
+                                read_object(Bucket=self.bucket_name,
+                                            Key=obj_name, **request_kwargs)
+                            invalid_resp = caught.exception.response
+                            self.assertEqual(400, invalid_resp[
+                                'ResponseMetadata']['HTTPStatusCode'],
+                                invalid_resp)
+                            if operation == 'GetObject':
+                                self.assertEqual('InvalidRequest',
+                                                 invalid_resp['Error']['Code'],
+                                                 invalid_resp)
+                                self.assertEqual(
+                                    'Value for x-amz-checksum-mode header '
+                                    'is invalid.',
+                                    invalid_resp['Error']['Message'],
+                                    invalid_resp)
+                            else:
+                                self.assertEqual('400',
+                                                 invalid_resp['Error']['Code'],
+                                                 invalid_resp)
+                finally:
+                    self.client.meta.events.unregister(
+                        event_name, inject_invalid_checksum_mode)
 
     def test_invalid_checksum(self):
         obj_name = self.create_name(self.ALGORITHM + '-invalid')
@@ -233,6 +344,8 @@ class ObjectChecksumMixin(object):
 
 class TestObjectChecksumCRC32(ObjectChecksumMixin, BaseS3TestCaseWithBucket):
     ALGORITHM = 'CRC32'
+    CHECKSUM_HDR = 'x-amz-checksum-crc32'
+    CHECKSUM_FIELD = 'ChecksumCRC32'
     EXPECTED = 'y/Q5Jg=='
     INVALID = 'y/Q5Jh=='
     BAD = 'z/Q5Jg=='
@@ -240,6 +353,8 @@ class TestObjectChecksumCRC32(ObjectChecksumMixin, BaseS3TestCaseWithBucket):
 
 class TestObjectChecksumCRC32C(ObjectChecksumMixin, BaseS3TestCaseWithBucket):
     ALGORITHM = 'CRC32C'
+    CHECKSUM_HDR = 'x-amz-checksum-crc32c'
+    CHECKSUM_FIELD = 'ChecksumCRC32C'
     EXPECTED = '4waSgw=='
     INVALID = '4waSgx=='
     BAD = '5waSgw=='
@@ -254,6 +369,8 @@ class TestObjectChecksumCRC32C(ObjectChecksumMixin, BaseS3TestCaseWithBucket):
 class TestObjectChecksumCRC64NVME(ObjectChecksumMixin,
                                   BaseS3TestCaseWithBucket):
     ALGORITHM = 'CRC64NVME'
+    CHECKSUM_HDR = 'x-amz-checksum-crc64nvme'
+    CHECKSUM_FIELD = 'ChecksumCRC64NVME'
     EXPECTED = 'rosUhgp5mIg='
     INVALID = 'rosUhgp5mIh='
     BAD = 'sosUhgp5mIg='
@@ -271,6 +388,8 @@ class TestObjectChecksumCRC64NVME(ObjectChecksumMixin,
 
 class TestObjectChecksumSHA1(ObjectChecksumMixin, BaseS3TestCaseWithBucket):
     ALGORITHM = 'SHA1'
+    CHECKSUM_HDR = 'x-amz-checksum-sha1'
+    CHECKSUM_FIELD = 'ChecksumSHA1'
     EXPECTED = '98O8HYCOBHMq32eZZczDTKeuNEE='
     INVALID = '98O8HYCOBHMq32eZZczDTKeuNEF='
     BAD = '+8O8HYCOBHMq32eZZczDTKeuNEE='
@@ -278,6 +397,8 @@ class TestObjectChecksumSHA1(ObjectChecksumMixin, BaseS3TestCaseWithBucket):
 
 class TestObjectChecksumSHA256(ObjectChecksumMixin, BaseS3TestCaseWithBucket):
     ALGORITHM = 'SHA256'
+    CHECKSUM_HDR = 'x-amz-checksum-sha256'
+    CHECKSUM_FIELD = 'ChecksumSHA256'
     EXPECTED = 'FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU='
     INVALID = 'FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiV='
     BAD = 'GeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU='
@@ -309,6 +430,50 @@ class TestObjectChecksums(BaseS3TestCaseWithBucket):
             resp['Error']['Message'],
             'Expecting a single x-amz-checksum- header. '
             'Multiple checksum Types are not allowed.')
+
+    @skip_if_checksum_persistence_disabled
+    def test_empty_full_object_checksum_persistence(self):
+        obj_name = self.create_name('empty-full-object')
+        expected = base64_str(crc32(b'').digest())
+        sent_headers = {}
+        capture = capture_prepared_headers(sent_headers)
+        event_name = 'before-send.s3.PutObject'
+        self.client.meta.events.register(event_name, capture)
+        try:
+            put_resp = self.client.put_object(
+                Bucket=self.bucket_name,
+                Key=obj_name,
+                Body=b'',
+                ChecksumCRC32=expected)
+        finally:
+            self.client.meta.events.unregister(event_name, capture)
+
+        self.assertEqual('0', sent_headers.get('content-length'))
+        self.assertNotIn('transfer-encoding', sent_headers)
+        self.assertEqual(
+            200, put_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(expected, put_resp['ChecksumCRC32'])
+        self.assertEqual('FULL_OBJECT', put_resp['ChecksumType'])
+
+        head_resp = self.client.head_object(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            ChecksumMode='ENABLED')
+        self.assertEqual(
+            200, head_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(0, head_resp['ContentLength'])
+        self.assertEqual(expected, head_resp['ChecksumCRC32'])
+        self.assertEqual('FULL_OBJECT', head_resp['ChecksumType'])
+
+        get_resp = self.client.get_object(
+            Bucket=self.bucket_name,
+            Key=obj_name,
+            ChecksumMode='ENABLED')
+        self.assertEqual(
+            200, get_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(b'', get_resp['Body'].read())
+        self.assertEqual(expected, get_resp['ChecksumCRC32'])
+        self.assertEqual('FULL_OBJECT', get_resp['ChecksumType'])
 
     def test_different_checksum_requested(self):
         with self.assertRaises(botocore.exceptions.ClientError) as caught:
