@@ -30,7 +30,10 @@ The following data are encrypted while at rest in Swift:
 * All custom user object metadata values i.e. metadata sent using
   X-Object-Meta- prefixed headers with PUT or POST requests
 * Non-empty object system metadata values whose exact header names middleware
-  declares in the sensitive sysmeta registry
+  declares in the sensitive sysmeta registry. For example, S3API registers
+  X-Object-Sysmeta-S3Api-Checksum-Value when its filter factory loads.
+  S3API writes this value when allow_store_checksums is true and a normal
+  object PUT has an X-Amz-Checksum-* header.
 
 Any data or metadata not included in the list above are not encrypted,
 including:

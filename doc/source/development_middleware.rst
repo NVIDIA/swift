@@ -452,6 +452,6 @@ operators.
 
 .. note::
 
-    Swift does not register a sensitive sysmeta name by default. Middleware
-    that registers a name must check all consumers and test the registered
-    fields with encryption enabled.
+    S3API registers ``X-Object-Sysmeta-S3Api-Checksum-Value`` when its filter
+    factory loads. Middleware that registers a name must check all consumers
+    and test the registered fields with encryption enabled.

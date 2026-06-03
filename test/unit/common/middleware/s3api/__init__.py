@@ -20,7 +20,7 @@ from unittest import mock
 import time
 from contextlib import contextmanager
 
-from swift.common import swob
+from swift.common import registry, swob
 from swift.common.http import is_success
 
 from swift.common.middleware.s3api.s3api import filter_factory
@@ -96,6 +96,10 @@ class S3ApiTestCase(BaseUnitTestCase):
 
     def setUp(self):
         super().setUp()
+        patcher = mock.patch.object(
+            registry, '_sensitive_sysmeta_names', set())
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # setup default config dict
         self.conf = {
             'allow_no_owner': False,
@@ -111,6 +115,7 @@ class S3ApiTestCase(BaseUnitTestCase):
             'check_bucket_owner': False,
             'force_swift_request_proxy_log': False,
             'allow_multipart_uploads': True,
+            'allow_store_checksums': True,
             'min_segment_size': 5242880,
             'log_level': 'debug',
             's3_inventory_enabled': False,

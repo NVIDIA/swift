@@ -14,15 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+from hashlib import sha1
 
 from swiftclient import client
 
+from swift.common.middleware.s3api.utils import MULTIUPLOAD_SUFFIX
+from swift.common.utils import base64_str
 from test.probe.common import ReplProbeTest
 from test.s3api import get_s3_client
 
 
 class TestCopySysmeta(ReplProbeTest):
-    """Exercise native and S3 copies of native and S3 MPU SLOs."""
+    """
+    Exercise native and S3 copies of native and S3 regular objects, MPU and
+    SLOs.
+    """
 
     def setUp(self):
         super(TestCopySysmeta, self).setUp()
@@ -32,6 +38,11 @@ class TestCopySysmeta(ReplProbeTest):
 
         self.s3 = get_s3_client()
         self.internal_client = self.make_internal_client()
+
+    def _require_checksum_persistence(self):
+        if not self.cluster_info.get('s3api', {}).get(
+                'allow_store_checksums', False):
+            self.skipTest('This test requires allow_store_checksums=true')
 
     def _make_swift_slo(self, source):
         segment_container = self._make_name(
@@ -63,6 +74,14 @@ class TestCopySysmeta(ReplProbeTest):
                 'ETag': part_etag,
                 'PartNumber': 1,
             }]})
+
+    def _make_s3_obj(self, key):
+        content = b's3-non-mpu-object'
+        exp_sha1 = base64_str(sha1(content).digest())
+        resp = self.s3.put_object(Bucket=self.container, Key=key,
+                                  Body=content, ChecksumSHA1=exp_sha1)
+        self.assertEqual(exp_sha1, resp.get('ChecksumSHA1'))
+        return exp_sha1
 
     def _swift_copy(self, source, destination, copy_manifest=False):
         parsed, conn = client.http_connection(self.url)
@@ -99,6 +118,27 @@ class TestCopySysmeta(ReplProbeTest):
             source)
         self.assertIn('x-object-sysmeta-s3api-etag', source_headers)
         return source_headers
+
+    def _assert_has_checksum_sysmeta(self, container, obj, algorithm, value):
+        headers = self.internal_client.get_object_metadata(
+            self.account, container, obj)
+        self.assertEqual(
+            algorithm,
+            headers.get('x-object-sysmeta-s3api-checksum-algorithm'))
+        self.assertEqual(
+            value, headers.get(
+                'x-object-sysmeta-s3api-checksum-value'))
+        self.assertEqual(
+            'FULL_OBJECT',
+            headers.get('x-object-sysmeta-s3api-checksum-type'))
+
+    def _assert_has_no_checksum_sysmeta(self, container, obj):
+        headers = self.internal_client.get_object_metadata(
+            self.account, container, obj)
+        for key in ('x-object-sysmeta-s3api-checksum-algorithm',
+                    'x-object-sysmeta-s3api-checksum-value',
+                    'x-object-sysmeta-s3api-checksum-type'):
+            self.assertNotIn(key, headers)
 
     def test_swift_copy_slo_as_slo(self):
         source = self._make_name('swift-slo-source-').decode()
@@ -185,3 +225,73 @@ class TestCopySysmeta(ReplProbeTest):
         self.assertNotIn('x-object-sysmeta-s3api-etag', copy_headers)
         self.assertNotIn('x-object-sysmeta-slo-etag', copy_headers)
         self.assertNotIn('x-object-sysmeta-slo-size', copy_headers)
+
+    def test_swift_copy_object_as_regular_object(self):
+        self._require_checksum_persistence()
+        source = self._make_name('s3-source-').decode()
+        destination = self._make_name('swift-copy-').decode()
+        source_sha1 = self._make_s3_obj(source)
+        self._assert_has_checksum_sysmeta(
+            self.container, source, 'SHA1', source_sha1)
+
+        self._swift_copy(source, destination)
+
+        # Swift COPY must not retain the source checksum metadata.
+        self._assert_has_no_checksum_sysmeta(self.container, destination)
+
+    def test_s3_copy_object_as_regular_object(self):
+        self._require_checksum_persistence()
+        source = self._make_name('s3-source-').decode()
+        destination = self._make_name('s3-copy-').decode()
+        source_sha1 = self._make_s3_obj(source)
+        self._assert_has_checksum_sysmeta(
+            self.container, source, 'SHA1', source_sha1)
+
+        self._s3_copy(source, destination)
+
+        copy_headers = self.internal_client.get_object_metadata(
+            self.account, self.container, destination)
+        self.assertNotIn('x-object-sysmeta-s3api-etag', copy_headers)
+        self.assertNotIn('x-object-sysmeta-slo-etag', copy_headers)
+        self.assertNotIn('x-object-sysmeta-slo-size', copy_headers)
+        # we don't yet compute checksums while copying...
+        self._assert_has_no_checksum_sysmeta(self.container, destination)
+
+    def test_s3_upload_part_copy_omits_checksum(self):
+        self._require_checksum_persistence()
+        # a source object uploaded with a checksum has checksum sysmeta, but
+        # a part copied from it does not: UploadPartCopy does not recompute a
+        # checksum, so the source checksum must not be inherited by the part
+        source = self._make_name('checksum-source-').decode()
+        destination = self._make_name('part-copy-mpu-').decode()
+        body = b'a probe object with a sha1 checksum'
+        exp_sha1 = base64_str(sha1(body).digest())
+
+        self.s3.put_object(Bucket=self.container, Key=source, Body=body,
+                           ChecksumAlgorithm='SHA1', ChecksumSHA1=exp_sha1)
+        self._assert_has_checksum_sysmeta(
+            self.container, source, 'SHA1', exp_sha1)
+
+        # create an mpu whose only part is copied from the source object
+        upload_id = self.s3.create_multipart_upload(
+            Bucket=self.container, Key=destination)['UploadId']
+        copy_resp = self.s3.upload_part_copy(
+            Bucket=self.container, Key=destination, PartNumber=1,
+            UploadId=upload_id,
+            CopySource={'Bucket': self.container, 'Key': source})
+        part_etag = copy_resp['CopyPartResult']['ETag']
+        self.s3.complete_multipart_upload(
+            Bucket=self.container, Key=destination, UploadId=upload_id,
+            MultipartUpload={'Parts': [{
+                'ETag': part_etag,
+                'PartNumber': 1,
+            }]})
+
+        # the part object lives in the +segments container, named
+        # <key>/<upload_id>/<part_number>
+        segments_container = self.container + MULTIUPLOAD_SUFFIX
+        part = '%s/%s/%d' % (destination, upload_id, 1)
+        self._assert_has_no_checksum_sysmeta(segments_container, part)
+
+        # ... and neither does the completed mpu manifest
+        self._assert_has_no_checksum_sysmeta(self.container, destination)
