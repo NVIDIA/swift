@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import unittest
 
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from unittest.mock import patch
 from swift.common.swob import Request, HTTPNoContent
 from swift.common.middleware.s3api.etree import fromstring, tostring, \
     Element, SubElement
+from swift.common.utils import checksum
 
 from test.unit.common.middleware.s3api import S3ApiTestCase
 
@@ -185,6 +187,37 @@ class TestS3ApiVersioning(S3ApiTestCase):
 
     def test_bucket_versioning_PUT_enabled(self):
         self._versioning_PUT_enabled('/bucket')
+
+    def test_bucket_versioning_PUT_checksum_not_persisted_or_echoed(self):
+        """Keep configuration-body checksums out of object metadata."""
+        elem = Element('VersioningConfiguration')
+        SubElement(elem, 'Status').text = 'Enabled'
+        xml = tostring(elem)
+        crc = base64.b64encode(checksum.crc32(xml).digest())
+
+        self.swift.register('POST', '/v1/AUTH_test/bucket', HTTPNoContent,
+                            {}, None)
+        req = Request.blank(
+            '/bucket?versioning',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(),
+                     'X-Amz-Checksum-Crc32': crc},
+            body=xml)
+
+        status, headers, body = self.call_s3api(req)
+
+        self.assertEqual(status.split()[0], '200', body)
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        self.assertNotIn('x-amz-checksum-type', headers)
+        call = self.swift.call_list[-1]
+        self.assertEqual('POST', call.method)
+        self.assertEqual('/v1/AUTH_test/bucket', call.path)
+        self.assertNotIn('swift.callback.update_footers', call.env)
+        for key in ('x-object-sysmeta-s3api-checksum-algorithm',
+                    'x-object-sysmeta-s3api-checksum-value',
+                    'x-object-sysmeta-s3api-checksum-type'):
+            self.assertNotIn(key, call.headers)
 
     def test_bucket_versioning_PUT_suspended(self):
         self._versioning_PUT_suspended('/bucket')

@@ -162,6 +162,17 @@ def skip_if_s3_acl_tests_disabled(func):
     return wrapper
 
 
+def skip_if_checksum_persistence_disabled(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not config_true_value(get_opt(
+                's3_checksum_persistence_tests_enabled', 'true')):
+            raise unittest.SkipTest(
+                's3_checksum_persistence_tests_enabled is false')
+        return func(*args, **kwargs)
+    return wrapper
+
+
 def etag_from_resp(response):
     return response['ETag']
 

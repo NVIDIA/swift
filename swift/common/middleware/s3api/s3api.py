@@ -165,9 +165,11 @@ from swift.common.utils import get_logger, config_true_value, \
     config_positive_int_value, split_path, closing_if_possible, \
     list_from_csv, parse_header, checksum, serialize_header
 from swift.common.middleware.s3api.utils import Config, \
-    classify_checksum_header_value, make_header_label, install_copy_hook
+    classify_checksum_header_value, make_header_label, install_copy_hook, \
+    s3api_sysmeta_header
 from swift.common.registry import register_swift_info, \
-    register_sensitive_header, register_sensitive_param
+    register_sensitive_header, register_sensitive_param, \
+    register_sensitive_sysmeta
 
 
 # https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-auth-using-authorization-header.html
@@ -324,6 +326,8 @@ class S3ApiMiddleware(object):
             wsgi_conf.get('force_swift_request_proxy_log', False))
         self.conf.allow_multipart_uploads = config_true_value(
             wsgi_conf.get('allow_multipart_uploads', True))
+        self.conf.allow_store_checksums = config_true_value(
+            wsgi_conf.get('allow_store_checksums', False))
         self.conf.min_segment_size = config_positive_int_value(
             wsgi_conf.get('min_segment_size', 5242880))
         self.conf.allowable_clock_skew = config_positive_int_value(
@@ -599,6 +603,8 @@ def filter_factory(global_conf, **local_conf):
             conf.get('max_multi_delete_objects', 1000)),
         allow_multipart_uploads=config_true_value(
             conf.get('allow_multipart_uploads', True)),
+        allow_store_checksums=config_true_value(
+            conf.get('allow_store_checksums', False)),
         min_segment_size=int(conf.get('min_segment_size', 5242880)),
         s3_acl=config_true_value(conf.get('s3_acl', False)),
         s3_inventory_enabled=config_true_value(
@@ -608,6 +614,8 @@ def filter_factory(global_conf, **local_conf):
     register_sensitive_header('authorization')
     register_sensitive_param('Signature')
     register_sensitive_param('X-Amz-Signature')
+    register_sensitive_sysmeta(
+        s3api_sysmeta_header('object', 'checksum-value'))
 
     def s3api_filter(app):
         return S3ApiMiddleware(ListingEtagMiddleware(app), conf)

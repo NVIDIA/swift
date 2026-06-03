@@ -162,6 +162,18 @@ class BaseS3ApiMultiDelete:
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
 
+        self.assertNotIn('swift.callback.update_footers', req.environ)
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        self.assertNotIn('x-amz-checksum-type', headers)
+
+        delete_call = self.swift.call_list[-1]
+        self.assertEqual('DELETE', delete_call.method)
+        self.assertNotIn('swift.callback.update_footers', delete_call.env)
+        for key in ('X-Object-Sysmeta-S3Api-Checksum-Algorithm',
+                    'X-Object-Sysmeta-S3Api-Checksum-Value',
+                    'X-Object-Sysmeta-S3Api-Checksum-Type'):
+            self.assertNotIn(key, delete_call.headers)
+
     def test_object_multi_DELETE(self):
         self.swift.register('DELETE', '/v1/AUTH_test/bucket/Key1',
                             swob.HTTPNoContent, {}, None)
