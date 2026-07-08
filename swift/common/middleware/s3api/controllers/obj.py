@@ -33,6 +33,7 @@ from swift.common.middleware.s3api.controllers.base import Controller
 from swift.common.middleware.s3api.s3response import S3NotImplemented, \
     InvalidRange, NoSuchKey, NoSuchVersion, InvalidArgument, HTTPNoContent, \
     PreconditionFailed, KeyTooLongError, NoSuchBucket
+from swift.common.middleware.proxy_logging import set_request_object_type
 
 
 class ObjectController(Controller):
@@ -116,6 +117,12 @@ class ObjectController(Controller):
                 raise NoSuchVersion(object_name, version_id)
 
         resp = req.get_response(self.app, query=query)
+
+        if resp.is_slo and s3api_sysmeta_header(
+                'object', 'upload-id') in resp.s3api_sysmeta_headers:
+            # Failed MPU requests won't have mpu object type set due to no
+            # clear signal from response, e.g. 404, 429, 503 and etc.
+            set_request_object_type(req, 'slo_mpu')
 
         if not resp.is_slo:
             # SLO ignores part_number for non-slo objects, but s3api only
