@@ -32,6 +32,35 @@ server_types = ['account', 'container', 'object']
 
 class TestRequestHelpers(unittest.TestCase):
 
+    def test_set_client_object_type(self):
+        req = Request.blank('/v1/a/c/o')
+        rh.set_client_object_type(req, 'mpu')
+        self.assertNotIn('swift.base_labels', req.environ)
+        self.assertNotIn('swift.extra_labels', req.environ)
+
+        cases = (
+            (None, {}, None),
+            ({}, {}, None),
+            ({'resource': 'container', 'method': 'GET'}, {}, None),
+            ({'resource': 'object', 'method': 'PUT'}, {}, None),
+            ({'resource': 'object'}, {}, None),
+            ({'resource': 'object', 'method': 'GET'}, None, None),
+            ({'resource': 'object', 'method': 'GET'}, {}, 'mpu'),
+            ({'resource': 'object', 'method': 'HEAD'}, {}, 'mpu'),
+        )
+        for base_labels, extra_labels, expected_object_type in cases:
+            with self.subTest(base_labels=base_labels,
+                              extra_labels=extra_labels):
+                req = Request.blank('/v1/a/c/o', method='GET', environ={
+                    'swift.base_labels': base_labels,
+                    'swift.extra_labels': extra_labels,
+                })
+                rh.set_client_object_type(req, 'mpu')
+                self.assertEqual(expected_object_type,
+                                 (extra_labels or {}).get('object_type'))
+                self.assertNotIn('object_type', base_labels or {})
+                self.assertIs(extra_labels, req.environ['swift.extra_labels'])
+
     def test_append_log_info(self):
         req = Request.blank('/v/a/c/o')
         self.assertNotIn('swift.log_info', req.environ)

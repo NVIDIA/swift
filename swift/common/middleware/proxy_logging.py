@@ -117,6 +117,7 @@ class CallbackInputProxy(InputProxy):
         eof is ``True`` if there are no more bytes to
         read from the wrapped input, ``False`` otherwise.
     """
+
     def __init__(self, wsgi_input, callback):
         super().__init__(wsgi_input)
         self.callback = callback
@@ -559,6 +560,8 @@ class ProxyLoggingMiddleware(object):
             labels['account'] = acc
         if resource:
             labels['resource'] = resource
+            # note: not updating 'object_type' here, using 'object_type' in
+            # extra_labels which could be updated by other middlewares
         if cont:
             labels['container'] = cont
         return labels
@@ -571,7 +574,9 @@ class ProxyLoggingMiddleware(object):
         The proxy logging middleware maintains a per-request dict of
         base_labels in the request environment that describes the *client*
         request. The base_labels dict is created by the leftmost proxy logging
-        instance and propagates to subrequests.
+        instance and propagates to subrequests. The extra_labels dict in the
+        request environment holds additional labels for response metrics, the
+        default values are absent instead of None.
 
         Other middlewares, including the rightmost proxy logging instance, may
         update base_labels if they consider themselves to have *authoritative*
@@ -608,6 +613,7 @@ class ProxyLoggingMiddleware(object):
             else:
                 base_labels['api'] = 'swift'
             req.environ['swift.base_labels'] = base_labels
+            req.environ.setdefault('swift.extra_labels', {})
             req_labels = ChainMap({}, base_labels)
         else:
             # expected in the right-most proxy_logging instance
@@ -622,7 +628,8 @@ class ProxyLoggingMiddleware(object):
         return req_labels
 
     @staticmethod
-    def get_response_labels(labels, status_int=None, policy_index=None):
+    def get_response_labels(labels, extra_labels=None,
+                            status_int=None, policy_index=None):
         """
         Returns a new dict, based on the given ``labels`` dict, with the
         additional given labels. These labels are typically used when emitting
@@ -634,6 +641,8 @@ class ProxyLoggingMiddleware(object):
         """
         resource_type = labels.get('resource')
         updated_labels = dict(labels)
+        if extra_labels is not None:
+            updated_labels.update(extra_labels)
         if resource_type == 'object' and \
                 policy_index is not None and \
                 POLICIES.get_by_index(policy_index) is not None:
@@ -697,8 +706,10 @@ class ProxyLoggingMiddleware(object):
             start_response(*start_response_args[0])
 
             policy_index = get_policy_index(req.headers, resp_headers)
+            extra_labels = req.environ.get('swift.extra_labels')
             resp_labels = self.get_response_labels(
-                req_labels, wire_status_int, policy_index=policy_index)
+                req_labels, extra_labels,
+                wire_status_int, policy_index=policy_index)
 
             # Log timing information for time-to-first-byte (GET requests only)
             ttfb = 0.0
@@ -757,9 +768,11 @@ class ProxyLoggingMiddleware(object):
             req = Request(env)
             env['swift.proxy_logging_status'] = 500
             status_int = status_int_for_logging()
+            extra_labels = req.environ.get('swift.extra_labels')
+            resp_labels = self.get_response_labels(req_labels, extra_labels)
             self.log_request(
                 req, status_int, input_proxy.bytes_received, 0, start_time,
-                time.time(), req_labels)
+                time.time(), resp_labels)
             raise
         else:
             return iter_response(iterable)
