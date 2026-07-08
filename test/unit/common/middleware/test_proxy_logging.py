@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -27,7 +28,7 @@ from urllib.parse import unquote
 
 from swift.common.statsd_client import LabelsMap
 from swift.common.utils import get_swift_logger, split_path, md5
-from swift.common.middleware import proxy_logging
+from swift.common.middleware import proxy_logging, slo
 from swift.common.registry import register_sensitive_header, \
     register_sensitive_param, get_sensitive_headers
 from swift.common.swob import Request, Response, HTTPServiceUnavailable, \
@@ -1253,6 +1254,28 @@ class TestProxyLogging(BaseTestProxyLogging):
         self.assertTiming('UNKNOWN.GET.500.timing', app,
                           exp_timing=200.0)
 
+    def test_middleware_object_exception_labels(self):
+        # Exception on an object GET emits request timing and zero bytes,
+        # and object_type is absent.
+        app = proxy_logging.ProxyLoggingMiddleware(
+            FakeAppThatExcepts(), {}, logger=self.logger)
+        app.statsd = self.statsd
+        req = Request.blank('/v1/a/c/o')
+        with mock.patch("swift.common.middleware.proxy_logging.time.time",
+                        side_effect=[18.0, 18.2]), \
+                self.assertRaises(Exception):
+            req.get_response(app)
+
+        exp_labels = {'account': 'a', 'api': 'swift', 'container': 'c',
+                      'method': 'GET', 'resource': 'object'}
+        self.assertLabeledTimingStats([
+            ('swift_proxy_server_request_timing', 200.0, exp_labels),
+        ])
+        self.assertLabeledUpdateStats([
+            ('swift_proxy_server_request_body_bytes', 0, exp_labels),
+            ('swift_proxy_server_response_body_bytes', 0, exp_labels),
+        ])
+
     def test_middleware_error(self):
         class ErrorFakeApp(object):
 
@@ -1628,38 +1651,40 @@ class TestProxyLogging(BaseTestProxyLogging):
         req = Request.blank(path, environ=environ, headers=req_hdrs)
         req.get_response(mw)
         self.assertEqual(1, len(req_environs))
-        return req_environs[0].get('swift.base_labels')
+        base_labels = req_environs[0].get('swift.base_labels')
+        extra_labels = req_environs[0].get('swift.extra_labels')
+        return [base_labels, extra_labels]
 
     def test_update_swift_base_labels_swift_request(self):
         mw_conf = {}
         req_hdrs = {}
         self.assertEqual(
-            {
+            [{
                 'resource': 'account',
                 'method': 'PUT',
                 'account': 'a',
                 'api': 'swift'
-            },
+            }, {}],
             self._do_test_swift_base_labels(mw_conf, '/v1/a', req_hdrs))
 
         self.assertEqual(
-            {
+            [{
                 'resource': 'container',
                 'method': 'PUT',
                 'account': 'a',
                 'container': 'c',
                 'api': 'swift'
-            },
+            }, {}],
             self._do_test_swift_base_labels(mw_conf, '/v1/a/c', req_hdrs))
 
         self.assertEqual(
-            {
+            [{
                 'resource': 'object',
                 'method': 'PUT',
                 'account': 'a',
                 'container': 'c',
                 'api': 'swift'
-            },
+            }, {}],
             self._do_test_swift_base_labels(mw_conf, '/v1/a/c/o', req_hdrs))
 
     def test_update_swift_base_labels_swift_request_partial_existing(self):
@@ -1672,35 +1697,40 @@ class TestProxyLogging(BaseTestProxyLogging):
                 'method': 'PUT',
                 'container': 'c',
             }),
+            'swift.extra_labels': {},
         }
 
+        # base_labels 'resource' should not be updated even though the resource
+        # type would be 'account' from request PATH_INFO
         self.assertEqual(
-            {
+            [{
                 'resource': 'object',
                 'method': 'PUT',
                 'account': 'a',
                 'container': 'c',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/v1/a', req_hdrs, extra_environ=extra_environ))
 
+        # base_labels 'resource' should not be updated even though the resource
+        # type would be 'container' from request PATH_INFO
         self.assertEqual(
-            {
+            [{
                 'resource': 'object',
                 'method': 'PUT',
                 'account': 'a',
                 'container': 'c',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/v1/a/ccc', req_hdrs, extra_environ=extra_environ))
 
         self.assertEqual(
-            {
+            [{
                 'resource': 'object',
                 'method': 'PUT',
                 'account': 'a',
                 'container': 'c',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/v1/a/c/ooo', req_hdrs, extra_environ=extra_environ))
 
@@ -1714,32 +1744,37 @@ class TestProxyLogging(BaseTestProxyLogging):
                 'resource': 'object',
                 'method': 'PUT',
             }),
+            'swift.extra_labels': {},
         }
 
+        # base_labels 'resource' should not be updated even though the resource
+        # type would be 'account' from request PATH_INFO
         self.assertEqual(
-            {
+            [{
                 'resource': 'object',
                 'method': 'PUT',
                 'account': 'a',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/v1/a', req_hdrs, extra_environ=extra_environ))
 
+        # base_labels 'resource' should not be updated even though the resource
+        # type would be 'container' from request PATH_INFO
         self.assertEqual(
-            {
+            [{
                 'resource': 'object',
                 'method': 'PUT',
                 'account': 'a',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/v1/a/c', req_hdrs, extra_environ=extra_environ))
 
         self.assertEqual(
-            {
+            [{
                 'resource': 'object',
                 'method': 'PUT',
                 'account': 'a',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/v1/a/c/o', req_hdrs, extra_environ=extra_environ))
 
@@ -1754,25 +1789,26 @@ class TestProxyLogging(BaseTestProxyLogging):
                 'account': 'a',
                 'container': 'c',
             }),
+            'swift.extra_labels': {},
         }
 
         self.assertEqual(
-            {
+            [{
                 'resource': 'object',
                 'method': 'PUT',
                 'account': 'a',
                 'container': 'c',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/v1/aa', req_hdrs, extra_environ=extra_environ))
 
         self.assertEqual(
-            {
+            [{
                 'resource': 'object',
                 'method': 'PUT',
                 'account': 'a',
                 'container': 'c',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/v1/aa/cc', req_hdrs, extra_environ=extra_environ))
 
@@ -1790,26 +1826,27 @@ class TestProxyLogging(BaseTestProxyLogging):
                 'container': 'c',
                 'api': 'S3'
             }),
+            'swift.extra_labels': {},
         }
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'object',
                 'method': 'PUT',
                 'container': 'c',
                 'api': 'S3'
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/bucket', req_hdrs, extra_environ=extra_environ))
 
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'object',
                 'method': 'PUT',
                 'container': 'c',
                 'api': 'S3'
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/bucket/obj', req_hdrs, extra_environ=extra_environ))
 
@@ -1818,65 +1855,66 @@ class TestProxyLogging(BaseTestProxyLogging):
                 'resource': 'object',
                 'method': 'PUT',
             }),
+            'swift.extra_labels': {},
         }
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'object',
                 'method': 'PUT',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/bucket', req_hdrs, extra_environ=extra_environ))
 
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'object',
                 'method': 'PUT',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/bucket/obj', req_hdrs, extra_environ=extra_environ))
 
         mw_conf = {'storage_domain': 'domain'}
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'object',
                 'method': 'PUT',
-            },
+            }, {}],
             self._do_test_swift_base_labels(
                 mw_conf, '/bucket/obj', req_hdrs, extra_environ=extra_environ))
 
     def _do_test_update_swift_base_labels_s3_request(self, req_hdrs):
         mw_conf = {}
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'container',
                 'method': 'PUT',
                 'container': 'bucket',
                 'api': 'S3'
-            },
+            }, {}],
             self._do_test_swift_base_labels(mw_conf, '/bucket', req_hdrs))
 
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'object',
                 'method': 'PUT',
                 'container': 'bucket',
                 'api': 'S3'
-            },
+            }, {}],
             self._do_test_swift_base_labels(mw_conf, '/bucket/obj', req_hdrs))
 
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'object',
                 'method': 'PUT',
                 'container': 'bucket',
                 'api': 'S3'
-            },
+            }, {}],
             self._do_test_swift_base_labels(mw_conf, '/bucket/obj/x',
                                             req_hdrs))
 
@@ -1906,44 +1944,44 @@ class TestProxyLogging(BaseTestProxyLogging):
             'Date': email.utils.formatdate(time.time() + 0),
         }
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'container',
                 'method': 'PUT',
                 'container': 'foo',
                 'api': 'S3'
-            },
+            }, {}],
             self._do_test_swift_base_labels(mw_conf, '/', req_hdrs))
 
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'object',
                 'method': 'PUT',
                 'container': 'foo',
                 'api': 'S3'
-            },
+            }, {}],
             self._do_test_swift_base_labels(mw_conf, '/obj', req_hdrs))
 
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'object',
                 'method': 'PUT',
                 'container': 'foo',
                 'api': 'S3'
-            },
+            }, {}],
             self._do_test_swift_base_labels(mw_conf, '/obj/x', req_hdrs))
 
         mw_conf = {'storage_domain': 'not-domain'}
         self.assertEqual(
-            {
+            [{
                 'account': None,
                 'resource': 'object',
                 'method': 'PUT',
                 'container': 'bucket',
                 'api': 'S3'
-            },
+            }, {}],
             self._do_test_swift_base_labels(mw_conf, '/bucket/obj', req_hdrs))
 
     def _do_test_base_labels_end_to_end(self, orig_path, new_path=None,
@@ -1952,14 +1990,17 @@ class TestProxyLogging(BaseTestProxyLogging):
         # combination replaces the request path with new_path
         mw_conf = {}
         base_labels = []
+        extra_labels = []
 
         def fake_mw(env, start_response):
             base_labels.append(dict(env.get('swift.base_labels')))
+            extra_labels.append(dict(env.get('swift.extra_labels')))
             env['PATH_INFO'] = new_path or orig_path
             return right_mw(env, start_response)
 
         def fake_app(env, start_response):
             base_labels.append(dict(env.get('swift.base_labels')))
+            extra_labels.append(dict(env.get('swift.extra_labels')))
             return HTTPOk()(env, start_response)
 
         left_mw = proxy_logging.ProxyLoggingMiddleware(
@@ -1972,91 +2013,49 @@ class TestProxyLogging(BaseTestProxyLogging):
         req.get_response(left_mw)
         self.assertEqual(2, len(base_labels))
 
-        return base_labels
+        return base_labels, extra_labels
 
-    def test_base_labels_end_to_end_info(self):
-        base_labels = self._do_test_base_labels_end_to_end('/info')
+    def test_base_labels_end_to_end_swift(self):
+        cases = (
+            ('/info', None, None, None),
+            ('/v1/a', 'a', None, 'account'),
+            ('/v1/a/c', 'a', 'c', 'container'),
+            ('/v1/a/c/o', 'a', 'c', 'object'),
+        )
+        for path, account, container, resource in cases:
+            with self.subTest(path=path):
+                base_labels, extra_labels = (
+                    self._do_test_base_labels_end_to_end(path))
+                exp_labels = {'account': account, 'api': 'swift',
+                              'method': 'PUT', 'resource': resource}
+                if container is not None:
+                    exp_labels['container'] = container
+                self.assertEqual([exp_labels, exp_labels], base_labels)
+                self.assertEqual([{}, {}], extra_labels)
 
-        self.assertEqual(
-            [{'account': None, 'method': 'PUT', 'api': 'swift',
-              'resource': None},
-             {'account': None, 'method': 'PUT', 'api': 'swift',
-              'resource': None}],
-            base_labels)
-
-    def test_base_labels_end_to_end_account(self):
-        base_labels = self._do_test_base_labels_end_to_end('/v1/a')
-
-        self.assertEqual(
-            [{'account': 'a', 'api': 'swift', 'method': 'PUT',
-              'resource': 'account'},
-             {'account': 'a', 'api': 'swift', 'method': 'PUT',
-              'resource': 'account'}],
-            base_labels)
-
-    def test_base_labels_end_to_end_container(self):
-        base_labels = self._do_test_base_labels_end_to_end('/v1/a/c')
-
-        self.assertEqual([{'account': 'a', 'container': 'c', 'method': 'PUT',
-                           'api': 'swift', 'resource': 'container'},
-                          {'account': 'a', 'container': 'c', 'method': 'PUT',
-                           'api': 'swift', 'resource': 'container'}],
-                         base_labels)
-
-    def test_base_labels_end_to_end_object(self):
-        base_labels = self._do_test_base_labels_end_to_end('/v1/a/c/o')
-
-        self.assertEqual(
-            [{'account': 'a', 'container': 'c', 'method': 'PUT',
-              'api': 'swift', 'resource': 'object'},
-             {'account': 'a', 'container': 'c', 'method': 'PUT',
-              'api': 'swift', 'resource': 'object'}],
-            base_labels)
-
-    def test_swift_base_labels_end_to_end_account_s3(self):
+    def test_base_labels_end_to_end_s3(self):
         req_hdrs = {
             'Authorization': 'AWS test:tester:hmac',
             'Date': email.utils.formatdate(time.time() + 0),
         }
-
-        base_labels = self._do_test_base_labels_end_to_end(
-            '/', '/v1/a', req_hdrs)
-        self.assertEqual(
-            [{'account': None, 'method': 'PUT', 'api': 'S3', 'resource': None},
-             {'account': 'a', 'method': 'PUT', 'resource': 'account',
-              'api': 'S3'}],
-            base_labels)
-
-    def test_base_labels_end_to_end_container_s3(self):
-        req_hdrs = {
-            'Authorization': 'AWS test:tester:hmac',
-            'Date': email.utils.formatdate(time.time() + 0),
-        }
-
-        base_labels = self._do_test_base_labels_end_to_end(
-            '/bucket', '/v1/a/bucket', req_hdrs)
-        self.assertEqual(
-            [{'account': None, 'container': 'bucket', 'method': 'PUT',
-              'resource': 'container', 'api': 'S3'},
-             {'account': 'a', 'container': 'bucket', 'method': 'PUT',
-              'resource': 'container', 'api': 'S3'}],
-            base_labels)
-
-    def test_base_labels_end_to_end_object_s3(self):
-        req_hdrs = {
-            'Authorization': 'AWS test:tester:hmac',
-            'Date': email.utils.formatdate(time.time() + 0),
-        }
-
-        base_labels = self._do_test_base_labels_end_to_end(
-            '/bucket/o', '/v1/a/bucket/o',
-            req_hdrs)
-        self.assertEqual(
-            [{'account': None, 'container': 'bucket', 'method': 'PUT',
-              'resource': 'object', 'api': 'S3'},
-             {'account': 'a', 'container': 'bucket',
-              'method': 'PUT', 'resource': 'object', 'api': 'S3'}],
-            base_labels)
+        cases = (
+            ('/', '/v1/a', None, None, 'account'),
+            ('/bucket', '/v1/a/bucket', 'bucket', 'container', 'container'),
+            ('/bucket/o', '/v1/a/bucket/o', 'bucket', 'object', 'object'),
+        )
+        for path, backend_path, container, resource, backend_resource in cases:
+            with self.subTest(path=path):
+                base_labels, extra_labels = (
+                    self._do_test_base_labels_end_to_end(
+                        path, backend_path, req_hdrs))
+                exp_labels = {'account': None, 'api': 'S3',
+                              'method': 'PUT', 'resource': resource}
+                if container is not None:
+                    exp_labels['container'] = container
+                exp_backend_labels = dict(
+                    exp_labels, account='a', resource=backend_resource)
+                self.assertEqual([exp_labels, exp_backend_labels], base_labels)
+                self.assertEqual([{}, {}], extra_labels)
 
     def test_base_labels_end_to_end_object_s3_sigv4(self):
         date_header = self.get_v4_amz_date_header()
@@ -2069,7 +2068,7 @@ class TestProxyLogging(BaseTestProxyLogging):
             ]),
         }
 
-        base_labels = self._do_test_base_labels_end_to_end(
+        base_labels, extra_labels = self._do_test_base_labels_end_to_end(
             '/bucket/o', '/v1/a/bucket/o',
             req_hdrs)
         self.assertEqual(
@@ -2078,6 +2077,9 @@ class TestProxyLogging(BaseTestProxyLogging):
              {'account': 'a', 'container': 'bucket',
               'method': 'PUT', 'resource': 'object', 'api': 'S3'}],
             base_labels)
+        self.assertEqual(
+            [{}, {}],
+            extra_labels)
 
     def _do_test_call_app(self, req, app):
         status, headers, body_iter = req.call_application(app)
@@ -2381,9 +2383,11 @@ class TestProxyLogging(BaseTestProxyLogging):
                               modified_method=None,
                               modified_path=None,
                               leftmost_proxy_logging=True,
-                              rightmost_proxy_logging=True):
+                              rightmost_proxy_logging=True,
+                              use_slo=False):
         # make a pipeline:
-        # proxy_logging s3api fake_auth [rewrite_path] proxy_logging fake_swift
+        # proxy_logging s3api fake_auth [slo] [rewrite_path]
+        # proxy_logging fake_swift
         fake_swift = FakeSwift(test_read_size=5)
         if rightmost_proxy_logging:
             app = subreq_app = proxy_logging.ProxyLoggingMiddleware(
@@ -2398,6 +2402,8 @@ class TestProxyLogging(BaseTestProxyLogging):
             app = PathRewritingApp(
                 app, self.logger, modified_method=modified_method,
                 modified_path=modified_path)
+        if use_slo:
+            app = slo.filter_factory({})(app)
         app = FakeAuthApp(app)
         app._pipeline_final_app = fake_swift
         app = s3api_filter_factory({
@@ -2414,6 +2420,139 @@ class TestProxyLogging(BaseTestProxyLogging):
                 app, proxy_logging_conf, logger=self.logger)
             app.statsd = self.statsd
         return app, subreq_app, fake_swift
+
+    def test_object_type_response_metrics_end_to_end(self):
+        # Check GET and HEAD metrics for normal objects, SLOs, and MPUs.
+        # Run requests through S3API, SLO, and both proxy_logging instances.
+        # Only the leftmost MPU response metrics have object_type=mpu.
+        segment_body = b'segment body'
+        segment_etag = md5(
+            segment_body, usedforsecurity=False).hexdigest()
+        manifest = [{
+            'name': '/bucket/segment%d' % i,
+            'hash': segment_etag,
+            'bytes': str(len(segment_body)),
+            'content_type': 'application/octet-stream',
+        } for i in range(2)]
+        manifest_body = json.dumps(manifest).encode('ascii')
+        manifest_etag = md5(
+            manifest_body, usedforsecurity=False).hexdigest()
+        slo_etag = md5(
+            (segment_etag * len(manifest)).encode('ascii'),
+            usedforsecurity=False).hexdigest()
+        cases = (
+            # expected_object_type, is_slo, s3_upload_id
+            (None, False, None),
+            (None, True, None),
+            ('mpu', True, 's3-upload-id-1'),
+        )
+
+        for method, case in itertools.product(('GET', 'HEAD'), cases):
+            expected_object_type, is_slo, s3_upload_id = case
+            with self.subTest(method=method, is_slo=is_slo,
+                              s3_upload_id=s3_upload_id):
+                self._clear()
+                self.subreq_logger.clear()
+                self.subreq_statsd.clear()
+                app, _subreq_app, swift = self._make_logged_pipeline(
+                    use_slo=True)
+                object_path = '/v1/AUTH_test/bucket/object'
+                if is_slo:
+                    response_headers = {
+                        'Content-Type': 'application/json',
+                        'Content-Length': str(len(manifest_body)),
+                        'Etag': manifest_etag,
+                        'Last-Modified': 'Fri, 01 Apr 2014 12:00:00 GMT',
+                        'X-Static-Large-Object': 'true',
+                        'X-Object-Sysmeta-Slo-Etag': slo_etag,
+                        'X-Object-Sysmeta-Slo-Size': str(
+                            len(segment_body) * len(manifest)),
+                    }
+                    if s3_upload_id is not None:
+                        response_headers[
+                            'X-Object-Sysmeta-S3api-Upload-Id'] = s3_upload_id
+                    swift.register(
+                        method, object_path, HTTPOk, response_headers,
+                        manifest_body)
+                    for segment in manifest:
+                        swift.register(
+                            'GET',
+                            '/v1/AUTH_test%s?multipart-manifest=get'
+                            % segment['name'],
+                            HTTPOk,
+                            {'Content-Length': str(len(segment_body)),
+                             'Etag': segment_etag},
+                            segment_body)
+                    expected_body = segment_body * len(manifest)
+                else:
+                    expected_body = b'normal body'
+                    swift.register(
+                        method, object_path, HTTPOk,
+                        {'Content-Length': str(len(expected_body)),
+                         'Etag': md5(expected_body,
+                                     usedforsecurity=False).hexdigest(),
+                         'Last-Modified':
+                             'Fri, 01 Apr 2014 12:00:00 GMT'},
+                        expected_body)
+
+                if method == 'HEAD':
+                    expected_body = b''
+                req = Request.blank('/bucket/object', method=method, headers={
+                    'Authorization': 'AWS test:tester:hmac',
+                    'Date': email.utils.formatdate(time.time()),
+                })
+                status, _headers, body = self._do_test_call_app(req, app)
+
+                self.assertEqual('200 OK', status)
+                self.assertEqual(expected_body, body)
+                # Keep object_type in extra_labels and out of base_labels.
+                base_labels = req.environ.get('swift.base_labels', None)
+                extra_labels = req.environ.get('swift.extra_labels', None)
+                self.assertNotIn('object_type', base_labels)
+                self.assertEqual(
+                    expected_object_type,
+                    extra_labels.get('object_type'))
+
+                response_metric_names = {
+                    'swift_proxy_server_request_ttfb',
+                    'swift_proxy_server_response_body_streaming_bytes',
+                    'swift_proxy_server_request_timing',
+                    'swift_proxy_server_request_body_bytes',
+                    'swift_proxy_server_response_body_bytes',
+                }
+                # Check the labels passed to the leftmost metric calls.
+                observed_names = set()
+                for call_type in ('timing', 'update_stats'):
+                    for args, kwargs in self.statsd.calls[call_type]:
+                        if args[0] not in response_metric_names:
+                            continue
+                        observed_names.add(args[0])
+                        labels = dict(kwargs['labels'])
+                        self.assertEqual(expected_object_type,
+                                         labels.get('object_type'))
+                        self.assertEqual('AUTH_test', labels['account'])
+                expected_metric_names = set(response_metric_names)
+                if method == 'HEAD':
+                    expected_metric_names.remove(
+                        'swift_proxy_server_request_ttfb')
+                    expected_metric_names.remove(
+                        'swift_proxy_server_response_body_streaming_bytes')
+                self.assertEqual(expected_metric_names, observed_names)
+
+                # Rightmost response metrics must have no object_type label.
+                rightmost_observed_names = set()
+                for call_type in ('timing', 'update_stats'):
+                    for args, kwargs in self.subreq_statsd.calls[call_type]:
+                        if args[0] not in response_metric_names:
+                            continue
+                        rightmost_observed_names.add(args[0])
+                        labels = dict(kwargs['labels'])
+                        self.assertNotIn('object_type', labels)
+                self.assertEqual(expected_metric_names,
+                                 rightmost_observed_names)
+                # Also check the labels in the encoded StatsD messages.
+                for payload, _address in self.subreq_statsd.sendto_calls:
+                    self.assertNotIn(b'object_type:', payload)
 
     def test_xfer_stats_put_object_s3api(self):
         backend_path = '/v1/AUTH_test/bucket+segments/object'
@@ -2492,7 +2631,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         self.assertEqual(status.split()[0], '200')
 
     def test_xfer_stats_get_object_s3api(self):
-        app, subreq_app, swift = self._make_logged_pipeline()
+        app, subreq_app, swift = self._make_logged_pipeline(use_slo=True)
         buffers = [b'some stuff\n',
                    b'some other stuff\n',
                    b'some additional stuff\n']
@@ -2517,6 +2656,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         self.assertEqual('/v1/AUTH_test/bucket/object',
                          req.environ['swift.backend_path'])
         base_labels = req.environ.get('swift.base_labels', None)
+        extra_labels = req.environ.get('swift.extra_labels', None)
         self.assertEqual(base_labels, {
             'resource': 'object',
             'method': 'GET',
@@ -2524,6 +2664,7 @@ class TestProxyLogging(BaseTestProxyLogging):
             'container': 'bucket',
             'api': 'S3'
         })
+        self.assertEqual(extra_labels, {})
 
         self.assertEqual(swift.calls, [
             ('GET', '/v1/AUTH_test/bucket/object'),
@@ -2585,6 +2726,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         self.assertEqual('201 Created', status)
 
         base_labels = req.environ.get('swift.base_labels', None)
+        extra_labels = req.environ.get('swift.extra_labels', None)
         self.assertEqual(base_labels, {
             'resource': 'object',
             'api': 'swift',
@@ -2592,6 +2734,7 @@ class TestProxyLogging(BaseTestProxyLogging):
             'account': 'AUTH_test',
             'container': 'bucket',
         })
+        self.assertEqual(extra_labels, {})
 
         self.assertEqual(swift.calls, [
             ('PUT', '/v1/AUTH_test/bucket/object'),
@@ -2630,6 +2773,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         self.assertEqual('/v1/AUTH_test/bucket/object',
                          req.environ['swift.backend_path'])
         base_labels = req.environ.get('swift.base_labels', None)
+        extra_labels = req.environ.get('swift.extra_labels', None)
         self.assertEqual(base_labels, {
             'resource': 'object',
             'method': 'PUT',
@@ -2637,13 +2781,14 @@ class TestProxyLogging(BaseTestProxyLogging):
             'container': 'bucket',
             'api': 'S3'
         })
+        self.assertEqual(extra_labels, {})
 
         self.assertEqual(swift.calls, [
             ('PUT', '/v1/AUTH_test/bucket/object'),
         ])
 
     def test_base_label_v4_auth_headers_GET(self):
-        app, subreq_app, swift = self._make_logged_pipeline()
+        app, subreq_app, swift = self._make_logged_pipeline(use_slo=True)
         buffers = [b'some stuff\n',
                    b'some other stuff\n',
                    b'some additional stuff\n']
@@ -2675,6 +2820,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         self.assertEqual('/v1/AUTH_test/bucket/object',
                          req.environ['swift.backend_path'])
         base_labels = req.environ.get('swift.base_labels', None)
+        extra_labels = req.environ.get('swift.extra_labels', None)
         self.assertEqual(base_labels, {
             'resource': 'object',
             'method': 'GET',
@@ -2682,6 +2828,7 @@ class TestProxyLogging(BaseTestProxyLogging):
             'container': 'bucket',
             'api': 'S3'
         })
+        self.assertEqual(extra_labels, {})
 
         self.assertEqual(swift.calls, [
             ('GET', '/v1/AUTH_test/bucket/object'),
@@ -2746,6 +2893,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         self.assertEqual('/v1/AUTH_test/bucket/object',
                          req.environ['swift.backend_path'])
         base_labels = req.environ.get('swift.base_labels', None)
+        extra_labels = req.environ.get('swift.extra_labels', None)
         self.assertEqual(base_labels, {
             'resource': 'object',
             'method': 'PUT',
@@ -2753,6 +2901,7 @@ class TestProxyLogging(BaseTestProxyLogging):
             'container': 'bucket',
             'api': 'S3'
         })
+        self.assertEqual(extra_labels, {})
 
         self.assertEqual(swift.calls, [
             ('PUT', '/v1/AUTH_test/bucket/object'),
@@ -2820,6 +2969,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         # request didn't reach the fake proxy app
         self.assertFalse(swift.calls)
         base_labels = req.environ.get('swift.base_labels', None)
+        extra_labels = req.environ.get('swift.extra_labels', None)
         self.assertEqual({
             'resource': 'object',
             'method': 'GET',
@@ -2827,6 +2977,7 @@ class TestProxyLogging(BaseTestProxyLogging):
             'container': 'bucket',
             'api': 'S3'
         }, base_labels)
+        self.assertEqual(extra_labels, {})
 
     def test_base_labels_put_s3api_storage_domain(self):
         app, subreq_app, swift = self._make_logged_pipeline(
@@ -2865,6 +3016,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         self.assertEqual('/v1/AUTH_test/ahost/object',
                          req.environ['swift.backend_path'])
         base_labels = req.environ.get('swift.base_labels', None)
+        extra_labels = req.environ.get('swift.extra_labels', None)
         self.assertEqual(base_labels, {
             'resource': 'object',
             'method': 'PUT',
@@ -2872,6 +3024,7 @@ class TestProxyLogging(BaseTestProxyLogging):
             'container': 'ahost',
             'api': 'S3'
         })
+        self.assertEqual(extra_labels, {})
 
         self.assertEqual(swift.calls, [
             ('PUT', '/v1/AUTH_test/ahost/object'),
@@ -2912,12 +3065,14 @@ class TestProxyLogging(BaseTestProxyLogging):
         self.assertEqual(swift.calls, [('POST', backend_path)])
 
         base_labels = req.environ.get('swift.base_labels')
+        extra_labels = req.environ.get('swift.extra_labels', None)
         self.assertEqual({'account': 'AUTH_test',
                           'api': 'S3',
                           'container': 'bucket',
                           'method': 'PUT',
                           'resource': 'object'},
                          base_labels)
+        self.assertEqual(extra_labels, {})
 
         # verify leftmost stats...
         self.assertUpdateStats([
@@ -3012,6 +3167,7 @@ class TestProxyLogging(BaseTestProxyLogging):
         self.assertEqual(swift.calls, [('PUT', backend_path)])
 
         base_labels = req.environ.get('swift.base_labels')
+        extra_labels = req.environ.get('swift.extra_labels', None)
         # note: the account is unknown
         self.assertEqual({'account': None,
                           'api': 'S3',
@@ -3019,6 +3175,7 @@ class TestProxyLogging(BaseTestProxyLogging):
                           'method': 'PUT',
                           'resource': 'object'},
                          base_labels)
+        self.assertEqual(extra_labels, {})
 
         # verify leftmost stats...
         self.assertUpdateStats([

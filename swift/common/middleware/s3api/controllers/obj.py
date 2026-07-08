@@ -18,7 +18,8 @@ import json
 
 from swift.common import constraints
 from swift.common.http import HTTP_OK, HTTP_PARTIAL_CONTENT, HTTP_NO_CONTENT
-from swift.common.request_helpers import update_etag_is_at_header
+from swift.common.request_helpers import update_etag_is_at_header, \
+    set_client_object_type
 from swift.common.swob import Range, content_range_header_value, \
     normalize_etag, parse_date_header
 from swift.common.utils import public, list_from_csv
@@ -116,6 +117,12 @@ class ObjectController(Controller):
                 raise NoSuchVersion(object_name, version_id)
 
         resp = req.get_response(self.app, query=query)
+
+        if resp.is_slo and s3api_sysmeta_header(
+                'object', 'upload-id') in resp.s3api_sysmeta_headers:
+            # Failed MPU requests won't have mpu object type set due to no
+            # clear signal from response, e.g. 404, 429, 503 and etc.
+            set_client_object_type(req, 'mpu')
 
         if not resp.is_slo:
             # SLO ignores part_number for non-slo objects, but s3api only

@@ -25,6 +25,7 @@ from unittest.mock import patch
 import json
 
 from swift.common import swob
+from swift.common.statsd_client import LabelsMap
 from swift.common.storage_policy import StoragePolicy
 from swift.common.swob import Request, parse_date_header
 from swift.common.middleware.proxy_logging import ProxyLoggingMiddleware
@@ -35,7 +36,8 @@ from swift.common.middleware.s3api.s3request import SigV4Request
 from swift.common.middleware.s3api.subresource import ACL, User, encode_acl, \
     Owner, Grant
 from swift.common.middleware.s3api.etree import fromstring
-from swift.common.middleware.s3api.utils import S3Timestamp
+from swift.common.middleware.s3api.utils import S3Timestamp, \
+    s3api_sysmeta_header
 from swift.common.middleware.versioned_writes.object_versioning import \
     DELETE_MARKER_CONTENT_TYPE
 from swift.common.utils import md5
@@ -81,8 +83,16 @@ class BaseS3ApiObj(object):
             'bucket', self.bucket_policy_index)
 
     def _test_object_GETorHEAD(self, method):
+        base_labels = LabelsMap(resource='object', method=method)
+        extra_labels = {
+        }
+        extra_environ = {
+            'swift.base_labels': base_labels,
+            'swift.extra_labels': extra_labels,
+        }
         req = Request.blank('/bucket/object',
-                            environ={'REQUEST_METHOD': method},
+                            environ={'REQUEST_METHOD': method,
+                                     **extra_environ},
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
         self.assertNotIn('swift.access_logging', req.environ)
@@ -121,6 +131,8 @@ class BaseS3ApiObj(object):
 
         if method == 'GET':
             self.assertEqual(body, self.object_body)
+        self.assertNotIn('object_type', base_labels)
+        self.assertNotIn('object_type', extra_labels)
 
     def test_object_GET(self):
         self._test_object_GETorHEAD('GET')
@@ -223,12 +235,70 @@ class BaseS3ApiObj(object):
             'HEAD', {'If-Match': '"%s"' % legacy_etag}, resp_headers)
         self.assertEqual('412', status)
 
+    def test_object_type_for_mpu(self):
+        object_path = '/v1/AUTH_test/bucket/object'
+        s3_upload_id_header = s3api_sysmeta_header('object', 'upload-id')
+        cases = (
+            ('GET', None, None),
+            ('GET', 's3-upload-id-2', 'mpu'),
+            ('HEAD', None, None),
+            ('HEAD', 's3-upload-id-2', 'mpu'),
+        )
+        for method, s3_upload_id, expected_object_type in cases:
+            with self.subTest(method=method, s3_upload_id=s3_upload_id):
+                response_headers = dict(self.response_headers)
+                response_headers['X-Static-Large-Object'] = 'true'
+                if s3_upload_id:
+                    response_headers[s3_upload_id_header] = s3_upload_id
+                self.swift.register(
+                    method, object_path, swob.HTTPOk, response_headers,
+                    self.object_body)
+                base_labels = LabelsMap(resource='object', method=method)
+                extra_labels = {}
+                extra_environ = {
+                    'swift.base_labels': base_labels,
+                    'swift.extra_labels': extra_labels,
+                }
+                req = Request.blank(
+                    '/bucket/object', method=method,
+                    environ=extra_environ,
+                    headers={
+                        'Authorization': 'AWS test:tester:hmac',
+                        'Date': self.get_date_header(),
+                    }
+                )
+
+                status, _headers, _body = self.call_s3api(req)
+
+                self.assertEqual('200 OK', status)
+                self.assertNotIn('object_type', base_labels)
+                self.assertEqual(expected_object_type,
+                                 extra_labels.get('object_type'))
+
+    def test_object_type_does_not_create_base_labels(self):
+        req = Request.blank('/bucket/object', headers={
+            'Authorization': 'AWS test:tester:hmac',
+            'Date': self.get_date_header(),
+        })
+
+        status, _headers, _body = self.call_s3api(req)
+
+        self.assertEqual('200 OK', status)
+        self.assertNotIn('swift.base_labels', req.environ)
+        self.assertNotIn('swift.extra_labels', req.environ)
+
     def test_object_HEAD_error(self):
         # HEAD does not return the body even an error response in the
         # specifications of the REST API.
         # So, check the response code for error test of HEAD.
+        extra_labels = {}
         req = Request.blank('/bucket/object',
-                            environ={'REQUEST_METHOD': 'HEAD'},
+                            environ={
+                                'REQUEST_METHOD': 'HEAD',
+                                'swift.base_labels': LabelsMap(
+                                    resource='object', method='HEAD'),
+                                'swift.extra_labels': extra_labels,
+                            },
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
         self.s3acl_response_modified = True
@@ -237,6 +307,7 @@ class BaseS3ApiObj(object):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '403')
         self.assertEqual(body, b'')  # sanity
+        self.assertNotIn('object_type', extra_labels)
 
         req = Request.blank('/bucket/object',
                             environ={'REQUEST_METHOD': 'HEAD'},

@@ -1020,6 +1020,15 @@ def get_log_info(environ):
     return ','.join(environ.get('swift.log_info', []))
 
 
+def set_client_object_type(req, object_type):
+    """Set the object type for a client object GET or HEAD."""
+    base_labels = req.environ.get('swift.base_labels') or {}
+    extra_labels = req.environ.get('swift.extra_labels')
+    if extra_labels is not None and base_labels.get('resource') == 'object' \
+            and base_labels.get('method') in ('GET', 'HEAD'):
+        extra_labels['object_type'] = object_type
+
+
 def get_heartbeat_response_body(data_format, data_dict, error_list, root_tag):
     """
     Returns a response body for heartbeat according to format.
