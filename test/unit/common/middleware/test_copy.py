@@ -20,7 +20,7 @@ import urllib.parse
 from swift.common.concurrency import eventlet
 
 from swift.common import swob
-from swift.common.middleware import copy
+from swift.common.middleware import copy, proxy_logging, slo
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import Request, HTTPException
 from swift.common.utils import close_if_possible, closing_if_possible, \
@@ -353,16 +353,20 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
         self.assertEqual('/v1/a/c/o2', self.authorized[1].path)
 
     def test_static_large_object(self):
+        self.ssc.app = slo.filter_factory({})(self.app)
+        logging_app = proxy_logging.ProxyLoggingMiddleware(
+            self.ssc, {}, logger=self.app.logger)
         self.app.register('GET', '/v1/a/c/o', swob.HTTPOk,
                           {'X-Static-Large-Object': 'True',
-                           'Etag': 'should not be sent'}, 'passed')
+                           'Etag': 'should not be sent'},
+                          b'[{"data": "cGFzc2Vk"}]')
         self.app.register('PUT', '/v1/a/c/o2',
-                          swob.HTTPCreated, {})
+                          swob.HTTPCreated, {'Content-Length': '0'})
         req = Request.blank('/v1/a/c/o2',
                             environ={'REQUEST_METHOD': 'PUT'},
                             headers={'Content-Length': '0',
                                      'X-Copy-From': 'c/o'})
-        status, headers, body = self.call_ssc(req)
+        status, headers, body = self.call_app(req, app=logging_app)
         self.assertEqual(status, '201 Created')
         self.assertTrue(('X-Copied-From', 'c/o') in headers)
         self.assertEqual(self.app.calls, [
@@ -376,6 +380,8 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
         self.assertEqual('/v1/a/c/o', self.authorized[0].path)
         self.assertEqual('PUT', self.authorized[1].method)
         self.assertEqual('/v1/a/c/o2', self.authorized[1].path)
+        self.assertEqual(b'passed', self.app.uploaded['/v1/a/c/o2'][1])
+        self.assertNotIn('object_type', req.environ['swift.extra_labels'])
 
     def test_basic_put_with_x_copy_from_across_container(self):
         self.app.register('GET', '/v1/a/c1/o1', swob.HTTPOk, {}, 'passed')
