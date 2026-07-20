@@ -19,6 +19,7 @@ import json
 import time
 import unittest
 import string
+from unittest import mock
 
 from unittest.mock import patch
 
@@ -978,8 +979,178 @@ class TestSloPutManifest(SloTestCase):
         self.assertEqual('a', manifest_data[0]['hash'])
         self.assertEqual('b', manifest_data[1]['hash'])
 
+    def test_handle_multipart_put_callback_receives_head_headers(self):
+        headers1 = {'Content-Length': '1', 'Etag': 'a',
+                    'Content-Type': 'text/html; charset=UTF-8',
+                    'X-Object-Meta-Hook-Test': 'hook-a',
+                    'X-Object-Sysmeta-S3Api-Checksum-Upload-Id': 'upload-a',
+                    'X-Object-Sysmeta-S3Api-Checksum-Value': 'checksum-a'}
+        self.app.register(
+            'HEAD', '/v1/AUTH_test/checktest/a_1', swob.HTTPOk,
+            dict(headers1), None)
+        headers2 = {'Content-Length': '2', 'Etag': 'b',
+                    'Content-Type': 'text/html; charset=UTF-8',
+                    'X-Object-Meta-Hook-Test': 'hook-b',
+                    'X-Object-Sysmeta-S3Api-Checksum-Upload-Id': 'upload-b',
+                    'X-Object-Sysmeta-S3Api-Checksum-Value': 'checksum-b'}
+        self.app.register(
+            'HEAD', '/v1/AUTH_test/checktest/b_2', swob.HTTPOk,
+            dict(headers2), None)
+        captured_manifest = []
+
+        def get_manifest(manifest):
+            """
+            Capture the manifest with its validation-only
+            segment HEAD headers.
+            """
+            captured_manifest.extend(
+                dict(item) if item is not None else None
+                for item in manifest)
+
+        manifest = json.dumps([
+            {'path': '/checktest/b_2'},
+            {'data': 'WA=='},
+            {'path': '/checktest/a_1'},
+            {'path': '/checktest/b_2'},
+        ])
+        req = Request.blank(
+            '/v1/AUTH_test/checktest/man_3?multipart-manifest=put',
+            environ={
+                'REQUEST_METHOD': 'PUT',
+                'swift.callback.slo_manifest_hook': get_manifest,
+            }, body=manifest)
+
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual(('201 Created', b''), (status, body))
+        self.assertEqual([{
+            'bytes': 2,
+            'content_type': 'text/html',
+            'last_modified': mock.ANY,
+            'hash': 'b',
+            'name': '/checktest/b_2',
+            'headers': headers2,
+        }, {
+            'data': 'WA==',
+        }, {
+            'bytes': 1,
+            'content_type': 'text/html',
+            'last_modified': mock.ANY,
+            'hash': 'a',
+            'name': '/checktest/a_1',
+            'headers': headers1,
+        }, {
+            'bytes': 2,
+            'content_type': 'text/html',
+            'last_modified': mock.ANY,
+            'hash': 'b',
+            'name': '/checktest/b_2',
+            'headers': headers2,
+        }], captured_manifest)
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/checktest/a_1'),
+            ('HEAD', '/v1/AUTH_test/checktest/b_2'),
+        ], sorted(self.app.calls[:-1]))
+        self.assertEqual(
+            ('PUT', '/v1/AUTH_test/checktest/man_3?multipart-manifest=put'),
+            self.app.calls[-1])
+
+        req = Request.blank(
+            '/v1/AUTH_test/checktest/man_3?multipart-manifest=get',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_app(req)
+        stored_manifest = json.loads(body)
+        self.assertFalse(any(
+            'headers' in item for item in stored_manifest))
+
+    def test_handle_multipart_put_without_callback_skips_head_headers(self):
+        manifest = json.dumps([
+            {'path': '/checktest/a_1'},
+            {'path': '/checktest/b_2'},
+        ])
+        req = Request.blank(
+            '/v1/AUTH_test/checktest/man_3?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'PUT'}, body=manifest)
+
+        with mock.patch.object(slo, 'HeaderKeyDict') as mock_header_key_dict:
+            status, headers, body = self.call_slo(req)
+
+        self.assertEqual(('201 Created', b''), (status, body))
+        mock_header_key_dict.assert_not_called()
+
+        req = Request.blank(
+            '/v1/AUTH_test/checktest/man_3?multipart-manifest=get',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_app(req)
+        stored_manifest = json.loads(body)
+        self.assertFalse(any(
+            'headers' in item for item in stored_manifest))
+
+    def test_handle_multipart_put_callback_header_changes_are_isolated(self):
+        callback_etags = []
+
+        def update_first_segment_headers(manifest):
+            """Update one segment's validation headers."""
+            manifest[0]['headers']['Etag'] = 'updated'
+            callback_etags.extend(
+                segment['headers']['Etag'] for segment in manifest)
+
+        manifest = json.dumps([
+            {'path': '/checktest/b_2', 'range': '0-0'},
+            {'path': '/checktest/b_2', 'range': '1-1'},
+        ])
+        req = Request.blank(
+            '/v1/AUTH_test/checktest/man_3?multipart-manifest=put',
+            environ={
+                'REQUEST_METHOD': 'PUT',
+                'swift.callback.slo_manifest_hook':
+                    update_first_segment_headers,
+            }, body=manifest)
+
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual(('201 Created', b''), (status, body))
+        self.assertEqual(['updated', 'b'], callback_etags)
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/checktest/b_2'),
+            ('PUT',
+             '/v1/AUTH_test/checktest/man_3?multipart-manifest=put'),
+        ], self.app.calls)
+
+    def test_handle_multipart_put_callback_keeps_none_for_failed_head(self):
+        self.app.register(
+            'HEAD', '/v1/AUTH_test/checktest/badreq', swob.HTTPBadRequest,
+            {'X-Object-Meta-Failure': 'failed-head'}, None)
+        captured_manifest = []
+
+        def get_manifest(manifest):
+            """Capture successful and failed manifest validation entries."""
+            captured_manifest.extend(
+                dict(item) if item is not None else None
+                for item in manifest)
+
+        manifest = json.dumps([
+            {'path': '/checktest/badreq'},
+            {'path': '/checktest/a_1'},
+        ])
+        req = Request.blank(
+            '/v1/AUTH_test/checktest/man_3?multipart-manifest=put',
+            environ={
+                'REQUEST_METHOD': 'PUT',
+                'swift.callback.slo_manifest_hook': get_manifest,
+            }, body=manifest)
+
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('400 Bad Request', status)
+        self.assertIsNone(captured_manifest[0])
+        self.assertEqual('/checktest/a_1', captured_manifest[1]['name'])
+        self.assertEqual('a', captured_manifest[1]['headers']['etag'])
+        self.assertEqual(2, self.app.call_count)
+
     def test_handle_multipart_put_with_manipulator_callback(self):
         def data_inserter(manifest):
+            """Insert inline data before, between, and after the segments."""
             for i in range(len(manifest), -1, -1):
                 manifest.insert(i, {'data': 'WA=='})
 
@@ -1014,6 +1185,7 @@ class TestSloPutManifest(SloTestCase):
 
     def test_handle_multipart_put_with_validator_callback(self):
         def complainer(manifest):
+            """Return a validation problem for every manifest segment."""
             return [(item['name'], "Don't wanna") for item in manifest]
 
         good_data = json.dumps([
