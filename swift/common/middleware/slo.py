@@ -1379,12 +1379,12 @@ class StaticLargeObject(object):
             out_content_type = 'text/plain'  # Ignore invalid header
         if not out_content_type:
             out_content_type = 'text/plain'
-        data_for_storage = [None] * len(parsed_data)
+        segments_data = [None] * len(parsed_data)
         total_size = 0
         path2indices = defaultdict(list)
         for index, seg_dict in enumerate(parsed_data):
             if 'data' in seg_dict:
-                data_for_storage[index] = seg_dict
+                segments_data[index] = seg_dict
                 total_size += len(base64.b64decode(seg_dict['data']))
             else:
                 path2indices[seg_dict['path']].append(index)
@@ -1400,6 +1400,8 @@ class StaticLargeObject(object):
                 headers={'x-auth-token': req.headers.get('x-auth-token')},
                 agent='%(orig)s SLO MultipartPUT', swift_source='SLO')
             return obj_name, sub_req.get_response(self)
+
+        hook = req.environ.get('swift.callback.slo_manifest_hook')
 
         def validate_seg_dict(seg_dict, head_seg_resp, allow_empty_segment):
             obj_name = seg_dict['path']
@@ -1465,8 +1467,10 @@ class StaticLargeObject(object):
                 'bytes': head_seg_resp.content_length,
                 'hash': head_seg_resp.etag,
                 'content_type': head_seg_resp.content_type,
-                'last_modified': last_modified_formatted
+                'last_modified': last_modified_formatted,
             }
+            if hook:
+                seg_data['headers'] = HeaderKeyDict(head_seg_resp.headers)
             if seg_dict.get('range'):
                 seg_data['range'] = seg_dict['range']
             if config_true_value(
@@ -1506,15 +1510,21 @@ class StaticLargeObject(object):
                         segment_length, seg_data = validate_seg_dict(
                             parsed_data[i], resp,
                             allow_empty_segment=(i == len(parsed_data) - 1))
-                        data_for_storage[i] = seg_data
+                        segments_data[i] = seg_data
                         total_size += segment_length
 
-            # Middleware left of SLO can add a callback to the WSGI
-            # environment to perform additional validation and/or
-            # manipulation on the manifest that will be written.
-            hook = req.environ.get('swift.callback.slo_manifest_hook')
+            # Middleware left of SLO can add a manifest validation callback to
+            # the WSGI environment. The callback will be passed a list. Each
+            # item in the list is either a dict of segment data, or None for a
+            # segment whose HEAD request failed. The callback may further
+            # validate and/or manipulate segment data. Segment data dicts for
+            # object-backed segments also include the key 'headers', whose
+            # value is a dict of HEAD response headers for the segment. The
+            # 'headers' key is popped from the segment data dict once the
+            # callback returns. Segment data dicts for inline data segments do
+            # not include the 'headers' key.
             if hook:
-                more_problems = hook(data_for_storage)
+                more_problems = hook(segments_data)
                 if more_problems:
                     problem_segments.extend(more_problems)
 
@@ -1534,8 +1544,12 @@ class StaticLargeObject(object):
                     out_content_type, resp_dict, problem_segments, 'upload')
                 return
 
+            # We only reach here if all seg_data are valid dicts.
             slo_etag = md5(usedforsecurity=False)
-            for seg_data in data_for_storage:
+            for seg_data in segments_data:
+                # HEAD response headers are for validation only; they carry
+                # backend sysmeta and must never reach the stored manifest.
+                seg_data.pop('headers', None)
                 if 'data' in seg_data:
                     raw_data = base64.b64decode(seg_data['data'])
                     r = md5(raw_data, usedforsecurity=False).hexdigest()
@@ -1565,7 +1579,7 @@ class StaticLargeObject(object):
                         yield chunk
                 return
 
-            json_data = json.dumps(data_for_storage).encode('utf-8')
+            json_data = json.dumps(segments_data).encode('utf-8')
             req.body = json_data
             req.headers.update({
                 SYSMETA_SLO_ETAG: slo_etag,
