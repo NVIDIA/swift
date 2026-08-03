@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from shutil import rmtree
 from urllib.parse import unquote
 from swift.common import utils
+from swift.common import concurrency
 from swift.common.exceptions import DiskFileError, DiskFileQuarantined
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import dump_recon_cache, md5, Timestamp, mkdirs
@@ -1588,13 +1589,48 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         self.assertEqual(1, len(warning_msgs))
         self.assertIn('no handoffs remaining', warning_msgs[0])
 
-        # need one more pass to cleanup the part dir
-        self.assertTrue(os.path.exists(self.parts_1['2']))
-        with mock.patch('swift.obj.reconstructor.ssync_sender',
-                        self._make_fake_ssync([])), \
-                mocked_http_conn() as request_log:
-            self.reconstructor.reconstruct()
         self.assertFalse(os.path.exists(self.parts_1['2']))
+
+    def test_rsync_revert_uses_ssync_for_mixed_primary_partition(self):
+        # sda1 is primary for fragment index 1 in part 0, but also has a
+        # fragment index 2 that must be reverted. It must not fork-lift the
+        # suffix since that would remove the local primary fragment.
+        self.reconstructor.prefer_rsync_reverts = True
+        jobs = self.reconstructor._get_part_jobs(
+            self.ec_local_dev, self.parts_1['0'], 0, self.ec_policy)
+        revert_job = next(job for job in jobs
+                          if job['job_type'] == REVERT and
+                          job['frag_index'] == 2)
+        self.assertEqual(1, revert_job['primary_frag_index'])
+
+        captured_ssync = []
+        with mock.patch('swift.obj.reconstructor.ssync_sender',
+                        self._make_fake_ssync(captured_ssync)), \
+                mock.patch('swift.obj.reconstructor.subprocess.Popen') \
+                as mock_popen:
+            self.reconstructor._revert(revert_job, time.time())
+
+        self.assertEqual(1, len(captured_ssync))
+        self.assertEqual(revert_job, captured_ssync[0]['job'])
+        mock_popen.assert_not_called()
+
+    def test_rsync_revert_ignores_object_limit(self):
+        reconstructor = object_reconstructor.ObjectReconstructor(
+            dict(self.conf, prefer_rsync_reverts='yes',
+                 max_objects_per_revert=1), logger=self.logger)
+        jobs = reconstructor._get_part_jobs(
+            self.ec_local_dev, self.parts_1['2'], 2, self.ec_policy)
+        revert_job = next(job for job in jobs if job['frag_index'] == 2)
+        self.assertIsNone(revert_job['primary_frag_index'])
+
+        sync_method, cleanup_method = reconstructor._dispatch_revert(
+            revert_job)
+
+        self.assertEqual('_rsync_revert', sync_method.__name__)
+        self.assertEqual('_delete_reverted_suffixes', cleanup_method.__name__)
+        self.assertIn(
+            'max_objects_per_revert does not limit rsync reverts',
+            self.logger.get_lines_for_level('warning')[-1])
 
     def test_get_part_jobs(self):
         # yeah, this test code expects a specific setup
@@ -1697,7 +1733,9 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             c['suffixes'],
             c.get('include_non_durable')
         ) for c in ssync_calls))
-        self.assertTrue(os.access(part_path, os.F_OK))
+        # Reverts transferred and purged every fragment, so this patch's
+        # empty-partition cleanup removes the now-empty handoff directory.
+        self.assertFalse(os.path.exists(part_path))
 
     def test_process_job_all_success(self):
         rehash_per_job_type = {SYNC: 1, REVERT: 0}
@@ -3846,6 +3884,11 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         self.assertEqual(sorted(job['hashes']), sorted(stub_hashes))
         self.assertEqual(job['local_dev'], self.local_dev)
 
+        with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
+                        return_value=(0, {})):
+            self.assertEqual(
+                [], self.reconstructor.build_reconstruction_jobs(part_info))
+
     def test_build_jobs_mixed(self):
         ring = self.policy.object_ring = self.fabricated_ring
         # find a partition for which we're a primary
@@ -3935,6 +3978,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
             '123': {None: 'hash'},
             'abc': {None: 'hash'},
         }
+        self.reconstructor.prefer_rsync_reverts = True
         with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
                         return_value=(0, stub_hashes)):
             jobs = self.reconstructor.build_reconstruction_jobs(part_info)
@@ -3943,7 +3987,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         expected = {
             'job_type': object_reconstructor.REVERT,
             'frag_index': None,
-            'suffixes': list(stub_hashes.keys()),
+            'suffixes': set(stub_hashes),
             'partition': partition,
             'path': part_path,
             'hashes': stub_hashes,
@@ -3957,6 +4001,9 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
              self.policy.ec_duplication_factor) -
             self.policy.ec_ndata + 1)
         self.assertEqual(len(job['sync_to']), expected_samples)
+        sync_method, cleanup_method = self.reconstructor._dispatch_revert(job)
+        self.assertEqual('_rsync_revert', sync_method.__name__)
+        self.assertEqual('_delete_reverted_suffixes', cleanup_method.__name__)
         for k, v in expected.items():
             msg = 'expected %s != %s for %s' % (
                 v, job[k], k)
@@ -4842,6 +4889,466 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
 
         self.assertEqual(self.reconstructor.handoffs_remaining, 0)
 
+    def _do_test_process_job_rsync_revert(
+            self, return_codes, replicate_responses=None):
+        partition = 0
+        frag_index = 2
+        part_nodes = self.policy.object_ring.get_part_nodes(partition)
+        handoff_node = list(
+            self.policy.object_ring.get_more_nodes(partition))[-1]
+        sync_to = [
+            dict(part_nodes[frag_index +
+                            i * self.policy.ec_n_unique_fragments])
+            for i in range(self.policy.ec_duplication_factor)]
+        part_path = os.path.join(self.devices, self.local_dev['device'],
+                                 diskfile.get_data_dir(self.policy),
+                                 str(partition))
+        suffix = 'abc'
+        os.makedirs(os.path.join(part_path, suffix))
+        job = {
+            'job_type': object_reconstructor.REVERT,
+            'frag_index': frag_index,
+            'primary_frag_index': None,
+            'suffixes': [suffix],
+            'sync_to': sync_to,
+            'partition': partition,
+            'path': part_path,
+            'hashes': {},
+            'policy': self.policy,
+            'local_dev': handoff_node,
+            'device': self.local_dev['device'],
+        }
+
+        def make_proc(return_code):
+            proc = mock.Mock()
+            proc.stdout.read.return_value = b''
+            proc.wait.return_value = return_code
+            return proc
+
+        success_count = return_codes.count(0)
+        replicate_responses = replicate_responses or [200] * success_count
+        with mock.patch('swift.obj.reconstructor.subprocess.Popen',
+                        side_effect=[make_proc(code)
+                                     for code in return_codes]), \
+                mocked_http_conn(*replicate_responses) as request_log:
+            self.reconstructor.prefer_rsync_reverts = True
+            self.reconstructor.process_job(job)
+        self.assertFalse(request_log.unexpected_requests)
+        return os.path.join(part_path, suffix)
+
+    def test_process_job_rsync_revert_cleanup(self):
+        suffix_path = self._do_test_process_job_rsync_revert(
+            [0] * self.policy.ec_duplication_factor)
+        self.assertFalse(os.path.exists(suffix_path))
+        self.assertFalse(os.path.exists(os.path.dirname(suffix_path)))
+        self.assertEqual(0, self.reconstructor.handoffs_remaining)
+
+    def test_process_job_rsync_revert_leaves_concurrent_partition_entry(self):
+        original_rmdir = os.rmdir
+        partition_path = os.path.join(
+            self.devices, self.local_dev['device'],
+            diskfile.get_data_dir(self.policy), '0')
+        partition_paths = []
+
+        def concurrent_rmdir(path, *args, **kwargs):
+            if path == partition_path and not partition_paths:
+                partition_paths.append(path)
+                os.makedirs(os.path.join(path, 'def'))
+            return original_rmdir(path, *args, **kwargs)
+
+        with mock.patch('swift.obj.reconstructor.os.rmdir',
+                        side_effect=concurrent_rmdir):
+            self._do_test_process_job_rsync_revert(
+                [0] * self.policy.ec_duplication_factor)
+
+        self.assertEqual([partition_path], partition_paths)
+        self.assertTrue(os.path.isdir(os.path.join(partition_path, 'def')))
+        self.assertEqual(0, self.reconstructor.handoffs_remaining)
+
+    def test_process_job_rsync_revert_invalidates_cached_suffix_hash(self):
+        partition = 2
+        frag_index = 2
+        df_mgr = self.reconstructor._df_router[self.policy]
+        part_path = os.path.join(
+            self.devices, self.local_dev['device'],
+            diskfile.get_data_dir(self.policy), str(partition))
+        os.makedirs(part_path)
+        df = df_mgr.get_diskfile(
+            self.local_dev['device'], partition, 'a', 'c',
+            'hash-invalidation', policy=self.policy)
+        timestamp = self.ts()
+        test_data = b'test data'
+        with df.create() as writer:
+            writer.write(test_data)
+            writer.put({
+                'X-Timestamp': timestamp.internal,
+                'Content-Length': len(test_data),
+                'Etag': md5(test_data, usedforsecurity=False).hexdigest(),
+                'X-Object-Sysmeta-Ec-Frag-Index': frag_index,
+            })
+            writer.commit(timestamp)
+        suffix = os.path.basename(os.path.dirname(df._datadir))
+        cached_hashes = df_mgr.get_hashes(
+            self.local_dev['device'], partition, [], self.policy)
+        self.assertIn(suffix, cached_hashes)
+
+        part_nodes = self.policy.object_ring.get_part_nodes(partition)
+        handoff_node = list(
+            self.policy.object_ring.get_more_nodes(partition))[-1]
+        sync_to = [
+            dict(part_nodes[frag_index +
+                            i * self.policy.ec_n_unique_fragments])
+            for i in range(self.policy.ec_duplication_factor)]
+        job = {
+            'job_type': object_reconstructor.REVERT,
+            'frag_index': frag_index,
+            'primary_frag_index': None,
+            'suffixes': [suffix],
+            'sync_to': sync_to,
+            'partition': partition,
+            'path': part_path,
+            'hashes': {},
+            'policy': self.policy,
+            'local_dev': handoff_node,
+            'device': self.local_dev['device'],
+        }
+        proc = mock.Mock()
+        proc.stdout.read.return_value = b''
+        proc.wait.return_value = 0
+        with mock.patch('swift.obj.reconstructor.subprocess.Popen',
+                        side_effect=[proc] * len(sync_to)), \
+                mocked_http_conn(*([200] * len(sync_to))) as request_log:
+            self.reconstructor.prefer_rsync_reverts = True
+            self.reconstructor.process_job(job)
+
+        self.assertFalse(request_log.unexpected_requests)
+        self.assertFalse(os.path.exists(os.path.join(part_path, suffix)))
+        hashes_after_cleanup = df_mgr.get_hashes(
+            self.local_dev['device'], partition, [], self.policy)
+        self.assertNotIn(suffix, hashes_after_cleanup)
+
+    def test_delete_reverted_suffixes_invalidates_before_removing(self):
+        df_mgr = self.reconstructor._df_router[self.policy]
+        part_path = os.path.join(
+            self.devices, self.local_dev['device'],
+            diskfile.get_data_dir(self.policy), '2')
+        suffix = 'abc'
+        suffix_path = os.path.join(part_path, suffix)
+        os.makedirs(suffix_path)
+        job = {
+            'path': part_path,
+            'policy': self.policy,
+        }
+
+        def lock_timeout(*args):
+            raise object_reconstructor.LockTimeout(None, part_path)
+
+        with mock.patch.object(
+                df_mgr, 'invalidate_hash',
+                side_effect=lock_timeout):
+            self.assertFalse(
+                self.reconstructor._delete_reverted_suffixes(job, [suffix]))
+
+        self.assertTrue(os.path.isdir(suffix_path))
+
+    def test_process_job_rsync_revert_cleans_empty_suffix_on_failure(self):
+        suffix_path = self._do_test_process_job_rsync_revert(
+            ([0] * (self.policy.ec_duplication_factor - 1)) + [1])
+        self.assertFalse(os.path.exists(suffix_path))
+        self.assertEqual(1, self.reconstructor.handoffs_remaining)
+
+    def test_process_job_rsync_revert_cleans_empty_suffix_on_cleanup_error(
+            self):
+        with mock.patch('swift.obj.reconstructor.shutil.rmtree',
+                        side_effect=OSError('injected cleanup failure')):
+            suffix_path = self._do_test_process_job_rsync_revert(
+                [0] * self.policy.ec_duplication_factor)
+
+        self.assertFalse(os.path.exists(suffix_path))
+        self.assertEqual(1, self.reconstructor.handoffs_remaining)
+        self.assertTrue(any(
+            'Unable to remove reverted suffix' in line
+            for line in self.logger.get_lines_for_level('error')))
+
+    def test_rsync_revert_transfers_all_suffixes_in_one_job(self):
+        ring = self.policy.object_ring = self.fabricated_ring
+        for partition in range(2 ** ring.part_power):
+            part_nodes = ring.get_part_nodes(partition)
+            if self.local_dev['id'] not in [node['id'] for node in part_nodes]:
+                break
+        else:
+            self.fail('the fabricated ring has no handoff partition')
+
+        part_path = os.path.join(
+            self.devices, self.local_dev['device'],
+            diskfile.get_data_dir(self.policy), str(partition))
+        suffix_paths = [
+            os.path.join(part_path, suffix)
+            for suffix in ('abc', 'def', 'fed', 'ghi')]
+        for suffix_path in suffix_paths:
+            os.makedirs(suffix_path)
+        hashes = {
+            'abc': {0: 'hash-0', None: 'durable'},
+            'def': {1: 'hash-1', None: 'durable'},
+            'fed': {None: 'tombstone'},
+            'ghi': {1: 'hash-1', None: 'durable'},
+        }
+        self.reconstructor.prefer_rsync_reverts = True
+        with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
+                        return_value=(0, hashes)):
+            jobs = self.reconstructor.build_reconstruction_jobs({
+                'local_dev': self.local_dev,
+                'part_path': part_path,
+                'partition': partition,
+                'policy': self.policy,
+            })
+
+        self.assertEqual(1, len(jobs))
+        self.assertEqual(1, jobs[0]['frag_index'])
+        self.assertEqual(
+            {'abc', 'def', 'fed', 'ghi'}, jobs[0]['suffixes'])
+        self.assertEqual(self.policy.ec_duplication_factor,
+                         len(jobs[0]['sync_to']))
+        proc = mock.Mock()
+        proc.stdout.read.return_value = b''
+        proc.wait.return_value = 0
+        with mock.patch('swift.obj.reconstructor.subprocess.Popen',
+                        return_value=proc) as mock_popen, \
+                mocked_http_conn(
+                    *([200] * self.policy.ec_duplication_factor)) \
+                as request_log:
+            self.reconstructor.process_job(jobs[0])
+
+        self.assertFalse(request_log.unexpected_requests)
+        self.assertEqual(self.policy.ec_duplication_factor,
+                         mock_popen.call_count)
+        for suffix_path in suffix_paths:
+            self.assertFalse(os.path.exists(suffix_path))
+        self.assertEqual(0, self.reconstructor.handoffs_remaining)
+
+    def test_revert_uses_tombstone_targets_for_bad_fragment_index(self):
+        ring = self.policy.object_ring = self.fabricated_ring
+        for partition in range(2 ** ring.part_power):
+            part_nodes = ring.get_part_nodes(partition)
+            if self.local_dev['id'] not in [node['id'] for node in part_nodes]:
+                break
+        else:
+            self.fail('the fabricated ring has no handoff partition')
+
+        part_path = os.path.join(
+            self.devices, self.local_dev['device'],
+            diskfile.get_data_dir(self.policy), str(partition))
+        bad_fi = len(part_nodes)
+        hashes = {
+            'abc': {0: 'hash-0'},
+            'def': {bad_fi: 'bad-hash'},
+            'ghi': {bad_fi: 'bad-hash'},
+        }
+        expected_targets = (
+            (self.policy.ec_n_unique_fragments *
+             self.policy.ec_duplication_factor) - self.policy.ec_ndata + 1)
+
+        self.reconstructor.prefer_rsync_reverts = True
+        with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
+                        return_value=(0, hashes)):
+            jobs = self.reconstructor.build_reconstruction_jobs({
+                'local_dev': self.local_dev,
+                'part_path': part_path,
+                'partition': partition,
+                'policy': self.policy,
+            })
+        self.assertEqual(1, len(jobs))
+        self.assertEqual(bad_fi, jobs[0]['frag_index'])
+        self.assertEqual({'abc', 'def', 'ghi'}, jobs[0]['suffixes'])
+        self.assertEqual(expected_targets, len(jobs[0]['sync_to']))
+
+        self.reconstructor.prefer_rsync_reverts = False
+        with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
+                        return_value=(0, hashes)):
+            jobs = self.reconstructor.build_reconstruction_jobs({
+                'local_dev': self.local_dev,
+                'part_path': part_path,
+                'partition': partition,
+                'policy': self.policy,
+            })
+        bad_job = next(job for job in jobs if job['frag_index'] == bad_fi)
+        self.assertEqual(['def', 'ghi'], bad_job['suffixes'])
+        self.assertEqual(expected_targets, len(bad_job['sync_to']))
+
+    def test_revert_uses_tombstone_targets_for_negative_fragment_index(self):
+        ring = self.policy.object_ring = self.fabricated_ring
+        for partition in range(2 ** ring.part_power):
+            part_nodes = ring.get_part_nodes(partition)
+            if self.local_dev['id'] not in [node['id'] for node in part_nodes]:
+                break
+        else:
+            self.fail('the fabricated ring has no handoff partition')
+
+        part_path = os.path.join(
+            self.devices, self.local_dev['device'],
+            diskfile.get_data_dir(self.policy), str(partition))
+        hashes = {'abc': {-1: 'bad-hash'}}
+        self.reconstructor.prefer_rsync_reverts = True
+        with mock.patch('swift.obj.diskfile.ECDiskFileManager._get_hashes',
+                        return_value=(0, hashes)):
+            jobs = self.reconstructor.build_reconstruction_jobs({
+                'local_dev': self.local_dev,
+                'part_path': part_path,
+                'partition': partition,
+                'policy': self.policy,
+            })
+
+        expected_targets = (
+            (self.policy.ec_n_unique_fragments *
+             self.policy.ec_duplication_factor) - self.policy.ec_ndata + 1)
+        self.assertEqual(1, len(jobs))
+        self.assertEqual(-1, jobs[0]['frag_index'])
+        self.assertEqual(expected_targets, len(jobs[0]['sync_to']))
+
+    def test_rsync_revert_command_transfers_suffixes_cross_region(self):
+        job = {
+            'local_dev': dict(self.local_dev, region=1),
+            'partition': 37,
+            'path': '/srv/node/sda1/objects/37',
+            'policy': self.policy,
+        }
+        node = {
+            'device': 'sdb1',
+            'region': 2,
+            'replication_ip': '192.0.2.37',
+        }
+        self.reconstructor.rsync_compress = True
+        self.reconstructor.rsync_io_timeout = '17'
+        self.reconstructor.rsync_bwlimit = '42'
+        self.reconstructor.rsync_module = '{replication_ip}::object_{region}'
+        proc = mock.Mock()
+        proc.stdout.read.return_value = b''
+        proc.wait.return_value = 0
+        with mock.patch('swift.obj.reconstructor.subprocess.Popen',
+                        return_value=proc) as mock_popen:
+            self.assertTrue(self.reconstructor.rsync(
+                node, job, ['abc', 'def']))
+
+        self.assertEqual([
+            'rsync', '--recursive', '--whole-file', '--human-readable',
+            '--xattrs', '--itemize-changes', '--ignore-existing',
+            '--timeout=17',
+            '--contimeout=17', '--bwlimit=42',
+            '--exclude=.*.[0-9a-zA-Z][0-9a-zA-Z][0-9a-zA-Z]'
+            '[0-9a-zA-Z][0-9a-zA-Z][0-9a-zA-Z]', '--compress',
+            '/srv/node/sda1/objects/37/abc',
+            '/srv/node/sda1/objects/37/def',
+            '192.0.2.37::object_2/sdb1/%s/37' %
+            diskfile.get_data_dir(self.policy),
+        ], mock_popen.call_args[0][0])
+
+    def test_rsync_revert_command_does_not_compress_same_region(self):
+        job = {
+            'local_dev': dict(self.local_dev, region=1),
+            'partition': 37,
+            'path': '/srv/node/sda1/objects/37',
+            'policy': self.policy,
+        }
+        node = {
+            'device': 'sdb1',
+            'region': 1,
+            'replication_ip': '192.0.2.37',
+        }
+        self.reconstructor.rsync_compress = True
+        proc = mock.Mock()
+        proc.stdout.read.return_value = b''
+        proc.wait.return_value = 0
+        with mock.patch('swift.obj.reconstructor.subprocess.Popen',
+                        return_value=proc) as mock_popen:
+            self.assertTrue(self.reconstructor.rsync(node, job, ['abc']))
+
+        self.assertNotIn('--compress', mock_popen.call_args[0][0])
+
+    def test_rsync_revert_logs_rsync_failure_output(self):
+        proc = mock.Mock()
+        proc.stdout.read.return_value = b'\n'.join([
+            b'<f+++++++++ abc/hash/data',
+            b'rsync: connection refused',
+        ])
+        proc.wait.return_value = 1
+        with mock.patch('swift.obj.reconstructor.subprocess.Popen',
+                        return_value=proc):
+            self.assertEqual(1, self.reconstructor._rsync(['rsync']))
+
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertIn('<f+++++++++ abc/hash/data', error_lines)
+        self.assertIn('rsync: connection refused', error_lines)
+        self.assertIn("Bad rsync return code: 1 <- ['rsync']",
+                      error_lines)
+
+    def test_rsync_revert_honors_log_rsync_transfers(self):
+        proc = mock.Mock()
+        proc.stdout.read.return_value = b'\n'.join([
+            b'cd+++++++++ abc',
+            b'<f+++++++++ abc/hash/data',
+            b'rsync: connection refused',
+        ])
+        proc.wait.return_value = 1
+        self.reconstructor.log_rsync_transfers = False
+        with mock.patch('swift.obj.reconstructor.subprocess.Popen',
+                        return_value=proc):
+            self.assertEqual(1, self.reconstructor._rsync(['rsync']))
+
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertNotIn('<f+++++++++ abc/hash/data', error_lines)
+        self.assertNotIn('cd+++++++++ abc', error_lines)
+        self.assertIn('rsync: connection refused', error_lines)
+
+    def test_rsync_revert_timeout_kills_and_reaps_child(self):
+        proc = mock.Mock()
+        proc.stdout.read.side_effect = Timeout()
+        proc.wait.return_value = 137
+        with mock.patch('swift.obj.reconstructor.subprocess.Popen',
+                        return_value=proc):
+            self.assertEqual(1, self.reconstructor._rsync(['rsync']))
+
+        proc.kill.assert_called_once_with()
+        proc.wait.assert_called_once_with(timeout=1.0)
+
+    def test_rsync_revert_timeout_reaps_wedged_child_asynchronously(self):
+        proc = mock.Mock()
+        proc.stdout.read.side_effect = Timeout()
+        proc.wait.side_effect = object_reconstructor.subprocess.TimeoutExpired(
+            'rsync', 1.0)
+        with mock.patch('swift.obj.reconstructor.subprocess.Popen',
+                        return_value=proc), \
+                mock.patch('swift.obj.reconstructor.spawn') as mock_spawn:
+            self.assertEqual(1, self.reconstructor._rsync(['rsync']))
+
+        proc.kill.assert_called_once_with()
+        proc.wait.assert_called_once_with(timeout=1.0)
+        mock_spawn.assert_called_once_with(proc.wait)
+
+    def test_rsync_revert_uses_green_subprocess(self):
+        self.assertIs(concurrency.subprocess,
+                      object_reconstructor.subprocess)
+
+    def test_process_job_rsync_revert_cleans_empty_suffix_on_replicate_error(
+            self):
+        responses = [Timeout() if index % 2 == 0 else Exception('boom')
+                     for index in range(self.policy.ec_duplication_factor)]
+        suffix_path = self._do_test_process_job_rsync_revert(
+            [0] * self.policy.ec_duplication_factor, responses)
+        self.assertFalse(os.path.exists(suffix_path))
+        self.assertEqual(1, self.reconstructor.handoffs_remaining)
+
+    def test_process_job_rsync_revert_cleans_empty_suffix_on_507_response(
+            self):
+        suffix_path = self._do_test_process_job_rsync_revert(
+            [0] * self.policy.ec_duplication_factor,
+            [507] * self.policy.ec_duplication_factor)
+
+        self.assertFalse(os.path.exists(suffix_path))
+        self.assertEqual(1, self.reconstructor.handoffs_remaining)
+        self.assertTrue(any(
+            'Invalid REPLICATE response 507' in line
+            for line in self.logger.get_lines_for_level('error')))
+
     def test_process_job_revert_cleanup_but_already_reclaimed(self):
         frag_index = random.randint(
             0, self.policy.ec_n_unique_fragments - 1)
@@ -5126,8 +5633,8 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
                                response_callback=ssync_response_callback):
             self.reconstructor.process_job(job)
 
-        # hashpath is still there, but it's empty
-        self.assertEqual([], os.listdir(df._datadir))
+        self.assertFalse(os.path.exists(df._datadir))
+        self.assertFalse(os.path.exists(part_path))
 
     def test_get_local_devices(self):
         local_devs = self.reconstructor.get_local_devices()
