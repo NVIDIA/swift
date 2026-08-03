@@ -537,6 +537,57 @@ max_objects_per_revert       0                         By default the reconstruc
                                                        primary partitions. A
                                                        value of 0 (the default)
                                                        means there is no limit.
+prefer_rsync_reverts         no                        Use rsync instead of SSYNC to
+                                                       revert a complete suffix from a
+                                                       pure handoff partition. The
+                                                       destination node reconstructs any
+                                                       fragment index that is not
+                                                       primary there. A revert from a
+                                                       partition with a local primary
+                                                       fragment always uses SSYNC.
+                                                       max_objects_per_revert does not
+                                                       limit rsync reverts. Rsync
+                                                       cleanup removes the complete
+                                                       source suffix after the transfer,
+                                                       so it can conflict with a
+                                                       concurrent client update.
+rsync_timeout                900                       Max duration of a revert rsync.
+                                                       Only used when
+                                                       prefer_rsync_reverts is enabled.
+rsync_io_timeout             30                        Timeout value sent to rsync
+                                                       --timeout and --contimeout
+                                                       options. Only used when
+                                                       prefer_rsync_reverts is enabled.
+rsync_bwlimit                0                         Bandwidth limit for rsync in kB/s.
+                                                       0 means unlimited. Only used when
+                                                       prefer_rsync_reverts is enabled.
+rsync_compress               no                        Allow rsync to compress the data
+                                                       that it sends to the destination
+                                                       node. Compression applies only
+                                                       when the destination node is in a
+                                                       different region than the local
+                                                       one. Only used when
+                                                       prefer_rsync_reverts is enabled.
+rsync_module                 {replication_ip}::object  Format of the rsync module where
+                                                       the reconstructor will send data.
+                                                       The configuration value can
+                                                       include some variables that will
+                                                       be extracted from the ring.
+                                                       Variables must follow the format
+                                                       {NAME} where NAME is one of: ip,
+                                                       port, replication_ip,
+                                                       replication_port, region, zone,
+                                                       device, meta. See
+                                                       etc/rsyncd.conf-sample for some
+                                                       examples. Only used when
+                                                       prefer_rsync_reverts is enabled.
+log_rsync_transfers          yes                       Log one itemized record for each
+                                                       file that an rsync revert
+                                                       transfers. The reconstructor does
+                                                       not log directory changes. It
+                                                       always logs rsync output that is
+                                                       not a transfer record. Set this
+                                                       to no to omit the file records.
 node_timeout                 DEFAULT or 10             Request timeout to external
                                                        services. The value used is the value
                                                        set in this section, or the value set
