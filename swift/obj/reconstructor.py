@@ -24,7 +24,8 @@ from collections import defaultdict
 import shutil
 
 from swift.common.concurrency import (
-    GreenPile, GreenPool, Timeout, sleep, tpool, spawn, GreenletExit
+    GreenPile, GreenPool, Timeout, sleep, tpool, spawn, GreenletExit,
+    subprocess
 )
 
 from swift.common.utils import (
@@ -33,7 +34,7 @@ from swift.common.utils import (
     GreenAsyncPile, Timestamp, remove_file, node_to_string,
     load_recon_cache, parse_override_options, distribute_evenly,
     remove_directory, config_request_node_count_value,
-    non_negative_int, get_prefixed_logger)
+    non_negative_int, get_prefixed_logger, rsync_module_interpolation)
 from swift.common.utils.pickle import unpickle
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.bufferedhttp import http_connect
@@ -41,13 +42,14 @@ from swift.common.daemon import Daemon, run_daemon
 from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 from swift.common.ring.utils import is_local_device
 from swift.obj.ssync_sender import Sender as ssync_sender
+from swift.obj.replicator import DEFAULT_RSYNC_TIMEOUT
 from swift.common.http import HTTP_OK, HTTP_NOT_FOUND, \
     HTTP_INSUFFICIENT_STORAGE
 from swift.obj.diskfile import DiskFileRouter, get_data_dir, \
     get_tmp_dir, DEFAULT_RECLAIM_AGE
 from swift.common.storage_policy import POLICIES, EC_POLICY
 from swift.common.exceptions import ConnectionTimeout, DiskFileError, \
-    SuffixSyncError, PartitionLockTimeout, DiskFileNotExist
+    SuffixSyncError, LockTimeout, PartitionLockTimeout, DiskFileNotExist
 
 SYNC, REVERT = ('sync_only', 'sync_revert')
 UNKNOWN_RESPONSE_STATUS = 0  # used as response status for timeouts, exceptions
@@ -254,6 +256,22 @@ class ObjectReconstructor(Daemon):
             conf.get('request_node_count', '2 * replicas'))
         self.max_objects_per_revert = non_negative_int(
             conf.get('max_objects_per_revert', 0))
+        self.prefer_rsync_reverts = config_true_value(
+            conf.get('prefer_rsync_reverts', 'no'))
+        if self.prefer_rsync_reverts and self.max_objects_per_revert:
+            self.logger.warning(
+                'max_objects_per_revert does not limit rsync reverts; it '
+                'only applies to ssync reverts')
+        self.rsync_timeout = int(conf.get('rsync_timeout',
+                                          DEFAULT_RSYNC_TIMEOUT))
+        self.rsync_io_timeout = conf.get('rsync_io_timeout', '30')
+        self.rsync_bwlimit = conf.get('rsync_bwlimit', '0')
+        self.rsync_compress = config_true_value(
+            conf.get('rsync_compress', 'no'))
+        self.rsync_module = conf.get('rsync_module', '').rstrip('/') or \
+            '{replication_ip}::object'
+        self.log_rsync_transfers = config_true_value(
+            conf.get('log_rsync_transfers', True))
         # When upgrading from liberasurecode<=1.5.0, you may want to continue
         # writing legacy CRCs until all nodes are upgraded and capabale of
         # reading fragments with zlib CRCs.
@@ -1133,6 +1151,7 @@ class ObjectReconstructor(Daemon):
                         hash=>timestamp
         """
         df_mgr = self._df_router[job['policy']]
+        success = True
         suffixes_to_delete = set()
         for object_hash, timestamps in objects.items():
             try:
@@ -1170,10 +1189,73 @@ class ObjectReconstructor(Daemon):
                 self.logger.exception(
                     'Unable to purge DiskFile (%r %r %r)',
                     object_hash, timestamps['ts_data'], job['frag_index'])
+                success = False
             suffixes_to_delete.add(object_hash[-3:])
 
         for suffix in suffixes_to_delete:
             remove_directory(os.path.join(job['path'], suffix))
+        return success
+
+    def _delete_reverted_suffixes(self, job, suffixes):
+        success = True
+        df_mgr = self._df_router[job['policy']]
+        for suffix in suffixes:
+            suffix_path = join(job['path'], suffix)
+            try:
+                # This is narrower than ObjectReplicator's rsync handoff
+                # cleanup, which removes an entire partition. Both accept a
+                # concurrent-write race: normal request routing should have
+                # returned to a recovered primary before this background
+                # cleanup reaches the handoff.
+                shutil.rmtree(suffix_path)
+                # Unlike ObjectReplicator's whole-partition cleanup, this
+                # leaves the partition hash cache behind. Invalidate this
+                # removed suffix before later replication can use it.
+                df_mgr.invalidate_hash(suffix_path)
+            except OSError as err:
+                if err.errno == errno.ENOENT:
+                    # A concurrent reclaimer already removed this suffix.
+                    continue
+                self.logger.exception(
+                    'Unable to remove reverted suffix %s',
+                    join(job['path'], suffix))
+                success = False
+        return success
+
+    def _maybe_cleanup_empty_revert_partition(self, job):
+        """Best-effort removal of a partition made empty by reverts.
+
+        Follow relinker's lock, unlink, and non-recursive-rmdir pattern.
+        This is narrower than ObjectReplicator's recursive handoff cleanup:
+        a concurrent write makes rmdir fail and leaves the partition for a
+        later pass, rather than recursively deleting the new entry.
+        """
+        # TODO: consolidate this empty-partition cleanup with relinker.
+        df_mgr = self._df_router[job['policy']]
+        try:
+            hashes = df_mgr.get_hashes(
+                job['device'], job['partition'], [], job['policy'])
+        except (OSError, LockTimeout):
+            return
+        if hashes:
+            return
+        try:
+            with df_mgr.replication_lock(
+                    job['device'], job['policy'], job['partition']), \
+                    df_mgr.partition_lock(
+                        job['device'], job['policy'], job['partition']):
+                for filename in ('hashes.pkl', 'hashes.invalid', '.lock',
+                                 '.lock-replication'):
+                    try:
+                        os.unlink(join(job['path'], filename))
+                    except OSError as err:
+                        if err.errno != errno.ENOENT:
+                            raise
+            # Once the locks are gone, a writer may have created an entry.
+            # Do not recursively remove it; like relinker, rmdir may fail.
+            os.rmdir(job['path'])
+        except (OSError, LockTimeout):
+            pass
 
     def process_job(self, job):
         """
@@ -1238,7 +1320,8 @@ class ObjectReconstructor(Daemon):
         self.logger.increment(
             'partition.delete.count.%s' % (job['local_dev']['device'],))
         syncd_with = 0
-        reverted_objs = {}
+        reverted_items = {}
+        cleanup_succeeded = False
         try:
             df_mgr = self._df_router[job['policy']]
             # Only object-server can take this lock if an incoming SSYNC is
@@ -1248,22 +1331,18 @@ class ObjectReconstructor(Daemon):
             with df_mgr.partition_lock(job['device'], job['policy'],
                                        job['partition'], name='replication',
                                        timeout=0.2):
+                sync_method, cleanup_method = self._dispatch_revert(job)
                 limited_by_max_objects = False
                 for node in job['sync_to']:
-                    node['backend_index'] = job['policy'].get_backend_index(
-                        node['index'])
-                    sender = ssync_sender(
-                        self, node, job, job['suffixes'],
-                        include_non_durable=True,
-                        max_objects=self.max_objects_per_revert)
-                    success, in_sync_objs = sender()
-                    limited_by_max_objects |= sender.limited_by_max_objects
+                    success, in_sync_items, limited = sync_method(node, job)
+                    limited_by_max_objects |= limited
                     if success:
                         syncd_with += 1
-                        reverted_objs.update(in_sync_objs)
+                        reverted_items.update(in_sync_items)
                 if syncd_with >= len(job['sync_to']):
-                    self.delete_reverted_objs(job, reverted_objs)
-                if syncd_with < len(job['sync_to']) or limited_by_max_objects:
+                    cleanup_succeeded = cleanup_method(job, reverted_items)
+                if (syncd_with < len(job['sync_to']) or
+                        limited_by_max_objects or not cleanup_succeeded):
                     self.handoffs_remaining += 1
         except PartitionLockTimeout:
             self.logger.info("Unable to lock handoff partition %d for revert "
@@ -1271,14 +1350,143 @@ class ObjectReconstructor(Daemon):
                              job['partition'], job['device'], job['policy'])
             self.logger.increment('partition.lock-failure.count')
             self.handoffs_remaining += 1
+        self._maybe_cleanup_empty_revert_partition(job)
         self.logger.timing_since('partition.delete.timing', begin)
+
+    def _ssync_revert(self, node, job):
+        """Revert a job to one node using SSYNC.
+
+        :returns: success, reverted objects, and whether the sender hit
+                  max_objects_per_revert
+        """
+        node['backend_index'] = job['policy'].get_backend_index(node['index'])
+        sender = ssync_sender(
+            self, node, job, job['suffixes'], include_non_durable=True,
+            max_objects=self.max_objects_per_revert)
+        success, in_sync_objs = sender()
+        return success, in_sync_objs, sender.limited_by_max_objects
+
+    def _dispatch_revert(self, job):
+        """Return the sync and cleanup methods for a revert job.
+
+        A pure handoff has no primary fragment index on this node, so its
+        complete suffixes may be moved to the primary for this job and
+        removed locally. The destination can subsequently use its normal
+        reconstruction work to place any minority fragment indexes.
+        """
+        if self.prefer_rsync_reverts:
+            if job['primary_frag_index'] is None:
+                self.logger.debug(
+                    'Fork-lifting partition %d on device %s with rsync',
+                    job['partition'], job['device'])
+                return self._rsync_revert, self._delete_reverted_suffixes
+            self.logger.debug(
+                'Using ssync for thin revert of partition %d on device %s; '
+                'it also has a primary fragment', job['partition'],
+                job['device'])
+        return self._ssync_revert, self.delete_reverted_objs
+
+    def _rsync(self, args):
+        """Run rsync, returning its process status."""
+        proc = None
+        try:
+            with Timeout(self.rsync_timeout):
+                proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT)
+                output = proc.stdout.read()
+                return_code = proc.wait()
+        except Timeout:
+            self.logger.error('Killing long-running rsync after %ds: %s',
+                              self.rsync_timeout, args)
+            if proc:
+                proc.kill()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    # A killed process may be stuck in uninterruptible I/O.
+                    # Do not hold a reconstruction worker for it, but leave a
+                    # greenthread waiting so it is reaped when it exits.
+                    spawn(proc.wait)
+            return 1
+        log_method = self.logger.error if return_code else self.logger.debug
+        for line in output.decode('utf8').splitlines():
+            if not line or line.startswith('cd+'):
+                continue
+            if line.startswith('<') and not self.log_rsync_transfers:
+                continue
+            log_method(line)
+        if return_code:
+            self.logger.error('Bad rsync return code: %d <- %s',
+                              return_code, args)
+        return return_code
+
+    def rsync(self, node, job, suffixes):
+        """Transfer suffixes to a node with rsync."""
+        args = [
+            'rsync', '--recursive', '--whole-file', '--human-readable',
+            '--xattrs', '--itemize-changes', '--ignore-existing',
+            '--timeout=%s' % self.rsync_io_timeout,
+            '--contimeout=%s' % self.rsync_io_timeout,
+            '--bwlimit=%s' % self.rsync_bwlimit,
+            '--exclude=.*.%s' % ''.join('[0-9a-zA-Z]' for i in range(6)),
+        ]
+        if self.rsync_compress and \
+                job['local_dev']['region'] != node['region']:
+            args.append('--compress')
+        args.extend(join(job['path'], suffix) for suffix in suffixes)
+        rsync_module = rsync_module_interpolation(self.rsync_module, node)
+        args.append(join(rsync_module, node['device'],
+                         get_data_dir(job['policy']), str(job['partition'])))
+        return self._rsync(args) == 0
+
+    def _rsync_revert(self, node, job):
+        """Move all suffixes in a pure-handoff partition to one node.
+
+        :returns: success, suffixes for whole-suffix cleanup, and False
+                  because max_objects_per_revert does not limit rsync
+                  reverts. The cleanup mapping is accumulated across every
+                  destination before cleanup; its values are immaterial.
+        """
+        success = self.rsync(node, job, job['suffixes'])
+        if success:
+            headers = dict(self.headers)
+            headers['X-Backend-Storage-Policy-Index'] = int(job['policy'])
+            # Match ObjectReplicator.rsync()'s effective revert semantics: a
+            # REPLICATE failure prevents source cleanup. Its notification
+            # semantics are inherited behavior, not independently established
+            # here; reconsider them whenever this code or its tests change.
+            try:
+                with Timeout(self.conn_timeout):
+                    conn = http_connect(
+                        node['replication_ip'], node['replication_port'],
+                        node['device'], job['partition'], 'REPLICATE',
+                        '/' + '-'.join(job['suffixes']), headers=headers)
+                with Timeout(self.http_timeout):
+                    try:
+                        resp = conn.getresponse()
+                        resp.read()
+                        if resp.status != HTTP_OK:
+                            self.logger.error(
+                                'Invalid REPLICATE response %(resp)s from '
+                                '%(remote)s after rsync', {
+                                    'resp': resp.status,
+                                    'remote': node_to_string(
+                                        node, replication=True)})
+                            success = False
+                    finally:
+                        conn.close()
+            except (Exception, Timeout):
+                self.logger.exception(
+                    'Unable to notify %s after rsync',
+                    node_to_string(node, replication=True))
+                success = False
+        return success, dict.fromkeys(job['suffixes']), False
 
     def _get_part_jobs(self, local_dev, part_path, partition, policy):
         """
         Helper function to build jobs for a partition, this method will
         read the suffix hashes and create job dictionaries to describe
-        the needed work.  There will be one job for each fragment index
-        discovered in the partition.
+        the needed work.
 
         For a fragment index which corresponds to this node's ring
         index, a job with job_type SYNC will be created to ensure that
@@ -1291,7 +1499,10 @@ class ObjectReconstructor(Daemon):
         the correct node and removed from this one.
 
         A partition may result in multiple jobs.  Potentially many
-        REVERT jobs, and zero or one SYNC job.
+        REVERT jobs, and zero or one SYNC job.  Typically, there will be one
+        job for each fragment index discovered in the partition; however when
+        using prefer_rsync_reverts a pure handoff partition will have only one
+        REVERT job for all suffixes in the partition.
 
         :param local_dev: the local device (node dict)
         :param part_path: full path to partition
@@ -1313,8 +1524,8 @@ class ObjectReconstructor(Daemon):
             self.logger.warning(
                 'Unexpected entity %r is not a directory' % part_path)
             return []
-        non_data_fragment_suffixes = []
-        data_fi_to_suffixes = defaultdict(list)
+        # None groups tombstone-only suffixes with no data fragment index.
+        fi_to_suffixes = defaultdict(list)
         for suffix, fi_hash in hashes.items():
             if not fi_hash:
                 # this is for sanity and clarity, normally an empty
@@ -1325,10 +1536,10 @@ class ObjectReconstructor(Daemon):
                 continue
             data_frag_indexes = [f for f in fi_hash if f is not None]
             if not data_frag_indexes:
-                non_data_fragment_suffixes.append(suffix)
+                fi_to_suffixes[None].append(suffix)
             else:
                 for fi in data_frag_indexes:
-                    data_fi_to_suffixes[fi].append(suffix)
+                    fi_to_suffixes[fi].append(suffix)
 
         # helper to ensure consistent structure of jobs
         def build_job(job_type, frag_index, suffixes, sync_to,
@@ -1353,19 +1564,23 @@ class ObjectReconstructor(Daemon):
         # aggregate jobs for all the fragment index in this part
         jobs = []
 
-        # check the primary nodes - to see if the part belongs here
+        # Find this device's primary fragment index, if any.
         primary_frag_index = None
+        sync_job = None
         part_nodes = policy.object_ring.get_part_nodes(partition)
         for node in part_nodes:
             if node['id'] == local_dev['id']:
                 # this partition belongs here, we'll need a sync job
                 primary_frag_index = policy.get_backend_index(node['index'])
                 try:
-                    suffixes = data_fi_to_suffixes.pop(primary_frag_index)
+                    suffixes = fi_to_suffixes.pop(primary_frag_index)
                 except KeyError:
                     # N.B. If this function ever returns an empty list of jobs
                     # the entire partition will be deleted.
                     suffixes = []
+                # A local primary retains tombstone-only suffixes in its SYNC
+                # job; they need no revert destination.
+                suffixes.extend(fi_to_suffixes.pop(None, []))
                 sync_job = build_job(
                     job_type=SYNC,
                     frag_index=primary_frag_index,
@@ -1378,61 +1593,82 @@ class ObjectReconstructor(Daemon):
                 jobs.append(sync_job)
                 break
 
-        # assign remaining data fragment suffixes to revert jobs
-        ordered_fis = sorted((len(suffixes), fi) for fi, suffixes
-                             in data_fi_to_suffixes.items())
-        for count, fi in ordered_fis:
-            # In single region EC a revert job must sync to the specific
-            # primary who's node_index matches the data's frag_index.  With
-            # duplicated EC frags a revert job must sync to all primary nodes
-            # that should be holding this frag_index.
-            if fi >= len(part_nodes):
+        # Primary: jobs = [SYNC]; pure handoff: jobs = [].
+        if not fi_to_suffixes:
+            return jobs
+
+        if jobs or not self.prefer_rsync_reverts:
+            # SSYNC has one job per data fragment index; may have primary sync
+            # *and* per-frag "thin revert" jobs.
+
+            # Revert work is a list. Remove no-data-frag-index suff while it
+            # is still indexed, then add it to revert_work. Primary jobs
+            # already placed no-data-frag-index suff in the sync job.
+            tombstone_suffixes = fi_to_suffixes.pop(None, [])
+            revert_work = sorted(
+                fi_to_suffixes.items(),
+                key=lambda item: len(item[1]), reverse=True)
+            if tombstone_suffixes:
+                # Revert no-data-frag-index suff somehow.
+                if revert_work:
+                    # Revert no-data-frag-index suff along with the most common
+                    # data-frag-index job.
+                    revert_work[0][1].extend(tombstone_suffixes)
+                else:
+                    # Special case: partition is ONLY tombstones (!?).
+                    revert_work = [(None, tombstone_suffixes)]
+        else:
+            # Rsync is only possible for pure-handoff reverts; gets one job
+            # for all suffixes.
+            rsync_suffixes = set(
+                itertools.chain.from_iterable(fi_to_suffixes.values()))
+            # Even if no-data-frag-index suff is "most common," prefer any
+            # *other* data-frag-index to target the rsync.
+            fi_to_suffixes.pop(None, None)
+            # The most common frag index selects primary destination set.
+            fi = max(
+                fi_to_suffixes,
+                key=lambda fi: len(fi_to_suffixes[fi]),
+                # fi=None means whole partition is ONLY tombstones (!?)
+                default=None)
+            revert_work = [(fi, rsync_suffixes)]
+
+        for fi, suffixes in revert_work:
+            target_fi = fi
+            if target_fi is not None and target_fi >= len(part_nodes):
                 self.logger.warning(
                     'Bad fragment index %r for suffixes %r under %s',
-                    fi, data_fi_to_suffixes[fi], part_path)
-                continue
-            nodes_sync_to = []
-            node_index = fi
-            for n in range(policy.ec_duplication_factor):
-                nodes_sync_to.append(part_nodes[node_index])
-                node_index += policy.ec_n_unique_fragments
+                    fi, suffixes, part_path)
+                target_fi = None
+            if target_fi is None:
+                # A job with ONLY no-data-frag-index suff will have no direct
+                # primary destination. Copy them to enough primaries that the
+                # remaining nodes cannot reconstruct stale data before removing
+                # them from this handoff.
+                nsample = (policy.ec_n_unique_fragments *
+                           policy.ec_duplication_factor) - policy.ec_ndata + 1
+                nodes_sync_to = random.sample(part_nodes, nsample)
+            else:
+                # In single region EC a revert job must sync to the specific
+                # primary who's node_index matches the data's frag_index.
+                # With duplicated EC frags a revert job must sync to all
+                # primary nodes that should be holding this frag_index.
+                nodes_sync_to = []
+                node_index = target_fi
+                for n in range(policy.ec_duplication_factor):
+                    nodes_sync_to.append(part_nodes[node_index])
+                    node_index += policy.ec_n_unique_fragments
 
             revert_job = build_job(
                 job_type=REVERT,
                 frag_index=fi,
-                suffixes=data_fi_to_suffixes[fi],
+                suffixes=suffixes,
                 sync_to=nodes_sync_to,
                 primary_frag_index=primary_frag_index
             )
             jobs.append(revert_job)
 
-        # now we need to assign suffixes that have no data fragments
-        if non_data_fragment_suffixes:
-            if jobs:
-                # the first job will be either the sync_job, or the
-                # revert_job for the fragment index that is most common
-                # among the suffixes
-                jobs[0]['suffixes'].extend(non_data_fragment_suffixes)
-            else:
-                # this is an unfortunate situation, we need a revert job to
-                # push partitions off this node, but none of the suffixes
-                # have any data fragments to hint at which node would be a
-                # good candidate to receive the tombstones.
-                #
-                # we'll check a sample of other primaries before we delete our
-                # local tombstones, the exact number doesn't matter as long as
-                # it's enough to ensure the tombstones are not lost and less
-                # than *all the replicas*
-                nsample = (policy.ec_n_unique_fragments *
-                           policy.ec_duplication_factor) - policy.ec_ndata + 1
-                jobs.append(build_job(
-                    job_type=REVERT,
-                    frag_index=None,
-                    suffixes=non_data_fragment_suffixes,
-                    sync_to=random.sample(part_nodes, nsample),
-                    primary_frag_index=primary_frag_index
-                ))
-        # return a list of jobs for this part
+        # Return a list of jobs for this part.
         return jobs
 
     def get_policy2devices(self):
