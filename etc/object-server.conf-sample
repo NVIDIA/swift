@@ -463,6 +463,36 @@ use = egg:swift#backend_ratelimit
 # default) means there is no limit.
 # max_objects_per_revert = 0
 #
+# Prefer rsync for a complete pure-handoff suffix during a revert. Any fragment
+# indexes that are not the revert destination's primary fragment are
+# subsequently handled by normal reconstruction there. Reverts for partitions
+# with a local primary fragment use SSYNC instead. max_objects_per_revert does
+# not limit rsync reverts; it applies only to SSYNC reverts.
+# Rsync cleanup removes the complete source suffix after transfer. This is
+# narrower than object replicator handoff cleanup, which removes a whole
+# partition, but a concurrent client update can still race it. The normal
+# request path should use a recovered primary before this background revert
+# runs. This is an optional performance mode; use SSYNC if it is working well
+# for your cluster.
+# prefer_rsync_reverts = no
+#
+# The following rsync settings also apply to prefer_rsync_reverts. They use
+# the same defaults and semantics as object-replicator: rsync_timeout is the
+# maximum duration of an rsync process; rsync_io_timeout applies to its I/O
+# and connection timeouts; rsync_bwlimit is in kB/s (0 is unlimited);
+# rsync_compress compresses transfers to a different region; and rsync_module
+# selects the destination module.
+# rsync_timeout = 900
+# rsync_io_timeout = 30
+# rsync_bwlimit = 0
+# rsync_compress = no
+# rsync_module = {replication_ip}::object
+#
+# Log itemized rsync file transfers for pure-handoff reverts. Directory-change
+# records are suppressed, matching object replication; non-transfer output is
+# always logged. Set this to no to omit per-file transfer records.
+# log_rsync_transfers = yes
+#
 # You can set scheduling priority of processes. Niceness values range from -20
 # (most favorable to the process) to 19 (least favorable to the process).
 # nice_priority =
