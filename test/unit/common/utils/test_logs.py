@@ -961,21 +961,34 @@ class TestUtilsLogs(unittest.TestCase):
     def test_get_swift_logger_console(self):
         logger = get_swift_logger(None)
         console_handlers = [h for h in logger.logger.handlers if
-                            isinstance(h, logging.StreamHandler)]
+                            isinstance(h, logging.StreamHandler) and
+                            isinstance(h.formatter, SwiftLogFormatter)]
         self.assertFalse(console_handlers)
+        self.assertNotIn(
+            logger.logger,
+            getattr(get_swift_logger, 'console_handler4logger', {}))
         logger = get_swift_logger(None, log_to_console=True)
         console_handlers = [h for h in logger.logger.handlers if
-                            isinstance(h, logging.StreamHandler)]
-        self.assertTrue(console_handlers)
-        # make sure you can't have two console handlers
-        self.assertEqual(len(console_handlers), 1)
+                            isinstance(h, logging.StreamHandler) and
+                            isinstance(h.formatter, SwiftLogFormatter)]
+        self.assertEqual(1, len(console_handlers))
         old_handler = console_handlers[0]
+        self.assertIs(
+            old_handler,
+            get_swift_logger.console_handler4logger[logger.logger])
+        self.assertIn(old_handler, logger.logger.handlers)
         logger = get_swift_logger(None, log_to_console=True)
         console_handlers = [h for h in logger.logger.handlers if
-                            isinstance(h, logging.StreamHandler)]
-        self.assertEqual(len(console_handlers), 1)
+                            isinstance(h, logging.StreamHandler) and
+                            isinstance(h.formatter, SwiftLogFormatter)]
+        self.assertEqual(1, len(console_handlers))
         new_handler = console_handlers[0]
+        self.assertIs(
+            new_handler,
+            get_swift_logger.console_handler4logger[logger.logger])
         self.assertNotEqual(new_handler, old_handler)
+        self.assertIn(new_handler, logger.logger.handlers)
+        self.assertNotIn(old_handler, logger.logger.handlers)
 
     def test_get_policy_index(self):
         # Account has no information about a policy
