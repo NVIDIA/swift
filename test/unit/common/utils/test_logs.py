@@ -33,6 +33,8 @@ import http.client
 from test.unit import with_tempdir
 from test.unit import quiet_eventlet_exceptions
 from test.unit.common.test_utils import MockOs, MockSys
+from test.debug_logger import (get_isolated_get_swift_logger,
+                               get_isolated_swift_logger)
 from swift.common.exceptions import Timeout, MessageTimeout, ConnectionTimeout
 
 from swift.common import utils
@@ -744,7 +746,7 @@ class TestUtilsLogs(unittest.TestCase):
     def test_get_prefixed_swift_logger_exception_method(self):
         # setup stream logging
         sio = StringIO()
-        base_logger = get_swift_logger(None)
+        base_logger = get_isolated_swift_logger(None)
         handler = logging.StreamHandler(sio)
         base_logger.logger.addHandler(handler)
         logger = get_prefixed_swift_logger(base_logger, 'some prefix: ')
@@ -959,18 +961,19 @@ class TestUtilsLogs(unittest.TestCase):
 
     @reset_logger_state
     def test_get_swift_logger_console(self):
-        logger = get_swift_logger(None)
+        get_logger = get_isolated_get_swift_logger()
+        logger = get_logger(None)
         console_handlers = [h for h in logger.logger.handlers if
                             isinstance(h, logging.StreamHandler)]
         self.assertFalse(console_handlers)
-        logger = get_swift_logger(None, log_to_console=True)
+        logger = get_logger(None, log_to_console=True)
         console_handlers = [h for h in logger.logger.handlers if
                             isinstance(h, logging.StreamHandler)]
         self.assertTrue(console_handlers)
         # make sure you can't have two console handlers
         self.assertEqual(len(console_handlers), 1)
         old_handler = console_handlers[0]
-        logger = get_swift_logger(None, log_to_console=True)
+        logger = get_logger(None, log_to_console=True)
         console_handlers = [h for h in logger.logger.handlers if
                             isinstance(h, logging.StreamHandler)]
         self.assertEqual(len(console_handlers), 1)

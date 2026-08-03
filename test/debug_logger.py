@@ -14,9 +14,11 @@
 # limitations under the License.
 import collections
 import contextlib
+import functools
 import logging
 from unittest import mock
 import sys
+import uuid
 
 from collections import defaultdict
 
@@ -290,6 +292,17 @@ def debug_logger(name='test', log_route=None):
     adapted_logger = DebugLogAdapter(DebugLogger(name=log_route), name)
     utils._patch_statsd_methods(adapted_logger, adapted_logger.logger)
     return adapted_logger
+
+
+def get_isolated_get_swift_logger():
+    """Get a get_swift_logger factory with a unique log route."""
+    return functools.partial(
+        utils.get_swift_logger, log_route='test-%s' % uuid.uuid4().hex)
+
+
+def get_isolated_swift_logger(*args, **kwargs):
+    """Get a Swift logger with a log route unique to this test call."""
+    return get_isolated_get_swift_logger()(*args, **kwargs)
 
 
 def debug_statsd_client(conf):
