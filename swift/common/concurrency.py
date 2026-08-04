@@ -57,6 +57,15 @@ shutdown_safe = eventlet.greenio.shutdown_safe
 spawn_n = eventlet.spawn_n
 ChunkReadError = eventlet.wsgi.ChunkReadError
 
+
+def get_tpool_num_threads():
+    """
+    Return the size of the eventlet thread pool. eventlet reads
+    EVENTLET_THREADPOOL_SIZE once at import, and defaults to 20.
+    """
+    return tpool._nthreads
+
+
 # flake8 raises a F401 without this
 __all__ = [
     'debug',
@@ -113,4 +122,5 @@ __all__ = [
     'shutdown_safe',
     'spawn_n',
     'ChunkReadError',
+    'get_tpool_num_threads',
 ]
