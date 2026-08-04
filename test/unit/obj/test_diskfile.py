@@ -1373,6 +1373,29 @@ class DiskFileManagerMixin(BaseDiskFileTestMixin):
         assert_invalid('-1.1')
         assert_invalid('auto')
 
+    def test_init_read_offload(self):
+        def assert_conf(conf, read_offload, burst, min_size, max_inflight):
+            for policy in POLICIES:
+                df_mgr = diskfile.DiskFileRouter(conf, self.logger)[policy]
+                self.assertEqual(read_offload, df_mgr.read_offload)
+                self.assertEqual(burst, df_mgr.read_offload_burst_size)
+                self.assertEqual(min_size, df_mgr.read_offload_min_size)
+                self.assertEqual(max_inflight,
+                                 df_mgr.read_offload_max_inflight_per_device)
+
+        assert_conf({}, False, 1024 * 1024, 1024 * 1024, 8)
+        # burst rounds down to whole disk chunks; min_size follows the burst
+        conf = {'read_offload': 'true', 'disk_chunk_size': '1024',
+                'read_offload_burst_size': '3000'}
+        assert_conf(conf, True, 2048, 2048, 8)
+        # a burst below one disk chunk becomes one chunk, never 0
+        conf['read_offload_burst_size'] = '1000'
+        assert_conf(conf, True, 1024, 1024, 8)
+        # explicit min_size wins; the per-device cap is at least 1
+        conf.update({'read_offload_min_size': '0',
+                     'read_offload_max_inflight_per_device': '0'})
+        assert_conf(conf, True, 1024, 0, 1)
+
     def test_cleanup_uses_configured_reclaim_age(self):
         # verify that the reclaim_age used when cleaning up tombstones is
         # either the default or the configured value
@@ -4618,6 +4641,459 @@ class DiskFileMixin(BaseDiskFileTestMixin):
                                         '\r\n--someheader\r\n', 150)
             self.assertEqual(b''.join(it), b'')
             self.assertEqual(quarantine_msgs, [])
+
+    def _set_read_offload(self, read_offload, burst_size=None,
+                          disk_chunk_size=None, max_inflight=2, min_size=0):
+        # BaseDiskFile.reader() gets these from its manager, so configure
+        # every manager the test might build a diskfile from.
+        mgrs = list(self.df_router.policy_to_manager.values())
+        if self.df_mgr not in mgrs:
+            mgrs.append(self.df_mgr)
+        for mgr in mgrs:
+            mgr.read_offload = read_offload
+            mgr.read_offload_max_inflight_per_device = max_inflight
+            mgr.read_offload_min_size = min_size
+            if disk_chunk_size is not None:
+                mgr.disk_chunk_size = disk_chunk_size
+            if burst_size is not None:
+                # bypasses the manager's chunk-rounding; tests pass a multiple
+                mgr.read_offload_burst_size = burst_size
+
+    def _is_ec(self):
+        return POLICIES.default.policy_type == EC_POLICY
+
+    def _read_in_mode(self, data, read_offload, obj, burst_size,
+                      disk_chunk_size, max_inflight=2):
+        self._set_read_offload(read_offload, burst_size=burst_size,
+                               disk_chunk_size=disk_chunk_size,
+                               max_inflight=max_inflight)
+        df, on_disk = self._create_test_file(data, obj=obj)
+        qmsgs = []
+        reader = df.reader(_quarantine_hook=qmsgs.append)
+        chunks = list(reader)
+        return {
+            'on_disk': on_disk,
+            'body': b''.join(chunks),
+            'sizes': [len(c) for c in chunks],
+            'qmsgs': qmsgs,
+            'bytes_read': reader._bytes_read,
+        }
+
+    @contextmanager
+    def _real_tpool(self):
+        # run offloads on the real eventlet thread pool; setUp stubs
+        # tpool.execute to run inline, so restore that stub on exit
+        tpool.execute = self._orig_tpool_exc
+        try:
+            yield
+        finally:
+            tpool.execute = lambda f, *a, **k: f(*a, **k)
+
+    def _raise_dfq(self, msg):
+        raise DiskFileQuarantined(msg)
+
+    def _offload_reader(self, data, obj, burst_size=4096,
+                        disk_chunk_size=1024, min_size=0):
+        # offload-enabled reader over a fresh object, with the list that
+        # captures any quarantine messages
+        self._set_read_offload(True, burst_size, disk_chunk_size,
+                               min_size=min_size)
+        df, on_disk = self._create_test_file(data, obj=obj)
+        qmsgs = []
+        return df.reader(_quarantine_hook=qmsgs.append), qmsgs
+
+    def test_read_offload_full_read_matches_direct(self):
+        # ensure offload yields the same bytes and disk_chunk_size-sliced chunk
+        # stream as the direct path, across sizes straddling chunk/burst edges
+        dcs, burst = 1024, 4096  # burst = 4 disk chunks
+        sizes = [0, 1, dcs - 1, dcs, dcs + 1,
+                 burst - 1, burst, burst + 1,
+                 2 * burst, 2 * burst + 1, 300 * 1024 + 7]
+        for size in sizes:
+            if self._is_ec() and size <= 1:
+                # empty / single-byte fragment archives aren't a meaningful
+                # on-disk case for EC; the sub-burst regime is covered below.
+                continue
+            data = os.urandom(size)
+            direct = self._read_in_mode(data, False, 'sz-%d-off' % size,
+                                        burst, dcs)
+            offl = self._read_in_mode(data, True, 'sz-%d-tp' % size,
+                                      burst, dcs)
+            msg = 'size=%d policy=%s' % (size, POLICIES.default.policy_type)
+            self.assertEqual(offl['body'], offl['on_disk'], msg)
+            self.assertEqual(offl['body'], direct['body'], msg)
+            # yielded chunk sizes (WSGI write sizes) must be unchanged
+            self.assertEqual(offl['sizes'], direct['sizes'], msg)
+            self.assertEqual(offl['bytes_read'], len(offl['on_disk']), msg)
+            self.assertEqual(direct['bytes_read'], offl['bytes_read'], msg)
+            self.assertEqual(offl['qmsgs'], [], msg)
+            self.assertEqual(direct['qmsgs'], [], msg)
+
+    def test_read_offload_range_reads_match_direct(self):
+        # ensure ranged reads (start / middle / suffix / boundary) return the
+        # same bytes under offload as on the direct path
+        dcs, burst = 1024, 4096
+        size = 5000
+        data = os.urandom(size)
+        self._set_read_offload(False, burst, dcs)
+        df, on_disk = self._create_test_file(data, obj='rng')
+
+        def read_range(read_offload, start, stop):
+            self._set_read_offload(read_offload, burst, dcs)
+            df2 = self._simple_get_diskfile(obj='rng')
+            qmsgs = []
+            with df2.open():
+                reader = df2.reader(_quarantine_hook=qmsgs.append)
+                body = b''.join(reader.app_iter_range(start, stop))
+            self.assertEqual(qmsgs, [], (read_offload, start, stop))
+            return body
+
+        ranges = [(0, None), (0, 100), (1000, 2000), (dcs, dcs + 10),
+                  (burst, None), (burst - 5, burst + 5), (size - 10, None)]
+        for start, stop in ranges:
+            direct = read_range(False, start, stop)
+            offl = read_range(True, start, stop)
+            msg = 'range=(%s,%s)' % (start, stop)
+            self.assertEqual(offl, direct, msg)
+            expected = on_disk[start:stop] if stop is not None \
+                else on_disk[start:]
+            self.assertEqual(offl, expected, msg)
+
+    def test_read_offload_caps_pread_to_remaining(self):
+        # ensure reads don't issue another full-burst pread after the requested
+        # span is satisfied, and don't over-read the final partial burst.
+        dcs, burst = 1024, 4096
+        obj = 'rngcap'
+        self._set_read_offload(True, burst, dcs)  # min_size 0
+        # large enough that the on-disk object spans several bursts for every
+        # policy -- an EC fragment is a fraction of the object, so size up so
+        # the fragment still exceeds one burst.
+        _, on_disk = self._create_test_file(os.urandom(128 * 1024),
+                                            obj=obj)
+        self.assertGreater(len(on_disk), burst + 100)
+
+        real_pread = os.pread
+
+        def read_recording_preads(rng=None):
+            calls = []
+
+            def traced_pread(fd, nbytes, offset):
+                calls.append((offset, nbytes))
+                return real_pread(fd, nbytes, offset)
+
+            df = self._simple_get_diskfile(obj=obj)
+            qmsgs = []
+            with df.open(), mock.patch('swift.obj.diskfile.os.pread',
+                                       traced_pread):
+                reader = df.reader(_quarantine_hook=qmsgs.append)
+                if rng is None:
+                    body = b''.join(reader)
+                else:
+                    body = b''.join(reader.app_iter_range(*rng))
+            self.assertEqual(qmsgs, [])
+            return body, calls
+
+        full_read_calls = [
+            (offset, min(burst, len(on_disk) - offset))
+            for offset in range(0, len(on_disk), burst)
+        ]
+        cases = [
+            (None, on_disk, full_read_calls),
+            ((0, burst), on_disk[:burst], [(0, burst)]),
+            ((1000, 1100), on_disk[1000:1100], [(1000, 100)]),
+        ]
+        for rng, expected_body, expected_calls in cases:
+            body, calls = read_recording_preads(rng)
+            self.assertEqual(body, expected_body, rng)
+            self.assertEqual(calls, expected_calls, rng)
+
+    def test_read_offload_quarantine_on_size_mismatch(self):
+        # ensure offload still quarantines when bytes read != metadata size
+        self._set_read_offload(True, 4096, 1024)
+        df, on_disk = self._create_test_file(os.urandom(3000), obj='qsize')
+        reader = df.reader(_quarantine_hook=self._raise_dfq)
+        reader._obj_size += 1
+        self.assertRaises(DiskFileQuarantined, b''.join, reader)
+
+    def test_read_offload_range_close_validation_boundary(self):
+        self._set_read_offload(True, 4096, 1024)
+
+        def reader_with_bad_etag(obj):
+            df, on_disk = self._create_test_file(os.urandom(20000), obj=obj)
+            reader = df.reader(_quarantine_hook=self._raise_dfq)
+            reader._etag = 'not-the-real-etag'
+            return reader, len(on_disk)
+
+        full_reader, obj_size = reader_with_bad_etag('frngfull')
+        self.assertRaises(DiskFileQuarantined, b''.join,
+                          full_reader.app_iter_range(0, obj_size))
+
+        partial_reader, obj_size = reader_with_bad_etag('frngpart')
+        b''.join(partial_reader.app_iter_range(0, obj_size // 2))
+        self.assertFalse(partial_reader._read_to_eof)
+
+    def test_read_offload_eio_quarantines(self):
+        # ensure an EIO from the offloaded pread is re-raised from a real tpool
+        # worker and quarantines, like a failed read() on the direct path
+        reader, qmsgs = self._offload_reader(os.urandom(5000), 'eio')
+        with self._real_tpool():
+            with mock.patch('swift.obj.diskfile.os.pread',
+                            side_effect=IOError(errno.EIO, 'Input/output '
+                                                'error')):
+                with self.assertRaises(IOError) as cm:
+                    b''.join(reader)
+        self.assertEqual(errno.EIO, cm.exception.errno)
+        self.assertEqual(1, len(qmsgs))
+
+    def test_read_offload_non_eio_error_propagates_without_quarantine(self):
+        # ensure a non-EIO error from the offloaded pread propagates and does
+        # not quarantine
+        reader, qmsgs = self._offload_reader(os.urandom(5000), 'ebadf')
+        with mock.patch('swift.obj.diskfile.os.pread',
+                        side_effect=OSError(errno.EBADF, 'Bad file descr')):
+            with self.assertRaises(OSError) as cm:
+                b''.join(reader)
+        self.assertEqual(errno.EBADF, cm.exception.errno)
+        self.assertEqual([], qmsgs)
+
+    def test_read_offload_short_pread_is_not_eof(self):
+        # ensure a short pread is retried, not taken as EOF: that would
+        # truncate the body and then quarantine a healthy object
+        self._set_read_offload(True, 4096, 1024)  # min_size 0
+        df, on_disk = self._create_test_file(os.urandom(20000), obj='shortrd')
+        real_pread = os.pread
+        preads = []
+
+        def short_pread(fd, nbytes, offset):
+            preads.append((offset, nbytes))
+            return real_pread(fd, max(1, nbytes // 2), offset)
+
+        df2 = self._simple_get_diskfile(obj='shortrd')
+        qmsgs = []
+        with df2.open(), mock.patch('swift.obj.diskfile.os.pread',
+                                    short_pread):
+            reader = df2.reader(_quarantine_hook=qmsgs.append)
+            body = b''.join(reader)
+        self.assertEqual(body, on_disk)
+        self.assertEqual(qmsgs, [])
+        self.assertTrue(reader._read_to_eof)
+        # every pread came back short, so it took more than one per burst
+        self.assertGreater(len(preads), len(on_disk) // 4096)
+
+    def test_read_offload_per_device_cap(self):
+        # ensure concurrent offloaded reads on one device never exceed the
+        # per-device cap, and all complete with correct data
+        import time as _time
+        cap, n_readers = 2, 6
+        self._set_read_offload(True, burst_size=4096, disk_chunk_size=1024,
+                               max_inflight=cap)
+        dfs = []
+        for i in range(n_readers):
+            data = os.urandom(16000)  # several bursts each
+            df, on_disk = self._create_test_file(data, obj='cap-%d' % i)
+            dfs.append((self._simple_get_diskfile(obj='cap-%d' % i), on_disk))
+
+        inflight = {'cur': 0, 'max': 0}
+        lock = threading.Lock()
+        orig_burst = diskfile.BaseDiskFileReader._read_burst
+
+        def traced(reader_self, fd, offset, nbytes):
+            with lock:
+                inflight['cur'] += 1
+                inflight['max'] = max(inflight['max'], inflight['cur'])
+            try:
+                _time.sleep(0.01)  # hold the slot to force contention
+                return orig_burst(reader_self, fd, offset, nbytes)
+            finally:
+                with lock:
+                    inflight['cur'] -= 1
+
+        results = {}
+        with self._real_tpool(), \
+                mock.patch.object(diskfile.BaseDiskFileReader,
+                                  '_read_burst', traced):
+            threads = []
+            for i, (df, on_disk) in enumerate(dfs):
+                def run(df=df, key='cap-%d' % i):
+                    df.open()
+                    results[key] = b''.join(df.reader())
+                threads.append(spawn(run))
+            for t in threads:
+                t.wait()
+
+        for i, (df, on_disk) in enumerate(dfs):
+            self.assertEqual(results['cap-%d' % i], on_disk)
+        self.assertGreater(inflight['max'], 0)
+        self.assertLessEqual(inflight['max'], cap)
+
+    def test_read_offload_drop_cache_parity(self):
+        # ensure offload suppresses the page-cache drop exactly when the direct
+        # path does -- only when keep_cache is set and the object fits in cache
+        # (derived from the actual on-disk size, so it holds for EC fragments)
+        dcs, burst = 1024, 4096
+        kcs = self.df_mgr.keep_cache_size  # 2 KiB
+        saw_no_drop = False
+        for i, (data, keep) in enumerate([
+                (os.urandom(1500), True), (os.urandom(1500), False),
+                (os.urandom(4096), True), (os.urandom(4096), False)]):
+            self._set_read_offload(True, burst, dcs)
+            df, on_disk = self._create_test_file(data, obj='dc-%d' % i)
+            keepable = keep and len(on_disk) < kcs
+            with mock.patch('swift.obj.diskfile.drop_buffer_cache') as m:
+                body = b''.join(df.reader(keep_cache=keep))
+            self.assertEqual(body, on_disk)
+            self.assertEqual(m.called, not keepable,
+                             'case %d keep=%s on_disk=%d kcs=%d'
+                             % (i, keep, len(on_disk), kcs))
+            saw_no_drop = saw_no_drop or keepable
+        if POLICIES.default.policy_type != EC_POLICY:
+            # the replication policy must exercise the no-drop (keep) branch
+            self.assertTrue(saw_no_drop)
+
+    def test_range_read_drop_cache_calls(self):
+        # ensure a ranged GET drops exactly the bytes it read: per window on
+        # the direct path, per burst under offload, starting at the range
+        # offset (not the file head)
+        dcs, burst, window = 1024, 4096, 4096
+        # a range ending exactly where the last windowed drop did
+        stop = 5 * dcs
+        # (read_offload, range start, expected drops)
+        cases = [(False, 0, [(0, stop)]),
+                 (True, 0, [(0, burst), (burst, stop - burst)]),
+                 (True, 500, [(500, burst), (500 + burst, stop - burst)])]
+        for i, (read_offload, start, expected) in enumerate(cases):
+            self._set_read_offload(read_offload, burst, dcs)  # min_size 0
+            # big enough that an EC fragment archive still exceeds the range
+            df, on_disk = self._create_test_file(
+                os.urandom(128 * 1024), obj='dccalls-%d' % i)
+            self.assertGreater(len(on_disk), 2 * stop)
+            dropped = []
+            with mock.patch('swift.obj.diskfile.DROP_CACHE_WINDOW', window), \
+                    mock.patch('swift.obj.diskfile.drop_buffer_cache',
+                               lambda fd, off, length: dropped.append(
+                                   (off, length))):
+                body = b''.join(
+                    df.reader().app_iter_range(start, start + stop))
+            self.assertEqual(body, on_disk[start:start + stop], i)
+            self.assertEqual(expected, dropped, i)
+
+    def test_read_offload_drops_cache_in_tpool(self):
+        # ensure each burst is dropped inside the tpool call that read it
+        burst = 4096
+        self._set_read_offload(True, burst, 1024)  # min_size 0
+        df, on_disk = self._create_test_file(os.urandom(10000), obj='dctp')
+        in_tpool = []
+        dropped = []
+
+        def fake_execute(func, *args, **kwargs):
+            in_tpool.append(True)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                in_tpool.pop()
+
+        with mock.patch.object(tpool, 'execute', fake_execute), \
+                mock.patch('swift.obj.diskfile.drop_buffer_cache',
+                           lambda fd, off, length: dropped.append(
+                               (off, length, bool(in_tpool)))):
+            body = b''.join(df.reader())
+        self.assertEqual(body, on_disk)
+        size = len(on_disk)
+        self.assertEqual(
+            [(off, min(burst, size - off), True)
+             for off in range(0, size, burst)], dropped)
+
+    def test_read_offload_etag_mismatch_quarantines(self):
+        # ensure an in-place body corruption (same length) still quarantines on
+        # an offloaded read -- etag check for replication, frag metadata for EC
+        self._set_read_offload(True, 4096, 1024)
+        df, on_disk = self._create_test_file(os.urandom(5000), obj='etagmm')
+        n = min(256, len(on_disk))
+        with open(df._data_file, 'r+b') as f:
+            f.seek(0)
+            f.write(b'\x00' * n)         # same length, different bytes
+
+        df2 = self._simple_get_diskfile(obj='etagmm')
+        with df2.open():
+            reader = df2.reader(_quarantine_hook=self._raise_dfq)
+            self.assertRaises(DiskFileQuarantined, b''.join, reader)
+
+    def test_read_offload_ec_frag_corruption_quarantines(self):
+        # ensure per-chunk EC fragment validation still runs when offloaded;
+        # etag validation is off so the frag check is the only thing that can
+        # catch the corruption
+        if not self._is_ec():
+            self.skipTest('EC policy only')
+        policy = POLICIES.default
+        self._set_read_offload(True, 4096, 1024)  # min_size 0
+        df, df_data = self._create_test_file(b'x' * policy.ec_segment_size,
+                                             timestamp=self.ts())
+        # liberasurecode < 1.2.0 only verifies the magic number 59 bytes in
+        corruption_length = 64
+        write_diskfile(df, self.ts(),
+                       b' ' * corruption_length + df_data[corruption_length:])
+        df.open()
+        reader = df.reader()
+        reader._etag_validate_frac = 0
+        with self.assertRaises(DiskFileQuarantined) as cm:
+            b''.join(reader)
+        self.assertEqual('Invalid EC metadata at offset 0x0',
+                         cm.exception.args[0])
+
+    def test_read_offload_app_iter_ranges_multipart(self):
+        # ensure multipart (multi-range) reads are identical under offload and
+        # direct, exercising app_iter_ranges across several ranges
+        dcs, burst = 1024, 4096
+        self._set_read_offload(False, burst, dcs)
+        df, on_disk = self._create_test_file(os.urandom(5000), obj='mpr')
+        n = len(on_disk)
+        ranges = [(0, min(100, n)), (n // 2, min(n // 2 + 100, n)),
+                  (max(0, n - 100), n)]
+
+        def read_mp(read_offload):
+            self._set_read_offload(read_offload, burst, dcs)
+            df2 = self._simple_get_diskfile(obj='mpr')
+            qmsgs = []
+            with df2.open():
+                reader = df2.reader(_quarantine_hook=qmsgs.append)
+                body = b''.join(reader.app_iter_ranges(
+                    ranges, 'application/octet-stream', 'boundary', n))
+            self.assertEqual(qmsgs, [], read_offload)
+            return body
+
+        direct = read_mp(False)
+        offl = read_mp(True)
+        self.assertEqual(offl, direct)
+        # each range's bytes appear in the multipart body
+        for start, stop in ranges:
+            self.assertIn(on_disk[start:stop], offl)
+
+    def test_read_offload_size_gate(self):
+        # ensure _should_offload gates on bytes transferred, not object size: a
+        # small object or a small range of a big object stays direct; only a
+        # large enough whole-object read is offloaded
+        dcs, burst = 1024, 4096
+        # (object size, range or None, expect offload)
+        cases = [(200, None, False),
+                 (100000, None, True),
+                 (100000, (1000, 1100), False)]
+        for i, (size, rng, expect) in enumerate(cases):
+            self._set_read_offload(True, burst, dcs, min_size=4096)
+            df, on_disk = self._create_test_file(os.urandom(size),
+                                                 obj='gate-%d' % i)
+            reader = df.reader()
+            offloaded = []
+            real = reader._offload_bursts
+            with mock.patch.object(
+                    reader, '_offload_bursts',
+                    side_effect=lambda: offloaded.append(1) or real()):
+                if rng is None:
+                    body, expected = b''.join(reader), on_disk
+                else:
+                    body = b''.join(reader.app_iter_range(*rng))
+                    expected = on_disk[rng[0]:rng[1]]
+            self.assertEqual(body, expected, 'case %d' % i)
+            self.assertEqual(bool(offloaded), expect, 'case %d' % i)
 
     def test_disk_file_mkstemp_creates_dir(self):
         for policy in POLICIES:

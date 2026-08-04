@@ -62,7 +62,8 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     normalize_etag, HTTPServiceUnavailable
 from swift.common.wsgi import run_wsgi
 from swift.container.backend import SHARDED
-from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter
+from swift.obj.diskfile import DEFAULT_READ_OFFLOAD_MAX_INFLIGHT, \
+    RESERVED_DATAFILE_META, DiskFileRouter
 from swift.obj.expirer import build_task_obj, embed_expirer_bytes_in_ctype, \
     X_DELETE_TYPE
 
@@ -264,6 +265,24 @@ class ObjectController(BaseStorageServer):
 
         if tpool_size:
             tpool.set_num_threads(tpool_size)
+
+        if config_true_value(conf.get('read_offload', 'false')):
+            # a pool smaller than one device's cap can't run its reads in
+            # parallel; they serialize and PUT fsyncs queue behind them
+            effective_tpool_size = tpool_size or int(
+                os.environ.get('EVENTLET_THREADPOOL_SIZE', 20))
+            max_inflight = max(1, int(conf.get(
+                'read_offload_max_inflight_per_device',
+                DEFAULT_READ_OFFLOAD_MAX_INFLIGHT)))
+            if effective_tpool_size < max_inflight:
+                self.logger.warning(
+                    'read_offload is enabled but the eventlet thread pool has '
+                    'only %(tpool_size)d thread(s), fewer than '
+                    'read_offload_max_inflight_per_device=%(max_inflight)d. '
+                    'Offloaded reads will serialize and delay the fsync of '
+                    'concurrent PUTs. Raise eventlet_tpool_num_threads.',
+                    {'tpool_size': effective_tpool_size,
+                     'max_inflight': max_inflight})
 
     def get_diskfile(self, device, partition, account, container, obj,
                      policy, **kwargs):

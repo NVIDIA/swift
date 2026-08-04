@@ -160,6 +160,40 @@ use = egg:swift#object
 # yielding.
 # cooperative_period = 0
 #
+# If true, offload each GET read+md5 to a thread pool (os.pread and hashlib
+# release the GIL) instead of running it on the hub, where a blocking read
+# stalls the other requests the worker is serving. Note this does not apply to
+# whole-object GETs when splice (see below) is also enabled.
+# read_offload = false
+#
+# Bytes per offloaded read, rounded down to a whole number of disk_chunk_size
+# chunks. A larger burst means fewer handoffs, but each offloaded GET holds a
+# whole burst in memory while it sends it. The server drops each burst from
+# the page cache directly after the read.
+# read_offload_burst_size = 1048576
+#
+# Only offload reads of at least this many bytes, measured on what the GET
+# transfers (so a small range of a big object counts as small); smaller reads
+# stay on the hub, where a single sub-burst handoff wouldn't pay off. Lowering
+# this offloads shorter GETs and costs average latency; raising it leaves more
+# reads on the hub and costs tail latency. The gate is on bytes transferred,
+# not on cache residency, so a page-cache hot object is offloaded too.
+# read_offload_min_size = 1048576
+#
+# Cap on concurrent offloaded reads per device. There is no per-device pool:
+# one process-global thread pool is shared with the fsync offload and with
+# every device the process serves, and this cap is what makes it per-device.
+# It does not help the slow disk itself, it stops that disk from starving the
+# healthy ones and the fsync of concurrent PUTs.
+#
+# Without servers_per_port one process serves every local device, so up to
+# (cap x local devices) reads contend for the pool; size
+# eventlet_tpool_num_threads (below) for that plus headroom for fsync. With
+# servers_per_port each disk usually gets its own process and pool, so the cap
+# is largely redundant; what matters is eventlet_tpool_num_threads, whose auto
+# default of 1 would serialize every offloaded read behind fsync.
+# read_offload_max_inflight_per_device = 8
+#
 # By default, the object-server will always validate the MD5 of object data
 # while streaming a complete object response. Occassionally this is identified
 # as a CPU bottleneck, consuming as much as 40% of the CPU time of the
