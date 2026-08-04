@@ -178,125 +178,149 @@ ionice_priority                          None        I/O scheduling priority of 
 [object-server]
 ***************
 
-================================== ====================== ===============================================
-Option                             Default                Description
----------------------------------- ---------------------- -----------------------------------------------
-use                                                       paste.deploy entry point for the
-                                                          object server.  For most cases,
-                                                          this should be
-                                                          ``egg:swift#object``.
-set log_name                       object-server          Label used when logging
-set log_facility                   LOG_LOCAL0             Syslog log facility
-set log_level                      INFO                   Logging level
-set log_requests                   True                   Whether or not to log each
-                                                          request
-set log_address                    /dev/log               Logging directory
-user                               swift                  User to run as
-max_upload_time                    86400                  Maximum time allowed to upload an
-                                                          object
-slow                               0                      If > 0, Minimum time in seconds for a PUT or
-                                                          DELETE request to complete.  This is only
-                                                          useful to simulate slow devices during testing
-                                                          and development.
-mb_per_sync                        512                    On PUT requests, sync file every
-                                                          n MB
-keep_cache_size                    5242880                Largest object size to keep in
-                                                          buffer cache
-keep_cache_private                 false                  Allow non-public objects to stay
-                                                          in kernel's buffer cache
-keep_cache_slo_manifest            false                  Allow SLO object's manifest file to stay in
-                                                          kernel's buffer cache if its size is under
-                                                          keep_cache_size. This config will only matter
-                                                          when 'keep_cache_private' is false.
-allowed_headers                    Content-Disposition,   Comma separated list of headers
-                                   Content-Encoding,      that can be set in metadata on an object.
-                                   X-Delete-At,           This list is in addition to
-                                   X-Object-Manifest,     X-Object-Meta-* headers and cannot include
-                                   X-Static-Large-Object  Content-Type, etag, Content-Length, or deleted
-                                   Cache-Control,
-                                   Content-Language,
-                                   Expires,
-                                   X-Robots-Tag
-replication_server                                        Configure parameter for creating
-                                                          specific server. To handle all verbs,
-                                                          including replication verbs, do not
-                                                          specify "replication_server"
-                                                          (this is the default). To only
-                                                          handle replication, set to a True
-                                                          value (e.g. "True" or "1").
-                                                          To handle only non-replication
-                                                          verbs, set to "False". Unless you
-                                                          have a separate replication network, you
-                                                          should not specify any value for
-                                                          "replication_server".
-replication_concurrency            4                      Set to restrict the number of
-                                                          concurrent incoming SSYNC
-                                                          requests; set to 0 for unlimited
-replication_concurrency_per_device 1                      Set to restrict the number of
-                                                          concurrent incoming SSYNC
-                                                          requests per device; set to 0 for
-                                                          unlimited requests per devices.
-                                                          This can help control I/O to each
-                                                          device. This does not override
-                                                          replication_concurrency described
-                                                          above, so you may need to adjust
-                                                          both parameters depending on your
-                                                          hardware or network capacity.
-replication_lock_timeout           15                     Number of seconds to wait for an
-                                                          existing replication device lock
-                                                          before giving up.
-replication_failure_threshold      100                    The number of subrequest failures
-                                                          before the
-                                                          replication_failure_ratio is
-                                                          checked
-replication_failure_ratio          1.0                    If the value of failures /
-                                                          successes of SSYNC
-                                                          subrequests exceeds this ratio,
-                                                          the overall SSYNC request
-                                                          will be aborted
-splice                             no                     Use splice() for zero-copy object
-                                                          GETs. This requires Linux kernel
-                                                          version 3.0 or greater. If you set
-                                                          "splice = yes" but the kernel
-                                                          does not support it, error messages
-                                                          will appear in the object server
-                                                          logs at startup, but your object
-                                                          servers should continue to function.
-nice_priority                      None                   Scheduling priority of server processes.
-                                                          Niceness values range from -20 (most
-                                                          favorable to the process) to 19 (least
-                                                          favorable to the process). The default
-                                                          does not modify priority.
-ionice_class                       None                   I/O scheduling class of server processes.
-                                                          I/O niceness class values are IOPRIO_CLASS_RT
-                                                          (realtime), IOPRIO_CLASS_BE (best-effort),
-                                                          and IOPRIO_CLASS_IDLE (idle).
-                                                          The default does not modify class and
-                                                          priority. Linux supports io scheduling
-                                                          priorities and classes since 2.6.13 with
-                                                          the CFQ io scheduler.
-                                                          Work only with ionice_priority.
-ionice_priority                    None                   I/O scheduling priority of server
-                                                          processes. I/O niceness priority is
-                                                          a number which goes from 0 to 7.
-                                                          The higher the value, the lower the I/O
-                                                          priority of the process. Work only with
-                                                          ionice_class.
-                                                          Ignored if IOPRIO_CLASS_IDLE is set.
-eventlet_tpool_num_threads         auto                   The number of threads in eventlet's thread pool.
-                                                          Most IO will occur in the object server's main
-                                                          thread, but certain "heavy" IO operations will
-                                                          occur in separate IO threads, managed by
-                                                          eventlet.
-                                                          The default value is auto, whose actual value
-                                                          is dependent on the servers_per_port value.
-                                                          If servers_per_port is zero then it uses
-                                                          eventlet's default (currently 20 threads).
-                                                          If the servers_per_port is nonzero then it'll
-                                                          only use 1 thread per process.
-                                                          This value can be overridden with an integer
-                                                          value.
-================================== ====================== ===============================================
+==================================== ====================== ===============================================
+Option                               Default                Description
+------------------------------------ ---------------------- -----------------------------------------------
+use                                                         paste.deploy entry point for the
+                                                            object server.  For most cases,
+                                                            this should be
+                                                            ``egg:swift#object``.
+set log_name                         object-server          Label used when logging
+set log_facility                     LOG_LOCAL0             Syslog log facility
+set log_level                        INFO                   Logging level
+set log_requests                     True                   Whether or not to log each
+                                                            request
+set log_address                      /dev/log               Logging directory
+user                                 swift                  User to run as
+max_upload_time                      86400                  Maximum time allowed to upload an
+                                                            object
+slow                                 0                      If > 0, Minimum time in seconds for a PUT or
+                                                            DELETE request to complete.  This is only
+                                                            useful to simulate slow devices during testing
+                                                            and development.
+mb_per_sync                          512                    On PUT requests, sync file every
+                                                            n MB
+keep_cache_size                      5242880                Largest object size to keep in
+                                                            buffer cache
+keep_cache_private                   false                  Allow non-public objects to stay
+                                                            in kernel's buffer cache
+keep_cache_slo_manifest              false                  Allow SLO object's manifest file to stay in
+                                                            kernel's buffer cache if its size is under
+                                                            keep_cache_size. This config will only matter
+                                                            when 'keep_cache_private' is false.
+allowed_headers                      Content-Disposition,   Comma separated list of headers
+                                     Content-Encoding,      that can be set in metadata on an object.
+                                     X-Delete-At,           This list is in addition to
+                                     X-Object-Manifest,     X-Object-Meta-* headers and cannot include
+                                     X-Static-Large-Object  Content-Type, etag, Content-Length, or deleted
+                                     Cache-Control,
+                                     Content-Language,
+                                     Expires,
+                                     X-Robots-Tag
+replication_server                                          Configure parameter for creating
+                                                            specific server. To handle all verbs,
+                                                            including replication verbs, do not
+                                                            specify "replication_server"
+                                                            (this is the default). To only
+                                                            handle replication, set to a True
+                                                            value (e.g. "True" or "1").
+                                                            To handle only non-replication
+                                                            verbs, set to "False". Unless you
+                                                            have a separate replication network, you
+                                                            should not specify any value for
+                                                            "replication_server".
+replication_concurrency              4                      Set to restrict the number of
+                                                            concurrent incoming SSYNC
+                                                            requests; set to 0 for unlimited
+replication_concurrency_per_device   1                      Set to restrict the number of
+                                                            concurrent incoming SSYNC
+                                                            requests per device; set to 0 for
+                                                            unlimited requests per devices.
+                                                            This can help control I/O to each
+                                                            device. This does not override
+                                                            replication_concurrency described
+                                                            above, so you may need to adjust
+                                                            both parameters depending on your
+                                                            hardware or network capacity.
+replication_lock_timeout             15                     Number of seconds to wait for an
+                                                            existing replication device lock
+                                                            before giving up.
+replication_failure_threshold        100                    The number of subrequest failures
+                                                            before the
+                                                            replication_failure_ratio is
+                                                            checked
+replication_failure_ratio            1.0                    If the value of failures /
+                                                            successes of SSYNC
+                                                            subrequests exceeds this ratio,
+                                                            the overall SSYNC request
+                                                            will be aborted
+splice                               no                     Use splice() for zero-copy object
+                                                            GETs. This requires Linux kernel
+                                                            version 3.0 or greater. If you set
+                                                            "splice = yes" but the kernel
+                                                            does not support it, error messages
+                                                            will appear in the object server
+                                                            logs at startup, but your object
+                                                            servers should continue to function.
+read_offload                         false                  If true, do the read and the MD5
+                                                            calculation of a GET in eventlet's
+                                                            thread pool, not on the hub. A blocking
+                                                            read on the hub stops all other requests
+                                                            of the worker. This does not apply to
+                                                            whole-object GETs when splice is also
+                                                            enabled.
+read_offload_burst_size              1048576                Bytes for each offloaded read. The value
+                                                            is rounded down to a whole number of
+                                                            disk_chunk_size chunks, with a minimum
+                                                            of one chunk. A larger burst means fewer
+                                                            handoffs, but each offloaded GET keeps
+                                                            one burst in memory while it sends it.
+read_offload_min_size                1048576                Only offload a GET that transfers at
+                                                            least this many bytes. A smaller read
+                                                            stays on the hub. The default is the
+                                                            value of read_offload_burst_size.
+read_offload_max_inflight_per_device 8                      Maximum number of concurrent offloaded
+                                                            reads for each device. All devices of
+                                                            one process share one thread pool, so
+                                                            this limit stops a slow device from
+                                                            using all threads.
+nice_priority                        None                   Scheduling priority of server processes.
+                                                            Niceness values range from -20 (most
+                                                            favorable to the process) to 19 (least
+                                                            favorable to the process). The default
+                                                            does not modify priority.
+ionice_class                         None                   I/O scheduling class of server processes.
+                                                            I/O niceness class values are IOPRIO_CLASS_RT
+                                                            (realtime), IOPRIO_CLASS_BE (best-effort),
+                                                            and IOPRIO_CLASS_IDLE (idle).
+                                                            The default does not modify class and
+                                                            priority. Linux supports io scheduling
+                                                            priorities and classes since 2.6.13 with
+                                                            the CFQ io scheduler.
+                                                            Work only with ionice_priority.
+ionice_priority                      None                   I/O scheduling priority of server
+                                                            processes. I/O niceness priority is
+                                                            a number which goes from 0 to 7.
+                                                            The higher the value, the lower the I/O
+                                                            priority of the process. Work only with
+                                                            ionice_class.
+                                                            Ignored if IOPRIO_CLASS_IDLE is set.
+eventlet_tpool_num_threads           auto                   The number of threads in eventlet's thread pool.
+                                                            Most IO will occur in the object server's main
+                                                            thread, but certain "heavy" IO operations will
+                                                            occur in separate IO threads, managed by
+                                                            eventlet.
+                                                            The default value is auto, whose actual value
+                                                            is dependent on the servers_per_port value.
+                                                            If servers_per_port is zero then it uses
+                                                            eventlet's default (currently 20 threads).
+                                                            If the servers_per_port is nonzero then it'll
+                                                            only use 1 thread per process.
+                                                            This value can be overridden with an integer
+                                                            value.
+                                                            Offloaded GET reads (see read_offload) also
+                                                            use this pool.
+==================================== ====================== ===============================================
 
 *******************
 [object-replicator]
