@@ -25,7 +25,8 @@ import time
 import traceback
 import socket
 
-from swift.common.concurrency import sleep, wsgi, Timeout, tpool, spawn
+from swift.common.concurrency import sleep, wsgi, Timeout, tpool, spawn, \
+    get_tpool_num_threads
 
 from swift.common.utils import public, get_logger, \
     config_true_value, config_percent_value, \
@@ -264,6 +265,22 @@ class ObjectController(BaseStorageServer):
 
         if tpool_size:
             tpool.set_num_threads(tpool_size)
+
+        effective_tpool_size = tpool_size or get_tpool_num_threads()
+        for dfm in self._diskfile_router.policy_to_manager.values():
+            max_inflight = dfm.read_offload_max_inflight_per_device
+            if dfm.read_offload and effective_tpool_size < max_inflight:
+                # a pool smaller than one device's cap can't run its reads in
+                # parallel; they serialize and PUT fsyncs queue behind them
+                self.logger.warning(
+                    'read_offload is enabled but the eventlet thread pool has '
+                    'only %(tpool_size)d thread(s), fewer than '
+                    'read_offload_max_inflight_per_device=%(max_inflight)d. '
+                    'Offloaded reads will serialize and delay the fsync of '
+                    'concurrent PUTs. Raise eventlet_tpool_num_threads.',
+                    {'tpool_size': effective_tpool_size,
+                     'max_inflight': max_inflight})
+                break
 
     def get_diskfile(self, device, partition, account, container, obj,
                      policy, **kwargs):
