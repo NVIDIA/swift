@@ -50,7 +50,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from datetime import timedelta
 
-from swift.common.concurrency import Timeout, tpool, trampoline
+from swift.common.concurrency import Semaphore, Timeout, tpool, trampoline
 from pyeclib.ec_iface import ECDriverError, ECInvalidFragmentMetadata, \
     ECBadFragmentChecksum, ECInvalidParameter
 
@@ -87,6 +87,30 @@ HASH_INVALIDATIONS_FILE = 'hashes.invalid'
 METADATA_KEY = b'user.swift.metadata'
 METADATA_CHECKSUM_KEY = b'user.swift.metadata_checksum'
 DROP_CACHE_WINDOW = 1024 * 1024
+DEFAULT_READ_OFFLOAD_BURST_SIZE = 1024 * 1024
+# one device's share of eventlet's pool of 20 threads; the other 12 stay
+# free for the other devices and for the fsync of a PUT
+DEFAULT_READ_OFFLOAD_MAX_INFLIGHT = 8
+
+# Per-device offload semaphores. Created on the hub greenlet only, so no lock.
+_device_offload_semaphores = {}
+
+
+def get_device_offload_semaphore(device_path, cap):
+    """
+    Return the shared per-device offload Semaphore, creating it once.
+
+    The first call for a device sets the cap. Later calls ignore their cap.
+    DiskFileRouter builds all managers of a process from the same conf, so
+    in-tree callers always pass the same cap.
+    """
+    sem = _device_offload_semaphores.get(device_path)
+    if sem is None:
+        sem = Semaphore(max(1, cap))
+        _device_offload_semaphores[device_path] = sem
+    return sem
+
+
 # These are system-set metadata keys that cannot be changed with a POST.
 # They should be lowercase.
 RESERVED_DATAFILE_META = {'content-length', 'deleted', 'etag'}
@@ -766,6 +790,22 @@ class BaseDiskFileManager(object):
         self.devices = conf.get('devices', '/srv/node')
         self.disk_chunk_size = config_positive_int_value(
             conf.get('disk_chunk_size', 65536))
+        self.read_offload = config_true_value(
+            conf.get('read_offload', 'false'))
+        burst = int(conf.get(
+            'read_offload_burst_size', DEFAULT_READ_OFFLOAD_BURST_SIZE))
+        # whole disk chunks (>=1) so offload yields the same chunk sizes
+        # as the direct path
+        self.read_offload_burst_size = (
+            max(1, burst // self.disk_chunk_size) * self.disk_chunk_size)
+        # cap one device's share of the shared tpool
+        self.read_offload_max_inflight_per_device = max(1, int(conf.get(
+            'read_offload_max_inflight_per_device',
+            DEFAULT_READ_OFFLOAD_MAX_INFLIGHT)))
+        # sub-burst reads stay on the hub: too little work to amortize the
+        # handoff. Defaults to one burst.
+        self.read_offload_min_size = int(conf.get(
+            'read_offload_min_size', self.read_offload_burst_size))
         self.keep_cache_size = int(conf.get('keep_cache_size', 5242880))
         self.bytes_per_sync = int(conf.get('mb_per_sync', 512)) * 1024 * 1024
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
@@ -2174,12 +2214,25 @@ class BaseDiskFileReader(object):
                                yielding during file read
     :param etag_validate_frac: the probability that we should perform etag
                                validation during a complete file read
+    :param read_offload: if true, offload each read+hash burst to an eventlet
+                         thread pool worker; if false, read+hash on the hub
+    :param read_offload_burst_size: size in bytes of each offloaded read; the
+                         burst is sliced into disk_chunk_size pieces for
+                         yielding so WSGI write sizes are unchanged
+    :param read_offload_max_inflight: per-device cap on concurrent offloaded
+                         reads (guards the shared thread pool against a single
+                         sick disk)
+    :param read_offload_min_size: only offload a read of at least this many
+                         bytes; smaller reads stay on the direct path
     """
     def __init__(self, fp, data_file, obj_size, etag,
                  disk_chunk_size, keep_cache_size, device_path, logger,
                  quarantine_hook, use_splice, pipe_size, diskfile,
                  keep_cache=False, cooperative_period=0,
-                 etag_validate_frac=1):
+                 etag_validate_frac=1, read_offload=False,
+                 read_offload_burst_size=DEFAULT_READ_OFFLOAD_BURST_SIZE,
+                 read_offload_max_inflight=DEFAULT_READ_OFFLOAD_MAX_INFLIGHT,
+                 read_offload_min_size=0):
         # Parameter tracking
         self._fp = fp
         self._data_file = data_file
@@ -2200,6 +2253,15 @@ class BaseDiskFileReader(object):
             self._keep_cache = False
         self._cooperative_period = cooperative_period
         self._etag_validate_frac = etag_validate_frac
+        self._read_offload = read_offload
+        # already rounded to whole disk chunks by the manager
+        self._read_offload_burst_size = read_offload_burst_size
+        self._read_offload_min_size = read_offload_min_size
+        if read_offload:
+            self._offload_semaphore = get_device_offload_semaphore(
+                device_path, read_offload_max_inflight)
+        else:
+            self._offload_semaphore = None
 
         # Internal Attributes
         self._iter_etag = None
@@ -2209,6 +2271,8 @@ class BaseDiskFileReader(object):
         self._md5_of_sent_bytes = None
         self._suppress_file_closing = False
         self._quarantined_dir = None
+        # bytes of the range; None = to EOF. Set by app_iter_range.
+        self._range_length = None
 
     @property
     def manager(self):
@@ -2224,9 +2288,23 @@ class BaseDiskFileReader(object):
         if self._iter_etag:
             self._iter_etag.update(chunk)
 
+    def _offload_chunk_checks(self, chunk):
+        """
+        Per-chunk validation that must run on the hub, not the offload thread
+        (EC frag checks can quarantine). The etag is already updated by
+        :meth:`_read_burst`; base does nothing.
+        """
+        pass
+
     def __iter__(self):
+        # choose the read path once per iteration; app_iter_range may have
+        # already set _range_length when this runs
+        if self._should_offload():
+            inner = self._offload_inner_iter()
+        else:
+            inner = self._inner_iter()
         return CooperativeIterator(
-            self._inner_iter(), period=self._cooperative_period)
+            inner, period=self._cooperative_period)
 
     def _inner_iter(self):
         """Returns an iterator over the data file."""
@@ -2265,6 +2343,95 @@ class BaseDiskFileReader(object):
         finally:
             if not self._suppress_file_closing:
                 self.close()
+
+    @property
+    def _transfer_length(self):
+        """
+        Bytes this read transfers from the current position: the length of
+        the range, else the rest of the object.
+        """
+        if self._range_length is None:
+            return self._obj_size - self._fp.tell()
+        return self._range_length
+
+    def _should_offload(self):
+        """
+        Offload only when enabled and the read transfers at least
+        read_offload_min_size. Gated on bytes transferred, not on object size,
+        so a small range of a big object stays direct.
+        """
+        if not self._read_offload:
+            return False
+        return self._transfer_length >= self._read_offload_min_size
+
+    def _offload_inner_iter(self):
+        """
+        Offloaded counterpart of :meth:`_inner_iter`. Each burst comes from a
+        tpool worker, which also updated the etag, so only the per-chunk
+        validation of :meth:`_offload_chunk_checks` is left here. The burst is
+        sliced into disk_chunk_size pieces, so the yielded chunk sizes match
+        the direct path.
+        """
+        try:
+            self._bytes_read = 0
+            self._started_at_0 = False
+            self._read_to_eof = False
+            self._init_checks()
+            for buf in self._offload_bursts():
+                for i in range(0, len(buf), self._disk_chunk_size):
+                    chunk = buf[i:i + self._disk_chunk_size]
+                    self._offload_chunk_checks(chunk)
+                    self._bytes_read += len(chunk)
+                    yield chunk
+        finally:
+            if not self._suppress_file_closing:
+                self.close()
+
+    def _read_burst(self, nbytes):
+        """
+        Read ``nbytes`` from ``self._fp``, update the etag with them and drop
+        them from the page cache (``b''`` at EOF). On a tpool worker: the read
+        and md5 both release the GIL. The drop runs in the thread that read the
+        pages, so the kernel finds them in the LRU batch of this CPU and does
+        not drain all CPUs. A reader has one burst in flight at a time, so
+        ``self._fp`` and ``_iter_etag`` are never used concurrently.
+        """
+        offset = self._fp.tell()
+        buf = self._fp.read(nbytes)
+        if buf:
+            if self._iter_etag is not None:
+                self._iter_etag.update(buf)
+            self._drop_cache(self._fp.fileno(), offset, len(buf))
+        return buf
+
+    def _offload_bursts(self):
+        """
+        Read+hash each burst on a tpool worker; the per-device semaphore bounds
+        concurrent offloads. ``self._fp`` carries the offset from burst to
+        burst.
+        """
+        if self._fp.tell() >= self._obj_size:
+            # the file cannot grow, so there is nothing left to read
+            self._read_to_eof = True
+            return
+        remaining = self._transfer_length
+        while remaining > 0:
+            nbytes = min(self._read_offload_burst_size, remaining)
+            try:
+                with self._offload_semaphore:
+                    buf = tpool.execute(self._read_burst, nbytes)
+            except IOError as e:
+                if e.errno == errno.EIO:
+                    self._quarantine(str(e))
+                raise
+            if not buf:
+                self._read_to_eof = True
+                return
+            # a short read is not EOF; loop for the rest
+            remaining -= len(buf)
+            yield buf
+        if self._fp.tell() >= self._obj_size:
+            self._read_to_eof = True
 
     def can_zero_copy_send(self):
         return self._use_splice
@@ -2383,6 +2550,8 @@ class BaseDiskFileReader(object):
             length = stop - start
         else:
             length = None
+        # bytes this range transfers, for _should_offload (None == to EOF)
+        self._range_length = length
         try:
             for chunk in self:
                 if length is not None:
@@ -3117,7 +3286,12 @@ class BaseDiskFile(object):
             use_splice=self._use_splice, quarantine_hook=_quarantine_hook,
             pipe_size=self._pipe_size, diskfile=self, keep_cache=keep_cache,
             cooperative_period=cooperative_period,
-            etag_validate_frac=etag_validate_frac)
+            etag_validate_frac=etag_validate_frac,
+            read_offload=self._manager.read_offload,
+            read_offload_burst_size=self._manager.read_offload_burst_size,
+            read_offload_max_inflight=(
+                self._manager.read_offload_max_inflight_per_device),
+            read_offload_min_size=self._manager.read_offload_min_size)
         # At this point the reader object is now responsible for closing
         # the file pointer.
         self._fp = None
@@ -3281,12 +3455,17 @@ class ECDiskFileReader(BaseDiskFileReader):
                  disk_chunk_size, keep_cache_size, device_path, logger,
                  quarantine_hook, use_splice, pipe_size, diskfile,
                  keep_cache=False, cooperative_period=0,
-                 etag_validate_frac=1):
+                 etag_validate_frac=1, read_offload=False,
+                 read_offload_burst_size=DEFAULT_READ_OFFLOAD_BURST_SIZE,
+                 read_offload_max_inflight=DEFAULT_READ_OFFLOAD_MAX_INFLIGHT,
+                 read_offload_min_size=0):
         super(ECDiskFileReader, self).__init__(
             fp, data_file, obj_size, etag,
             disk_chunk_size, keep_cache_size, device_path, logger,
             quarantine_hook, use_splice, pipe_size, diskfile, keep_cache,
-            cooperative_period, etag_validate_frac)
+            cooperative_period, etag_validate_frac, read_offload,
+            read_offload_burst_size, read_offload_max_inflight,
+            read_offload_min_size)
         self.frag_buf = None
         self.frag_offset = 0
         self.frag_size = self._diskfile.policy.fragment_size
@@ -3337,8 +3516,8 @@ class ECDiskFileReader(BaseDiskFileReader):
                 'Problem checking EC fragment %(datadir)s: %(err)s',
                 {'datadir': self._diskfile._datadir, 'err': err})
 
-    def _update_checks(self, chunk):
-        super(ECDiskFileReader, self)._update_checks(chunk)
+    def _check_frag_chunk(self, chunk):
+        # validate whole fragments as data accumulates; chunk-size agnostic
         if self.frag_buf is not None:
             self.frag_buf += chunk
             cursor = 0
@@ -3348,6 +3527,14 @@ class ECDiskFileReader(BaseDiskFileReader):
                 self.frag_offset += self.frag_size
             if cursor:
                 self.frag_buf = self.frag_buf[cursor:]
+
+    def _update_checks(self, chunk):
+        super(ECDiskFileReader, self)._update_checks(chunk)
+        self._check_frag_chunk(chunk)
+
+    def _offload_chunk_checks(self, chunk):
+        # etag already updated by _read_burst; only frag validation remains
+        self._check_frag_chunk(chunk)
 
     def _handle_close_quarantine(self):
         super(ECDiskFileReader, self)._handle_close_quarantine()
