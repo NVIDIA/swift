@@ -137,6 +137,33 @@ class TestTpoolSize(unittest.TestCase):
             object_server.ObjectController(conf)
         self.assertEqual([], mock_snt.mock_calls)
 
+    def _read_offload_warnings(self, conf):
+        logger = debug_logger()
+        with mock.patch('eventlet.tpool.set_num_threads'):
+            object_server.ObjectController(conf, logger=logger)
+        return [line for line in logger.get_lines_for_level('warning')
+                if 'read_offload' in line]
+
+    def test_read_offload_undersized_tpool_warns(self):
+        # servers_per_port defaults the pool to one thread
+        warnings = self._read_offload_warnings(
+            {'servers_per_port': '3', 'read_offload': 'true'})
+        self.assertEqual(1, len(warnings), warnings)
+        self.assertIn('only 1 thread(s)', warnings[0])
+        self.assertIn('read_offload_max_inflight_per_device=8', warnings[0])
+
+    def test_read_offload_sized_tpool_does_not_warn(self):
+        self.assertEqual([], self._read_offload_warnings(
+            {'servers_per_port': '3', 'read_offload': 'true',
+             'eventlet_tpool_num_threads': '8'}))
+        # eventlet's own default is big enough for the default cap
+        self.assertEqual([], self._read_offload_warnings(
+            {'read_offload': 'true'}))
+
+    def test_read_offload_disabled_does_not_warn(self):
+        self.assertEqual([], self._read_offload_warnings(
+            {'servers_per_port': '3'}))
+
 
 class SameReqEnv(object):
 
