@@ -154,6 +154,52 @@ and replicators should resume their job::
 
 Now you need to copy the updated .ring.gz again to all nodes.
 
+--------------------------------
+4. Audit old partition locations
+--------------------------------
+
+Once the finished ring has been copied to all nodes and re-read, run the audit
+on every object storage node, specifying the policy whose partition power was
+increased::
+
+    swift-object-relinker audit --policy <policy-name-or-index>
+
+.. note::
+
+    The ``--policy`` flag is required for ``audit`` since processing a
+    replicated policy by default may have unintended consequences.
+
+The audit is only available when no partition power increase is in progress;
+in other words, the ring's ``next_part_power`` must be ``None``. It scans the
+old, lower half of the partition namespace and calculates the expected current
+partition for each hash directory. A hash directory found in an ancestor of
+its expected partition is quarantined. A misplaced hash directory that is not
+such an ancestor is left in place and logged as a warning. By default, the
+audit considers ancestors from the two most recent partition power increases.
+This limit may be changed with ``--max-audit-history-quarantine-threshold``
+or the corresponding option in the ``[object-relinker]`` configuration section.
+
+.. warning::
+
+    Keep ``object-replicator`` stopped when auditing a replicated policy.
+    Otherwise, a stale hash directory may be processed as a handoff for
+    the wrong partition before the audit can quarantine it.
+
+The relinker persists progress for each device and policy data directory in
+``<devices>/<device>/relink.<data-dir>.json``. For example, with the default
+devices path, policy index 1 on device ``sda`` uses
+``/srv/node/sda/relink.objects-1.json``. An interrupted audit uses this file to
+resume at incomplete partitions, and a subsequent audit skips partitions that
+are already marked complete. Unlike relink and cleanup, a completed audit does
+not itself cause another ring-state change, so merely running the command again
+does not rescan those partitions.
+
+To perform a full rescan, make sure that no relinker process is running, remove
+the relevant state file from every device, and then run the audit again::
+
+    rm /srv/node/sda/relink.objects-1.json
+    swift-object-relinker audit --policy 1
+
 ----------
 Background
 ----------
