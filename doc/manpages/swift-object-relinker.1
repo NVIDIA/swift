@@ -17,7 +17,7 @@
 .TH SWIFT-OBJECT-RELINKER "1" "December 2017" "OpenStack Swift"
 
 .SH NAME
-\fBswift\-object\-relinker\fR \- relink and cleanup objects to increase partition power
+\fBswift\-object\-relinker\fR \- relink, cleanup, and audit objects for partition power increases
 .SH SYNOPSIS
 .B swift\-object\-relinker
 [\fIoptions\fR] <\fIcommand\fR>
@@ -26,7 +26,8 @@
 .PP
 The relinker prepares an object server's filesystem for a partition power
 change by crawling the filesystem and linking existing objects to future
-partition directories.
+partition directories. After a partition power increase, it can also audit old
+partition directories and quarantine hashes that cleanup did not remove.
 
 More information can be found at
 .BI https://docs.openstack.org/swift/latest/ring_partpower.html
@@ -39,6 +40,10 @@ Relink files for partition power increase.
 .TP
 \fBcleanup\fR
 Remove hard links in the old locations.
+
+.TP
+\fBaudit\fR
+Quarantine uncleaned hash directories in the old locations.
 
 .SH OPTIONS
 .TP
@@ -56,6 +61,12 @@ Path to swift device directory
 .TP
 \fB\-\-skip\-mount\-check\fR
 Don't test if disk is mounted
+
+.TP
+\fB\-\-max\-audit\-history\-quarantine\-threshold\fR \fIN\fR
+Allow \fBaudit\fR to quarantine a hash directory only when its current
+location is an ancestor within the most recent \fIN\fR partition power
+increases. The value must be between 1 and 32 inclusive; the default is 2.
 
 .TP
 \fB\-\-logfile\fR \fILOGFILE\fR
