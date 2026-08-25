@@ -25,7 +25,8 @@ from swift.common.middleware.s3api.s3checksum import \
     checksum_sysmeta_to_response_headers, checksum_sysmeta_values, \
     format_supported_checksum_algorithms, get_checksum_hasher, \
     normalize_checksum_algorithm, normalize_checksum_type, \
-    normalize_checksum_mode, validate_checksum_value
+    normalize_checksum_mode, split_composite_checksum, \
+    validate_checksum_value
 from swift.common.middleware.s3api.exception import \
     S3InputChecksumMismatch, S3InputChecksumTrailerInvalid
 from swift.common.header_key_dict import HeaderKeyDict
@@ -305,6 +306,34 @@ class TestModuleFunctions(unittest.TestCase):
         self.assertEqual(
             'CRC32', checksum_algorithm_from_header(
                 'x-amz-checksum-crc32'))
+
+    def test_split_composite_checksum(self):
+        self.assertEqual(
+            ('DUoRhQ==', None), split_composite_checksum('DUoRhQ=='))
+        self.assertEqual(
+            ('DUoRhQ==', 1), split_composite_checksum('DUoRhQ==-1'))
+        self.assertEqual(
+            ('DUoRhQ==', 10000), split_composite_checksum('DUoRhQ==-10000'))
+        # beyond being non-empty, the digest is not inspected
+        self.assertEqual(
+            ('not!base64', None), split_composite_checksum('not!base64'))
+
+    def test_split_composite_checksum_bad_part_count(self):
+        # A part count of zero or less is impossible, and anything that is not
+        # a plain integer never was a part count.
+        for value in ('DUoRhQ==-0', 'DUoRhQ==--1', 'DUoRhQ==-abc',
+                      'DUoRhQ==-', 'DUoRhQ==-1.0', 'DUoRhQ==-+1',
+                      'DUoRhQ==-1-2'):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    split_composite_checksum(value)
+
+    def test_split_composite_checksum_missing_digest(self):
+        # A suffix with nothing in front of it is not a checksum at all.
+        for value in ('', '-', '-1'):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    split_composite_checksum(value)
 
     def test_checksum_sysmeta_headers_without_type(self):
         self.assertEqual(HeaderKeyDict({

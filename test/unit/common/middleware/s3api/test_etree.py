@@ -68,6 +68,53 @@ class TestS3ApiEtree(unittest.TestCase):
         self.assertEqual(text, b'\xef\xbc\xa1'.decode('utf8'))
         self.assertIsInstance(text, str)
 
+    def test_complete_multipart_upload_result_with_checksum(self):
+        for checksum_value, checksum_type in (
+                ('AAAAAA==', None), ('AAAAAA==-2', 'COMPOSITE')):
+            with self.subTest(checksum_type=checksum_type):
+                type_xml = ('<ChecksumType>%s</ChecksumType>' % checksum_type
+                            if checksum_type else '')
+                xml = '''
+                    <CompleteMultipartUploadResult>
+                      <Location>http://localhost/bucket/object</Location>
+                      <Bucket>bucket</Bucket>
+                      <Key>object</Key>
+                      <ETag>"etag"</ETag>
+                      <ChecksumCRC32>%s</ChecksumCRC32>
+                      %s
+                    </CompleteMultipartUploadResult>
+                ''' % (checksum_value, type_xml)
+
+                elem = etree.fromstring(xml, 'CompleteMultipartUploadResult')
+
+                self.assertEqual(
+                    checksum_value, elem.find('ChecksumCRC32').text)
+                if checksum_type:
+                    self.assertEqual(
+                        checksum_type, elem.find('ChecksumType').text)
+                else:
+                    self.assertIsNone(elem.find('ChecksumType'))
+
+    def test_complete_multipart_upload_result_rejects_invalid_checksums(self):
+        # A response permits one checksum, with an optional checksum type.
+        for checksum_xml in (
+                '<ChecksumCRC32>AAAAAA==</ChecksumCRC32>'
+                '<ChecksumSHA256>BBBBBB==</ChecksumSHA256>',
+                '<ChecksumType>FULL_OBJECT</ChecksumType>'):
+            with self.subTest(checksum_xml=checksum_xml):
+                xml = '''
+                    <CompleteMultipartUploadResult>
+                      <Location>http://localhost/bucket/object</Location>
+                      <Bucket>bucket</Bucket>
+                      <Key>object</Key>
+                      <ETag>"etag"</ETag>
+                      %s
+                    </CompleteMultipartUploadResult>
+                ''' % checksum_xml
+
+                with self.assertRaises(etree.DocumentInvalid):
+                    etree.fromstring(xml, 'CompleteMultipartUploadResult')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -3,5 +3,15 @@ start =
     element Location { xsd:anyURI },
     element Bucket { xsd:string },
     element Key { xsd:string },
-    element ETag { xsd:string }
+    element ETag { xsd:string },
+    (
+      (
+        element ChecksumCRC32 { xsd:string } |
+        element ChecksumCRC32C { xsd:string } |
+        element ChecksumCRC64NVME { xsd:string } |
+        element ChecksumSHA1 { xsd:string } |
+        element ChecksumSHA256 { xsd:string }
+      ),
+      element ChecksumType { xsd:string }?
+    )?
   }

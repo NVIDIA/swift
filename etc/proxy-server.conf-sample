@@ -642,11 +642,14 @@ user_test5_tester5 = testing5 service
 
 [filter:s3api]
 use = egg:swift#s3api
-# Write checksum metadata on a new PUT Object, MPU marker, or MPU part.
+# Write checksum metadata on a new PUT Object, MPU marker, MPU part, or
+# completed MPU.
 # The default is false.
 # Enable only after all proxy and internal applications that read, write, or
 # copy these objects have the checksum code and old workers have drained.
-# Complete or abort existing MPUs before disabling.
+# Legacy MPUs can complete with checksum request fields, but do not compare
+# or store them, with this option on or off. Request-format checks still apply.
+# Complete or abort existing MPUs before disabling or rolling back.
 # allow_store_checksums = false
 
 # s3api setup:

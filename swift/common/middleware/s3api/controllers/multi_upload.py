@@ -64,11 +64,13 @@ import copy
 import os
 import re
 import time
+from itertools import repeat
 
 from swift.common import constraints
 from swift.common.swob import Range, bytes_to_wsgi, normalize_etag, \
     wsgi_quote, wsgi_to_str, parse_date_header
-from swift.common.utils import json, public, reiterate, md5, serialize_header
+from swift.common.utils import json, public, reiterate, md5, base64_str, \
+    serialize_header
 from swift.common.utils.timestamp import Timestamp, NormalTimestamp
 from swift.common.request_helpers import get_container_update_override_key, \
     get_param
@@ -84,15 +86,17 @@ from swift.common.middleware.s3api.s3response import InvalidArgument, \
     BucketAlreadyExists, EntityTooSmall, InvalidPartOrder, InvalidRequest, \
     HTTPOk, HTTPNoContent, NoSuchKey, NoSuchUpload, NoSuchBucket, \
     BucketAlreadyOwnedByYou, ServiceUnavailable, PreconditionFailed, \
-    S3NotImplemented
+    S3NotImplemented, BadDigest, InternalError
 from swift.common.middleware.s3api.s3checksum import \
     CHECKSUM_TYPE_FULL_OBJECT, CHECKSUM_TYPE_COMPOSITE, \
-    CHECKSUMS_BY_HEADER, FULL_OBJECT_MPU_CHECKSUM_HEADERS, \
+    CHECKSUMS_BY_HEADER, CHECKSUM_XML_ELEMENTS, \
+    FULL_OBJECT_MPU_CHECKSUM_HEADERS, \
     COMPOSITE_MPU_CHECKSUM_HEADERS, checksum_header_from_algorithm, \
-    checksum_algorithm_from_header, \
+    checksum_algorithm_from_header, checksum_xml_element_from_header, \
     checksum_sysmeta_headers, format_supported_checksum_algorithms, \
     checksum_sysmeta_to_response_headers, checksum_sysmeta_values, \
-    normalize_checksum_type, get_checksum_hasher
+    normalize_checksum_type, split_composite_checksum, \
+    validate_checksum_value, get_checksum_hasher
 from swift.common.middleware.s3api.utils import unique_id, \
     MULTIUPLOAD_SUFFIX, S3Timestamp, s3api_sysmeta_header
 from swift.common.middleware.s3api.etree import Element, SubElement, \
@@ -278,6 +282,157 @@ def _validate_mpu_initiate_checksum_headers(checksum_attrs):
         checksum_attrs.type, checksum_attrs.header)
 
 
+def _validate_mpu_complete_checksum_headers(
+        request_checksum_attrs, mpu_checksum_attrs):
+    """
+    Validate CompleteMultipartUpload checksums against the MPU configuration.
+
+    :param request_checksum_attrs: The request checksum configuration.
+    :param mpu_checksum_attrs: The stored MPU checksum configuration.
+    """
+    # Validate an explicit type, including on a completed upload.
+    if (request_checksum_attrs.type is not None and
+            request_checksum_attrs.type not in (
+                CHECKSUM_TYPE_COMPOSITE, CHECKSUM_TYPE_FULL_OBJECT)):
+        raise InvalidRequest(
+            'Value for x-amz-checksum-type header is invalid.')
+
+    if mpu_checksum_attrs.is_mpu_in_progress:
+        # The completion type must match the stored initiation type.
+        if (request_checksum_attrs.type and
+                mpu_checksum_attrs.is_checksum_aware and
+                request_checksum_attrs.type != mpu_checksum_attrs.type):
+            raise InvalidRequest(
+                'The upload was created using the %s checksum mode. '
+                'The complete request must use the same checksum mode.' %
+                (mpu_checksum_attrs.type or 'null'))
+
+        # A supplied final checksum must use the MPU's checksum algorithm.
+        if (request_checksum_attrs.header and
+                mpu_checksum_attrs.is_checksum_aware and
+                request_checksum_attrs.header != mpu_checksum_attrs.header):
+            # S3 returns the checksums in lowercase for this error
+            raise InvalidRequest(
+                'Checksum Type mismatch occurred, expected checksum '
+                'Type: %s, actual checksum Type: %s' % (
+                    mpu_checksum_attrs.algorithm.lower(),
+                    request_checksum_attrs.algorithm.lower()))
+
+    # A malformed value is rejected before it is ever compared. S3 checks this
+    # even once the upload has finished, when nothing is left to compare.
+    if request_checksum_attrs.header:
+        _validate_complete_checksum_value(
+            get_checksum_hasher(request_checksum_attrs.header),
+            request_checksum_attrs.header,
+            request_checksum_attrs.value)
+
+
+def _validate_complete_checksum_value(checksum_hasher, checksum_header,
+                                      checksum_value):
+    """
+    Validate the final checksum supplied to CompleteMultipartUpload.
+
+    S3 accepts the -<part_count> suffix whatever the checksum type is.
+
+    :param checksum_hasher: The hashing algorithm for this checksum.
+    :param checksum_header: The checksum header that carried the value.
+    :param checksum_value: A final checksum value.
+    :raises InvalidRequest: if the digest or the -<part_count> suffix is
+        malformed.
+    """
+    try:
+        b64digest, _ = split_composite_checksum(checksum_value)
+        validate_checksum_value(checksum_hasher, b64digest)
+    except ValueError:
+        raise InvalidRequest(
+            'Value for %s header is invalid.' % checksum_header)
+
+
+def _validate_part_checksum(checksum_attrs, checksum_value):
+    """
+    Validate and decode a part checksum.
+
+    :param checksum_attrs: The checksum configuration that selects the
+        algorithm.
+    :param checksum_value: A base64 checksum value.
+    :return: The decoded raw checksum bytes.
+    :raises InvalidArgument: if the value is not valid for the algorithm.
+    """
+    checksum_hasher = get_checksum_hasher(checksum_attrs.header)
+    try:
+        return validate_checksum_value(checksum_hasher, checksum_value)
+    except ValueError:
+        # Use the S3 error message for an invalid part checksum.
+        raise InvalidArgument(
+            checksum_attrs.header, checksum_value,
+            'Invalid Base64 or multiple checksums present in request')
+
+
+def _validate_part_checksum_occurrences(part_elem):
+    """
+    Validate that we only have 1 checksum within the client
+    MPU manifest and return that 1 checksum.
+
+    :param part_elem: CompleteMultipartUpload ``Part`` XML element.
+    :return: A ``(checksum_header, checksum_value)`` pair, or ``(None, None)``.
+    :raises InvalidArgument: if the part contains multiple checksum elements.
+    """
+    checksum_values = []
+    for checksum_header, checksum_elem_name in \
+            CHECKSUM_XML_ELEMENTS.items():
+        checksum_elem = part_elem.find('./%s' % checksum_elem_name)
+        if checksum_elem is not None and checksum_elem.text is not None:
+            checksum_values.append((checksum_header, checksum_elem.text))
+    # Each part can have only one checksum element.
+    if len(checksum_values) > 1:
+        argument_value = ''.join(
+            '%s:%s;' % (
+                checksum_algorithm_from_header(checksum_header),
+                checksum_value)
+            for checksum_header, checksum_value in checksum_values)
+        raise InvalidArgument(
+            'Checksum', argument_value,
+            'Invalid Base64 or multiple checksums present in request')
+    if checksum_values:
+        return checksum_values[0]
+    return None, None
+
+
+def _validate_request_manifest_checksum_part(
+        part_elem, checksum_attrs, part_number):
+    """
+    Validate a checksum supplied for a CompleteMultipartUpload part element.
+
+    :param part_elem: CompleteMultipartUpload ``Part`` XML element.
+    :param checksum_attrs: The checksum configuration stored on the MPU.
+    :param part_number: The part number associated with the checksum.
+    :return: The encoded checksum value, or ``None`` when the part does not
+        supply a checksum, the MPU is legacy, or it has already finished.
+    """
+    if not checksum_attrs.is_mpu_in_progress:
+        # Once the upload has finished S3 replays it without looking at the
+        # checksums the client echoed back to us.
+        return None
+    part_checksum_header, part_checksum_value = \
+        _validate_part_checksum_occurrences(part_elem)
+    if not checksum_attrs.is_checksum_aware:
+        # Checksum fields do not change a legacy MPU's checksum settings.
+        return None
+    if (part_checksum_header is not None and
+            part_checksum_header != checksum_attrs.header):
+        # S3 reports an algorithm mismatch as BadDigest.
+        raise BadDigest(
+            'The %s you specified for part %d did not match what we '
+            'received.' % (
+                checksum_algorithm_from_header(part_checksum_header).lower(),
+                part_number))
+    if part_checksum_header is None:
+        return None
+    # Validate the checksum before SLO reads the parts.
+    _validate_part_checksum(checksum_attrs, part_checksum_value)
+    return part_checksum_value
+
+
 def _validate_upload_part_checksum_headers(
         req, checksum_attrs):
     """
@@ -312,6 +467,77 @@ def _validate_upload_part_checksum_headers(
             'Checksum Type mismatch occurred, expected checksum '
             'Type: %s, actual checksum Type: null' %
             checksum_attrs.algorithm.lower())
+
+
+class _CompositeChecksumHasher:
+    """
+    Computes the S3 composite checksum for ordered raw part checksum bytes.
+
+    S3 composite checksum values hash the concatenated per-part checksum
+    digests and append the part count to the base64 final digest.
+
+    :param checksum_attrs: The checksum configuration that selects the
+        algorithm.
+    """
+    def __init__(self, checksum_attrs):
+        self.checksum_hasher = get_checksum_hasher(checksum_attrs.header)
+        self.num_parts = 0
+
+    def update(self, b64digest, *args, **kwargs):
+        raw_value = validate_checksum_value(self.checksum_hasher, b64digest)
+        self.checksum_hasher.update(raw_value)
+        self.num_parts += 1
+
+    def base64digest(self):
+        """
+        :return: The composite checksum value, including its -<part_count>
+            suffix.
+        """
+        return '%s-%d' % (base64_str(self.checksum_hasher.digest()),
+                          self.num_parts)
+
+    def matches(self, b64digest):
+        """
+        :param b64digest: A client supplied checksum value, with or without a
+            -<part_count> suffix. Its syntax has already been validated by
+            ``_validate_complete_checksum_value``.
+        :return: Whether the value matches the calculated composite checksum.
+        """
+        digest, part_count = split_composite_checksum(b64digest)
+        if digest != base64_str(self.checksum_hasher.digest()):
+            return False
+        # S3 treats the part count suffix as optional.
+        return part_count in (None, self.num_parts)
+
+
+class _FullObjectChecksumHasher:
+    """
+    Computes the S3 full-object checksum from ordered part checksums and sizes.
+
+    Full-object MPU checksums are CRC checksums over the concatenated object
+    bytes. Since each part's CRC and size are known, we can
+    combine the per-part CRC values.
+
+    :param checksum_attrs: The checksum configuration that selects the CRC
+        variant.
+    """
+    def __init__(self, checksum_attrs):
+        self.checksum_hasher = get_checksum_hasher(checksum_attrs.header)
+
+    def update(self, b64digest, length, *args, **kwargs):
+        digest = validate_checksum_value(self.checksum_hasher, b64digest)
+        crc = self.checksum_hasher.crc_from_digest(digest)
+        self.checksum_hasher.combine(crc, length)
+
+    def base64digest(self):
+        return base64_str(self.checksum_hasher.digest())
+
+    def matches(self, b64digest):
+        """
+        :param b64digest: A client supplied checksum value.
+        :return: Whether the value matches the calculated full-object checksum.
+        """
+        return b64digest == self.base64digest()
 
 
 def _get_upload_info(req, app, upload_id):
@@ -363,7 +589,22 @@ def _get_upload_info(req, app, upload_id):
             req.headers['X-Amz-Copy-Source'] = copy_source
 
 
-def _make_complete_body(req, s3_etag, yielded_anything):
+def _make_complete_body(req, s3_etag, yielded_anything,
+                        checksum_header=None, checksum_value=None,
+                        checksum_type=None):
+    """
+    Build the CompleteMultipartUploadResult XML response body.
+
+    When a checksum was persisted for the completed object, include the
+    matching checksum element and checksum type in the AWS-compatible result.
+    :param req: The S3 request.
+    :param s3_etag: The final S3 multipart ETag without surrounding quotes.
+    :param yielded_anything: Whether heartbeat output has already been sent.
+    :param checksum_header: The checksum header used for the final checksum.
+    :param checksum_value: The final checksum value to include.
+    :param checksum_type: The S3 checksum type, such as COMPOSITE.
+    :return: Serialized XML bytes.
+    """
     result_elem = Element('CompleteMultipartUploadResult')
 
     # NOTE: boto with sig v4 appends port to HTTP_HOST value at
@@ -387,10 +628,189 @@ def _make_complete_body(req, s3_etag, yielded_anything):
     SubElement(result_elem, 'Bucket').text = req.container_name
     SubElement(result_elem, 'Key').text = wsgi_to_str(req.object_name)
     SubElement(result_elem, 'ETag').text = '"%s"' % s3_etag
+    checksum_elem_name = checksum_xml_element_from_header(checksum_header)
+    if checksum_elem_name and checksum_value:
+        SubElement(result_elem, checksum_elem_name).text = checksum_value
+    if checksum_type and checksum_value:
+        SubElement(result_elem, 'ChecksumType').text = checksum_type
     body = tostring(result_elem, xml_declaration=not yielded_anything)
     if yielded_anything:
         return b'\n' + body
     return body
+
+
+class _CompleteMultipartUploadSloManifestHook:
+    """Validate an S3 multipart upload's SLO manifest."""
+    ERROR_MESSAGE = 'Invalid S3 multipart upload manifest'
+
+    def __init__(
+            self, min_segment_size, upload_id, mpu_checksum_attrs,
+            request_checksum_attrs, req_part_checksums):
+        """Capture the request-local multipart completion state."""
+        self.min_segment_size = min_segment_size
+        self.upload_id = upload_id
+        self.mpu_checksum_attrs = mpu_checksum_attrs
+        self.request_checksum_attrs = request_checksum_attrs
+        self.req_part_checksums = req_part_checksums
+        self.final_checksum_value = mpu_checksum_attrs.value
+        self._error = None
+
+    @property
+    def error(self):
+        # the property facilitates easier test mocking
+        return self._error
+
+    def _create_error(self, error):
+        """Cache an S3 error and return an SLO manifest error."""
+        self._error = error
+        return [(self.upload_id, self.ERROR_MESSAGE)]
+
+    def _get_stored_part_checksum_value(self, manifest_item):
+        """
+        Return the checksum value found in the HEAD response headers included
+        in an slo manifest item, or None if no checksum value is found.
+        """
+        segment_head_headers = manifest_item.get('headers') or {}
+        stored_checksum_value = segment_head_headers.get(
+            s3api_sysmeta_header('object', 'checksum-value'))
+        return stored_checksum_value
+
+    def _get_req_part_checksum_value(self, req_part_checksum):
+        """Validate and return the checksum for a completed part."""
+        req_checksum_value = req_part_checksum['checksum_value']
+
+        # FULL_OBJECT completion may omit client-provided per-part
+        # checksums; use the value persisted during UploadPart instead.
+        # COMPOSITE parts require a checksum. If the client provided one,
+        # make sure it matches the stored value.
+        if req_checksum_value is None and self.mpu_checksum_attrs.is_composite:
+            raise InvalidRequest(
+                'The upload was created using a %s checksum. The complete '
+                'request must include the checksum for each part. It was '
+                'missing for part %d in the request.' % (
+                    self.mpu_checksum_attrs.algorithm.lower(),
+                    req_part_checksum['part_number']))
+        return req_checksum_value
+
+    def _validate_part_checksum(self, slo_manifest_item, req_part_checksum):
+        stored_checksum_value = (
+            self._get_stored_part_checksum_value(slo_manifest_item))
+        if not stored_checksum_value:
+            # No checksum is available for this part.
+            return None
+
+        req_checksum_value = self._get_req_part_checksum_value(
+            req_part_checksum)
+        if req_checksum_value and req_checksum_value != stored_checksum_value:
+            # S3 does not return the invalid checksum in this error.
+            raise InvalidPart(
+                upload_id=self.upload_id,
+                part_number=req_part_checksum['part_number'],
+                e_tag=req_part_checksum['etag'])
+        return stored_checksum_value
+
+    def _validate_parts(self, slo_manifest):
+        """
+        Validate all manifest parts in S3 error-precedence order.
+
+        :raises ErrorResponse: The highest-precedence segment error.
+        """
+        if self.mpu_checksum_attrs.is_checksum_aware:
+            if self.mpu_checksum_attrs.is_composite:
+                hasher = _CompositeChecksumHasher(self.mpu_checksum_attrs)
+            else:
+                hasher = _FullObjectChecksumHasher(self.mpu_checksum_attrs)
+        else:
+            hasher = None
+
+        # Keep all part errors so S3 error precedence can select the response.
+        missing_part_checksum = nonconsecutive = part_checksum_error = \
+            size_error = False
+        req_part_checksums = (
+            self.req_part_checksums if hasher else repeat(None))
+        for index, (slo_manifest_item, req_part_checksum) in enumerate(
+                zip(slo_manifest, req_part_checksums)):
+            if slo_manifest_item is None:
+                # SLO reports this failed part HEAD.
+                missing_part_checksum = True
+                continue
+
+            if hasher:
+                if (self.mpu_checksum_attrs.is_composite and
+                        req_part_checksum['part_number'] != index + 1):
+                    # COMPOSITE requires consecutive parts. Save the error
+                    # because other client errors can take precedence.
+                    nonconsecutive = True
+
+                part_checksum_invalid = False
+                try:
+                    part_checksum_value = self._validate_part_checksum(
+                        slo_manifest_item, req_part_checksum)
+                except ErrorResponse as err:
+                    # Save the error, but use the stored checksum
+                    # when calculating the final checksum.
+                    part_checksum_error = err
+                    part_checksum_invalid = True
+                    part_checksum_value = (
+                        self._get_stored_part_checksum_value(
+                            slo_manifest_item))
+
+                # Calculate the final checksum to preserve error precedence.
+                if part_checksum_value:
+                    hasher.update(part_checksum_value,
+                                  slo_manifest_item['bytes'])
+                else:
+                    # A part without a stored checksum prevents the final
+                    # checksum calculation.
+                    missing_part_checksum = True
+
+                if part_checksum_invalid:
+                    # A part checksum error takes precedence over a part
+                    # size error.
+                    continue
+
+            if (index < len(slo_manifest) - 1 and
+                    slo_manifest_item['bytes'] < self.min_segment_size):
+                # Save the size error and check the remaining parts.
+                size_error = size_error or EntityTooSmall()
+
+        # Preserve S3 error precedence: final checksum, size, part checksum,
+        # then nonconsecutive parts for COMPOSITE.
+        if (hasher
+                and not missing_part_checksum
+                and self.request_checksum_attrs.header
+                and not hasher.matches(
+                    self.request_checksum_attrs.value)):
+            raise BadDigest(
+                'The %s you specified did not match the calculated '
+                'checksum.' %
+                self.request_checksum_attrs.algorithm.lower())
+        elif size_error:
+            raise size_error
+        elif part_checksum_error:
+            raise part_checksum_error
+        elif missing_part_checksum:
+            return None
+        elif nonconsecutive:
+            # S3 returns a 500 for nonconsecutive parts with COMPOSITE checksum
+            # type, so we do the same:
+            # https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html#using-additional-checksums
+            raise InternalError()
+        elif hasher:
+            return hasher.base64digest()
+        return None
+
+    def __call__(self, manifest):
+        """Validate the manifest and calculate its completed checksum."""
+        try:
+            self.final_checksum_value = self._validate_parts(manifest)
+        except ErrorResponse as err:
+            # Don't let an S3 error escape from inside the SLO response
+            # iterator. Ask SLO to fail the manifest, then replay the error in
+            # the S3API response iterator.
+            return self._create_error(err)
+
+        return None
 
 
 class PartController(Controller):
@@ -922,6 +1342,12 @@ class UploadController(Controller):
                 'Conditional uploads are not supported.')
 
         resp, is_marker = _get_upload_info(req, self.app, upload_id)
+        request_checksum_attrs = MPUChecksumAttrs.from_request(req)
+        mpu_checksum_attrs = MPUChecksumAttrs.from_sysmeta(
+            resp.sysmeta_headers, is_marker)
+        _validate_mpu_complete_checksum_headers(
+            request_checksum_attrs, mpu_checksum_attrs)
+
         marker_delta = (
             float(Timestamp(resp.sw_headers.get('X-Backend-Timestamp', '0')))
             - float(NormalTimestamp.now()))
@@ -962,6 +1388,7 @@ class UploadController(Controller):
         container = req.container_name + MULTIUPLOAD_SUFFIX
         s3_etag_hasher = md5(usedforsecurity=False)
         manifest = []
+        req_part_checksums = []
         previous_number = 0
         try:
             xml = req.xml(MAX_COMPLETE_UPLOAD_BODY_SIZE)
@@ -978,7 +1405,6 @@ class UploadController(Controller):
                 xml, 'CompleteMultipartUpload', self.logger)
             for part_elem in complete_elem.iterchildren('Part'):
                 part_number = int(part_elem.find('./PartNumber').text)
-
                 if part_number <= previous_number:
                     raise InvalidPartOrder(upload_id=upload_id)
                 previous_number = part_number
@@ -993,6 +1419,14 @@ class UploadController(Controller):
                     raise InvalidPart(upload_id=upload_id,
                                       part_number=part_number,
                                       e_tag=etag)
+                checksum_value = _validate_request_manifest_checksum_part(
+                    part_elem, mpu_checksum_attrs, part_number)
+                if mpu_checksum_attrs.is_checksum_aware:
+                    req_part_checksums.append({
+                        'part_number': part_number,
+                        'checksum_value': checksum_value,
+                        'etag': etag,
+                    })
                 manifest.append({
                     'path': '/%s/%s/%s/%d' % (
                         wsgi_to_str(container), wsgi_to_str(req.object_name),
@@ -1015,7 +1449,8 @@ class UploadController(Controller):
         already_uploaded_s3_etag = resp.s3api_sysmeta_headers.get(
             s3_etag_header)
         if already_uploaded_s3_etag == s3_etag:
-            # If the segments to use haven't changed, the work is already done
+            # If the segments to use haven't changed, the work is already done.
+            # S3 omits the checksum elements when replaying a completed upload.
             return HTTPOk(body=_make_complete_body(req, s3_etag, False),
                           content_type='application/xml')
         elif already_uploaded_s3_etag:
@@ -1027,20 +1462,35 @@ class UploadController(Controller):
         headers[get_container_update_override_key('etag')] = \
             serialize_header('', {'s3_etag': s3_etag})
 
-        too_small_message = ('s3api requires that each segment be at least '
-                             '%d bytes' % self.conf.min_segment_size)
+        # Install the SLO manifest hook
+        manifest_hook = _CompleteMultipartUploadSloManifestHook(
+            min_segment_size=self.conf.min_segment_size,
+            upload_id=upload_id,
+            mpu_checksum_attrs=mpu_checksum_attrs,
+            request_checksum_attrs=request_checksum_attrs,
+            req_part_checksums=req_part_checksums)
+        req.environ['swift.callback.slo_manifest_hook'] = manifest_hook
 
-        def size_checker(manifest):
-            # Check the size of each segment except the last and make sure
-            # they are all more than the minimum upload chunk size.
-            # Note that we need to use the *internal* keys, since we're
-            # looking at the manifest that's about to be written.
-            return [
-                (item['name'], too_small_message)
-                for item in manifest[:-1]
-                if item and item['bytes'] < self.conf.min_segment_size]
+        # SLO invokes the manifest hook before issuing the downstream manifest
+        # PUT. By the time the object controller requests footers for that PUT,
+        # the hook has calculated the final checksum metadata.
+        if self.conf.allow_store_checksums and \
+                mpu_checksum_attrs.is_checksum_aware:
+            original_update_footers = req.environ.get(
+                'swift.callback.update_footers')
 
-        req.environ['swift.callback.slo_manifest_hook'] = size_checker
+            def update_footers(footers):
+                """Persist final MPU checksum metadata, when available."""
+                if original_update_footers:
+                    original_update_footers(footers)
+                checksum_value = manifest_hook.final_checksum_value
+                if checksum_value:
+                    footers.update(checksum_sysmeta_headers(
+                        mpu_checksum_attrs.algorithm,
+                        checksum_value,
+                        mpu_checksum_attrs.type))
+            req.environ['swift.callback.update_footers'] = update_footers
+
         start_time = time.time()
 
         def response_iter():
@@ -1081,8 +1531,8 @@ class UploadController(Controller):
                             raise PreconditionFailed
                         elif body['Response Status'] != '201 Created':
                             for seg, err in body['Errors']:
-                                if err == too_small_message:
-                                    raise EntityTooSmall()
+                                if err == manifest_hook.ERROR_MESSAGE:
+                                    raise manifest_hook.error
                                 elif err in ('Etag Mismatch', '404 Not Found'):
                                     raise InvalidPart(upload_id=upload_id)
                             raise InvalidRequest(
@@ -1091,8 +1541,8 @@ class UploadController(Controller):
                                               for err in body['Errors']))
                 except InvalidRequest as err_resp:
                     msg = err_resp._msg
-                    if too_small_message in msg:
-                        raise EntityTooSmall(msg)
+                    if manifest_hook.ERROR_MESSAGE in msg:
+                        raise manifest_hook.error
                     elif ', Etag Mismatch' in msg:
                         raise InvalidPart(upload_id=upload_id)
                     elif ', 404 Not Found' in msg:
@@ -1111,7 +1561,14 @@ class UploadController(Controller):
                     # complete), so much the better.
                     pass
 
-                yield _make_complete_body(req, s3_etag, yielded_anything)
+                checksum_value = (
+                    manifest_hook.final_checksum_value
+                    if self.conf.allow_store_checksums else None)
+                yield _make_complete_body(
+                    req, s3_etag, yielded_anything,
+                    mpu_checksum_attrs.header,
+                    checksum_value,
+                    mpu_checksum_attrs.type)
             except ErrorResponse as err_resp:
                 if yielded_anything:
                     err_resp.xml_declaration = False
