@@ -15,6 +15,7 @@
 import errno
 import importlib
 import os
+import struct
 import sys
 import unittest
 from unittest import mock
@@ -268,13 +269,44 @@ class TestCRC64NVME(unittest.TestCase):
                       checksum.crc64nvme_isal)
 
 
+class TestCRCCombine(unittest.TestCase):
+    def check_combine(self, crc_func):
+        part_one = b'part one'
+        part_two = b'part two longer'
+        part_one_crc = crc_func(part_one)
+        part_two_crc = crc_func(part_two)
+        final_crc = crc_func(part_one + part_two)
+        combined_crc = part_one_crc.copy()
+        self.assertIsNone(combined_crc.combine(
+            part_two_crc.crc, len(part_two)))
+        self.assertEqual(final_crc.crc, combined_crc.crc)
+        self.assertEqual(final_crc.digest(), combined_crc.digest())
+
+    def check_combine_multiple(self, crc_func):
+        # Combine several parts, including an empty part, as for a full MPU.
+        parts = [b'part one', b'part two longer', b'p3', b'', b'part five']
+        combined_crc = crc_func()
+        for part in parts:
+            combined_crc.combine(crc_func(part).crc, len(part))
+        final_crc = crc_func(b''.join(parts))
+        self.assertEqual(final_crc.crc, combined_crc.crc)
+        self.assertEqual(final_crc.digest(), combined_crc.digest())
+
+    def test_combine(self):
+        for crc_func in (checksum.crc32, checksum.crc32c, checksum.crc64nvme):
+            with self.subTest(algorithm=crc_func.__name__):
+                self.check_combine(crc_func)
+                self.check_combine_multiple(crc_func)
+
+
 class TestCRCHasher(unittest.TestCase):
     def setUp(self):
         self.logger = debug_logger()
 
     def test_base_crc_hasher(self):
         func = mock.MagicMock(return_value=0xbad1)
-        hasher = checksum.CRCHasher('fake', func)
+        hasher = checksum.CRCHasher(
+            'fake', func, checksum.crc32_combine_anycrc)
         self.assertEqual('fake', hasher.name)
         self.assertEqual(32, hasher.width)
         self.assertEqual(0, hasher.crc)
@@ -286,6 +318,13 @@ class TestCRCHasher(unittest.TestCase):
         self.assertEqual(b'\x00\x00\xba\xd1', hasher.digest())
         self.assertEqual('0000bad1', hasher.hexdigest())
 
+    def test_crc_from_digest_error(self):
+        for crc_func in (checksum.crc32, checksum.crc64nvme):
+            with self.subTest(algorithm=crc_func.__name__):
+                hasher = crc_func(b'123456789')
+                with self.assertRaises(struct.error):
+                    hasher.crc_from_digest(hasher.digest()[:-1])
+
     def test_crc32_hasher(self):
         # See CRC-32/ISO-HDLC at
         # https://reveng.sourceforge.io/crc-catalogue/17plus.htm
@@ -294,6 +333,8 @@ class TestCRCHasher(unittest.TestCase):
         self.assertEqual(4, hasher.digest_size)
         self.assertIs(checksum._select_crc32_impl(), hasher.crc_func)
         self.assertEqual(32, hasher.width)
+        self.assertIs(checksum.crc32_combine_anycrc,
+                      hasher.crc_combine_func)
         self.assertEqual(0, hasher.crc)
         self.assertEqual(b'\x00\x00\x00\x00', hasher.digest())
         self.assertEqual('00000000', hasher.hexdigest())
@@ -302,6 +343,8 @@ class TestCRCHasher(unittest.TestCase):
         self.assertEqual(0xcbf43926, hasher.crc)
         self.assertEqual(b'\xcb\xf4\x39\x26', hasher.digest())
         self.assertEqual('cbf43926', hasher.hexdigest())
+        self.assertEqual(0xcbf43926,
+                         hasher.crc_from_digest(hasher.digest()))
 
     def test_crc32_hasher_contructed_with_data(self):
         hasher = checksum.crc32(b'123456789')
@@ -324,6 +367,8 @@ class TestCRCHasher(unittest.TestCase):
         hasher_copy = hasher.copy()
         self.assertEqual('crc32', hasher.name)
         self.assertIs(hasher.crc_func, hasher_copy.crc_func)
+        self.assertIs(hasher.crc_combine_func,
+                      hasher_copy.crc_combine_func)
         self.assertEqual('cbf43926', hasher_copy.hexdigest())
         hasher_copy.update(b'foo')
         self.assertEqual('cbf43926', hasher.hexdigest())
@@ -338,6 +383,8 @@ class TestCRCHasher(unittest.TestCase):
         hasher = checksum.crc32c()
         self.assertEqual('crc32c', hasher.name)
         self.assertEqual(32, hasher.width)
+        self.assertIs(checksum.crc32c_combine_anycrc,
+                      hasher.crc_combine_func)
         self.assertEqual(0, hasher.crc)
         self.assertEqual(b'\x00\x00\x00\x00', hasher.digest())
         self.assertEqual('00000000', hasher.hexdigest())
@@ -365,6 +412,8 @@ class TestCRCHasher(unittest.TestCase):
         hasher_copy = hasher.copy()
         self.assertEqual('crc32c', hasher_copy.name)
         self.assertIs(hasher.crc_func, hasher_copy.crc_func)
+        self.assertIs(hasher.crc_combine_func,
+                      hasher_copy.crc_combine_func)
         self.assertEqual('e3069283', hasher_copy.hexdigest())
         hasher_copy.update(b'foo')
         self.assertEqual('e3069283', hasher.hexdigest())
@@ -397,8 +446,7 @@ class TestCRCHasher(unittest.TestCase):
     def test_crc32c_hasher_selects_isal_impl(self):
         scuc = 'swift.common.utils.checksum'
         with mock.patch(scuc + '.crc32c_isal') as mock_isal, \
-                mock.patch(scuc + '.crc32c_kern'), \
-                mock.patch(scuc + '.crc32c_anycrc'):
+                mock.patch(scuc + '.crc32c_kern'):
             mock_isal.__name__ = 'crc32c_isal'
             self.assertIs(mock_isal, checksum.crc32c().crc_func)
             checksum.log_selected_implementation(self.logger)
@@ -412,6 +460,8 @@ class TestCRCHasher(unittest.TestCase):
         self.assertEqual('crc64nvme', hasher.name)
         self.assertEqual(8, hasher.digest_size)
         self.assertEqual(64, hasher.width)
+        self.assertIs(checksum.crc64nvme_combine_anycrc,
+                      hasher.crc_combine_func)
         self.assertEqual(0, hasher.crc)
         self.assertEqual(b'\x00\x00\x00\x00\x00\x00\x00\x00', hasher.digest())
         self.assertEqual('0000000000000000', hasher.hexdigest())
@@ -420,6 +470,8 @@ class TestCRCHasher(unittest.TestCase):
         self.assertEqual(0xae8b14860a799888, hasher.crc)
         self.assertEqual(b'\xae\x8b\x14\x86\x0a\x79\x98\x88', hasher.digest())
         self.assertEqual('ae8b14860a799888', hasher.hexdigest())
+        self.assertEqual(0xae8b14860a799888,
+                         hasher.crc_from_digest(hasher.digest()))
 
     def test_crc64nvme_hasher_constructed_with_data(self):
         hasher = checksum.crc64nvme(b'123456789')
@@ -437,6 +489,8 @@ class TestCRCHasher(unittest.TestCase):
         hasher_copy = hasher.copy()
         self.assertEqual('crc64nvme', hasher_copy.name)
         self.assertIs(hasher.crc_func, hasher_copy.crc_func)
+        self.assertIs(hasher.crc_combine_func,
+                      hasher_copy.crc_combine_func)
         self.assertEqual('ae8b14860a799888', hasher_copy.hexdigest())
         hasher_copy.update(b'foo')
         self.assertEqual('ae8b14860a799888', hasher.hexdigest())
@@ -459,8 +513,7 @@ class TestCRCHasher(unittest.TestCase):
 
     def test_crc64nvme_hasher_selects_isal_impl(self):
         scuc = 'swift.common.utils.checksum'
-        with mock.patch(scuc + '.crc64nvme_isal') as mock_isal, \
-                mock.patch(scuc + '.crc64nvme_anycrc'):
+        with mock.patch(scuc + '.crc64nvme_isal') as mock_isal:
             mock_isal.__name__ = 'crc64nvme_isal'
             self.assertIs(mock_isal, checksum.crc64nvme().crc_func)
             checksum.log_selected_implementation(self.logger)

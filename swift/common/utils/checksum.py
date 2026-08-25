@@ -22,6 +22,9 @@ import socket
 import struct
 
 
+crc32_combine_anycrc = anycrc.Model('CRC32').combine
+crc32c_combine_anycrc = anycrc.Model('CRC32C').combine
+crc64nvme_combine_anycrc = anycrc.Model('CRC64-NVME').combine
 crc32_anycrc = anycrc.Model('CRC32').calc
 crc32c_anycrc = anycrc.Model('CRC32C').calc
 crc64nvme_anycrc = anycrc.Model('CRC64-NVME').calc
@@ -160,14 +163,17 @@ def _select_crc64nvme_impl():
 
 class CRCHasher(object):
     """
-    Helper that works like a hashlib hasher, but with a CRC.
+    Helper that works like a hashlib hasher, but with a CRC. The ``update``
+    and ``combine`` methods change the CRC.
     """
-    def __init__(self, name, crc_func, data=None, initial_value=0, width=32):
+    def __init__(self, name, crc_func, crc_combine_func,
+                 data=None, initial_value=0, width=32):
         """
         Initialize the CRCHasher.
 
         :param name: Name of the hasher
         :param crc_func: Function to compute the CRC.
+        :param crc_combine_func: Function to combine two CRC values.
         :param data: Data to update the hasher.
         :param initial_value: Initial CRC value.
         :param width: Width (in bits) of CRC values.
@@ -178,6 +184,7 @@ class CRCHasher(object):
         if width not in (32, 64):
             raise ValueError("CRCHasher only supports 32- or 64-bit CRCs")
         self.width = width
+        self.crc_combine_func = crc_combine_func
         if data is not None:
             self.update(data)
 
@@ -206,6 +213,19 @@ class CRCHasher(object):
         """
         return struct.pack(self.digest_fmt, self.crc)
 
+    def crc_from_digest(self, digest):
+        """
+        Return the raw CRC value unpacked from the given digest.
+
+        This is the inverse of :meth:`digest`.
+
+        :param digest: A packed CRC value of ``digest_size`` bytes, as
+            returned by :meth:`digest`.
+        :returns: an int value.
+        :raises struct.error: if ``digest`` is not ``digest_size`` bytes.
+        """
+        return struct.unpack(self.digest_fmt, digest)[0]
+
     def hexdigest(self):
         """
         Return the hexadecimal representation of the current CRC value.
@@ -224,21 +244,40 @@ class CRCHasher(object):
         return CRCHasher(self.name,
                          self.crc_func,
                          initial_value=self.crc,
-                         width=self.width)
+                         width=self.width,
+                         crc_combine_func=self.crc_combine_func)
+
+    def combine(self, other_crc, other_len):
+        """
+        Combine another CRC value with this hasher's CRC, in place.
+
+        Shift ``self.crc`` by the length of the bytes used to calculate
+        ``other_crc``, then combine it with ``other_crc``. The result is
+        the CRC that this hasher would have had if it had been updated
+        with those bytes.
+
+        :param other_crc: The CRC value to combine with this hasher's CRC.
+        :param other_len: Length, in bytes, of the data that was used to
+            calculate ``other_crc``.
+        :returns: None; the combined value is stored in ``self.crc``.
+        """
+        self.crc = self.crc_combine_func(self.crc, other_crc, other_len)
 
 
 def crc32(data=None, initial_value=0):
     return CRCHasher('crc32',
                      _select_crc32_impl(),
                      data=data,
-                     initial_value=initial_value)
+                     initial_value=initial_value,
+                     crc_combine_func=crc32_combine_anycrc)
 
 
 def crc32c(data=None, initial_value=0):
     return CRCHasher('crc32c',
                      _select_crc32c_impl(),
                      data=data,
-                     initial_value=initial_value)
+                     initial_value=initial_value,
+                     crc_combine_func=crc32c_combine_anycrc)
 
 
 def crc64nvme(data=None, initial_value=0):
@@ -246,7 +285,8 @@ def crc64nvme(data=None, initial_value=0):
                      _select_crc64nvme_impl(),
                      data=data,
                      initial_value=initial_value,
-                     width=64)
+                     width=64,
+                     crc_combine_func=crc64nvme_combine_anycrc)
 
 
 def log_selected_implementation(logger):
