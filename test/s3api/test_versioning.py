@@ -20,7 +20,8 @@ from botocore.exceptions import ClientError
 import io
 
 from swift.common.header_key_dict import HeaderKeyDict
-from swift.common.utils import md5
+from swift.common.utils import base64_str, md5
+from swift.common.utils.checksum import crc32
 from test.s3api import (BaseS3TestCase,
                         skip_if_checksum_persistence_disabled)
 
@@ -271,6 +272,78 @@ class TestObjectVersioning(BaseS3TestCase):
             latest_head_resp['ChecksumSHA256'])
         self.assertEqual('FULL_OBJECT', latest_head_resp['ChecksumType'])
         self.assertNotIn('ChecksumCRC32', latest_head_resp)
+
+    @skip_if_checksum_persistence_disabled
+    def test_checksum_metadata_on_multipart_object_versions(self):
+        obj_name = self.create_name('versioned-checksum-mpu')
+        bodies = (b'first multipart version', b'second multipart version')
+        checksums = []
+
+        # Complete two uploads to the same key to create separate versions.
+        for body in bodies:
+            part_digest = crc32(body).digest()
+            part_checksum = base64_str(part_digest)
+            final_checksum = '%s-1' % base64_str(crc32(part_digest).digest())
+            checksums.append(final_checksum)
+            create_resp = self.client.create_multipart_upload(
+                Bucket=self.bucket_name, Key=obj_name,
+                ChecksumAlgorithm='CRC32', ChecksumType='COMPOSITE')
+            upload_id = create_resp['UploadId']
+            part_resp = self.client.upload_part(
+                Bucket=self.bucket_name, Key=obj_name, UploadId=upload_id,
+                PartNumber=1, Body=body, ChecksumCRC32=part_checksum)
+            self.assertEqual(
+                200, part_resp['ResponseMetadata']['HTTPStatusCode'])
+            self.assertEqual(part_checksum, part_resp['ChecksumCRC32'])
+
+            complete_resp = self.client.complete_multipart_upload(
+                Bucket=self.bucket_name, Key=obj_name, UploadId=upload_id,
+                MultipartUpload={'Parts': [{
+                    'PartNumber': 1, 'ETag': part_resp['ETag'],
+                    'ChecksumCRC32': part_checksum}]})
+            self.assertEqual(
+                200, complete_resp['ResponseMetadata']['HTTPStatusCode'])
+            self.assertEqual(final_checksum, complete_resp['ChecksumCRC32'])
+            self.assertEqual('COMPOSITE', complete_resp['ChecksumType'])
+        self.assertNotEqual(checksums[0], checksums[1])
+
+        versions_resp = self.client.list_object_versions(
+            Bucket=self.bucket_name, Prefix=obj_name)
+        versions = [
+            version for version in versions_resp['Versions']
+            if version['Key'] == obj_name
+        ]
+        self.assertEqual(2, len(versions))
+        second_version, first_version = versions
+        self.assertTrue(second_version['IsLatest'])
+        self.assertFalse(first_version['IsLatest'])
+        self.assertNotEqual(
+            first_version['VersionId'], second_version['VersionId'])
+
+        # Read each version with its own body and checksum.
+        for version, body, expected_checksum in zip(
+                (first_version, second_version), bodies, checksums):
+            with self.subTest(version_id=version['VersionId']):
+                get_resp = self.client.get_object(
+                    Bucket=self.bucket_name, Key=obj_name,
+                    VersionId=version['VersionId'], ChecksumMode='ENABLED')
+                self.assertEqual(
+                    200, get_resp['ResponseMetadata']['HTTPStatusCode'])
+                self.assertEqual(version['VersionId'], get_resp['VersionId'])
+                self.assertEqual(body, get_resp['Body'].read())
+                self.assertEqual(expected_checksum, get_resp['ChecksumCRC32'])
+                self.assertEqual('COMPOSITE', get_resp['ChecksumType'])
+
+        # A read without a version follows the latest-version symlink.
+        latest_get_resp = self.client.get_object(
+            Bucket=self.bucket_name, Key=obj_name, ChecksumMode='ENABLED')
+        self.assertEqual(
+            200, latest_get_resp['ResponseMetadata']['HTTPStatusCode'])
+        self.assertEqual(
+            second_version['VersionId'], latest_get_resp['VersionId'])
+        self.assertEqual(bodies[1], latest_get_resp['Body'].read())
+        self.assertEqual(checksums[1], latest_get_resp['ChecksumCRC32'])
+        self.assertEqual('COMPOSITE', latest_get_resp['ChecksumType'])
 
     def test_delete_versioned_objects(self):
         etags = []

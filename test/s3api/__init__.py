@@ -332,7 +332,11 @@ class BaseS3TestCaseWithBucket(BaseS3Mixin, unittest.TestCase):
     def setUpClass(cls):
         cls.bucket_name = cls.create_name('bucket')
         client = cls.get_s3_client(1)
-        cls.create_bucket(client, cls.bucket_name)
+        resp = cls.create_bucket(client, cls.bucket_name)
+        # AWS S3 identifies itself in the Server header. Tests use this flag
+        # for known differences between AWS S3 and Swift.
+        cls.is_aws = resp['ResponseMetadata']['HTTPHeaders'].get(
+            'server') == 'AmazonS3'
 
     @classmethod
     def tearDownClass(cls):
