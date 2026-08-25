@@ -18,11 +18,14 @@ from io import BytesIO
 import unittest
 
 from swift.common.middleware.s3api.s3checksum import \
-    ChecksummingInput, get_checksum_hasher, validate_checksum_value, \
-    normalize_checksum_algorithm, checksum_algorithm_from_header, \
+    CHECKSUMS_BY_HEADER, COMPOSITE_MPU_CHECKSUM_HEADERS, \
+    FULL_OBJECT_MPU_CHECKSUM_HEADERS, \
+    ChecksummingInput, checksum_algorithm_from_header, \
     checksum_header_from_algorithm, checksum_sysmeta_headers, \
-    normalize_checksum_mode, checksum_sysmeta_to_response_headers, \
-    checksum_sysmeta_values
+    checksum_sysmeta_to_response_headers, checksum_sysmeta_values, \
+    format_supported_checksum_algorithms, get_checksum_hasher, \
+    normalize_checksum_algorithm, normalize_checksum_type, \
+    normalize_checksum_mode, validate_checksum_value
 from swift.common.middleware.s3api.exception import \
     S3InputChecksumMismatch, S3InputChecksumTrailerInvalid
 from swift.common.header_key_dict import HeaderKeyDict
@@ -30,25 +33,46 @@ from swift.common.utils import checksum
 
 
 class TestChecksummingInput(unittest.TestCase):
+    def test_calculated_checksum_too_short(self):
+        body = b'123456789'
+        wrapped = ChecksummingInput(
+            BytesIO(body), len(body) + 1, checksum.crc32(),
+            'x-amz-checksum-crc32', None)
+
+        self.assertIsNone(wrapped.checksum_value)
+        self.assertEqual(body, wrapped.read(len(body)))
+        self.assertIsNone(wrapped.checksum_value)
+        with self.assertRaises(S3InputChecksumMismatch):
+            wrapped.read()
+        self.assertIsNone(wrapped.checksum_value)
+        self.assertTrue(wrapped.wsgi_input.closed)
+
     def test_checksum_value(self):
         body = b'123456789'
         expected_checksum = base64.b64encode(
             checksum.crc32(body).digest()).decode('ascii')
-        checksum_source = {
-            'x-amz-checksum-crc32': expected_checksum,
-        }
-        wrapped = ChecksummingInput(
-            BytesIO(body), len(body), checksum.crc32(),
-            'x-amz-checksum-crc32', checksum_source)
+        for content_length, checksum_source in (
+                (len(body), {'x-amz-checksum-crc32': expected_checksum}),
+                (len(body), None), (None, None)):
+            with self.subTest(content_length=content_length,
+                              checksum_source=checksum_source):
+                wrapped = ChecksummingInput(
+                    BytesIO(body), content_length, checksum.crc32(),
+                    'x-amz-checksum-crc32', checksum_source)
 
-        self.assertEqual('x-amz-checksum-crc32', wrapped.checksum_key)
-        self.assertEqual('CRC32', wrapped.algorithm)
-        self.assertIsNone(wrapped.checksum_value)
-        self.assertEqual(b'1234', wrapped.read(4))
-        self.assertIsNone(wrapped.checksum_value)
-        self.assertEqual(b'56789', wrapped.read())
-        self.assertEqual(expected_checksum, wrapped.checksum_value)
-        self.assertFalse(wrapped.wsgi_input.closed)
+                self.assertEqual('x-amz-checksum-crc32', wrapped.checksum_key)
+                self.assertEqual('CRC32', wrapped.algorithm)
+                self.assertIsNone(wrapped.checksum_value)
+                # Retain the value only when the input is complete.
+                self.assertEqual(b'1234', wrapped.read(4))
+                self.assertIsNone(wrapped.checksum_value)
+                self.assertEqual(b'56789', wrapped.read(5))
+                if content_length is None:
+                    # An exact-size read does not signal EOF.
+                    self.assertIsNone(wrapped.checksum_value)
+                    self.assertEqual(b'', wrapped.read(1))
+                self.assertEqual(expected_checksum, wrapped.checksum_value)
+                self.assertFalse(wrapped.wsgi_input.closed)
 
     def test_mismatched_checksum(self):
         body = b'123456789'
@@ -82,16 +106,19 @@ class TestChecksummingInput(unittest.TestCase):
     def test_empty_body(self):
         expected_checksum = base64.b64encode(
             checksum.crc32(b'').digest()).decode('ascii')
-        checksum_source = {
-            'x-amz-checksum-crc32': expected_checksum,
-        }
-        wrapped = ChecksummingInput(
-            BytesIO(b''), 0, checksum.crc32(),
-            'x-amz-checksum-crc32', checksum_source)
+        for content_length, checksum_source in (
+                (0, {'x-amz-checksum-crc32': expected_checksum}),
+                (0, None), (None, None)):
+            with self.subTest(content_length=content_length,
+                              checksum_source=checksum_source):
+                wrapped = ChecksummingInput(
+                    BytesIO(b''), content_length, checksum.crc32(),
+                    'x-amz-checksum-crc32', checksum_source)
 
-        self.assertEqual(b'', wrapped.read())
-        self.assertEqual(expected_checksum, wrapped.checksum_value)
-        self.assertFalse(wrapped.wsgi_input.closed)
+                self.assertIsNone(wrapped.checksum_value)
+                self.assertEqual(b'', wrapped.read())
+                self.assertEqual(expected_checksum, wrapped.checksum_value)
+                self.assertFalse(wrapped.wsgi_input.closed)
 
     def test_missing_checksum_source(self):
         # the client promised a checksum trailer but never sent one
@@ -124,17 +151,19 @@ class TestChecksummingInput(unittest.TestCase):
         body = b'123456789'
         expected_checksum = base64.b64encode(
             checksum.crc32(body).digest()).decode('ascii')
-        checksum_source = {
-            'x-amz-checksum-crc32': expected_checksum,
-        }
-        wrapped = ChecksummingInput(
-            BytesIO(body), len(body) - 1, checksum.crc32(),
-            'x-amz-checksum-crc32', checksum_source)
+        for checksum_source in (
+                {'x-amz-checksum-crc32': expected_checksum}, None):
+            with self.subTest(checksum_source=checksum_source):
+                wrapped = ChecksummingInput(
+                    BytesIO(body), len(body) - 1, checksum.crc32(),
+                    'x-amz-checksum-crc32', checksum_source)
 
-        with self.assertRaises(S3InputChecksumMismatch) as raised:
-            wrapped.read()
-        self.assertEqual(('CRC32',), raised.exception.args)
-        self.assertTrue(wrapped.wsgi_input.closed)
+                self.assertIsNone(wrapped.checksum_value)
+                with self.assertRaises(S3InputChecksumMismatch) as raised:
+                    wrapped.read()
+                self.assertEqual(('CRC32',), raised.exception.args)
+                self.assertIsNone(wrapped.checksum_value)
+                self.assertTrue(wrapped.wsgi_input.closed)
 
 
 class TestGetChecksumHasher(unittest.TestCase):
@@ -186,6 +215,32 @@ class TestModuleFunctions(unittest.TestCase):
         self.assertIsNone(normalize_checksum_mode(None))
         self.assertEqual('ENABLED', normalize_checksum_mode('enabled'))
 
+    def test_normalize_checksum_type(self):
+        self.assertEqual('COMPOSITE', normalize_checksum_type('composite'))
+        self.assertEqual('FULL_OBJECT', normalize_checksum_type(
+            'full_object'))
+
+    def test_mpu_checksum_capabilities_come_from_checksum_headers(self):
+        self.assertEqual(
+            ('x-amz-checksum-crc32', 'x-amz-checksum-crc32c',
+             'x-amz-checksum-crc64nvme'),
+            FULL_OBJECT_MPU_CHECKSUM_HEADERS)
+        self.assertEqual(
+            ('x-amz-checksum-crc32', 'x-amz-checksum-crc32c',
+             'x-amz-checksum-sha1', 'x-amz-checksum-sha256'),
+            COMPOSITE_MPU_CHECKSUM_HEADERS)
+        self.assertTrue(
+            set(FULL_OBJECT_MPU_CHECKSUM_HEADERS).issubset(
+                CHECKSUMS_BY_HEADER))
+        self.assertTrue(
+            set(COMPOSITE_MPU_CHECKSUM_HEADERS).issubset(
+                CHECKSUMS_BY_HEADER))
+
+    def test_format_supported_checksum_algorithms(self):
+        self.assertEqual(
+            '[CRC32, CRC32C, CRC64NVME, SHA1, SHA256]',
+            format_supported_checksum_algorithms())
+
     def test_checksum_sysmeta_headers(self):
         sysmeta_headers = checksum_sysmeta_headers(
             'crc32', 'DUoRhQ==', 'FULL_OBJECT')
@@ -228,11 +283,23 @@ class TestModuleFunctions(unittest.TestCase):
                 self.assertEqual(
                     {}, checksum_sysmeta_to_response_headers(sysmeta))
 
+        # missing all checksum sysmeta
+        sysmeta = {'x-object-sysmeta-s3api-etag': 'an-etag'}
+        self.assertEqual({}, checksum_sysmeta_to_response_headers(sysmeta))
+
     def test_checksum_header_from_algorithm(self):
         self.assertEqual(
             'x-amz-checksum-crc32', checksum_header_from_algorithm('crc32'))
         self.assertEqual(
             'x-amz-checksum-crc-32', checksum_header_from_algorithm('crc-32'))
+        for algorithm in ('CRC32', 'CRC32C', 'CRC64NVME', 'SHA1', 'SHA256'):
+            with self.subTest(algorithm=algorithm):
+                checksum_header = checksum_header_from_algorithm(algorithm)
+                self.assertEqual(
+                    'x-amz-checksum-%s' % algorithm.lower(), checksum_header)
+                self.assertEqual(
+                    algorithm,
+                    checksum_algorithm_from_header(checksum_header))
 
     def test_checksum_algorithm_from_header(self):
         self.assertEqual(
