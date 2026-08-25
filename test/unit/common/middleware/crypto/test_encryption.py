@@ -22,11 +22,12 @@ import uuid
 from unittest import mock
 
 from swift.common import storage_policy, constraints, registry
-from swift.common.middleware import copy
+from swift.common.middleware import copy, slo
 from swift.common.middleware import crypto
 from swift.common.middleware.crypto import keymaster
 from swift.common.middleware.crypto.crypto_utils import (
     load_crypto_meta, Crypto)
+from swift.common.middleware.s3api.etree import fromstring
 from swift.common.middleware.s3api.s3api import \
     filter_factory as s3api_filter_factory
 from swift.common.ring import Ring
@@ -303,7 +304,7 @@ class TestCryptoPipelineChanges(unittest.TestCase):
         self.assertEqual('bar', resp.headers.get('x-object-meta-foo'))
         self.assertEqual(SENSITIVE_VALUE, resp.headers.get(SENSITIVE_HEADER))
 
-    def test_s3_checksum_with_crypto_pipeline(self):
+    def test_s3_checksum_with_crypto_pipeline_object_put(self):
         container_name = uuid.uuid4().hex
         container_path = 'http://foo:8080/v1/a/' + container_name
         req = Request.blank(
@@ -455,6 +456,93 @@ class TestCryptoPipelineChanges(unittest.TestCase):
                                 resp.headers['X-Amz-Checksum-Type'])
                             for hdr in internal_checksum_headers:
                                 self.assertNotIn(hdr, resp.headers)
+
+    def test_s3_checksum_with_crypto_pipeline_upload_part(self):
+        container_name = uuid.uuid4().hex
+        container_path = 'http://foo:8080/v1/a/' + container_name
+        req = Request.blank(
+            container_path, method='PUT',
+            headers={'X-Storage-Policy': 'one'})
+        resp = req.get_response(self.proxy_app)
+        self.assertEqual('201 Created', resp.status)
+
+        class ExistingAccountAuthApp(FakeAuthApp):
+            def _update_s3_path_info(self, env):
+                super()._update_s3_path_info(env)
+                env['PATH_INFO'] = env['PATH_INFO'].replace(
+                    '/v1/AUTH_test', '/v1/a', 1)
+
+        slo_app = slo.filter_factory({})(self.crypto_app)
+        auth_app = ExistingAccountAuthApp(slo_app)
+        auth_app._pipeline_final_app = self.proxy_app
+        s3_app = s3api_filter_factory(
+            {}, auth_pipeline_check='false', allow_no_owner='true',
+            allow_store_checksums='true')(
+                auth_app)
+        s3_app.logger = self.proxy_app.logger
+
+        part_checksum = base64.b64encode(
+            checksum.crc32(self.plaintext).digest()).decode('ascii')
+        auth_headers = {
+            'Authorization': 'AWS test:tester:hmac',
+            'Date': email.utils.formatdate(),
+        }
+        s3_path = '/%s/o' % container_name
+        create_headers = dict(auth_headers)
+        create_headers.update({
+            'X-Amz-Checksum-Algorithm': 'CRC32',
+            'X-Amz-Checksum-Type': 'COMPOSITE',
+        })
+        req = Request.blank(
+            s3_path + '?uploads', method='POST', headers=create_headers)
+        create_resp = req.get_response(s3_app)
+        self.assertEqual('200 OK', create_resp.status)
+        create_result = fromstring(
+            create_resp.body, 'InitiateMultipartUploadResult')
+        upload_id = create_result.find('UploadId').text
+        self.assertEqual(
+            'CRC32', create_resp.headers['X-Amz-Checksum-Algorithm'])
+        self.assertEqual(
+            'COMPOSITE', create_resp.headers['X-Amz-Checksum-Type'])
+
+        upload_part_headers = dict(auth_headers)
+        upload_part_headers['X-Amz-Checksum-Crc32'] = part_checksum
+        req = Request.blank(
+            s3_path + '?partNumber=1&uploadId=' + upload_id,
+            method='PUT', body=self.plaintext, headers=upload_part_headers)
+        part_resp = req.get_response(s3_app)
+        self.assertEqual('200 OK', part_resp.status)
+        self.assertEqual(
+            part_checksum, part_resp.headers['X-Amz-Checksum-Crc32'])
+        self.assertNotIn('X-Amz-Checksum-Type', part_resp.headers)
+
+        # Bypass the crypto middleware to prove that the part body was
+        # encrypted while its checksum sysmeta survived the footer callback.
+        segment_path = '%s+segments/o/%s/1' % (
+            container_path, upload_id)
+        req = Request.blank(segment_path, method='GET')
+        encrypted_part_resp = req.get_response(self.proxy_app)
+        self.assertEqual('200 OK', encrypted_part_resp.status)
+        self.assertNotEqual(self.plaintext, encrypted_part_resp.body)
+        self.assertIn(
+            'X-Object-Sysmeta-Crypto-Body-Meta',
+            encrypted_part_resp.headers)
+        self.assertEqual(
+            'CRC32',
+            encrypted_part_resp.headers[
+                'X-Object-Sysmeta-S3Api-Checksum-Algorithm'])
+        self.assertEqual('FULL_OBJECT',
+                         encrypted_part_resp.headers[
+                             'X-Object-Sysmeta-S3Api-Checksum-Type'])
+        # the checksum value was encrypted and moved to crypto namespace...
+        self.assertNotIn('X-Object-Sysmeta-S3api-Checksum-Value',
+                         encrypted_part_resp.headers)
+        self.assertIn('X-Object-Sysmeta-Crypto-Sysmeta-S3api-Checksum-Value',
+                      encrypted_part_resp.headers)
+        self.assertNotEqual(
+            part_checksum,
+            encrypted_part_resp.headers[
+                'X-Object-Sysmeta-Crypto-Sysmeta-S3api-Checksum-Value'])
 
     def test_write_with_crypto_read_with_crypto_different_root_secrets(self):
         root_secret = self.crypto_app.root_secret
