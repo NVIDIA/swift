@@ -208,6 +208,28 @@ class TestRequest(S3ApiTestCase):
         permission = args[1]
         self.assertEqual(permission, 'READ')
 
+    def test_bucket_put_does_not_echo_validated_checksum(self):
+        body = (
+            b'<CreateBucketConfiguration>'
+            b'<LocationConstraint>us-east-1</LocationConstraint>'
+            b'</CreateBucketConfiguration>')
+        crc = base64.b64encode(checksum.crc32(body).digest())
+        req = Request.blank(
+            '/bucket', method='PUT', body=body,
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header(),
+                     'X-Amz-Checksum-Crc32': crc})
+
+        status, headers, response_body = self.call_s3api(req)
+
+        self.assertEqual('200 OK', status, response_body)
+        checksumming_input = req.environ['wsgi.input']
+        self.assertIsInstance(checksumming_input, s3request.ChecksummingInput)
+        self.assertEqual(crc.decode('ascii'),
+                         checksumming_input.checksum_value)
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        self.assertNotIn('x-amz-checksum-type', headers)
+
     def test_get_validate_param(self):
         def create_s3request_with_param(param, value):
             req = Request.blank(
@@ -1566,7 +1588,7 @@ class TestRequest(S3ApiTestCase):
             sigv4_req.environ.get('swift.callback.update_footers'))
         self.assertFalse(sigv4_req.checksum_sysmeta_footers)
 
-    def test_sig_v4_unsgnd_pyld_crc32_ok(self):
+    def test_crc32_ok(self):
         body = b'abcdefghijklmnopqrstuvwxyz\n'
         crc = base64.b64encode(checksum.crc32(body).digest())
         sigv4_req = self._test_sig_v4_unsigned_payload(
@@ -1589,43 +1611,81 @@ class TestRequest(S3ApiTestCase):
         update_footers = sigv4_req.environ.get('swift.callback.update_footers')
         self.assertIsNone(update_footers)
 
+    def test_calculates_crc32_without_checksum_source(self):
+        body = b'abcdefghijklmnopqrstuvwxyz\n'
+        exp_checksum = base64.b64encode(
+            checksum.crc32(body).digest()).decode('ascii')
+        sigv4_req = self._test_sig_v4_unsigned_payload(body=body)
+
+        self.assertNotIn('x-amz-checksum-crc32', sigv4_req.headers)
+        self.assertIsNone(sigv4_req.checksumming_input)
+        checksumming_input = sigv4_req.install_checksumming_input(
+            checksum.crc32(), 'x-amz-checksum-crc32', None)
+        self.assertIs(checksumming_input, sigv4_req.checksumming_input)
+        self.assertIs(checksumming_input,
+                      sigv4_req.environ['wsgi.input'])
+        self.assertIsNone(checksumming_input.checksum_value)
+
+        self.assertEqual(body, sigv4_req.environ['wsgi.input'].read())
+        # the checksum is known, but nothing was persisted
+        self.assertEqual(
+            exp_checksum, checksumming_input.checksum_value)
+        self.assertIsNone(sigv4_req.checksum_sysmeta_footers)
+        self.assertNotIn(
+            'swift.callback.update_footers', sigv4_req.environ)
+
     def test_crc32_persist_sysmeta(self):
         body = b'abcdefghijklmnopqrstuvwxyz\n'
         crc = base64.b64encode(checksum.crc32(body).digest())
-        sigv4_req = self._test_sig_v4_unsigned_payload(
-            body=body,
-            extra_headers={'X-Amz-Checksum-Crc32': crc}
-        )
-        sigv4_req.enable_checksum_persistence()
+        for client_checksum in (True, False):
+            with self.subTest(client_checksum=client_checksum):
+                sigv4_req = self._test_sig_v4_unsigned_payload(
+                    body=body, extra_headers=(
+                        {'X-Amz-Checksum-Crc32': crc} if client_checksum
+                        else None))
+                if not client_checksum:
+                    # The controller can calculate a checksum for the client.
+                    self.assertNotIn('x-amz-checksum-crc32', sigv4_req.headers)
+                    sigv4_req.install_checksumming_input(
+                        checksum.crc32(), 'x-amz-checksum-crc32', None)
+                sigv4_req.enable_checksum_persistence()
 
-        exp_checksum = crc.decode('ascii')
-        self.assertIsNone(sigv4_req.checksum_sysmeta_footers)
-        self.assertNotIn(
-            'x-object-sysmeta-s3api-checksum-value',
-            sigv4_req.headers)
-        self.assertNotIn(
-            'x-object-sysmeta-s3api-checksum-algorithm', sigv4_req.headers)
-        self.assertNotIn(
-            'x-object-sysmeta-s3api-checksum-type', sigv4_req.headers)
-        update_footers = sigv4_req.environ.get('swift.callback.update_footers')
-        self.assertIsNotNone(update_footers)
-        footers = {}
-        update_footers(footers)
-        self.assertNotIn(
-            'x-object-sysmeta-s3api-checksum-value', footers)
-        self.assertNotIn(
-            'x-object-sysmeta-s3api-checksum-algorithm', footers)
-        self.assertNotIn(
-            'x-object-sysmeta-s3api-checksum-type', footers)
-        self.assertEqual(body, sigv4_req.environ['wsgi.input'].read())
-        footers = {}
-        update_footers(footers)
-        exp_sysmeta = HeaderKeyDict({
-            'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
-            'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
-            'x-object-sysmeta-s3api-checksum-value': exp_checksum})
-        self.assertEqual(exp_sysmeta, sigv4_req.checksum_sysmeta_footers)
-        self.assertEqual(exp_sysmeta, footers)
+                exp_checksum = crc.decode('ascii')
+                # The callback must not store a value before the body is read.
+                self.assertIsNone(sigv4_req.checksum_sysmeta_footers)
+                self.assertNotIn(
+                    'x-object-sysmeta-s3api-checksum-value',
+                    sigv4_req.headers)
+                self.assertNotIn(
+                    'x-object-sysmeta-s3api-checksum-algorithm',
+                    sigv4_req.headers)
+                self.assertNotIn(
+                    'x-object-sysmeta-s3api-checksum-type', sigv4_req.headers)
+                update_footers = sigv4_req.environ.get(
+                    'swift.callback.update_footers')
+                self.assertIsNotNone(update_footers)
+                footers = {}
+                update_footers(footers)
+                self.assertIsNone(sigv4_req.checksum_sysmeta_footers)
+                self.assertNotIn(
+                    'x-object-sysmeta-s3api-checksum-value', footers)
+                self.assertNotIn(
+                    'x-object-sysmeta-s3api-checksum-algorithm', footers)
+                self.assertNotIn(
+                    'x-object-sysmeta-s3api-checksum-type', footers)
+                self.assertEqual({}, footers)
+                self.assertEqual(body, sigv4_req.environ['wsgi.input'].read())
+                self.assertEqual(exp_checksum,
+                                 sigv4_req.checksumming_input.checksum_value)
+                footers = {}
+                update_footers(footers)
+                exp_sysmeta = HeaderKeyDict({
+                    'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+                    'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+                    'x-object-sysmeta-s3api-checksum-value': exp_checksum})
+                self.assertEqual(exp_sysmeta,
+                                 sigv4_req.checksum_sysmeta_footers)
+                self.assertEqual(exp_sysmeta, footers)
 
     def test_crc32_persist_sysmeta_wrapped_input(self):
         body = b'abcdefghijklmnopqrstuvwxyz\n'

@@ -23,18 +23,21 @@ import unittest
 from urllib.parse import parse_qs, quote, quote_plus
 
 from swift.common import swob
+from swift.common.middleware import copy, slo
 from swift.common.swob import Request, parse_date_header
-from swift.common.utils import checksum, json, md5
+from swift.common.utils import checksum, json, md5, MD5_OF_EMPTY_STRING
 from swift.common.utils.timestamp import Timestamp, NormalTimestamp
-
 from test.unit import FakeMemcache, patch_policies, mock_normal_timestamp_now
 from test.unit.common.middleware.s3api import S3ApiTestCase, S3ApiTestCaseAcl
 from test.unit.common.middleware.s3api.helpers import UnreadableInput
 from swift.common.middleware.s3api.etree import fromstring, tostring
 from swift.common.middleware.s3api.subresource import Owner, Grant, User, \
     ACL, encode_acl, decode_acl, ACLPublicRead
-from swift.common.middleware.s3api.utils import s3api_sysmeta_header, \
-    S3Timestamp
+from swift.common.middleware.s3api.s3checksum import \
+    checksum_algorithm_from_header
+from swift.common.middleware.s3api.controllers.multi_upload import \
+    MPUChecksumAttrs
+from swift.common.middleware.s3api.utils import S3Timestamp
 from swift.common.middleware.s3api.s3request import MAX_32BIT_INT
 from swift.common.storage_policy import StoragePolicy, POLICIES
 from swift.proxy.controllers.base import get_cache_key
@@ -51,9 +54,15 @@ XML = '<CompleteMultipartUpload>' \
     '</CompleteMultipartUpload>'
 
 OBJECTS_TEMPLATE = \
-    (('object/X/1', '2014-05-07T19:47:51.592270', '0123456789abcdef', 100,
+    (('object/X/1',
+      '2014-05-07T19:47:51.592270',
+      '0123456789abcdef0123456789abcdef',
+      100,
       '2014-05-07T19:47:52.000Z'),
-     ('object/X/2', '2014-05-07T19:47:52.592270', 'fedcba9876543210', 200,
+     ('object/X/2',
+      '2014-05-07T19:47:52.592270',
+      'fedcba9876543210fedcba9876543210',
+      200,
       '2014-05-07T19:47:53.000Z'))
 
 MULTIPARTS_TEMPLATE = \
@@ -92,6 +101,115 @@ S3_ETAG = '"%s-2"' % md5(binascii.a2b_hex(
     'fedcba9876543210fedcba9876543210'), usedforsecurity=False).hexdigest()
 
 
+class TestMPUChecksumAttrs(unittest.TestCase):
+
+    def test_defaults_are_not_checksum_aware(self):
+        attrs = MPUChecksumAttrs()
+
+        self.assertIsNone(attrs.header)
+        self.assertIsNone(attrs.value)
+        self.assertIsNone(attrs.type)
+        self.assertTrue(attrs.is_mpu_in_progress)
+        self.assertIsNone(attrs.algorithm)
+        self.assertFalse(attrs.is_checksum_aware)
+        self.assertFalse(attrs.is_full_object)
+        self.assertFalse(attrs.is_composite)
+
+    def test_checksum_properties(self):
+        for header, checksum_type, algorithm in (
+                ('X-Amz-Checksum-Crc32', 'full_object', 'CRC32'),
+                ('X-Amz-Checksum-Sha256', 'composite', 'SHA256')):
+            with self.subTest(checksum_type=checksum_type):
+                attrs = MPUChecksumAttrs(header, checksum_type=checksum_type)
+
+                self.assertEqual(header.lower(), attrs.header)
+                self.assertEqual(checksum_type.upper(), attrs.type)
+                self.assertEqual(algorithm, attrs.algorithm)
+                self.assertTrue(attrs.is_checksum_aware)
+                self.assertEqual(checksum_type == 'full_object',
+                                 attrs.is_full_object)
+                self.assertEqual(checksum_type == 'composite',
+                                 attrs.is_composite)
+
+    def test_completed_checksum_properties(self):
+        attrs = MPUChecksumAttrs(
+            'x-amz-checksum-crc32', 'AAAAAA==', 'FULL_OBJECT',
+            is_mpu_in_progress=False)
+
+        self.assertFalse(attrs.is_mpu_in_progress)
+        self.assertEqual('CRC32', attrs.algorithm)
+        self.assertFalse(attrs.is_checksum_aware)
+        self.assertFalse(attrs.is_full_object)
+        self.assertFalse(attrs.is_composite)
+
+    def test_from_request_with_algorithm(self):
+        req = Request.blank(
+            '/bucket/object?uploads', method='POST', headers={
+                'X-Amz-Checksum-Algorithm': 'CRC32',
+                'X-Amz-Checksum-Type': 'full_object',
+            })
+
+        attrs = MPUChecksumAttrs.from_request(req)
+
+        self.assertEqual('x-amz-checksum-crc32', attrs.header)
+        self.assertIsNone(attrs.value)
+        self.assertEqual('FULL_OBJECT', attrs.type)
+        self.assertTrue(attrs.is_mpu_in_progress)
+
+    def test_from_request_with_checksum(self):
+        for method, query, headers, value, checksum_type in (
+                ('POST', 'uploadId=X', {
+                    'X-Amz-Checksum-Crc32': 'AAAAAA==',
+                    'X-Amz-Checksum-Type': 'COMPOSITE',
+                }, 'AAAAAA==', 'COMPOSITE'),
+                ('PUT', 'partNumber=1&uploadId=X', {
+                    'X-Amz-Checksum-Crc32': 'AAAAAA==',
+                }, 'AAAAAA==', None),
+                # A trailer declares the algorithm before its value is read.
+                ('PUT', 'partNumber=1&uploadId=X', {
+                    'X-Amz-Trailer': 'x-amz-checksum-crc32',
+                }, None, None)):
+            with self.subTest(method=method, headers=headers):
+                req = Request.blank('/bucket/object?' + query,
+                                    method=method, headers=headers)
+                attrs = MPUChecksumAttrs.from_request(req)
+
+                self.assertEqual('x-amz-checksum-crc32', attrs.header)
+                self.assertEqual(value, attrs.value)
+                self.assertEqual(checksum_type, attrs.type)
+                self.assertTrue(attrs.is_mpu_in_progress)
+
+    def test_from_request_ignores_algorithm_header(self):
+        for method, query in (('POST', 'uploadId=X'),
+                              ('PUT', 'partNumber=1&uploadId=X')):
+            with self.subTest(method=method):
+                req = Request.blank(
+                    '/bucket/object?' + query, method=method,
+                    headers={'X-Amz-Checksum-Algorithm': 'CRC32'})
+                attrs = MPUChecksumAttrs.from_request(req)
+
+                self.assertIsNone(attrs.header)
+                self.assertIsNone(attrs.value)
+                self.assertIsNone(attrs.type)
+                self.assertTrue(attrs.is_mpu_in_progress)
+
+    def test_from_sysmeta(self):
+        sysmeta_headers = {
+            'x-object-sysmeta-s3api-checksum-algorithm': 'crc32',
+            'x-object-sysmeta-s3api-checksum-value': 'AAAAAA==',
+            'x-object-sysmeta-s3api-checksum-type': 'full_object',
+        }
+
+        attrs = MPUChecksumAttrs.from_sysmeta(
+            sysmeta_headers, is_mpu_in_progress=False)
+
+        self.assertEqual('x-amz-checksum-crc32', attrs.header)
+        self.assertEqual('AAAAAA==', attrs.value)
+        self.assertEqual('FULL_OBJECT', attrs.type)
+        self.assertFalse(attrs.is_mpu_in_progress)
+        self.assertFalse(attrs.is_checksum_aware)
+
+
 class BaseS3ApiMultiUpload(object):
 
     def setUp(self):
@@ -106,31 +224,39 @@ class BaseS3ApiMultiUpload(object):
 
         self.s3api.conf.min_segment_size = 1
 
-        objects = [{'name': item[0], 'last_modified': item[1],
-                    'hash': item[2], 'bytes': item[3]}
-                   for item in OBJECTS_TEMPLATE]
+        self._segment_listing_objects = [
+            {'name': item[0], 'last_modified': item[1],
+             'hash': item[2], 'bytes': item[3]}
+            for item in OBJECTS_TEMPLATE]
 
         self.swift.register('PUT', self.segment_bucket,
                             swob.HTTPAccepted, {}, None)
-        # default to just returning everybody...
-        self.swift.register('GET', self.segment_bucket, swob.HTTPOk, {},
-                            json.dumps(objects))
-        self.swift.register('GET', '%s?format=json&marker=%s' % (
-                            self.segment_bucket, objects[-1]['name']),
-                            swob.HTTPOk, {}, json.dumps([]))
-        # but for the listing when aborting an upload, break it up into pages
+        json_headers = {'Content-Type': 'application/json'}
         self.swift.register(
-            'GET', '%s?delimiter=/&format=json&marker=&prefix=object/X/' % (
-                self.segment_bucket, ),
-            swob.HTTPOk, {}, json.dumps(objects[:1]))
+            'GET', self.segment_bucket, swob.HTTPOk, json_headers,
+            json.dumps(self._segment_listing_objects))
+        self.swift.register(
+            'GET', '%s?format=json&marker=%s' % (
+                self.segment_bucket,
+                self._segment_listing_objects[-1]['name']),
+            swob.HTTPOk, json_headers, json.dumps([]))
+        # For aborting an upload, return the segment listing in pages.
+        self.swift.register(
+            'GET', '%s?delimiter=/&format=json&marker=&prefix=object/X/' %
+            self.segment_bucket,
+            swob.HTTPOk, json_headers,
+            json.dumps(self._segment_listing_objects[:1]))
         self.swift.register(
             'GET', '%s?delimiter=/&format=json&marker=%s&prefix=object/X/' % (
-                self.segment_bucket, objects[0]['name']),
-            swob.HTTPOk, {}, json.dumps(objects[1:]))
+                self.segment_bucket,
+                self._segment_listing_objects[0]['name']),
+            swob.HTTPOk, json_headers,
+            json.dumps(self._segment_listing_objects[1:]))
         self.swift.register(
             'GET', '%s?delimiter=/&format=json&marker=%s&prefix=object/X/' % (
-                self.segment_bucket, objects[-1]['name']),
-            swob.HTTPOk, {}, '[]')
+                self.segment_bucket,
+                self._segment_listing_objects[-1]['name']),
+            swob.HTTPOk, json_headers, '[]')
         self.swift.register('HEAD', self.segment_bucket + '/object/X',
                             swob.HTTPOk,
                             {'x-object-meta-foo': 'bar',
@@ -778,10 +904,9 @@ class BaseS3ApiMultiUpload(object):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
 
-    def test_object_upload_part_checksum_not_persisted_or_echoed(self):
-        # FULL_OBJECT checksum sysmeta is a whole-object concept; an MPU part
-        # upload must not persist or echo it (that stays out of scope until
-        # composite/part checksums are implemented).
+    def test_object_upload_part_checksum_persistence_disabled(self):
+        self.s3api.conf.allow_store_checksums = False
+        # Validate the supplied checksum without writing checksum metadata.
         part_body = b'part object body'
         crc = base64.b64encode(checksum.crc32(part_body).digest())
         req = Request.blank(
@@ -1147,6 +1272,469 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
     def test_bucket_upload_part_success_mixed_policy(self):
         self._do_test_bucket_upload_part_success(0, 1)
 
+    def test_object_upload_part_stored_checksum_validation_disabled(self):
+        self.s3api.conf.allow_store_checksums = False
+        self._register_checksum_upload_marker()
+        part_body = b'part object'
+        part_checksum = base64.b64encode(
+            checksum.crc32(part_body).digest()).decode('ascii')
+        # Disabling writes must not remove a stored MPU's validation rules.
+        for checksum_headers, expected_status in (
+                ({'X-Amz-Checksum-Crc32': part_checksum}, '200 OK'),
+                ({}, '400 Bad Request'),
+                ({'X-Amz-Checksum-Sha256': base64.b64encode(
+                    hashlib.sha256(part_body).digest()).decode('ascii')},
+                 '400 Bad Request')):
+            with self.subTest(headers=checksum_headers):
+                req = Request.blank(
+                    '/bucket/object?partNumber=1&uploadId=X', method='PUT',
+                    headers={
+                        'Authorization': 'AWS test:tester:hmac',
+                        'Date': self.get_date_header(),
+                        **checksum_headers}, body=part_body)
+                with self.stubbed_container_info():
+                    status, headers, body = self.call_s3api(req)
+                self.assertEqual(expected_status, status, body)
+                if status == '200 OK':
+                    self.assertNotIn('x-amz-checksum-crc32', headers)
+                    self.assertNotIn('swift.callback.update_footers',
+                                     self.swift.call_list[-1].env)
+                else:
+                    self.assertEqual('InvalidRequest',
+                                     self._get_error_code(body))
+
+    def _register_checksum_upload_marker(
+            self, header='x-amz-checksum-crc32',
+            checksum_type='COMPOSITE'):
+        self.swift.register(
+            'HEAD', self.segment_bucket + '/object/X', swob.HTTPOk,
+            {'content-type': 'application/directory',
+             'x-object-sysmeta-s3api-checksum-algorithm':
+                 checksum_algorithm_from_header(header),
+             'x-object-sysmeta-s3api-checksum-type':
+                 checksum_type}, None)
+
+    def _register_part_checksum(self, part_number, value,
+                                header='x-amz-checksum-crc32',
+                                content_length=None):
+        """
+        Register checksum sysmeta returned by a part HEAD request.
+        """
+        part_name = 'object/X/%d' % part_number
+        for obj in self._segment_listing_objects:
+            if obj['name'] != part_name:
+                continue
+            self.swift.register(
+                'HEAD', '%s/%s' % (self.segment_bucket, part_name),
+                swob.HTTPOk, {
+                    'Etag': obj['hash'],
+                    'Content-Length': str(
+                        obj['bytes'] if content_length is None
+                        else content_length),
+                    'x-object-sysmeta-s3api-checksum-algorithm':
+                        checksum_algorithm_from_header(header),
+                    'x-object-sysmeta-s3api-checksum-value': value,
+                }, None)
+            return
+        self.fail('could not find part %s in segment listing' % part_name)
+
+    def _complete_mpu_xml_with_crc32(self, parts):
+        etags = {
+            1: self._segment_listing_objects[0]['hash'],
+            2: self._segment_listing_objects[1]['hash'],
+            3: MD5_OF_EMPTY_STRING,
+        }
+        parts_xml = ''.join(
+            '<Part>'
+            '<PartNumber>%d</PartNumber>'
+            '<ETag>%s</ETag>'
+            '<ChecksumCRC32>%s</ChecksumCRC32>'
+            '</Part>' % (
+                part_number, etags[part_number], part_checksum)
+            for part_number, part_checksum in parts)
+        return '<CompleteMultipartUpload>%s</CompleteMultipartUpload>' % (
+            parts_xml)
+
+    def test_object_upload_part_checksum_without_mpu_algorithm(self):
+        # A marker without checksum sysmeta (no algorithm at initiation, or
+        # initiated before allow_store_checksums was on) keeps the MPU legacy:
+        # part checksums are validated but never stored.
+        body = b'part object'
+        part_checksum = base64.b64encode(
+            hashlib.sha256(body).digest()).decode('ascii')
+        bad_checksum = base64.b64encode(
+            hashlib.sha256(b'wrong body').digest()).decode('ascii')
+        for enabled in (False, True):
+            self.s3api.conf.allow_store_checksums = enabled
+            for supplied_checksum, error in (
+                    (part_checksum, None), (bad_checksum, 'BadDigest'),
+                    ('not-base64!', 'InvalidRequest')):
+                with self.subTest(enabled=enabled, checksum=supplied_checksum):
+                    self.swift.clear_calls()
+                    req = Request.blank(
+                        '/bucket/object?partNumber=1&uploadId=X', method='PUT',
+                        headers={'Authorization': 'AWS test:tester:hmac',
+                                 'Date': self.get_date_header(),
+                                 'X-Amz-Checksum-Sha256': supplied_checksum},
+                        body=body)
+                    with self.stubbed_container_info():
+                        status, headers, resp_body = self.call_s3api(req)
+                    self.assertNotIn('x-amz-checksum-sha256', headers)
+                    self.assertNotIn('x-amz-checksum-type', headers)
+                    if error:
+                        self.assertEqual('400 Bad Request', status)
+                        self.assertEqual(
+                            error, self._get_error_code(resp_body))
+                        continue
+
+                    # A valid checksum permits the PUT without sysmeta.
+                    self.assertEqual('200 OK', status, resp_body)
+                    self.assertEqual([
+                        ('HEAD', self.segment_bucket + '/object/X'),
+                        ('PUT', self.segment_bucket + '/object/X/1'),
+                    ], self.swift.calls)
+                    put_call = self.swift.call_list[-1]
+                    self.assertEqual(body, put_call.body)
+                    self.assertNotIn('swift.callback.update_footers',
+                                     put_call.env)
+                    for key in ('x-object-sysmeta-s3api-checksum-algorithm',
+                                'x-object-sysmeta-s3api-checksum-value',
+                                'x-object-sysmeta-s3api-checksum-type'):
+                        self.assertNotIn(key, put_call.headers)
+                        self.assertNotIn(key, put_call.footers)
+
+    def test_object_upload_part_trailer_without_mpu_checksum(self):
+        # Like the header case, but with the checksum in an aws-chunked
+        # trailer. A legacy MPU still rejects a bad or malformed trailer while
+        # the body is read, but never stores the part checksum.
+        body = b'part object'
+        part_checksum = base64.b64encode(
+            checksum.crc32(body).digest()).decode('ascii')
+        bad_checksum = base64.b64encode(
+            checksum.crc32(b'wrong body').digest()).decode('ascii')
+        authz_header = 'AWS4-HMAC-SHA256 ' + ', '.join([
+            'Credential=test:tester/%s/us-east-1/s3/aws4_request' %
+            self.get_v4_amz_date_header().split('T', 1)[0],
+            'SignedHeaders=content-encoding;content-length;host;'
+            'x-amz-content-sha256;x-amz-date;'
+            'x-amz-decoded-content-length;x-amz-trailer',
+            'Signature=X',
+        ])
+        for enabled in (False, True):
+            self.s3api.conf.allow_store_checksums = enabled
+            for supplied_checksum, error in (
+                    (part_checksum, None), (bad_checksum, 'BadDigest'),
+                    ('not-base64!', 'InvalidRequest')):
+                with self.subTest(enabled=enabled, checksum=supplied_checksum):
+                    self.swift.clear_calls()
+                    chunked_body = (
+                        b'%x\r\n%s\r\n'
+                        b'0\r\n'
+                        b'x-amz-checksum-crc32: %s\r\n'
+                    ) % (len(body), body, supplied_checksum.encode('ascii'))
+                    req = Request.blank(
+                        '/bucket/object?partNumber=1&uploadId=X', method='PUT',
+                        headers={
+                            'Authorization': authz_header,
+                            'Content-Encoding': 'aws-chunked',
+                            'Content-Length': str(len(chunked_body)),
+                            'X-Amz-Content-SHA256':
+                                'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+                            'X-Amz-Date': self.get_v4_amz_date_header(),
+                            'X-Amz-Decoded-Content-Length': str(len(body)),
+                            'X-Amz-Trailer': 'x-amz-checksum-crc32',
+                        }, body=chunked_body)
+                    with self.stubbed_container_info():
+                        status, headers, resp_body = self.call_s3api(req)
+                    self.assertNotIn('x-amz-checksum-crc32', headers)
+                    self.assertNotIn('x-amz-checksum-type', headers)
+                    if error:
+                        self.assertEqual('400 Bad Request', status)
+                        self.assertEqual(
+                            error, self._get_error_code(resp_body))
+                        continue
+
+                    self.assertEqual('200 OK', status, resp_body)
+                    self.assertEqual([
+                        ('HEAD', self.segment_bucket + '/object/X'),
+                        ('PUT', self.segment_bucket + '/object/X/1'),
+                    ], self.swift.calls)
+                    put_call = self.swift.call_list[-1]
+                    self.assertEqual(body, put_call.body)
+                    self.assertNotIn('swift.callback.update_footers',
+                                     put_call.env)
+                    for key in ('x-object-sysmeta-s3api-checksum-algorithm',
+                                'x-object-sysmeta-s3api-checksum-value',
+                                'x-object-sysmeta-s3api-checksum-type'):
+                        self.assertNotIn(key, put_call.headers)
+                        self.assertNotIn(key, put_call.footers)
+
+    def test_object_upload_part_copy_checksum_not_persisted_or_echoed(self):
+        # we don't have this support yet...
+        crc = base64.b64encode(checksum.crc32(b'').digest()).decode('ascii')
+        status, headers, _body = self._test_copy_for_s3acl(
+            'test:tester', put_header={
+                'Content-Length': '0',
+                'X-Amz-Checksum-Crc32': crc})
+
+        self.assertEqual(status.split()[0], '200')
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        self.assertNotIn('x-amz-checksum-type', headers)
+        put_call = self.swift.call_list[-1]
+        self.assertNotIn('x-object-sysmeta-s3api-checksum-algorithm',
+                         put_call.footers)
+        self.assertNotIn('x-object-sysmeta-s3api-checksum-value',
+                         put_call.footers)
+        self.assertNotIn('x-object-sysmeta-s3api-checksum-type',
+                         put_call.footers)
+
+    def test_object_upload_part_composite_checksum_value(self):
+        self._register_checksum_upload_marker()
+        body = b'part object'
+        part_checksum = base64.b64encode(
+            checksum.crc32(body).digest()).decode('ascii')
+        for sdk_headers in ({}, {'X-Amz-Sdk-Checksum-Algorithm': 'CRC32'}):
+            with self.subTest(sdk_headers=sdk_headers):
+                self.swift.clear_calls()
+                req = Request.blank('/bucket/object?partNumber=1&uploadId=X',
+                                    method='PUT',
+                                    headers={'Authorization':
+                                             'AWS test:tester:hmac',
+                                             'Date': self.get_date_header(),
+                                             'X-Amz-Checksum-Crc32':
+                                             part_checksum,
+                                             **sdk_headers},
+                                    body=body)
+                with patch('swift.common.middleware.s3api.s3request.'
+                           'get_container_info',
+                           lambda env, app, swift_source: {'status': 204}):
+                    status, headers, resp_body = self.call_s3api(req)
+
+                self.assertEqual(status, '200 OK')
+                self.assertEqual(
+                    part_checksum, headers['x-amz-checksum-crc32'])
+                self.assertNotIn('x-amz-checksum-type', headers)
+                self.assertEqual([
+                    ('HEAD', '/v1/AUTH_test/bucket+segments/object/X'),
+                    ('PUT', '/v1/AUTH_test/bucket+segments/object/X/1'),
+                ], self.swift.calls)
+                put_call = self.swift.call_list[-1]
+                self.assertEqual(body, put_call.body)
+                self.assertEqual('CRC32', put_call.footers[
+                    'x-object-sysmeta-s3api-checksum-algorithm'])
+                self.assertEqual(part_checksum, put_call.footers[
+                    'x-object-sysmeta-s3api-checksum-value'])
+                self.assertEqual('FULL_OBJECT', put_call.footers[
+                    'x-object-sysmeta-s3api-checksum-type'])
+
+    def test_object_upload_part_composite_checksum_trailer(self):
+        self._register_checksum_upload_marker()
+        body = b'part object'
+        part_checksum = base64.b64encode(
+            checksum.crc32(body).digest()).decode('ascii')
+        chunked_body = (
+            b'%x\r\n%s\r\n'
+            b'0\r\n'
+            b'x-amz-checksum-crc32: %s\r\n'
+        ) % (len(body), body, part_checksum.encode('ascii'))
+        authz_header = 'AWS4-HMAC-SHA256 ' + ', '.join([
+            'Credential=test:tester/%s/us-east-1/s3/aws4_request' %
+            self.get_v4_amz_date_header().split('T', 1)[0],
+            'SignedHeaders=content-encoding;content-length;host;'
+            'x-amz-content-sha256;x-amz-date;'
+            'x-amz-decoded-content-length;x-amz-sdk-checksum-algorithm;'
+            'x-amz-trailer',
+            'Signature=X',
+        ])
+        req = Request.blank('/bucket/object?partNumber=1&uploadId=X',
+                            method='PUT',
+                            headers={
+                                'Authorization': authz_header,
+                                'Content-Encoding': 'aws-chunked',
+                                'Content-Length': str(len(chunked_body)),
+                                'X-Amz-Content-SHA256':
+                                'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+                                'X-Amz-Date': self.get_v4_amz_date_header(),
+                                'X-Amz-Decoded-Content-Length':
+                                str(len(body)),
+                                'X-Amz-Sdk-Checksum-Algorithm': 'CRC32',
+                                'X-Amz-Trailer': 'x-amz-checksum-crc32',
+                            },
+                            body=chunked_body)
+        with patch('swift.common.middleware.s3api.s3request.'
+                   'get_container_info',
+                   lambda env, app, swift_source: {'status': 204}):
+            status, headers, resp_body = self.call_s3api(req)
+
+        self.assertEqual(status, '200 OK')
+        self.assertEqual(part_checksum, headers['x-amz-checksum-crc32'])
+        self.assertNotIn('x-amz-checksum-type', headers)
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket+segments/object/X'),
+            ('PUT', '/v1/AUTH_test/bucket+segments/object/X/1'),
+        ], self.swift.calls)
+        put_call = self.swift.call_list[-1]
+        self.assertEqual(body, put_call.body)
+        self.assertEqual('CRC32', put_call.footers[
+            'x-object-sysmeta-s3api-checksum-algorithm'])
+        self.assertEqual(part_checksum, put_call.footers[
+            'x-object-sysmeta-s3api-checksum-value'])
+        self.assertEqual('FULL_OBJECT', put_call.footers[
+            'x-object-sysmeta-s3api-checksum-type'])
+
+    def test_object_upload_part_composite_checksum_bad_value(self):
+        self._register_checksum_upload_marker()
+        body = b'part object'
+        part_checksum = base64.b64encode(
+            checksum.crc32(b'not the part').digest()).decode('ascii')
+        req = Request.blank('/bucket/object?partNumber=1&uploadId=X',
+                            method='PUT',
+                            headers={'Authorization':
+                                     'AWS test:tester:hmac',
+                                     'Date': self.get_date_header(),
+                                     'X-Amz-Checksum-Crc32':
+                                     part_checksum},
+                            body=body)
+        with patch('swift.common.middleware.s3api.s3request.'
+                   'get_container_info',
+                   lambda env, app, swift_source: {'status': 204}):
+            status, headers, resp_body = self.call_s3api(req)
+
+        self.assertEqual(status, '400 Bad Request')
+        self.assertEqual(self._get_error_code(resp_body), 'BadDigest')
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        put_call = self.swift.call_list[-1]
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket+segments/object/X'),
+            ('PUT', '/v1/AUTH_test/bucket+segments/object/X/1'),
+        ], self.swift.calls)
+        self.assertIsNone(put_call.body)
+        self.assertNotIn('/v1/AUTH_test/bucket+segments/object/X/1',
+                         self.swift.uploaded)
+        for key in ('x-object-sysmeta-s3api-checksum-algorithm',
+                    'x-object-sysmeta-s3api-checksum-value',
+                    'x-object-sysmeta-s3api-checksum-type'):
+            self.assertNotIn(key, put_call.footers)
+
+    def test_object_upload_part_composite_checksum_missing_algorithm(self):
+        self._register_checksum_upload_marker()
+        body = b'part object'
+        req = Request.blank('/bucket/object?partNumber=1&uploadId=X',
+                            method='PUT',
+                            headers={'Authorization':
+                                     'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()},
+                            body=body)
+        with patch('swift.common.middleware.s3api.s3request.'
+                   'get_container_info',
+                   lambda env, app, swift_source: {'status': 204}):
+            status, headers, resp_body = self.call_s3api(req)
+
+        self.assertEqual(status, '400 Bad Request')
+        self.assertEqual(self._get_error_code(resp_body), 'InvalidRequest')
+        self.assertEqual(
+            'Checksum Type mismatch occurred, expected checksum '
+            'Type: crc32, actual checksum Type: null',
+            self._get_error_message(resp_body))
+        self.assertNotIn('x-amz-checksum-crc32', headers)
+        self.assertNotIn('x-amz-checksum-type', headers)
+        self.assertEqual([
+            ('HEAD', '/v1/AUTH_test/bucket+segments/object/X'),
+        ], self.swift.calls)
+
+    def test_object_upload_part_full_object_checksum_optional(self):
+        self._register_checksum_upload_marker(checksum_type='FULL_OBJECT')
+        self.swift.read_size = 4
+        body = b'part object'
+        part_checksum = base64.b64encode(
+            checksum.crc32(body).digest()).decode('ascii')
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                self.swift.clear_calls()
+                req = Request.blank(
+                    '/bucket/object?partNumber=1&uploadId=X', method='PUT',
+                    headers={'Authorization': 'AWS test:tester:hmac',
+                             'Date': self.get_date_header()}, body=body)
+                if chunked:
+                    # WSGI input has the bytes after HTTP chunk decoding.
+                    req.headers['Transfer-Encoding'] = 'chunked'
+                    req.content_length = None
+                with self.stubbed_container_info():
+                    status, headers, resp_body = self.call_s3api(req)
+
+                self.assertEqual(status, '200 OK')
+                self.assertEqual(part_checksum,
+                                 headers['x-amz-checksum-crc32'])
+                self.assertNotIn('x-amz-checksum-type', headers)
+                self.assertEqual([
+                    ('HEAD', '/v1/AUTH_test/bucket+segments/object/X'),
+                    ('PUT', '/v1/AUTH_test/bucket+segments/object/X/1'),
+                ], self.swift.calls)
+                put_call = self.swift.call_list[-1]
+                self.assertEqual(body, put_call.body)
+                self.assertEqual('CRC32', put_call.footers[
+                    'x-object-sysmeta-s3api-checksum-algorithm'])
+                self.assertEqual(part_checksum, put_call.footers[
+                    'x-object-sysmeta-s3api-checksum-value'])
+                self.assertEqual('FULL_OBJECT', put_call.footers[
+                    'x-object-sysmeta-s3api-checksum-type'])
+
+    def test_upload_part_full_object_checksum_persistence_disabled(self):
+        self.s3api.conf.allow_store_checksums = False
+        self._register_checksum_upload_marker(checksum_type='FULL_OBJECT')
+        self.swift.read_size = 4
+        # Keep the stored MPU rules when a part has no client checksum.
+        body = b'part object'
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                self.swift.clear_calls()
+                req = Request.blank(
+                    '/bucket/object?partNumber=1&uploadId=X', method='PUT',
+                    headers={'Authorization': 'AWS test:tester:hmac',
+                             'Date': self.get_date_header()}, body=body)
+                if chunked:
+                    req.headers['Transfer-Encoding'] = 'chunked'
+                    req.content_length = None
+                with self.stubbed_container_info():
+                    status, headers, resp_body = self.call_s3api(req)
+                self.assertEqual('200 OK', status, resp_body)
+                self.assertNotIn('x-amz-checksum-crc32', headers)
+                put_call = self.swift.call_list[-1]
+                self.assertEqual(body, put_call.body)
+                self.assertNotIn('swift.callback.update_footers', put_call.env)
+                self.assertFalse(put_call.footers)
+
+    def test_object_upload_part_checksum_wrong_algorithm(self):
+        for checksum_type in ('COMPOSITE', 'FULL_OBJECT'):
+            with self.subTest(checksum_type=checksum_type):
+                self.swift.clear_calls()
+                self._register_checksum_upload_marker(
+                    checksum_type=checksum_type)
+                body = b'part object'
+                part_checksum = base64.b64encode(
+                    hashlib.sha256(body).digest()).decode('ascii')
+                req = Request.blank('/bucket/object?partNumber=1&uploadId=X',
+                                    method='PUT',
+                                    headers={'Authorization':
+                                             'AWS test:tester:hmac',
+                                             'Date': self.get_date_header(),
+                                             'X-Amz-Sdk-Checksum-Algorithm':
+                                             'SHA256',
+                                             'X-Amz-Checksum-Sha256':
+                                             part_checksum},
+                                    body=body)
+                with patch('swift.common.middleware.s3api.s3request.'
+                           'get_container_info',
+                           lambda env, app, swift_source: {'status': 204}):
+                    status, headers, resp_body = self.call_s3api(req)
+
+                self.assertEqual(status, '400 Bad Request')
+                self.assertEqual(self._get_error_code(resp_body),
+                                 'InvalidRequest')
+                self.assertEqual([
+                    ('HEAD', '/v1/AUTH_test/bucket+segments/object/X'),
+                ], self.swift.calls)
+
     def test_bucket_upload_part_v4_bad_hash(self):
         authz_header = 'AWS4-HMAC-SHA256 ' + ', '.join([
             'Credential=test:tester/%s/us-east-1/s3/aws4_request' %
@@ -1235,7 +1823,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             bucket_policy_index=int(POLICIES.default),
             segment_bucket_policy_index=None,
             expected_read_acl=None,
-            expected_write_acl=None):
+            expected_write_acl=None,
+            expected_checksum_algorithm=None,
+            expected_checksum_type=None):
         if segment_bucket_policy_index is None:
             segment_bucket_policy_index = bucket_policy_index
         self._register_bucket_policy_index_head('bucket', bucket_policy_index)
@@ -1254,6 +1844,17 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         status, headers, body = self.call_s3api(req)
         fromstring(body, 'InitiateMultipartUploadResult')
         self.assertEqual(status.split()[0], '200')
+        if expected_checksum_algorithm and \
+                self.s3api.conf.allow_store_checksums:
+            self.assertEqual(
+                expected_checksum_algorithm,
+                headers.get('x-amz-checksum-algorithm'))
+            self.assertEqual(
+                expected_checksum_type,
+                headers.get('x-amz-checksum-type'))
+        else:
+            self.assertNotIn('x-amz-checksum-algorithm', headers)
+            self.assertNotIn('x-amz-checksum-type', headers)
 
         self.assertEqual(req.environ['swift.backend_path'],
                          '/v1/AUTH_test/bucket+segments/object/X')
@@ -1263,6 +1864,21 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         _, _, req_headers = self.swift.calls_with_headers[-1]
         self.assertEqual(req_headers.get('X-Object-Meta-Foo'), 'bar')
         self.assertEqual(req_headers.get('Content-Encoding'), 'gzip')
+        if expected_checksum_algorithm and \
+                self.s3api.conf.allow_store_checksums:
+            self.assertEqual(
+                expected_checksum_algorithm,
+                req_headers.get('x-object-sysmeta-s3api-checksum-algorithm'))
+            self.assertEqual(
+                expected_checksum_type,
+                req_headers.get('x-object-sysmeta-s3api-checksum-type'))
+        else:
+            self.assertNotIn('x-object-sysmeta-s3api-checksum-algorithm',
+                             req_headers)
+            self.assertNotIn('x-object-sysmeta-s3api-checksum-type',
+                             req_headers)
+        self.assertNotIn(
+            'x-object-sysmeta-s3api-checksum-value', req_headers)
         self.assertNotIn('Etag', req_headers)
         self.assertNotIn('Content-MD5', req_headers)
         if bucket_exists:
@@ -1307,7 +1923,8 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             'Content-MD5': base64.b64encode(b'blahblahblahblah').strip()},
             fake_memcache)
 
-    def test_object_multipart_upload_initiate_with_checksum_algorithm(self):
+    def test_object_multipart_upload_initiate_crc32_composite_checksum_type(
+            self):
         fake_memcache = FakeMemcache()
         fake_memcache.store[get_cache_key(
             'AUTH_test', 'bucket+segments')] = {'status': 204}
@@ -1315,7 +1932,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             'AUTH_test', 'bucket')] = {'status': 204}
         self._test_object_multipart_upload_initiate(
             {'X-Amz-Checksum-Algorithm': 'CRC32',
-             'X-Amz-Checksum-Type': 'COMPOSITE'}, fake_memcache)
+             'X-Amz-Checksum-Type': 'COMPOSITE'}, fake_memcache,
+            expected_checksum_algorithm='CRC32',
+            expected_checksum_type='COMPOSITE')
         self.assertEqual([
             (('swift_s3_checksum_algo_request',), {
                 'labels': {
@@ -1329,6 +1948,201 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                 },
             }),
         ], self.statsd.calls['increment'])
+
+    def test_object_multipart_upload_initiate_checksum_persistence_disabled(
+            self):
+        self.s3api.conf.allow_store_checksums = False
+        # Accept and normalize the request without storing its configuration.
+        fake_memcache = FakeMemcache()
+        fake_memcache.store[get_cache_key(
+            'AUTH_test', 'bucket+segments')] = {'status': 204}
+        fake_memcache.store[get_cache_key(
+            'AUTH_test', 'bucket')] = {'status': 204}
+        self._test_object_multipart_upload_initiate(
+            {'X-Amz-Checksum-Algorithm': 'CRC32',
+             'X-Amz-Checksum-Type': 'COMPOSITE'},
+            fake_memcache)
+
+    def test_object_multipart_upload_initiate_checksum_value_does_not_override(
+            self):
+        fake_memcache = FakeMemcache()
+        fake_memcache.store[get_cache_key(
+            'AUTH_test', 'bucket+segments')] = {'status': 204}
+        fake_memcache.store[get_cache_key(
+            'AUTH_test', 'bucket')] = {'status': 204}
+        self._test_object_multipart_upload_initiate(
+            {
+                'X-Amz-Checksum-Algorithm': 'CRC32',
+                'X-Amz-Checksum-SHA256': base64.b64encode(
+                    b'\x00' * 32).decode('ascii'),
+                'X-Amz-Checksum-Type': 'COMPOSITE',
+            }, fake_memcache,
+            expected_checksum_algorithm='CRC32',
+            expected_checksum_type='COMPOSITE')
+
+    def test_object_multipart_upload_initiate_crc32_full_object_checksum_type(
+            self):
+        for algorithm, checksum_type in (
+                ('CRC32', 'FULL_OBJECT'), ('crc32', 'full_object')):
+            with self.subTest(algorithm=algorithm,
+                              checksum_type=checksum_type):
+                fake_memcache = FakeMemcache()
+                fake_memcache.store[get_cache_key(
+                    'AUTH_test', 'bucket+segments')] = {'status': 204}
+                fake_memcache.store[get_cache_key(
+                    'AUTH_test', 'bucket')] = {'status': 204}
+                self._test_object_multipart_upload_initiate(
+                    {'X-Amz-Checksum-Algorithm': algorithm,
+                     'X-Amz-Checksum-Type': checksum_type}, fake_memcache,
+                    expected_checksum_algorithm='CRC32',
+                    expected_checksum_type='FULL_OBJECT')
+
+    def test_object_multipart_upload_initiate_sha1_composite_checksum_type(
+            self):
+        for algorithm, checksum_type in (
+                ('SHA1', 'COMPOSITE'), ('sHa1', 'composite')):
+            with self.subTest(algorithm=algorithm,
+                              checksum_type=checksum_type):
+                fake_memcache = FakeMemcache()
+                fake_memcache.store[get_cache_key(
+                    'AUTH_test', 'bucket+segments')] = {'status': 204}
+                fake_memcache.store[get_cache_key(
+                    'AUTH_test', 'bucket')] = {'status': 204}
+                self._test_object_multipart_upload_initiate(
+                    {'X-Amz-Checksum-Algorithm': algorithm,
+                     'X-Amz-Checksum-Type': checksum_type}, fake_memcache,
+                    expected_checksum_algorithm='SHA1',
+                    expected_checksum_type='COMPOSITE')
+
+    def test_object_multipart_upload_initiate_default_composite_checksum_type(
+            self):
+        for algorithm in ('CRC32', 'CRC32C', 'SHA1', 'SHA256'):
+            with self.subTest(algorithm=algorithm):
+                fake_memcache = FakeMemcache()
+                fake_memcache.store[get_cache_key(
+                    'AUTH_test', 'bucket+segments')] = {'status': 204}
+                fake_memcache.store[get_cache_key(
+                    'AUTH_test', 'bucket')] = {'status': 204}
+                self._test_object_multipart_upload_initiate(
+                    {'X-Amz-Checksum-Algorithm': algorithm}, fake_memcache,
+                    expected_checksum_algorithm=algorithm,
+                    expected_checksum_type='COMPOSITE')
+
+    def test_object_multipart_upload_initiate_crc64nvme_default_checksum_type(
+            self):
+        fake_memcache = FakeMemcache()
+        fake_memcache.store[get_cache_key(
+            'AUTH_test', 'bucket+segments')] = {'status': 204}
+        fake_memcache.store[get_cache_key(
+            'AUTH_test', 'bucket')] = {'status': 204}
+        self._test_object_multipart_upload_initiate(
+            {'X-Amz-Checksum-Algorithm': 'CRC64NVME'}, fake_memcache,
+            expected_checksum_algorithm='CRC64NVME',
+            expected_checksum_type='FULL_OBJECT')
+
+    def test_object_multipart_upload_initiate_checksum_type_needs_algorithm(
+            self):
+        fake_memcache = FakeMemcache()
+        fake_memcache.store[get_cache_key(
+            'AUTH_test', 'bucket')] = {'status': 204}
+        req = Request.blank('/bucket/object?uploads',
+                            environ={'REQUEST_METHOD': 'POST',
+                                     'swift.cache': fake_memcache},
+                            headers={'Authorization':
+                                     'AWS test:tester:hmac',
+                                     'Date': self.get_date_header(),
+                                     'X-Amz-Checksum-Type': 'COMPOSITE'})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '400')
+        self.assertEqual(self._get_error_code(body), 'InvalidRequest')
+        self.assertEqual(
+            self._get_error_message(body),
+            'The x-amz-checksum-type header can only be used with the '
+            'x-amz-checksum-algorithm header.')
+        self.assertEqual([], self.swift.calls)
+
+    def test_object_multipart_upload_initiate_rejects_unsupported_algorithm(
+            self):
+        # S3 accepts any case but rejects hyphenated spellings, so these must
+        # not be normalized into the algorithm they resemble.
+        for algorithm in ('CRC128', 'CRC-32', 'CRC-32C', 'CRC64-NVME',
+                          'crc-64nvme', 'SHA-1', 'SHA-256', 'sha-256'):
+            with self.subTest(algorithm=algorithm):
+                fake_memcache = FakeMemcache()
+                fake_memcache.store[get_cache_key(
+                    'AUTH_test', 'bucket')] = {'status': 204}
+                req = Request.blank(
+                    '/bucket/object?uploads',
+                    environ={'REQUEST_METHOD': 'POST',
+                             'swift.cache': fake_memcache},
+                    headers={'Authorization': 'AWS test:tester:hmac',
+                             'Date': self.get_date_header(),
+                             'X-Amz-Checksum-Algorithm': algorithm})
+
+                status, headers, body = self.call_s3api(req)
+
+                self.assertEqual('400 Bad Request', status)
+                self.assertEqual('InvalidRequest',
+                                 self._get_error_code(body))
+                self.assertEqual(
+                    'Checksum algorithm provided is unsupported. Please try '
+                    'again with any of the valid types: '
+                    '[CRC32, CRC32C, CRC64NVME, SHA1, SHA256]',
+                    self._get_error_message(body))
+                self.assertEqual([], self.swift.calls)
+
+    def test_object_multipart_upload_initiate_rejects_invalid_checksum_type(
+            self):
+        # Validate the type before the algorithm. An empty type is invalid too.
+        for algorithm, checksum_type in (
+                ('CRC32', 'NOT_A_TYPE'), (None, 'NOT_A_TYPE'),
+                ('CRC32', ''), (None, '')):
+            with self.subTest(algorithm=algorithm,
+                              checksum_type=checksum_type):
+                fake_memcache = FakeMemcache()
+                fake_memcache.store[get_cache_key(
+                    'AUTH_test', 'bucket')] = {'status': 204}
+                request_headers = {
+                    'Authorization': 'AWS test:tester:hmac',
+                    'Date': self.get_date_header(),
+                    'X-Amz-Checksum-Type': checksum_type}
+                if algorithm is not None:
+                    request_headers['X-Amz-Checksum-Algorithm'] = algorithm
+                req = Request.blank(
+                    '/bucket/object?uploads', method='POST',
+                    environ={'swift.cache': fake_memcache},
+                    headers=request_headers)
+
+                status, headers, body = self.call_s3api(req)
+
+                self.assertEqual('400 Bad Request', status)
+                self.assertEqual('InvalidRequest', self._get_error_code(body))
+                self.assertEqual(
+                    'Value for x-amz-checksum-type header is invalid.',
+                    self._get_error_message(body))
+                self.assertEqual([], self.swift.calls)
+
+    def test_object_multipart_upload_initiate_rejects_algorithm_type_mismatch(
+            self):
+        for algorithm, checksum_type in (('sha1', 'full_object'),
+                                         ('sha256', 'full_object'),
+                                         ('crc64nvme', 'composite')):
+            with self.subTest(algorithm=algorithm,
+                              checksum_type=checksum_type):
+                fake_memcache = FakeMemcache()
+                fake_memcache.store[get_cache_key(
+                    'AUTH_test', 'bucket')] = {'status': 204}
+                req = Request.blank(
+                    '/bucket/object?uploads', method='POST',
+                    environ={'swift.cache': fake_memcache},
+                    headers={'Authorization': 'AWS test:tester:hmac',
+                             'Date': self.get_date_header(),
+                             'X-Amz-Checksum-Algorithm': algorithm,
+                             'X-Amz-Checksum-Type': checksum_type})
+                status, headers, body = self.call_s3api(req)
+                self.assertEqual('400', status.split()[0])
+                self.assertEqual('InvalidRequest', self._get_error_code(body))
+                self.assertEqual([], self.swift.calls)
 
     def test_object_mpu_initiate_with_segment_bucket_mixed_policy(self):
         fake_memcache = FakeMemcache()
@@ -1491,12 +2305,12 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertEqual(req_headers.get(
             'X-Object-Sysmeta-S3api-Content-Type'), 'cat/picture')
         tmpacl_header = req_headers.get(
-            s3api_sysmeta_header('object', 'tmpacl'))
+            'x-object-sysmeta-s3api-tmpacl')
         self.assertTrue(tmpacl_header)
         acl_header = encode_acl('object',
                                 ACLPublicRead(Owner('test:tester',
                                                     'test:tester')))
-        self.assertEqual(acl_header.get(s3api_sysmeta_header('object', 'acl')),
+        self.assertEqual(acl_header.get('x-object-sysmeta-s3api-acl'),
                          tmpacl_header)
 
     def test_object_mpu_initiate_s3acl_with_segment_bucket(self):
@@ -1744,6 +2558,68 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertEqual('Fri, 25 Mar 2022 09:34:00 GMT',
                          headers.get('Expires'))
         self.assertEqual('no-cache', headers.get('Cache-Control'))
+
+    def test_object_multipart_upload_complete_with_part_checksums(self):
+        part_one = b'part one'
+        part_two = b'part two'
+        part_one_checksum = base64.b64encode(
+            checksum.crc32(part_one).digest()).decode('ascii')
+        part_two_checksum = base64.b64encode(
+            checksum.crc32(part_two).digest()).decode('ascii')
+        for checksum_type, lengths in (
+                ('COMPOSITE', (None, None)),
+                ('FULL_OBJECT', (len(part_one), len(part_two)))):
+            with self.subTest(checksum_type=checksum_type):
+                self.swift.clear_calls()
+                self._register_checksum_upload_marker(
+                    checksum_type=checksum_type)
+                self._register_part_checksum(
+                    1, part_one_checksum, content_length=lengths[0])
+                self._register_part_checksum(
+                    2, part_two_checksum, content_length=lengths[1])
+
+                xml = self._complete_mpu_xml_with_crc32((
+                    (1, part_one_checksum),
+                    (2, part_two_checksum),
+                ))
+                req = Request.blank('/bucket/object?uploadId=X',
+                                    method='POST',
+                                    headers={'Authorization':
+                                             'AWS test:tester:hmac',
+                                             'Date': self.get_date_header()},
+                                    body=xml)
+
+                original_app = self.app.app
+                self.app.app = slo.filter_factory({})(self.swift)
+                try:
+                    status, headers, body = self.call_s3api(req)
+                finally:
+                    self.app.app = original_app
+
+                self.assertEqual(status, '200 OK')
+                elem = fromstring(body, 'CompleteMultipartUploadResult')
+                self.assertEqual(S3_ETAG, elem.find('ETag').text)
+                # We do not calculate final MPU checksums yet
+                self.assertIsNone(elem.find('ChecksumCRC32'))
+                self.assertIsNone(elem.find('ChecksumType'))
+                self.assertEqual([
+                    ('HEAD', '/v1/AUTH_test'),
+                    ('HEAD', '/v1/AUTH_test/bucket'),
+                    ('HEAD', '/v1/AUTH_test/bucket+segments/object/X'),
+                    ('HEAD', '/v1/AUTH_test/bucket+segments/object/X/1'),
+                    ('HEAD', '/v1/AUTH_test/bucket+segments/object/X/2'),
+                    ('PUT', '/v1/AUTH_test/bucket/object?'
+                            'heartbeat=on&multipart-manifest=put'),
+                    ('DELETE', '/v1/AUTH_test/bucket+segments/object/X'),
+                ], self.swift.calls)
+
+                put_call = self.swift.call_list[-2]
+                self.assertNotIn('x-object-sysmeta-s3api-checksum-algorithm',
+                                 put_call.footers)
+                self.assertNotIn('x-object-sysmeta-s3api-checksum-value',
+                                 put_call.footers)
+                self.assertNotIn('x-object-sysmeta-s3api-checksum-type',
+                                 put_call.footers)
 
     def test_object_multipart_upload_complete_non_ascii(self):
         wsgi_snowman = '\xe2\x98\x83'
@@ -2938,8 +3814,50 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertEqual('bytes=0-9', put_headers['Range'])
         self.assertEqual('/src_bucket/src_obj', put_headers['X-Copy-From'])
 
+    def test_upload_part_copy_range_does_not_copy_source_checksum(self):
+        # test ranged copy part on MPU initiated without checksum.
+        # The default setup registers the default MPU marker response with
+        # no checksum algorithm, header, or type fields.
+        source_body = b'0123456789abcdefghij'
+        copied_body = source_body[:10]
+        source_checksum = base64.b64encode(
+            checksum.crc32(source_body).digest()).decode('ascii')
+        copied_checksum = base64.b64encode(
+            checksum.crc32(copied_body).digest()).decode('ascii')
+        self.assertNotEqual(source_checksum, copied_checksum)
+        source_headers = {
+            'Content-Type': 'application/source',
+            'Content-Length': str(len(source_body)),
+            'x-object-sysmeta-s3api-checksum-algorithm':
+                'CRC32',
+            'x-object-sysmeta-s3api-checksum-value': source_checksum,
+            'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
+        }
+        self.swift.register(
+            'GET', '/v1/AUTH_test/src_bucket/src_obj', swob.HTTPOk,
+            source_headers, source_body)
+        self.app.app = copy.filter_factory({})(self.swift)
+
+        status, headers, body = self._test_copy_for_s3acl(
+            'test:tester', src_headers=source_headers,
+            put_header={'X-Amz-Copy-Source-Range': 'bytes=0-9'})
+
+        self.assertEqual('200', status.split()[0])
+        part_put = self.swift.call_list[-1]
+        self.assertEqual(copied_body, part_put.body)
+        for header in (
+                'x-object-sysmeta-s3api-checksum-algorithm',
+                'x-object-sysmeta-s3api-checksum-value',
+                'x-object-sysmeta-s3api-checksum-type'):
+            self.assertNotIn(
+                header, part_put.headers,
+                'source checksum %s was copied onto ranged part; checksum '
+                'for copied bytes is %s' % (
+                    source_checksum, copied_checksum))
+
 
 class TestS3ApiMultiUploadNonUTC(TestS3ApiMultiUpload):
+
     def setUp(self):
         self.orig_tz = os.environ.get('TZ', '')
         os.environ['TZ'] = 'EST+05EDT,M4.1.0,M10.5.0'
@@ -2973,20 +3891,20 @@ class TestS3ApiMultiUploadAcl(BaseS3ApiMultiUpload, S3ApiTestCaseAcl):
         self.assertEqual(req_headers.get(
             'X-Object-Sysmeta-S3api-Has-Content-Type'), 'no')
         tmpacl_header = req_headers.get(
-            s3api_sysmeta_header('object', 'tmpacl'))
+            'x-object-sysmeta-s3api-tmpacl')
         self.assertTrue(tmpacl_header)
         acl_header = encode_acl('object',
                                 ACLPublicRead(Owner('test:tester',
                                                     'test:tester')))
-        self.assertEqual(acl_header.get(s3api_sysmeta_header('object', 'acl')),
+        self.assertEqual(acl_header.get('x-object-sysmeta-s3api-acl'),
                          tmpacl_header)
 
     def test_object_multipart_upload_complete_s3acl(self):
         acl_headers = encode_acl('object', ACLPublicRead(Owner('test:tester',
                                                                'test:tester')))
         headers = {}
-        headers[s3api_sysmeta_header('object', 'tmpacl')] = \
-            acl_headers.get(s3api_sysmeta_header('object', 'acl'))
+        headers['x-object-sysmeta-s3api-tmpacl'] = \
+            acl_headers.get('x-object-sysmeta-s3api-acl')
         headers['X-Object-Meta-Foo'] = 'bar'
         headers['Content-Type'] = 'baz/quux'
         self.swift.register('HEAD', '/v1/AUTH_test/bucket+segments/object/X',
@@ -3232,6 +4150,7 @@ class TestS3ApiMultiUploadAcl(BaseS3ApiMultiUpload, S3ApiTestCaseAcl):
 
 
 class TestS3ApiMultiUploadAclNonUTC(TestS3ApiMultiUploadAcl):
+
     def setUp(self):
         self.orig_tz = os.environ.get('TZ', '')
         os.environ['TZ'] = 'EST+05EDT,M4.1.0,M10.5.0'

@@ -642,9 +642,11 @@ user_test5_tester5 = testing5 service
 
 [filter:s3api]
 use = egg:swift#s3api
-# Write a validated checksum on a new PUT Object. The default is false.
+# Write checksum metadata on a new PUT Object, MPU marker, or MPU part.
+# The default is false.
 # Enable only after all proxy and internal applications that read, write, or
 # copy these objects have the checksum code and old workers have drained.
+# Complete or abort existing MPUs before disabling.
 # allow_store_checksums = false
 
 # s3api setup:
