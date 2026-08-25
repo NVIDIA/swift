@@ -105,7 +105,6 @@ class TestRequest(S3ApiTestCase):
     def setUp(self):
         super(TestRequest, self).setUp()
         self.s3api.conf.s3_acl = True
-        self.request_conf = Config({'allow_store_checksums': True})
         s3request.SIGV4_CHUNK_MIN_SIZE = 2
 
     def test_xml_rejects_chunked_body_over_max_length(self):
@@ -284,7 +283,7 @@ class TestRequest(S3ApiTestCase):
                      'x-amz-checksum-mode': 'I love Google Cloud Storage!'})
 
         with self.assertRaises(InvalidRequest) as result:
-            S3Request(req.environ, conf=self.request_conf)
+            S3Request(req.environ)
 
         self.assertIn(
             b'<Message>Value for x-amz-checksum-mode header is invalid.'
@@ -1571,7 +1570,7 @@ class TestRequest(S3ApiTestCase):
     def _test_sig_v4_unsigned_payload(self, body=None, extra_headers=None):
         req = self._make_sig_v4_unsigned_payload_req(
             body=body, extra_headers=extra_headers)
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         # Verify header signature
         self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
         return sigv4_req
@@ -1726,40 +1725,33 @@ class TestRequest(S3ApiTestCase):
             'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
             'x-object-sysmeta-s3api-checksum-type': 'FULL_OBJECT',
         })
-        for enabled in (True, False):
-            with self.subTest(persistence_enabled=enabled):
-                self.request_conf.allow_store_checksums = enabled
-                sigv4_req = self._test_sig_v4_unsigned_payload(
-                    body=body,
-                    extra_headers={'X-Amz-Checksum-Crc32': crc})
-                sigv4_req.environ['swift.callback.update_footers'] = \
-                    original_update_footers
-                sigv4_req.enable_checksum_persistence()
-                update_footers = sigv4_req.environ.get(
-                    'swift.callback.update_footers')
-                self.assertIsNotNone(update_footers)
-                if not enabled:
-                    self.assertIs(original_update_footers, update_footers)
+        sigv4_req = self._test_sig_v4_unsigned_payload(
+            body=body,
+            extra_headers={'X-Amz-Checksum-Crc32': crc})
+        sigv4_req.environ['swift.callback.update_footers'] = \
+            original_update_footers
+        sigv4_req.enable_checksum_persistence()
+        update_footers = sigv4_req.environ.get(
+            'swift.callback.update_footers')
+        self.assertIsNotNone(update_footers)
 
-                footers = HeaderKeyDict()
-                update_footers(footers)
-                self.assertEqual('already-here', footers[existing_footer])
-                self.assertNotIn(
-                    'x-object-sysmeta-s3api-checksum-value', footers)
-                self.assertNotIn(
-                    'x-object-sysmeta-s3api-checksum-algorithm', footers)
-                self.assertNotIn(
-                    'x-object-sysmeta-s3api-checksum-type', footers)
+        footers = HeaderKeyDict()
+        update_footers(footers)
+        self.assertEqual('already-here', footers[existing_footer])
+        self.assertNotIn(
+            'x-object-sysmeta-s3api-checksum-value', footers)
+        self.assertNotIn(
+            'x-object-sysmeta-s3api-checksum-algorithm', footers)
+        self.assertNotIn(
+            'x-object-sysmeta-s3api-checksum-type', footers)
 
-                self.assertEqual(body, sigv4_req.environ['wsgi.input'].read())
-                footers = HeaderKeyDict()
-                update_footers(footers)
-                exp_footers = HeaderKeyDict({existing_footer: 'already-here'})
-                if enabled:
-                    exp_footers.update(exp_sysmeta)
-                self.assertEqual(exp_sysmeta if enabled else None,
-                                 sigv4_req.checksum_sysmeta_footers)
-                self.assertEqual(exp_footers, footers)
+        self.assertEqual(body, sigv4_req.environ['wsgi.input'].read())
+        footers = HeaderKeyDict()
+        update_footers(footers)
+        exp_footers = HeaderKeyDict({existing_footer: 'already-here'})
+        exp_footers.update(exp_sysmeta)
+        self.assertEqual(exp_sysmeta, sigv4_req.checksum_sysmeta_footers)
+        self.assertEqual(exp_footers, footers)
 
     def test_sig_v4_unsgnd_pyld_crc32_mismatch(self):
         body = b'abcdefghijklmnopqrstuvwxyz\n'
@@ -1781,14 +1773,14 @@ class TestRequest(S3ApiTestCase):
             extra_headers={'X-Amz-Checksum-Crc32': 'not a crc'}
         )
         with self.assertRaises(s3request.InvalidRequest):
-            SigV4Request(req.environ, conf=self.request_conf)
+            SigV4Request(req.environ)
 
     @patch.object(S3Request, '_validate_dates', lambda *a: None)
     def test_sig_v4_unsgnd_pyld_declares_crc32_trailer(self):
         req = self._make_sig_v4_unsigned_payload_req(
             extra_headers={'X-Amz-Trailer': 'x-amz-checksum-crc32'})
         with self.assertRaises(s3request.MalformedTrailerError):
-            SigV4Request(req.environ, conf=self.request_conf)
+            SigV4Request(req.environ)
 
     def _make_valid_v4_streaming_hmac_sha256_payload_request(self):
         environ = {
@@ -2087,7 +2079,7 @@ class TestRequest(S3ApiTestCase):
 
         req = self._make_sig_v4_streaming_unsigned_payload_trailer_req(
             body=body, extra_headers=headers)
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         # Verify header signature
         self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
         return sigv4_req
@@ -2305,7 +2297,7 @@ class TestRequest(S3ApiTestCase):
             body=body,
             extra_headers=headers
         )
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         checksumming_input = sigv4_req.environ['wsgi.input']
         self.assertIsNone(checksumming_input.checksum_value)
         self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
@@ -2354,7 +2346,7 @@ class TestRequest(S3ApiTestCase):
             body=body,
             extra_headers=headers
         )
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         checksumming_input = sigv4_req.environ['wsgi.input']
         with self.assertRaises(s3request.BadDigest) as cm, \
                 sigv4_req.translate_read_errors():
@@ -2375,7 +2367,7 @@ class TestRequest(S3ApiTestCase):
             body=body,
             extra_headers={'x-amz-checksum-crc32': crc}
         )
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
                          sigv4_req.environ['wsgi.input'].read())
 
@@ -2390,7 +2382,7 @@ class TestRequest(S3ApiTestCase):
             body=body,
             extra_headers={'x-amz-checksum-crc32': crc}
         )
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         with self.assertRaises(S3InputChecksumMismatch):
             sigv4_req.environ['wsgi.input'].read()
 
@@ -2406,7 +2398,7 @@ class TestRequest(S3ApiTestCase):
             body=body,
             extra_headers={'x-amz-checksum-crc32c': crc}
         )
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
                          sigv4_req.environ['wsgi.input'].read())
 
@@ -2421,7 +2413,7 @@ class TestRequest(S3ApiTestCase):
             body=body,
             extra_headers={'x-amz-checksum-crc32c': crc}
         )
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         with self.assertRaises(S3InputChecksumMismatch):
             sigv4_req.environ['wsgi.input'].read()
 
@@ -2437,7 +2429,7 @@ class TestRequest(S3ApiTestCase):
             body=body,
             extra_headers={'x-amz-checksum-crc64nvme': crc}
         )
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
                          sigv4_req.environ['wsgi.input'].read())
 
@@ -2452,7 +2444,7 @@ class TestRequest(S3ApiTestCase):
             body=body,
             extra_headers={'x-amz-checksum-crc64nvme': crc}
         )
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         with self.assertRaises(S3InputChecksumMismatch):
             sigv4_req.environ['wsgi.input'].read()
 
@@ -2468,7 +2460,7 @@ class TestRequest(S3ApiTestCase):
             body=body,
             extra_headers={'x-amz-checksum-sha1': crc}
         )
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         self.assertEqual(b'abcdefghijklmnopqrstuvwxyz\n',
                          sigv4_req.environ['wsgi.input'].read())
 
@@ -2483,7 +2475,7 @@ class TestRequest(S3ApiTestCase):
             body=body,
             extra_headers={'x-amz-checksum-sha1': crc}
         )
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         with self.assertRaises(S3InputChecksumMismatch):
             sigv4_req.environ['wsgi.input'].read()
 
@@ -2501,7 +2493,7 @@ class TestRequest(S3ApiTestCase):
             extra_headers=headers
         )
         with self.assertRaises(InvalidRequest) as cm:
-            SigV4Request(req.environ, conf=self.request_conf)
+            SigV4Request(req.environ)
         self.assertIn('Expecting a single x-amz-checksum- header',
                       str(cm.exception.body))
 
@@ -2519,7 +2511,7 @@ class TestRequest(S3ApiTestCase):
             extra_headers=headers
         )
         with self.assertRaises(InvalidRequest) as cm:
-            SigV4Request(req.environ, conf=self.request_conf)
+            SigV4Request(req.environ)
         self.assertIn('Value for x-amz-sdk-checksum-algorithm header is '
                       'invalid.', str(cm.exception.body))
 
@@ -2555,7 +2547,7 @@ class TestRequest(S3ApiTestCase):
         extra_headers = {'X-Amz-Checksum-Crc32': crc}
         req = self._make_sig_v4_unsgnd_pyld_multi_delete_req(
             body, extra_headers)
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         # Verify header signature
         self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
         resp_body = sigv4_req.environ['wsgi.input'].read()
@@ -2569,7 +2561,7 @@ class TestRequest(S3ApiTestCase):
         extra_headers = {'X-Amz-Checksum-Crc32': crc}
         req = self._make_sig_v4_unsgnd_pyld_multi_delete_req(
             body, extra_headers)
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         # Verify header signature
         self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
         # the crc is verified for a multi-delete POST
@@ -2611,7 +2603,7 @@ class TestRequest(S3ApiTestCase):
         extra_headers = {'X-Amz-Checksum-Crc32': crc}
         req = self._make_sig_v4_unsgnd_pyld_multi_upload_req(
             body, extra_headers)
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         # Verify header signature
         self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
         resp_body = sigv4_req.environ['wsgi.input'].read()
@@ -2628,7 +2620,7 @@ class TestRequest(S3ApiTestCase):
         extra_headers = {'X-Amz-Checksum-Crc32': crc}
         req = self._make_sig_v4_unsgnd_pyld_multi_upload_req(
             body, extra_headers)
-        sigv4_req = SigV4Request(req.environ, conf=self.request_conf)
+        sigv4_req = SigV4Request(req.environ)
         # Verify header signature
         self.assertTrue(sigv4_req.sig_checker.check_signature('secret'))
         # the crc is not verified for a multi-upload complete POST
@@ -2643,7 +2635,7 @@ class TestRequest(S3ApiTestCase):
                      'x-amz-checksum-crc32': 'absolute garbage'})
 
         with self.assertRaises(InvalidRequest) as result:
-            S3Request(req.environ, conf=self.request_conf)
+            S3Request(req.environ)
 
         self.assertIn(
             b'<Message>Value for x-amz-checksum-crc32 header is invalid.'
@@ -2658,7 +2650,7 @@ class TestRequest(S3ApiTestCase):
                      'x-amz-checksum-crc32': 'absolute garbage'})
 
         with self.assertRaises(InvalidRequest) as result:
-            S3Request(req.environ, conf=self.request_conf)
+            S3Request(req.environ)
 
         self.assertIn(
             b'<Message>Value for x-amz-checksum-crc32 header is invalid.'
@@ -2673,7 +2665,7 @@ class TestRequest(S3ApiTestCase):
                      'x-amz-checksum-crc32': 'absolute garbage'})
 
         try:
-            s3req = S3Request(req.environ, conf=self.request_conf)
+            s3req = S3Request(req.environ)
         except ErrorResponse as err:
             self.fail('Unexpected exception raised: %s' % err)
 
@@ -2688,7 +2680,7 @@ class TestRequest(S3ApiTestCase):
                      'x-amz-checksum-garbage': 'absolute garbage'})
 
         with self.assertRaises(InvalidRequest) as result:
-            S3Request(req.environ, conf=self.request_conf)
+            S3Request(req.environ)
 
         self.assertIn(
             b'<Message>The algorithm type you specified in '

@@ -1586,10 +1586,9 @@ class S3Request(swob.Request):
         Enable checksum persistence if this S3Request has a checksum that can
         be persisted.
         """
-        # Only add a footer callback when persistence is on and this request
-        # has a checksum to validate.
-        if self.conf.allow_store_checksums and \
-                self.checksumming_input is not None:
+        # Only add a footer callback when this request has a checksum to
+        # validate.
+        if self.checksumming_input is not None:
             self._install_checksum_footers_callback(self.checksumming_input)
 
     def _install_checksum_footers_callback(self, checksumming_input):

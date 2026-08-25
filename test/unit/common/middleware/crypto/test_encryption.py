@@ -56,7 +56,11 @@ class TestCryptoPipelineChanges(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._test_context = setup_servers()
+        cls._test_context = setup_servers(extra_conf={
+            'allowed_headers': (
+                'content-encoding, x-object-manifest, '
+                'x-static-large-object, content-disposition, foo'),
+        })
         cls.proxy_app = cls._test_context["test_servers"][0]
 
     @classmethod
@@ -458,6 +462,13 @@ class TestCryptoPipelineChanges(unittest.TestCase):
                                 self.assertNotIn(hdr, resp.headers)
 
     def test_s3_checksum_with_crypto_pipeline_upload_part(self):
+        for checksum_type in ('COMPOSITE', 'FULL_OBJECT'):
+            with self.subTest(checksum_type=checksum_type):
+                self._test_s3_checksum_with_crypto_pipeline_upload_part(
+                    checksum_type)
+
+    def _test_s3_checksum_with_crypto_pipeline_upload_part(
+            self, checksum_type):
         container_name = uuid.uuid4().hex
         container_path = 'http://foo:8080/v1/a/' + container_name
         req = Request.blank(
@@ -480,21 +491,37 @@ class TestCryptoPipelineChanges(unittest.TestCase):
             allow_store_checksums='true')(
                 auth_app)
         s3_app.logger = self.proxy_app.logger
-
-        part_checksum = base64.b64encode(
-            checksum.crc32(self.plaintext).digest()).decode('ascii')
+        # Allow the small test parts to complete.
+        s3_app.conf.min_segment_size = 1
         auth_headers = {
             'Authorization': 'AWS test:tester:hmac',
             'Date': email.utils.formatdate(),
         }
-        s3_path = '/%s/o' % container_name
+        part_bodies = [b'first part', self.plaintext]
+        plaintext = b''.join(part_bodies)
+        part_digests = [checksum.crc32(body).digest() for body in part_bodies]
+        part_checksums = [
+            base64.b64encode(digest).decode('ascii')
+            for digest in part_digests]
+        if checksum_type == 'COMPOSITE':
+            final_checksum = '%s-%d' % (
+                base64.b64encode(checksum.crc32(
+                    b''.join(part_digests)).digest()).decode('ascii'),
+                len(part_bodies))
+        else:
+            final_checksum = base64.b64encode(
+                checksum.crc32(plaintext).digest()).decode('ascii')
+        object_name = checksum_type.lower()
+        object_path = container_path + '/' + object_name
+        s3_path = '/%s/%s' % (container_name, object_name)
         create_headers = dict(auth_headers)
         create_headers.update({
             'X-Amz-Checksum-Algorithm': 'CRC32',
-            'X-Amz-Checksum-Type': 'COMPOSITE',
+            'X-Amz-Checksum-Type': checksum_type,
         })
         req = Request.blank(
-            s3_path + '?uploads', method='POST', headers=create_headers)
+            s3_path + '?uploads', method='POST',
+            headers=create_headers)
         create_resp = req.get_response(s3_app)
         self.assertEqual('200 OK', create_resp.status)
         create_result = fromstring(
@@ -503,46 +530,130 @@ class TestCryptoPipelineChanges(unittest.TestCase):
         self.assertEqual(
             'CRC32', create_resp.headers['X-Amz-Checksum-Algorithm'])
         self.assertEqual(
-            'COMPOSITE', create_resp.headers['X-Amz-Checksum-Type'])
+            checksum_type, create_resp.headers['X-Amz-Checksum-Type'])
 
-        upload_part_headers = dict(auth_headers)
-        upload_part_headers['X-Amz-Checksum-Crc32'] = part_checksum
+        complete_parts = []
+        for part_number, (body, part_checksum) in enumerate(
+                zip(part_bodies, part_checksums), 1):
+            upload_part_headers = dict(auth_headers)
+            if checksum_type == 'COMPOSITE':
+                upload_part_headers['X-Amz-Checksum-Crc32'] = \
+                    part_checksum
+            req = Request.blank(
+                '%s?partNumber=%d&uploadId=%s' % (
+                    s3_path, part_number, upload_id),
+                method='PUT', body=body, headers=upload_part_headers)
+            part_resp = req.get_response(s3_app)
+            self.assertEqual('200 OK', part_resp.status)
+            self.assertEqual(
+                part_checksum,
+                part_resp.headers['X-Amz-Checksum-Crc32'])
+            self.assertNotIn('X-Amz-Checksum-Type', part_resp.headers)
+            part_etag = part_resp.headers['Etag']
+
+            # Read stored data without crypto to check that the body
+            # and checksum are encrypted.
+            segment_path = '%s+segments/%s/%s/%d' % (
+                container_path, object_name, upload_id, part_number)
+            req = Request.blank(segment_path, method='GET')
+            encrypted_part_resp = req.get_response(self.proxy_app)
+            self.assertEqual('200 OK', encrypted_part_resp.status)
+            self.assertNotEqual(body, encrypted_part_resp.body)
+            self.assertIn(
+                'X-Object-Sysmeta-Crypto-Body-Meta',
+                encrypted_part_resp.headers)
+            self.assertEqual(
+                'CRC32',
+                encrypted_part_resp.headers[
+                    'X-Object-Sysmeta-S3Api-Checksum-Algorithm'])
+            self.assertEqual(
+                'FULL_OBJECT',
+                encrypted_part_resp.headers[
+                    'X-Object-Sysmeta-S3Api-Checksum-Type'])
+            self.assertNotIn(
+                'X-Object-Sysmeta-S3api-Checksum-Value',
+                encrypted_part_resp.headers)
+            self.assertIn(
+                'X-Object-Sysmeta-Crypto-Sysmeta-S3api-'
+                'Checksum-Value',
+                encrypted_part_resp.headers)
+            self.assertNotEqual(
+                part_checksum,
+                encrypted_part_resp.headers[
+                    'X-Object-Sysmeta-Crypto-Sysmeta-S3api-'
+                    'Checksum-Value'])
+
+            complete_part = (
+                '<Part><PartNumber>%d</PartNumber><ETag>%s</ETag>' % (
+                    part_number, part_etag))
+            if checksum_type == 'COMPOSITE':
+                complete_part += (
+                    '<ChecksumCRC32>%s</ChecksumCRC32>' %
+                    part_checksum)
+            complete_parts.append(complete_part + '</Part>')
+
+        complete_body = (
+            '<CompleteMultipartUpload>%s</CompleteMultipartUpload>' %
+            ''.join(complete_parts))
         req = Request.blank(
-            s3_path + '?partNumber=1&uploadId=' + upload_id,
-            method='PUT', body=self.plaintext, headers=upload_part_headers)
-        part_resp = req.get_response(s3_app)
-        self.assertEqual('200 OK', part_resp.status)
+            s3_path + '?uploadId=' + upload_id,
+            method='POST', body=complete_body, headers=auth_headers)
+        complete_resp = req.get_response(s3_app)
+        self.assertEqual('200 OK', complete_resp.status)
+        complete_result = fromstring(
+            complete_resp.body, 'CompleteMultipartUploadResult')
         self.assertEqual(
-            part_checksum, part_resp.headers['X-Amz-Checksum-Crc32'])
-        self.assertNotIn('X-Amz-Checksum-Type', part_resp.headers)
+            final_checksum, complete_result.find('ChecksumCRC32').text)
+        self.assertEqual(
+            checksum_type, complete_result.find('ChecksumType').text)
 
-        # Bypass the crypto middleware to prove that the part body was
-        # encrypted while its checksum sysmeta survived the footer callback.
-        segment_path = '%s+segments/o/%s/1' % (
-            container_path, upload_id)
-        req = Request.blank(segment_path, method='GET')
-        encrypted_part_resp = req.get_response(self.proxy_app)
-        self.assertEqual('200 OK', encrypted_part_resp.status)
-        self.assertNotEqual(self.plaintext, encrypted_part_resp.body)
+        # Check the encrypted checksum on the stored SLO manifest.
+        req = Request.blank(object_path, method='GET')
+        encrypted_manifest_resp = req.get_response(self.proxy_app)
+        self.assertEqual('200 OK', encrypted_manifest_resp.status)
+        self.assertEqual(
+            'True',
+            encrypted_manifest_resp.headers['X-Static-Large-Object'])
         self.assertIn(
             'X-Object-Sysmeta-Crypto-Body-Meta',
-            encrypted_part_resp.headers)
+            encrypted_manifest_resp.headers)
         self.assertEqual(
             'CRC32',
-            encrypted_part_resp.headers[
+            encrypted_manifest_resp.headers[
                 'X-Object-Sysmeta-S3Api-Checksum-Algorithm'])
-        self.assertEqual('FULL_OBJECT',
-                         encrypted_part_resp.headers[
-                             'X-Object-Sysmeta-S3Api-Checksum-Type'])
-        # the checksum value was encrypted and moved to crypto namespace...
-        self.assertNotIn('X-Object-Sysmeta-S3api-Checksum-Value',
-                         encrypted_part_resp.headers)
-        self.assertIn('X-Object-Sysmeta-Crypto-Sysmeta-S3api-Checksum-Value',
-                      encrypted_part_resp.headers)
+        self.assertEqual(
+            checksum_type,
+            encrypted_manifest_resp.headers[
+                'X-Object-Sysmeta-S3Api-Checksum-Type'])
+        self.assertNotIn(
+            'X-Object-Sysmeta-S3api-Checksum-Value',
+            encrypted_manifest_resp.headers)
+        self.assertIn(
+            'X-Object-Sysmeta-Crypto-Sysmeta-S3api-Checksum-Value',
+            encrypted_manifest_resp.headers)
         self.assertNotEqual(
-            part_checksum,
-            encrypted_part_resp.headers[
-                'X-Object-Sysmeta-Crypto-Sysmeta-S3api-Checksum-Value'])
+            final_checksum,
+            encrypted_manifest_resp.headers[
+                'X-Object-Sysmeta-Crypto-Sysmeta-S3api-'
+                'Checksum-Value'])
+
+        checksum_headers = dict(auth_headers)
+        checksum_headers['X-Amz-Checksum-Mode'] = 'ENABLED'
+        for enabled in (True, False):
+            s3_app.conf.allow_store_checksums = enabled
+            for method in ('GET', 'HEAD'):
+                req = Request.blank(
+                    s3_path, method=method, headers=checksum_headers)
+                get_resp = req.get_response(s3_app)
+                self.assertEqual('200 OK', get_resp.status)
+                self.assertEqual(
+                    plaintext if method == 'GET' else b'', get_resp.body)
+                self.assertEqual(
+                    final_checksum,
+                    get_resp.headers['X-Amz-Checksum-Crc32'])
+                self.assertEqual(
+                    checksum_type,
+                    get_resp.headers['X-Amz-Checksum-Type'])
 
     def test_write_with_crypto_read_with_crypto_different_root_secrets(self):
         root_secret = self.crypto_app.root_secret

@@ -137,6 +137,7 @@ class ObjectController(Controller):
                 resp.headers['Content-Range'] = \
                     'bytes 0-%d/%s' % (int(resp.headers['Content-Length']) - 1,
                                        resp.headers['Content-Length'])
+                # TODO: Return part checksum metadata
             # else: part_number is None
 
         if req.method == 'HEAD':
@@ -198,7 +199,7 @@ class ObjectController(Controller):
         if 'X-Amz-Copy-Source' in req.headers:
             # note: checksum re-calculation while copying is not yet supported
             req.check_copy_source(self.app)
-        else:
+        elif self.conf.allow_store_checksums:
             req.enable_checksum_persistence()
         if not req.headers.get('Content-Type'):
             # can't setdefault because it can be None for some reason
