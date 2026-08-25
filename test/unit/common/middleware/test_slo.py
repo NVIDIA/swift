@@ -980,19 +980,21 @@ class TestSloPutManifest(SloTestCase):
         self.assertEqual('b', manifest_data[1]['hash'])
 
     def test_handle_multipart_put_callback_receives_head_headers(self):
-        headers1 = {'Content-Length': '1', 'Etag': 'a',
-                    'Content-Type': 'text/html; charset=UTF-8',
-                    'X-Object-Meta-Hook-Test': 'hook-a',
-                    'X-Object-Sysmeta-S3Api-Checksum-Upload-Id': 'upload-a',
-                    'X-Object-Sysmeta-S3Api-Checksum-Value': 'checksum-a'}
+        headers1 = {
+            'Content-Length': '1', 'Etag': 'a',
+            'Content-Type': 'text/html; charset=UTF-8',
+            'X-Object-Meta-Hook-Test': 'hook-a',
+            'X-Object-Sysmeta-S3Api-Checksum-Value': 'checksum-a',
+        }
         self.app.register(
             'HEAD', '/v1/AUTH_test/checktest/a_1', swob.HTTPOk,
             dict(headers1), None)
-        headers2 = {'Content-Length': '2', 'Etag': 'b',
-                    'Content-Type': 'text/html; charset=UTF-8',
-                    'X-Object-Meta-Hook-Test': 'hook-b',
-                    'X-Object-Sysmeta-S3Api-Checksum-Upload-Id': 'upload-b',
-                    'X-Object-Sysmeta-S3Api-Checksum-Value': 'checksum-b'}
+        headers2 = {
+            'Content-Length': '2', 'Etag': 'b',
+            'Content-Type': 'text/html; charset=UTF-8',
+            'X-Object-Meta-Hook-Test': 'hook-b',
+            'X-Object-Sysmeta-S3Api-Checksum-Value': 'checksum-b',
+        }
         self.app.register(
             'HEAD', '/v1/AUTH_test/checktest/b_2', swob.HTTPOk,
             dict(headers2), None)
