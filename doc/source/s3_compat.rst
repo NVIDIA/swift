@@ -99,8 +99,8 @@ A subset of the AWS checksum feature is implemented, including:
   CRC64NVME, SHA1 or SHA256 algorithms. This covers both a checksum header on a
   fixed-length body and a checksum trailer on a SigV4 ``aws-chunked`` body.
 
-* Optional persistence of a validated checksum for a `PUT Object`_ or
-  `Upload Part`_ request, and checksum settings for an
+* Optional persistence of a validated checksum for a `PUT Object`_,
+  `Upload Part`_, or `Complete Multipart Upload`_ request, and settings for an
   `Initiate Multipart Upload`_ request.
   Set ``allow_store_checksums = true`` in ``[filter:s3api]`` to enable it.
   The default is ``false``. When enabled, the checksum header is returned
@@ -111,17 +111,24 @@ A subset of the AWS checksum feature is implemented, including:
   that read, write, or copy these objects. Keep S3API registration and COPY
   cleanup in each applicable process. Drain old workers, then enable the
   option and reload the applications.
-  The option controls checksum storage for `PUT Object`_ requests and for the
-  checksum settings of `Initiate Multipart Upload`_ requests. It does not
-  control `Upload Part`_ requests. When an MPU has stored checksum settings,
-  each upload part validates or calculates its checksum, stores it, and
-  returns it. This continues after you disable the option. An MPU without
-  stored checksum settings stays a legacy MPU, also after you enable the
-  option. Its parts still validate a supplied checksum, but do not store or
-  return it.
-  Before you disable the option, complete or
-  abort the MPUs that have stored checksum settings. After you disable the
-  option, existing checksum reads, decryption, and COPY protection continue.
+  The option on the proxy that receives the request controls checksum storage
+  for `PUT Object`_ requests and for the checksum settings of
+  `Initiate Multipart Upload`_ requests. After that, the stored settings
+  control the MPU. The option on the proxy that receives a later
+  `Upload Part`_ or `Complete Multipart Upload`_ request has no effect. Each
+  upload part validates or calculates its checksum, stores it, and returns it.
+  When each part has a stored checksum, completion compares a supplied final
+  checksum, and stores and returns the final checksum.
+  To stop new checksum-aware MPUs, first disable the option on all proxies.
+  Then complete or abort the existing checksum-aware MPUs on proxies that have
+  the checksum code. Existing checksum reads, S3API registration, decryption,
+  and COPY cleanup continue.
+  An MPU without stored checksum settings stays a legacy MPU, also after you
+  enable the option. Its parts still validate a supplied checksum, but do not
+  store or return it. Its completion can include checksum fields with the
+  option on or off. These fields do not enable checksum comparison or storage.
+  Request-format checks still apply. Ordinary ETag-only completion remains
+  supported.
 
 * Selection of a checksum algorithm and type for `Initiate Multipart Upload`_.
   ``COMPOSITE`` supports CRC32, CRC32C, SHA1, and SHA256. ``FULL_OBJECT``
@@ -129,23 +136,27 @@ A subset of the AWS checksum feature is implemented, including:
   ``COMPOSITE`` uploads require the selected checksum on each part.
   ``FULL_OBJECT`` uploads can omit the part checksum; Swift calculates it.
 
+* Validation of an ``x-amz-checksum-*`` value supplied with a
+  `Complete Multipart Upload`_ request.
+  If a part has no stored checksum, or an empty one, completion keeps the
+  compatibility behavior. It does not compare a supplied final checksum and
+  writes no final checksum. The response has no checksum fields.
+  Request-format checks still apply.
+
 * Return of a checksum header with a `GET Object`_ or `HEAD Object`_ response
   when the client sends ``x-amz-checksum-mode: ENABLED`` and the checksum has
   previously been persisted. Any other value for the ``x-amz-checksum-mode``
   header is rejected with ``InvalidRequest``. Note that a checksum header will
-  not be returned for objects stored prior to checksum persistence support, nor
-  for a multipart upload.
+  not be returned for objects stored prior to checksum persistence support.
 
 The following checksum features, and any not mentioned above, are not yet
 supported:
 
-* Validation of an ``x-amz-checksum-*`` value supplied with a
-  `Complete Multipart Upload`_ request.
-
-* Persistence of a validated checksum for `Complete Multipart Upload`_.
-
 * Re-calculation of checksum values during `PUT Object Copy`_ and
   `Upload Part Copy`_ requests.
+
+* Return of checksum metadata for `List Parts`_ or individual parts in
+  `GET Object`_ and `HEAD Object`_ responses.
 
 * Inclusion of the per-object checksum algorithm and type in bucket listing
   responses.

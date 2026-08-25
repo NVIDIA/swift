@@ -25,12 +25,14 @@ import requests.models
 import struct
 import zlib
 from urllib.parse import urlsplit, urlunsplit, quote
+from xml.etree import ElementTree
 
+from botocore.exceptions import ClientError
 from swift.common import bufferedhttp
 from swift.common.utils.ipaddrs import parse_socket_string
 
-from test.s3api import (BaseS3TestCaseWithBucket, get_opt, get_s3_client,
-                        skip_if_checksum_persistence_disabled)
+from test.s3api import (BaseS3TestCaseWithBucket, code_from_error, get_opt,
+                        get_s3_client, skip_if_checksum_persistence_disabled)
 
 
 def _hmac(key, message, digest):
@@ -2518,7 +2520,7 @@ class TestV4AuthHeaders(InputErrorsMixin, BaseS3TestCaseWithBucket):
 
     def _put_unsigned_payload_with_crc32_trailer(
             self, trailer='x-amz-checksum-crc32', checksum=None,
-            obj_name='test-obj', query=None):
+            obj_name='test-obj', query=None, extra_headers=None):
         """PUT unsigned aws-chunked TEST_BODY with a CRC32 trailer."""
         if checksum is None:
             checksum = _crc32(TEST_BODY)
@@ -2539,7 +2541,8 @@ class TestV4AuthHeaders(InputErrorsMixin, BaseS3TestCaseWithBucket):
                 'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
                 'content-encoding': 'aws-chunked',
                 'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                'x-amz-trailer': trailer})
+                'x-amz-trailer': trailer,
+                **(extra_headers or {})})
 
     def test_strm_unsgnd_pyld_trl_with_trailer_ok(self):
         resp = self._put_unsigned_payload_with_crc32_trailer()
@@ -2582,89 +2585,194 @@ class TestV4AuthHeaders(InputErrorsMixin, BaseS3TestCaseWithBucket):
         self.assertEqual(
             'FULL_OBJECT', resp.headers.get('x-amz-checksum-type'))
 
-    def test_strm_unsgnd_pyld_trl_legacy_upload_part(self):
+    def test_strm_unsgnd_pyld_trl_no_chksm_mpu_upload_part_bad_chksm(self):
         client = get_s3_client(1)
-        obj_name = self.create_name('aws-chunked-trailer-legacy-mpu')
+        obj_name = self.create_name('no-checksum-mpu')
         create_resp = client.create_multipart_upload(
             Bucket=self.bucket_name, Key=obj_name)
         self.assertEqual(200, create_resp[
             'ResponseMetadata']['HTTPStatusCode'])
         self.assertNotIn('ChecksumAlgorithm', create_resp)
         upload_id = create_resp['UploadId']
-
         try:
             # Checksum validation is independent of stored MPU settings.
             for supplied_checksum, error in (
-                    (_crc32(TEST_BODY), None),
                     (_crc32(b'wrong body'), 'BadDigest'),
                     ('not-base64!', 'InvalidRequest')):
                 with self.subTest(checksum=supplied_checksum):
                     resp = self._put_unsigned_payload_with_crc32_trailer(
                         checksum=supplied_checksum, obj_name=obj_name,
                         query={'partNumber': '1', 'uploadId': upload_id})
-                    if error:
-                        self.assertEqual(400, resp.status_code)
-                        self.assertIn('<Code>%s</Code>' % error, resp.text)
-                        self.assertNotIn('x-amz-checksum-crc32', resp.headers)
-                    else:
-                        self.assertOK(resp)
-                        # AWS returns the checksum that it validates. Swift
-                        # can omit it. If the response has the checksum, it
-                        # must be the correct value.
-                        if 'x-amz-checksum-crc32' in resp.headers:
-                            self.assertEqual(
-                                supplied_checksum,
-                                resp.headers['x-amz-checksum-crc32'])
+                    self.assertEqual(400, resp.status_code)
+                    self.assertIn('<Code>%s</Code>' % error, resp.text)
+                    self.assertNotIn('x-amz-checksum-crc32', resp.headers)
                     self.assertNotIn('x-amz-checksum-type', resp.headers)
         finally:
             client.abort_multipart_upload(
                 Bucket=self.bucket_name, Key=obj_name, UploadId=upload_id)
 
-    @skip_if_checksum_persistence_disabled
-    def test_strm_unsgnd_pyld_trl_upload_part_persistence(self):
+    def test_strm_unsgnd_pyld_trl_no_chksm_mpu_upload_part_ok_chksm(self):
+        client = get_s3_client(1)
+        obj_name = self.create_name('no-checksum-mpu')
+        create_resp = client.create_multipart_upload(
+            Bucket=self.bucket_name, Key=obj_name)
+        self.assertEqual(200, create_resp[
+            'ResponseMetadata']['HTTPStatusCode'])
+        self.assertNotIn('ChecksumAlgorithm', create_resp)
+        upload_id = create_resp['UploadId']
+        try:
+            # Checksum validation is independent of stored MPU settings.
+            resp = self._put_unsigned_payload_with_crc32_trailer(
+                checksum=_crc32(TEST_BODY), obj_name=obj_name,
+                query={'partNumber': '1', 'uploadId': upload_id})
+            self.assertOK(resp)
+            if self.is_aws:
+                # AWS returns the checksum that it validates.
+                self.assertEqual(_crc32(TEST_BODY),
+                                 resp.headers['x-amz-checksum-crc32'])
+            else:
+                # TODO: on master, swift s3api does not return the checksum in
+                # response headers after verification, and does not return it
+                # when the MPU has no checksum settings with current checksum
+                # persistence implementation. Align s3api to return it as AWS
+                # does (see patch 1014627).
+                self.assertNotIn('x-amz-checksum-crc32', resp.headers)
+            self.assertNotIn('x-amz-checksum-type', resp.headers)
+        finally:
+            client.abort_multipart_upload(
+                Bucket=self.bucket_name, Key=obj_name, UploadId=upload_id)
+
+    def _abort_mpu_if_pending(self, client, obj_name, upload_id):
+        try:
+            client.abort_multipart_upload(
+                Bucket=self.bucket_name, Key=obj_name, UploadId=upload_id)
+        except ClientError as err:
+            # An already-completed upload is gone; AWS reports that as
+            # NoSuchUpload, Swift as NoSuchKey.
+            if code_from_error(err) not in ('NoSuchUpload', 'NoSuchKey'):
+                raise
+
+    def _complete_mpu_after_streamed_part(
+            self, checksum_type, streamed_complete=False):
         client = get_s3_client(1)
         obj_name = self.create_name(
-            'aws-chunked-trailer-mpu-persistence')
+            'aws-chunked-trailer-complete-%s' % checksum_type.lower())
         create_resp = client.create_multipart_upload(
             Bucket=self.bucket_name,
             Key=obj_name,
             ChecksumAlgorithm='CRC32',
-            ChecksumType='COMPOSITE')
+            ChecksumType=checksum_type)
+        upload_id = create_resp['UploadId']
+        # Ensure the upload is aborted if not completed; the helper is a no-op
+        # once CompleteMultipartUpload has succeeded.
+        self.addCleanup(
+            self._abort_mpu_if_pending, client, obj_name, upload_id)
         self.assertEqual(
             200, create_resp['ResponseMetadata']['HTTPStatusCode'])
-        upload_id = create_resp['UploadId']
 
-        try:
-            part_checksum = _crc32(TEST_BODY)
-            chunked_body = b''.join(
+        # Stream the part with a CRC32 trailer and the SDK algorithm header.
+        part_checksum = _crc32(TEST_BODY)
+        part_resp = self._put_unsigned_payload_with_crc32_trailer(
+            obj_name=obj_name,
+            query={'partNumber': '1', 'uploadId': upload_id},
+            extra_headers={'x-amz-sdk-checksum-algorithm': 'CRC32'})
+        self.assertOK(part_resp)
+        self.assertEqual(
+            part_checksum, part_resp.headers.get('x-amz-checksum-crc32'))
+
+        if checksum_type == 'COMPOSITE':
+            part_xml = (
+                '<Part>'
+                '<PartNumber>1</PartNumber>'
+                '<ETag>%s</ETag>'
+                '<ChecksumCRC32>%s</ChecksumCRC32>'
+                '</Part>' % (part_resp.headers['etag'], part_checksum))
+        else:
+            part_xml = (
+                '<Part>'
+                '<PartNumber>1</PartNumber>'
+                '<ETag>%s</ETag>'
+                '</Part>' % part_resp.headers['etag'])
+        complete_body = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<CompleteMultipartUpload '
+            'xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            '%s'
+            '</CompleteMultipartUpload>' % part_xml).encode('utf-8')
+
+        if streamed_complete:
+            # This checked request sends the completion XML as an aws-chunked
+            # body with a CRC32 trailer of the XML. The trailer ends with two
+            # CRLFs.
+            request_body = b''.join(
                 b'%x\r\n%s\r\n' % (len(chunk), chunk)
-                for chunk in [TEST_BODY, b''])[:-2]
-            chunked_body += (
-                f'x-amz-checksum-crc32: {part_checksum}\r\n'
+                for chunk in [complete_body, b''])[:-2]
+            request_body += (
+                f'x-amz-checksum-crc32: {_crc32(complete_body)}\r\n\r\n'
             ).encode('ascii')
-            part_resp = self.conn.make_request(
-                self.bucket_name,
-                obj_name,
-                query={'partNumber': '1', 'uploadId': upload_id},
-                method='PUT',
-                body=chunked_body,
-                headers={
-                    'x-amz-content-sha256':
-                        'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
-                    'content-encoding': 'aws-chunked',
-                    'x-amz-decoded-content-length': str(len(TEST_BODY)),
-                    'x-amz-sdk-checksum-algorithm': 'CRC32',
-                    'x-amz-trailer': 'x-amz-checksum-crc32'})
-            self.assertOK(part_resp)
+            request_headers = {
+                'x-amz-content-sha256': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+                'content-encoding': 'aws-chunked',
+                'x-amz-decoded-content-length': str(len(complete_body)),
+                'x-amz-trailer': 'x-amz-checksum-crc32'}
+        else:
+            # Complete with ordinary XML and its payload hash.
+            request_body = complete_body
+            request_headers = {
+                'x-amz-content-sha256': _sha256(complete_body)}
+        complete_resp = self.conn.make_request(
+            self.bucket_name,
+            obj_name,
+            query={'uploadId': upload_id},
+            method='POST',
+            body=request_body,
+            headers=request_headers)
+
+        if streamed_complete and self.is_aws:
+            # AWS rejects this checked request; Swift completes it. Show only
+            # selected fields: a signature error body can contain the signed
+            # request, which includes the session token.
+            # See bug report at https://bugs.launchpad.net/swift/+bug/2173716
+            self.assertEqual(400, complete_resp.status_code)
+            root = ElementTree.fromstring(complete_resp.content.lstrip())
             self.assertEqual(
-                part_checksum,
-                part_resp.headers.get('x-amz-checksum-crc32'))
-            self.assertNotIn('x-amz-checksum-type', part_resp.headers)
-        finally:
-            client.abort_multipart_upload(
-                Bucket=self.bucket_name,
-                Key=obj_name,
-                UploadId=upload_id)
+                ('Error', 'InvalidRequest',
+                 'The value of x-amz-content-sha256 header is invalid.'),
+                (root.tag, root.findtext('Code'), root.findtext('Message')))
+            return
+
+        # S3 can return an error document with HTTP 200, so parse the result.
+        # Remove heartbeat whitespace that can come before the XML.
+        self.assertOK(complete_resp, None)
+        self.assertEqual(
+            '{http://s3.amazonaws.com/doc/2006-03-01/}'
+            'CompleteMultipartUploadResult',
+            ElementTree.fromstring(complete_resp.content.lstrip()).tag,
+            complete_resp.text)
+
+        resp = self.conn.make_request(
+            self.bucket_name,
+            obj_name,
+            headers={'x-amz-content-sha256': 'UNSIGNED-PAYLOAD'})
+        self.assertOK(resp, TEST_BODY)
+
+    @skip_if_checksum_persistence_disabled
+    def test_strm_unsgnd_pyld_trl_upload_part_complete_mpu_composite(self):
+        self._complete_mpu_after_streamed_part('COMPOSITE')
+
+    @skip_if_checksum_persistence_disabled
+    def test_strm_unsgnd_pyld_trl_upload_part_complete_mpu_full_object(self):
+        self._complete_mpu_after_streamed_part('FULL_OBJECT')
+
+    @skip_if_checksum_persistence_disabled
+    def test_strm_unsgnd_pyld_trl_complete_mpu_trailer_composite(self):
+        self._complete_mpu_after_streamed_part(
+            'COMPOSITE', streamed_complete=True)
+
+    @skip_if_checksum_persistence_disabled
+    def test_strm_unsgnd_pyld_trl_complete_mpu_trailer_full_object(self):
+        self._complete_mpu_after_streamed_part(
+            'FULL_OBJECT', streamed_complete=True)
 
     def test_strm_unsgnd_pyld_trl_with_comma_in_trailer_ok(self):
         resp = self._put_unsigned_payload_with_crc32_trailer(
