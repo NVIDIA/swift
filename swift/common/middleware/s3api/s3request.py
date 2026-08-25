@@ -1086,7 +1086,7 @@ class S3Request(swob.Request):
                 checksum_source = self.headers
 
             if checksum_key and verify_checksum:
-                self._install_checksumming_input_wrapper(
+                self.install_checksumming_input(
                     checksum_hasher, checksum_key, checksum_source)
 
         # Lock in string-to-sign now, before we start messing with query params
@@ -1561,10 +1561,14 @@ class S3Request(swob.Request):
         raise InvalidRequest(
             'Value for x-amz-checksum-mode header is invalid.')
 
-    def _install_checksumming_input_wrapper(
+    def install_checksumming_input(
             self, checksum_hasher, checksum_key, checksum_source):
         """
-        Install and return the input wrapper that validates the checksum.
+        Install an input wrapper that calculates and optionally validates
+        a checksum.
+
+        A checksum source enables validation against a client value. Passing
+        None retains the calculated checksum for controller-owned behavior.
         """
         checksumming_input = ChecksummingInput(
             self.environ['wsgi.input'],
@@ -1593,7 +1597,7 @@ class S3Request(swob.Request):
         Install a callback to persist checksum metadata after validation.
         If checksum validation fails, the PUT fails before a matching checksum
         is recorded, so no checksum sysmeta is persisted. If validation is
-        successful, sysmeta is attached to the uploaded whole-object body.
+        successful, sysmeta is attached to the uploaded object or part.
 
         :param checksumming_input: The wrapper validating the request body.
         """

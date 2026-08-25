@@ -85,6 +85,14 @@ from swift.common.middleware.s3api.s3response import InvalidArgument, \
     HTTPOk, HTTPNoContent, NoSuchKey, NoSuchUpload, NoSuchBucket, \
     BucketAlreadyOwnedByYou, ServiceUnavailable, PreconditionFailed, \
     S3NotImplemented
+from swift.common.middleware.s3api.s3checksum import \
+    CHECKSUM_TYPE_FULL_OBJECT, CHECKSUM_TYPE_COMPOSITE, \
+    CHECKSUMS_BY_HEADER, FULL_OBJECT_MPU_CHECKSUM_HEADERS, \
+    COMPOSITE_MPU_CHECKSUM_HEADERS, checksum_header_from_algorithm, \
+    checksum_algorithm_from_header, \
+    checksum_sysmeta_headers, format_supported_checksum_algorithms, \
+    checksum_sysmeta_to_response_headers, checksum_sysmeta_values, \
+    normalize_checksum_type, get_checksum_hasher
 from swift.common.middleware.s3api.utils import unique_id, \
     MULTIUPLOAD_SUFFIX, S3Timestamp, s3api_sysmeta_header
 from swift.common.middleware.s3api.etree import Element, SubElement, \
@@ -95,6 +103,215 @@ DEFAULT_MAX_PARTS_LISTING = 1000
 DEFAULT_MAX_UPLOADS = 1000
 
 MAX_COMPLETE_UPLOAD_BODY_SIZE = 2048 * 1024
+
+
+def _validate_checksum_type_with_checksum_header(
+        checksum_type, checksum_header):
+    """
+    Validate that an MPU checksum type supports the checksum header.
+
+    :param checksum_type: The normalized MPU checksum type.
+    :param checksum_header: The corresponding x-amz-checksum-* header.
+    :raises InvalidRequest: if the algorithm does not support the type.
+    """
+    if ((checksum_type == CHECKSUM_TYPE_FULL_OBJECT and
+         checksum_header not in FULL_OBJECT_MPU_CHECKSUM_HEADERS) or
+            (checksum_type == CHECKSUM_TYPE_COMPOSITE and
+             checksum_header not in COMPOSITE_MPU_CHECKSUM_HEADERS)):
+        checksum_algorithm = checksum_algorithm_from_header(checksum_header)
+        raise InvalidRequest(
+            'The %s checksum type cannot be used with the %s '
+            'checksum algorithm.' % (
+                checksum_type, checksum_algorithm.lower()))
+
+
+class MPUChecksumAttrs:
+    """Store the checksum configuration for a multipart upload."""
+
+    def __init__(self, checksum_header=None, checksum_value=None,
+                 checksum_type=None, is_mpu_in_progress=True):
+        """Initialize a multipart upload checksum configuration."""
+        if checksum_header is not None:
+            checksum_header = checksum_header.lower()
+        self.header = checksum_header
+        self.value = checksum_value
+        # S3 normalizes the types
+        if checksum_type is not None:
+            checksum_type = normalize_checksum_type(checksum_type)
+        self.type = checksum_type
+        self.is_mpu_in_progress = is_mpu_in_progress
+
+    @property
+    def algorithm(self):
+        """Return the normalized checksum algorithm, if configured."""
+        if self.header is None:
+            return None
+        return checksum_algorithm_from_header(self.header)
+
+    @property
+    def is_checksum_aware(self):
+        """Return whether the multipart upload has a valid checksum mode."""
+        return self.is_full_object or self.is_composite
+
+    @property
+    def is_full_object(self):
+        """Return whether the multipart upload uses full-object checksums."""
+        return (
+            self.is_mpu_in_progress and
+            self.type == CHECKSUM_TYPE_FULL_OBJECT and
+            self.header in FULL_OBJECT_MPU_CHECKSUM_HEADERS)
+
+    @property
+    def is_composite(self):
+        """Return whether the multipart upload uses composite checksums."""
+        return (
+            self.is_mpu_in_progress and
+            self.type == CHECKSUM_TYPE_COMPOSITE and
+            self.header in COMPOSITE_MPU_CHECKSUM_HEADERS)
+
+    @classmethod
+    def from_request(cls, req):
+        """
+        Return an MPU checksum configuration from an S3 request.
+
+        :param req: The S3 request.
+        """
+        checksum_header = checksum_value = None
+        if 'uploads' in req.params:
+            # CreateMultipartUpload uses x-amz-checksum-algorithm to configure
+            # the checksum used by the upload.
+            checksum_algorithm = req.headers.get(
+                'x-amz-checksum-algorithm')
+            if checksum_algorithm:
+                checksum_header = checksum_header_from_algorithm(
+                    checksum_algorithm)
+        else:
+            # UploadPart and CompleteMultipartUpload use an
+            # x-amz-checksum-* value header.
+            # S3Request has already validated that at most one supported value
+            # header exists and that it matches x-amz-sdk-checksum-algorithm,
+            # if supplied.
+            checksum_header, checksum_value = \
+                cls._get_checksum_value_header(req)
+            if checksum_header is None and 'partNumber' in req.params:
+                # Only use the trailer if this is a UploadPart request,
+                # CompleteMultiPartUpload does not use the trailer
+                checksum_header = cls._get_checksum_trailer_header(req)
+        checksum_type = req.headers.get('x-amz-checksum-type')
+        return cls(checksum_header, checksum_value, checksum_type)
+
+    @staticmethod
+    def _get_checksum_value_header(req):
+        """Return the checksum value header and value from a request."""
+        checksum_headers = [
+            (header, value)
+            for header, value in req.headers.items()
+            if header.lower() in CHECKSUMS_BY_HEADER
+        ]
+        if checksum_headers:
+            return checksum_headers[0]
+        return None, None
+
+    @staticmethod
+    def _get_checksum_trailer_header(req):
+        """Return the checksum header declared in x-amz-trailer."""
+        checksum_trailer = req.headers.get('x-amz-trailer', '').strip()
+        checksum_trailer_headers = [
+            header.strip().lower()
+            for header in checksum_trailer.rstrip(',').split(',')
+            if header.strip().lower() in CHECKSUMS_BY_HEADER
+        ] if checksum_trailer else []
+        if checksum_trailer_headers:
+            return checksum_trailer_headers[0]
+        return None
+
+    @classmethod
+    def from_sysmeta(cls, sysmeta_headers, is_mpu_in_progress):
+        """Return an MPU checksum configuration stored in object sysmeta."""
+        checksum_algorithm, checksum_value, checksum_type = \
+            checksum_sysmeta_values(
+                sysmeta_headers)
+        checksum_header = None
+        if checksum_algorithm is not None:
+            checksum_header = checksum_header_from_algorithm(
+                checksum_algorithm)
+        return cls(
+            checksum_header, checksum_value, checksum_type,
+            is_mpu_in_progress)
+
+
+def _validate_mpu_initiate_checksum_headers(checksum_attrs):
+    """
+    Validate and normalize checksum headers for CreateMultipartUpload.
+
+    :param checksum_attrs: The MPU checksum configuration to validate.
+    """
+    # Validate x-amz-checksum-type first...
+    if checksum_attrs.type is not None and checksum_attrs.type not in (
+            CHECKSUM_TYPE_COMPOSITE, CHECKSUM_TYPE_FULL_OBJECT):
+        raise InvalidRequest(
+            'Value for x-amz-checksum-type header is invalid.')
+    # then make sure we have an x-amz-checksum-algorithm for it too
+    if checksum_attrs.type and not checksum_attrs.header:
+        raise InvalidRequest(
+            'The x-amz-checksum-type header can only be used with the '
+            'x-amz-checksum-algorithm header.')
+    if not checksum_attrs.header:
+        return
+
+    if checksum_attrs.header not in CHECKSUMS_BY_HEADER:
+        raise InvalidRequest(
+            'Checksum algorithm provided is unsupported. Please '
+            'try again with any of the valid types: %s' %
+            format_supported_checksum_algorithms())
+
+    # Decide the default checksum type for this MPU
+    # which will be COMPOSITE, unless the algorithm cannot
+    # be COMPOSITE
+    if checksum_attrs.type is None:
+        if checksum_attrs.header in COMPOSITE_MPU_CHECKSUM_HEADERS:
+            checksum_attrs.type = CHECKSUM_TYPE_COMPOSITE
+        else:
+            checksum_attrs.type = CHECKSUM_TYPE_FULL_OBJECT
+
+    _validate_checksum_type_with_checksum_header(
+        checksum_attrs.type, checksum_attrs.header)
+
+
+def _validate_upload_part_checksum_headers(
+        req, checksum_attrs):
+    """
+    Validate UploadPart checksum headers against the MPU configuration.
+
+    FULL_OBJECT MPUs may omit a part checksum, in which case this function
+    installs an input wrapper to calculate it. COMPOSITE MPUs require the
+    request to supply the configured checksum algorithm.
+    :param req: The S3 request.
+    :param checksum_attrs: The checksum configuration stored on the MPU;
+        must be checksum-aware (``is_checksum_aware`` is True).
+    """
+    request_checksum_attrs = MPUChecksumAttrs.from_request(req)
+    if request_checksum_attrs.header:
+        if request_checksum_attrs.header != checksum_attrs.header:
+            raise InvalidRequest(
+                # The type refers to the algorithm here, not the
+                # x-amz-checksum-type value. This is the AWS
+                # error message
+                'Checksum Type mismatch occurred, expected checksum '
+                'Type: %s, actual checksum Type: %s' % (
+                    checksum_attrs.algorithm.lower(),
+                    request_checksum_attrs.algorithm.lower()))
+    elif checksum_attrs.is_full_object:
+        checksum_hasher = get_checksum_hasher(checksum_attrs.header)
+        # Since the request did not have a header, we have to add
+        # the wrapper ourselves
+        req.install_checksumming_input(
+            checksum_hasher, checksum_attrs.header, None)
+    else:
+        raise InvalidRequest(
+            'Checksum Type mismatch occurred, expected checksum '
+            'Type: %s, actual checksum Type: null' %
+            checksum_attrs.algorithm.lower())
 
 
 def _get_upload_info(req, app, upload_id):
@@ -203,7 +420,18 @@ class PartController(Controller):
         part_number = req.validate_part_number()
 
         upload_id = get_param(req, 'uploadId')
-        _get_upload_info(req, self.app, upload_id)
+        upload_info, is_marker = _get_upload_info(req, self.app, upload_id)
+        mpu_checksum_attrs = MPUChecksumAttrs.from_sysmeta(
+            upload_info.sysmeta_headers, is_marker)
+        if 'X-Amz-Copy-Source' not in req.headers:
+            if mpu_checksum_attrs.is_checksum_aware:
+                # S3Request has validated that the request's checksum headers
+                # are self-consistent, now we validate them for consistency
+                # with the stored MPU checksum attributes
+                _validate_upload_part_checksum_headers(
+                    req, mpu_checksum_attrs)
+                # Legacy MPUs validate input but do not store part checksums.
+                req.enable_checksum_persistence()
 
         req.container_name += MULTIUPLOAD_SUFFIX
         req.object_name = '%s/%s/%d' % (req.object_name, upload_id,
@@ -239,6 +467,11 @@ class PartController(Controller):
 
         resp = req.get_response(self.app)
 
+        if req.checksum_sysmeta_footers:
+            resp.headers.update(checksum_sysmeta_to_response_headers(
+                req.checksum_sysmeta_footers))
+            # UploadPart responses do not echo the type
+            resp.headers.pop('x-amz-checksum-type', None)
         if 'X-Amz-Copy-Source' in req.headers:
             last_modified_ts = S3Timestamp(
                 parse_date_header(resp.headers['Last-Modified']))
@@ -441,6 +674,15 @@ class UploadsController(Controller):
         # Create a unique S3 upload id from UUID to avoid duplicates.
         upload_id = unique_id()
 
+        mpu_checksum_attrs = MPUChecksumAttrs.from_request(req)
+        _validate_mpu_initiate_checksum_headers(mpu_checksum_attrs)
+        if self.conf.allow_store_checksums and \
+                mpu_checksum_attrs.is_checksum_aware:
+            req.headers.update(checksum_sysmeta_headers(
+                mpu_checksum_attrs.algorithm,
+                None,
+                mpu_checksum_attrs.type))
+
         seg_container = req.container_name + MULTIUPLOAD_SUFFIX
         content_type = req.headers.get('Content-Type')
         if content_type:
@@ -488,7 +730,15 @@ class UploadsController(Controller):
 
         body = tostring(result_elem)
 
-        return HTTPOk(body=body, content_type='application/xml')
+        resp = HTTPOk(body=body, content_type='application/xml')
+        if self.conf.allow_store_checksums and \
+                mpu_checksum_attrs.is_checksum_aware:
+            resp.headers.update({
+                'x-amz-checksum-algorithm':
+                    mpu_checksum_attrs.algorithm,
+                'x-amz-checksum-type': mpu_checksum_attrs.type,
+            })
+        return resp
 
 
 class UploadController(Controller):

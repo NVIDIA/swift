@@ -99,7 +99,9 @@ A subset of the AWS checksum feature is implemented, including:
   CRC64NVME, SHA1 or SHA256 algorithms. This covers both a checksum header on a
   fixed-length body and a checksum trailer on a SigV4 ``aws-chunked`` body.
 
-* Optional persistence of a validated checksum for a `PUT Object`_ request.
+* Optional persistence of a validated checksum for a `PUT Object`_ or
+  `Upload Part`_ request, and checksum settings for an
+  `Initiate Multipart Upload`_ request.
   Set ``allow_store_checksums = true`` in ``[filter:s3api]`` to enable it.
   The default is ``false``. When enabled, the checksum header is returned
   with the `PUT Object`_ response along with
@@ -108,8 +110,19 @@ A subset of the AWS checksum feature is implemented, including:
   Before you enable it, upgrade all applicable proxy and internal applications
   that read, write, or copy these objects. Keep S3API registration and COPY
   cleanup in each applicable process. Drain old workers, then enable the
-  option and reload the applications. Disabling the option stops new checksum
-  writes. Existing checksum reads, decryption, and COPY protection continue.
+  option and reload the applications. Drain checksum-aware multipart uploads
+  before you disable the option or roll back the checksum code. Disabling the
+  option stops new checksum writes. Existing checksum reads, decryption,
+  stored MPU validation, and COPY protection continue.
+  An upload part stores and returns its checksum only when the MPU has
+  stored checksum settings and the option is enabled. Parts of legacy MPUs
+  still validate a supplied checksum, but do not store or return it.
+
+* Selection of a checksum algorithm and type for `Initiate Multipart Upload`_.
+  ``COMPOSITE`` supports CRC32, CRC32C, SHA1, and SHA256. ``FULL_OBJECT``
+  supports CRC32, CRC32C, and CRC64NVME.
+  ``COMPOSITE`` uploads require the selected checksum on each part.
+  ``FULL_OBJECT`` uploads can omit the part checksum; Swift calculates it.
 
 * Return of a checksum header with a `GET Object`_ or `HEAD Object`_ response
   when the client sends ``x-amz-checksum-mode: ENABLED`` and the checksum has
@@ -124,8 +137,7 @@ supported:
 * Validation of an ``x-amz-checksum-*`` value supplied with a
   `Complete Multipart Upload`_ request.
 
-* Persistence of a validated checksum for `Complete Multipart Upload`_ and
-  `Upload Part`_ requests.
+* Persistence of a validated checksum for `Complete Multipart Upload`_.
 
 * Re-calculation of checksum values during `PUT Object Copy`_ and
   `Upload Part Copy`_ requests.
