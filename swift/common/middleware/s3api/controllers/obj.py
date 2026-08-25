@@ -137,6 +137,7 @@ class ObjectController(Controller):
                 resp.headers['Content-Range'] = \
                     'bytes 0-%d/%s' % (int(resp.headers['Content-Length']) - 1,
                                        resp.headers['Content-Length'])
+                # TODO: Return part checksum metadata
             # else: part_number is None
 
         if req.method == 'HEAD':
