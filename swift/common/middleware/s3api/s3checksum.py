@@ -35,6 +35,14 @@ CHECKSUMS_BY_HEADER = {
     'x-amz-checksum-sha256': sha256,
 }
 
+CHECKSUM_XML_ELEMENTS = {
+    'x-amz-checksum-crc32': 'ChecksumCRC32',
+    'x-amz-checksum-crc32c': 'ChecksumCRC32C',
+    'x-amz-checksum-crc64nvme': 'ChecksumCRC64NVME',
+    'x-amz-checksum-sha1': 'ChecksumSHA1',
+    'x-amz-checksum-sha256': 'ChecksumSHA256',
+}
+
 
 def normalize_checksum_mode(mode):
     """Return an uppercase x-amz-checksum-mode value."""
@@ -85,6 +93,13 @@ COMPOSITE_MPU_CHECKSUM_HEADERS = tuple(
     if checksum_algorithm_from_header(checksum_header) != 'CRC64NVME')
 
 
+def checksum_xml_element_from_header(checksum_header):
+    """Return the S3 XML element for a stored checksum header."""
+    if checksum_header is None:
+        return None
+    return CHECKSUM_XML_ELEMENTS.get(checksum_header.lower())
+
+
 def get_checksum_hasher(header):
     """
     Return a checksum hasher for an x-amz-checksum-* header.
@@ -100,6 +115,28 @@ def validate_checksum_value(checksum_hasher, b64digest):
         b64digest,
         exact_size=checksum_hasher.digest_size,
     )
+
+
+def split_composite_checksum(checksum_value):
+    """
+    Split a composite checksum value into its digest and part count.
+
+    :param checksum_value: A composite checksum value, with or without a
+        -<part_count> suffix.
+    :return: A ``(b64digest, part_count)`` pair, where ``part_count`` is
+        ``None`` if the value carries no suffix.
+    :raises ValueError: if the digest is empty, or the suffix is not a
+        positive integer.
+    """
+    # Base64 has no '-', so the first one always starts the suffix.
+    b64digest, sep, part_count = checksum_value.partition('-')
+    if not b64digest:
+        raise ValueError('missing digest')
+    if not sep:
+        return b64digest, None
+    if not part_count.isdigit() or int(part_count) < 1:
+        raise ValueError('invalid part count %r' % part_count)
+    return b64digest, int(part_count)
 
 
 def checksum_sysmeta_headers(checksum_algorithm, checksum_value,

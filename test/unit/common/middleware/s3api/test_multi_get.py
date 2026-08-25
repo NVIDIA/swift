@@ -86,6 +86,17 @@ class TestMpuGETorHEAD(S3ApiTestCase):
         self.swift.register(
             'GET', '/v1/AUTH_test/bucket/mpu',
             swob.HTTPOk, manifest_headers, manifest_json.encode('ascii'))
+
+        checksum_headers, checksum_json = _prepare_mpu(
+            self.swift, self.ts, 'Y', 3, segment_key='checksum-mpu')
+        checksum_headers.update({
+            'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+            'x-object-sysmeta-s3api-checksum-value': 'AAAAAA==-3',
+            'x-object-sysmeta-s3api-checksum-type': 'COMPOSITE',
+        })
+        self.swift.register(
+            'GET', '/v1/AUTH_test/bucket/checksum-mpu',
+            swob.HTTPOk, checksum_headers, checksum_json.encode('ascii'))
         self.s3_acl = False
 
     def test_mpu_GET(self):
@@ -112,6 +123,65 @@ class TestMpuGETorHEAD(S3ApiTestCase):
         self.assertEqual(headers['Content-Length'], '30')
         self.assertEqual(headers['Etag'], '"%s"' % self.s3_etag)
         self.assertNotIn('X-Amz-Mp-Parts-Count', headers)
+
+    def test_checksum_mpu_checksum_mode_enabled(self):
+        for method in ('GET', 'HEAD'):
+            with self.subTest(method=method):
+                req = swob.Request.blank(
+                    '/bucket/checksum-mpu', method=method, headers={
+                        'Authorization': 'AWS test:tester:hmac',
+                        'Date': self.get_date_header(),
+                        'x-amz-checksum-mode': 'ENABLED',
+                    })
+
+                status, headers, body = self.call_s3api(req)
+
+                self.assertEqual('200', status.split()[0])
+                self.assertEqual(
+                    b'aaaaabbbbbbbbbbccccccccccccccc'
+                    if method == 'GET' else b'', body)
+                self.assertEqual('30', headers['Content-Length'])
+                self.assertEqual('AAAAAA==-3', headers['x-amz-checksum-crc32'])
+                self.assertEqual('COMPOSITE', headers['x-amz-checksum-type'])
+
+    def test_checksum_mpu_range_omits_checksum_headers(self):
+        for method in ('GET', 'HEAD'):
+            with self.subTest(method=method):
+                req = swob.Request.blank(
+                    '/bucket/checksum-mpu', method=method, headers={
+                        'Authorization': 'AWS test:tester:hmac',
+                        'Date': self.get_date_header(),
+                        'Range': 'bytes=0-3',
+                        'x-amz-checksum-mode': 'ENABLED',
+                    })
+
+                status, headers, body = self.call_s3api(req)
+
+                self.assertEqual('206', status.split()[0])
+                self.assertEqual(b'aaaa' if method == 'GET' else b'', body)
+                self.assertEqual('bytes 0-3/30', headers['Content-Range'])
+                self.assertEqual('4', headers['Content-Length'])
+                self.assertNotIn('x-amz-checksum-crc32', headers)
+                self.assertNotIn('x-amz-checksum-type', headers)
+
+    def test_checksum_mpu_without_checksum_mode_omits_checksum_headers(self):
+        for method in ('GET', 'HEAD'):
+            with self.subTest(method=method):
+                req = swob.Request.blank(
+                    '/bucket/checksum-mpu', method=method, headers={
+                        'Authorization': 'AWS test:tester:hmac',
+                        'Date': self.get_date_header(),
+                    })
+
+                status, headers, body = self.call_s3api(req)
+
+                self.assertEqual('200', status.split()[0])
+                self.assertEqual(
+                    b'aaaaabbbbbbbbbbccccccccccccccc'
+                    if method == 'GET' else b'', body)
+                self.assertEqual('30', headers['Content-Length'])
+                self.assertNotIn('x-amz-checksum-crc32', headers)
+                self.assertNotIn('x-amz-checksum-type', headers)
 
     def test_mpu_GET_part_num(self):
         req = swob.Request.blank('/bucket/mpu', params={
@@ -333,6 +403,8 @@ class TestMpuGETorHEADAcl(TestMpuGETorHEAD, S3ApiTestCaseAcl):
             self.default_owner, self.grants, 'object')
         self.swift.update_sticky_response_headers(
             '/v1/AUTH_test/bucket/mpu', object_headers)
+        self.swift.update_sticky_response_headers(
+            '/v1/AUTH_test/bucket/checksum-mpu', object_headers)
         # this is used to flag insertion of expected HEAD pre-flight request of
         # object ACLs
         self.s3_acl = True
