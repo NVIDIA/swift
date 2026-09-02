@@ -20,7 +20,8 @@ from swift.common.constraints import valid_api_version, check_utf8
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_success
 from swift.common.middleware.crypto.crypto_utils import CryptoWSGIContext, \
-    load_crypto_meta, extract_crypto_meta, Crypto
+    load_crypto_meta, extract_crypto_meta, Crypto, \
+    ENCRYPTED_SENSITIVE_SYSMETA_PREFIX, OBJECT_SYSMETA_PREFIX
 from swift.common.exceptions import EncryptionException, UnknownSecretIdError
 from swift.common.request_helpers import get_object_transient_sysmeta, \
     get_sys_meta_prefix, get_user_meta_prefix, \
@@ -197,11 +198,42 @@ class DecrypterObjContext(BaseDecrypterContext):
                 result.append((new_prefix + short_name, decrypted_value))
         return result
 
-    def decrypt_resp_headers(self, put_keys, post_keys, update_cors_exposed):
+    def decrypt_sensitive_sysmeta(self, keys):
+        """
+        Decrypt sensitive sysmeta and restore its original object sysmeta
+        name.
+
+        :param keys: a dict of keys.
+        :return: a list of (header, value) pairs of decrypted sysmeta.
+        """
+        prefix_len = len(ENCRYPTED_SENSITIVE_SYSMETA_PREFIX)
+        result = []
+        for name, val in self._response_headers:
+            if (name.lower().startswith(
+                    ENCRYPTED_SENSITIVE_SYSMETA_PREFIX) and val):
+                short_name = name[prefix_len:]
+                if (not short_name or
+                        short_name.lower().startswith('crypto-')):
+                    self.logger.error(
+                        'Invalid encrypted sysmeta header %s', name)
+                    raise HTTPInternalServerError(
+                        body='Error decrypting header',
+                        content_type='text/plain')
+                decrypted_value = self._decrypt_header(
+                    name, val, keys[self.server_type], required=True)
+                result.append(
+                    (OBJECT_SYSMETA_PREFIX.title() + short_name,
+                     decrypted_value))
+        return result
+
+    def decrypt_resp_headers(self, put_keys, sysmeta_keys, post_keys,
+                             update_cors_exposed):
         """
         Find encrypted headers and replace with the decrypted versions.
 
         :param put_keys: a dict of decryption keys used for object PUT.
+        :param sysmeta_keys: a dict of decryption keys used for encrypted
+                             sysmeta.
         :param post_keys: a dict of decryption keys used for object POST.
         :param update_cors_exposed: if True then ensure the response headers
             include an ``Access-Control-Expose-Headers`` header populated with
@@ -230,6 +262,10 @@ class DecrypterObjContext(BaseDecrypterContext):
                 decrypted_etag = self._decrypt_header(
                     etag_header, encrypted_etag, put_keys['container'])
                 mod_hdr_pairs.append((etag_header, decrypted_etag))
+
+        if sysmeta_keys:
+            mod_hdr_pairs.extend(
+                self.decrypt_sensitive_sysmeta(sysmeta_keys))
 
         # Decrypt all user metadata. Encrypted user metadata values are stored
         # in the x-object-transient-sysmeta-crypto-meta- namespace. Those are
@@ -324,6 +360,10 @@ class DecrypterObjContext(BaseDecrypterContext):
     def handle(self, req, start_response):
         app_resp = self._app_call(req.environ)
 
+        has_encrypted_sysmeta = any(
+            name.lower().startswith(ENCRYPTED_SENSITIVE_SYSMETA_PREFIX)
+            and value for name, value in self._response_headers)
+
         try:
             put_crypto_meta = self._read_crypto_meta(
                 'X-Object-Sysmeta-Crypto-Body-Meta', True)
@@ -331,6 +371,21 @@ class DecrypterObjContext(BaseDecrypterContext):
             post_crypto_meta = self._read_crypto_meta(
                 'X-Object-Transient-Sysmeta-Crypto-Meta', False)
             post_keys = self.get_decryption_keys(req, post_crypto_meta)
+            sysmeta_crypto_meta = self._read_crypto_meta(
+                'X-Object-Sysmeta-Crypto-Meta', False)
+            if has_encrypted_sysmeta:
+                if ((sysmeta_crypto_meta is None or
+                     'key_id' not in sysmeta_crypto_meta or
+                     sysmeta_crypto_meta.get('cipher') !=
+                     self.crypto.cipher) and
+                    not config_true_value(
+                        req.environ.get('swift.crypto.override'))):
+                    raise EncryptionException(
+                        'Invalid or missing X-Object-Sysmeta-Crypto-Meta')
+                sysmeta_keys = self.get_decryption_keys(
+                    req, sysmeta_crypto_meta)
+            else:
+                sysmeta_keys = None
         except EncryptionException as err:
             self.logger.error(
                 "Error decrypting object: %s",
@@ -346,7 +401,7 @@ class DecrypterObjContext(BaseDecrypterContext):
             return app_resp
 
         mod_resp_headers = self.decrypt_resp_headers(
-            put_keys, post_keys,
+            put_keys, sysmeta_keys, post_keys,
             update_cors_exposed=bool(req.headers.get('origin')))
 
         if put_crypto_meta and req.method == 'GET' and \
