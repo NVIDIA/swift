@@ -86,6 +86,15 @@ class TestDecrypterObjectRequests(unittest.TestCase):
                 ';swift_meta=' + get_crypto_meta_header(other_crypto_meta),
             'x-object-sysmeta-container-update-override-etag':
                 encrypt_and_append_meta('encrypt me, too', cont_key),
+            'x-object-sysmeta-crypto-sysmeta-test-digest':
+                encrypt_and_append_meta(
+                    'ziJc4A==',
+                    object_key,
+                    {'iv': FAKE_IV,
+                     'cipher': Crypto.cipher}),
+            'x-object-sysmeta-crypto-meta':
+                get_crypto_meta_header({'key_id': key_id,
+                                        'cipher': Crypto.cipher}),
             'x-object-sysmeta-test': 'do not encrypt me',
         })
 
@@ -108,7 +117,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         # then the decrypted header will win where there is a name clash...
         hdrs.update({
             'x-object-meta-test': 'unexpected, overwritten by decrypted value',
-            'x-object-meta-distinct': 'unexpected but distinct from encrypted'
+            'x-object-meta-distinct': 'unexpected but distinct from encrypted',
+            'x-object-sysmeta-test-digest':
+                'unexpected, overwritten by decrypted value',
         })
         self.app.register(
             method, '/v1/a/c/o', HTTPOk, body=enc_body, headers=hdrs)
@@ -124,6 +135,12 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual(
             'encrypt me, too',
             resp.headers['X-Object-Sysmeta-Container-Update-Override-Etag'])
+        # Encrypted sysmeta is restored to its original object sysmeta name.
+        self.assertEqual(
+            'ziJc4A==',
+            resp.headers['X-Object-Sysmeta-Test-Digest'])
+        self.assertNotIn(
+            'X-Object-Sysmeta-Crypto-Sysmeta-Test-Digest', resp.headers)
         self.assertNotIn('X-Object-Sysmeta-Crypto-Body-Meta', resp.headers)
         self.assertNotIn('X-Object-Sysmeta-Crypto-Etag', resp.headers)
         self.assertNotIn('Access-Control-Expose-Headers', resp.headers)
@@ -201,8 +218,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual(b'', resp.body)
 
     def _check_unencrypted_data_and_encrypted_metadata(self, method):
+        callback = mock.Mock(side_effect=fetch_crypto_keys)
         env = {'REQUEST_METHOD': method,
-               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+               CRYPTO_KEY_CALLBACK: callback}
         req = Request.blank('/v1/a/c/o', environ=env)
         body = b'object data'
         plaintext_etag = md5hex(body)
@@ -229,6 +247,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual('text/plain', resp.headers['Content-Type'])
         self.assertEqual('encrypt me', resp.headers['x-object-meta-test'])
         self.assertNotIn('Access-Control-Expose-Headers', resp.headers)
+        # Only the body and user metadata paths fetch keys.
+        self.assertEqual([mock.call(key_id=None), mock.call(key_id=None)],
+                         callback.call_args_list)
         return resp
 
     def test_GET_unencrypted_data_and_encrypted_metadata(self):
@@ -273,6 +294,58 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         resp = self._check_encrypted_data_and_unencrypted_metadata('HEAD')
         self.assertEqual(b'', resp.body)
 
+    def test_GET_sensitive_sysmeta_no_body_crypto_meta(self):
+        # a zero byte object has no body crypto meta; the key id in the
+        # x-object-sysmeta-crypto-meta selects the key for sensitive sysmeta
+        callback = mock.Mock(side_effect=fetch_crypto_keys)
+        env = {'REQUEST_METHOD': 'GET',
+               CRYPTO_KEY_CALLBACK: callback}
+        req = Request.blank('/v1/a/c/o', environ=env)
+        object_key = fetch_crypto_keys(key_id={'secret_id': 'myid'})['object']
+        hdrs = HeaderKeyDict({
+            'content-type': 'text/plain',
+            'content-length': '0',
+            'etag': MD5_OF_EMPTY_STRING,
+            'x-object-sysmeta-crypto-sysmeta-test-digest':
+                encrypt_and_append_meta(
+                    'ziJc4A==',
+                    object_key,
+                    {'iv': FAKE_IV,
+                     'cipher': Crypto.cipher}),
+            'x-object-sysmeta-crypto-meta':
+                get_crypto_meta_header({'key_id': {'secret_id': 'myid'},
+                                        'cipher': Crypto.cipher}),
+        })
+        self.app.register('GET', '/v1/a/c/o', HTTPOk, body=b'', headers=hdrs)
+        resp = req.get_response(self.decrypter)
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(b'', resp.body)
+        self.assertEqual(
+            'ziJc4A==',
+            resp.headers['X-Object-Sysmeta-Test-Digest'])
+        self.assertEqual([mock.call(key_id=None), mock.call(key_id=None),
+                          mock.call(key_id={'secret_id': 'myid'})],
+                         callback.call_args_list)
+
+    def test_empty_sensitive_sysmeta_without_common_crypto_meta(self):
+        encrypted_name = 'X-Object-Sysmeta-Crypto-Sysmeta-Test-Digest'
+        for method in ('GET', 'HEAD'):
+            with self.subTest(method=method):
+                callback = mock.Mock(side_effect=fetch_crypto_keys)
+                req = Request.blank(
+                    '/v1/a/c/o', method=method,
+                    environ={CRYPTO_KEY_CALLBACK: callback})
+                self.app.register(method, '/v1/a/c/o', HTTPOk,
+                                  headers={encrypted_name: ''})
+                resp = req.get_response(self.decrypter)
+                self.assertEqual('200 OK', resp.status)
+                self.assertNotIn(encrypted_name, resp.headers)
+                self.assertNotIn('X-Object-Sysmeta-Test-Digest', resp.headers)
+                # Empty sensitive sysmeta does not need another key lookup.
+                self.assertEqual(
+                    [mock.call(key_id=None), mock.call(key_id=None)],
+                    callback.call_args_list)
+
     def test_headers_case(self):
         body = b'fAkE ApP'
         req = Request.blank('/v1/a/c/o', body='FaKe', headers={
@@ -299,6 +372,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
             'Etag': '7f7837924188f7b511a9e3881a9f77a8',
             'X-Object-Sysmeta-Container-Update-Override-Etag':
             'encrypt me, too',
+            'X-Object-Sysmeta-Test-Digest': 'ziJc4A==',
             'X-Object-Meta-Test': 'encrypt me',
             'Content-Length': '8',
             'X-Object-Meta-Ignores-Case': 'thIs pArt WilL bE cOol',
@@ -389,6 +463,27 @@ class TestDecrypterObjectRequests(unittest.TestCase):
     def test_HEAD_304_response(self):
         self._test_304_response('HEAD')
 
+    def test_GET_416_response_with_sensitive_sysmeta(self):
+        env = {CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        resp_body = b'The requested range is not satisfiable'
+        req = Request.blank(
+            '/v1/a/c/o', environ=env,
+            headers={'Range': 'bytes=%d-' % len(resp_body)})
+        hdrs = self._make_response_headers(
+            len(resp_body), md5hex(b''), fetch_crypto_keys(), b'not used')
+        self.app.register(
+            'GET', '/v1/a/c/o', HTTPRequestedRangeNotSatisfiable,
+            body=resp_body, headers=hdrs)
+
+        resp = req.get_response(self.decrypter)
+
+        self.assertEqual('416 Requested Range Not Satisfiable', resp.status)
+        self.assertIn(b'The Range requested is not available', resp.body)
+        self.assertEqual(
+            'ziJc4A==', resp.headers['X-Object-Sysmeta-Test-Digest'])
+        self.assertNotIn(
+            'X-Object-Sysmeta-Crypto-Sysmeta-Test-Digest', resp.headers)
+
     def _test_404_response(self, method):
         # simulate a 404 response, sanity check response headers
         env = {CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
@@ -454,6 +549,121 @@ class TestDecrypterObjectRequests(unittest.TestCase):
                       'X-Object-Sysmeta-Container-Update-Override-Etag',
                       self.decrypter.logger.get_lines_for_level('error')[0])
         return resp
+
+    def _test_sensitive_sysmeta_bad_meta(self, method, sensitive_value):
+        env = {'REQUEST_METHOD': method,
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        req = Request.blank('/v1/a/c/o', environ=env)
+        body = b'FAKE APP'
+        key = fetch_crypto_keys()['object']
+        enc_body = encrypt(body, key, FAKE_IV)
+        hdrs = self._make_response_headers(
+            len(body), md5hex(body), fetch_crypto_keys(), b'not used')
+        hdrs['x-object-sysmeta-crypto-sysmeta-test-digest'] = \
+            sensitive_value
+        self.app.register(method, '/v1/a/c/o', HTTPOk, body=enc_body,
+                          headers=hdrs)
+        resp = req.get_response(self.decrypter)
+        # the key lookup and the meta parsing fail like decryption does
+        self.assertEqual('500 Internal Error', resp.status)
+        return resp
+
+    def test_GET_sensitive_sysmeta_bad_crypto_meta(self):
+        # a value whose crypto meta cannot be parsed
+        resp = self._test_sensitive_sysmeta_bad_meta(
+            'GET', 'ziJc4A==; swift_meta=not-a-crypto-meta')
+        self.assertIn('Error decrypting header '
+                      'X-Object-Sysmeta-Crypto-Sysmeta-Test-Digest',
+                      '\n'.join(
+                          self.decrypter.logger.get_lines_for_level('error')))
+        self.assertIn(b'Error decrypting header', resp.body)
+
+    def test_GET_sensitive_sysmeta_missing_common_crypto_meta(self):
+        env = {'REQUEST_METHOD': 'GET',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        req = Request.blank('/v1/a/c/o', environ=env)
+        body = b'FAKE APP'
+        hdrs = self._make_response_headers(
+            len(body), md5hex(body), fetch_crypto_keys(), b'not used')
+        hdrs.pop('x-object-sysmeta-crypto-meta')
+        encrypted_name = 'x-object-sysmeta-crypto-sysmeta-test-digest'
+        encrypted_value = hdrs.pop(encrypted_name)
+        hdrs['x-object-sysmeta-crypto-sysmeta-empty'] = ''
+        hdrs[encrypted_name] = encrypted_value
+        self.app.register('GET', '/v1/a/c/o', HTTPOk, body=body,
+                          headers=hdrs)
+        resp = req.get_response(self.decrypter)
+        self.assertEqual('500 Internal Error', resp.status)
+        self.assertIn(b'Error decrypting object', resp.body)
+        self.assertIn(
+            'Invalid or missing X-Object-Sysmeta-Crypto-Meta',
+            '\n'.join(self.decrypter.logger.get_lines_for_level('error')))
+
+    def test_GET_sensitive_sysmeta_invalid_common_crypto_meta(self):
+        env = {'REQUEST_METHOD': 'GET',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        req = Request.blank('/v1/a/c/o', environ=env)
+        body = b'FAKE APP'
+        hdrs = self._make_response_headers(
+            len(body), md5hex(body), fetch_crypto_keys(), b'not used')
+        hdrs['x-object-sysmeta-crypto-meta'] = get_crypto_meta_header(
+            {'key_id': None})
+        self.app.register('GET', '/v1/a/c/o', HTTPOk, body=body,
+                          headers=hdrs)
+        resp = req.get_response(self.decrypter)
+        self.assertEqual('500 Internal Error', resp.status)
+        self.assertIn(b'Error decrypting object', resp.body)
+        self.assertIn(
+            'Invalid or missing X-Object-Sysmeta-Crypto-Meta',
+            '\n'.join(self.decrypter.logger.get_lines_for_level('error')))
+
+    def test_GET_sensitive_sysmeta_invalid_header_name(self):
+        for invalid_name in ('x-object-sysmeta-crypto-sysmeta-',
+                             'x-object-sysmeta-crypto-sysmeta-crypto-test'):
+            with self.subTest(name=invalid_name):
+                env = {'REQUEST_METHOD': 'GET',
+                       CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+                req = Request.blank('/v1/a/c/o', environ=env)
+                body = b'FAKE APP'
+                hdrs = self._make_response_headers(
+                    len(body), md5hex(body), fetch_crypto_keys(),
+                    b'not used')
+                hdrs[invalid_name] = hdrs.pop(
+                    'x-object-sysmeta-crypto-sysmeta-test-digest')
+                self.app.register('GET', '/v1/a/c/o', HTTPOk, body=body,
+                                  headers=hdrs)
+                resp = req.get_response(self.decrypter)
+                self.assertEqual('500 Internal Error', resp.status)
+                self.assertIn(b'Error decrypting header', resp.body)
+
+    def test_GET_sensitive_sysmeta_unknown_secret_id(self):
+        # the root secret that encrypted the sensitive sysmeta is no longer
+        # configured, so the key id in x-object-sysmeta-crypto-meta is unknown
+        env = {'REQUEST_METHOD': 'GET',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        req = Request.blank('/v1/a/c/o', environ=env)
+        object_key = fetch_crypto_keys(key_id={'secret_id': 'myid'})['object']
+        hdrs = HeaderKeyDict({
+            'content-type': 'text/plain',
+            'content-length': '0',
+            'etag': MD5_OF_EMPTY_STRING,
+            'x-object-sysmeta-crypto-sysmeta-test-digest':
+                encrypt_and_append_meta(
+                    'ziJc4A==',
+                    object_key,
+                    {'iv': FAKE_IV,
+                     'cipher': Crypto.cipher}),
+            'x-object-sysmeta-crypto-meta':
+                get_crypto_meta_header({'key_id': {'secret_id': 'unknown'},
+                                        'cipher': Crypto.cipher}),
+        })
+        self.app.register('GET', '/v1/a/c/o', HTTPOk, body=b'', headers=hdrs)
+        resp = req.get_response(self.decrypter)
+        self.assertEqual('500 Internal Error', resp.status)
+        self.assertIn('Error decrypting object: unknown',
+                      '\n'.join(
+                          self.decrypter.logger.get_lines_for_level('error')))
+        self.assertIn(b'Error decrypting object', resp.body)
 
     def test_GET_override_etag_bad_iv(self):
         bad_crypto_meta = fake_get_crypto_meta()
@@ -1017,7 +1227,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
             'Test', self.decrypter.logger.get_lines_for_level('error')[0])
 
     def test_GET_decryption_override(self):
-        # This covers the case of an old un-encrypted object
+        # Override returns raw crypto sysmeta.
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys,
                'swift.crypto.override': True}
@@ -1027,7 +1237,13 @@ class TestDecrypterObjectRequests(unittest.TestCase):
                 'content-type': 'text/plain',
                 'content-length': len(body),
                 'x-object-meta-test': 'do not encrypt me',
-                'x-object-sysmeta-test': 'do not encrypt me'}
+                'x-object-sysmeta-test': 'do not encrypt me',
+                'x-object-sysmeta-example-sensitive-field': 'ordinary',
+                'x-object-sysmeta-crypto-sysmeta-extension-secret':
+                    'ciphertext',
+                'x-object-sysmeta-crypto-meta':
+                    get_crypto_meta_header({'key_id': None,
+                                            'cipher': Crypto.cipher})}
         self.app.register('GET', '/v1/a/c/o', HTTPOk, body=body, headers=hdrs)
         resp = req.get_response(self.decrypter)
         self.assertEqual(body, resp.body)
@@ -1038,6 +1254,34 @@ class TestDecrypterObjectRequests(unittest.TestCase):
                          resp.headers['x-object-meta-test'])
         self.assertEqual('do not encrypt me',
                          resp.headers['x-object-sysmeta-test'])
+        # An ordinary name that contains "sensitive" has no special handling.
+        self.assertEqual(
+            'ordinary',
+            resp.headers['x-object-sysmeta-example-sensitive-field'])
+        self.assertEqual(
+            'ciphertext',
+            resp.headers[
+                'x-object-sysmeta-crypto-sysmeta-extension-secret'])
+
+    def test_GET_decryption_override_sysmeta_without_crypto_meta(self):
+        # Override does not need x-object-sysmeta-crypto-meta.
+        env = {'REQUEST_METHOD': 'GET',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys,
+               'swift.crypto.override': True}
+        req = Request.blank('/v1/a/c/o', environ=env)
+        body = b'FAKE APP'
+        hdrs = {'Etag': md5hex(body),
+                'content-type': 'text/plain',
+                'content-length': len(body),
+                'x-object-sysmeta-crypto-sysmeta-test-digest': 'ciphertext'}
+        self.app.register('GET', '/v1/a/c/o', HTTPOk, body=body, headers=hdrs)
+        resp = req.get_response(self.decrypter)
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(body, resp.body)
+        self.assertEqual(
+            'ciphertext',
+            resp.headers['x-object-sysmeta-crypto-sysmeta-test-digest'])
+        self.assertFalse(self.decrypter.logger.get_lines_for_level('error'))
 
 
 class TestDecrypterContainerRequests(unittest.TestCase):

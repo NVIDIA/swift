@@ -16,6 +16,7 @@
 # Used by get_swift_info and register_swift_info to store information about
 # the swift cluster.
 from copy import deepcopy
+import re
 
 _swift_info = {}
 _swift_admin_info = {}
@@ -88,6 +89,52 @@ def register_swift_info(name='swift', admin=False, **kwargs):
 
 _sensitive_headers = set()
 _sensitive_params = set()
+
+_sensitive_sysmeta_names = set()
+_object_sysmeta_prefix = 'x-object-sysmeta-'
+_crypto_sysmeta_prefix = _object_sysmeta_prefix + 'crypto-'
+_header_name_re = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
+
+
+def _normalize_sensitive_sysmeta(name):
+    if not isinstance(name, str):
+        raise TypeError
+    name.encode('ascii')
+    if not _header_name_re.match(name):
+        raise ValueError('Invalid header name: %r' % name)
+    # In request headers, swob changes '_' to '-'. The encrypter then cannot
+    # find the name, and the object server stores the value in clear text.
+    if '_' in name:
+        raise ValueError('Cannot use "_" in a sensitive sysmeta name: %r' %
+                         name)
+    name = name.lower()
+    if (not name.startswith(_object_sysmeta_prefix) or
+            name == _object_sysmeta_prefix):
+        raise ValueError('Not an object sysmeta header: %r' % name)
+    if name.startswith(_crypto_sysmeta_prefix):
+        raise ValueError('Crypto sysmeta cannot be declared sensitive: %r' %
+                         name)
+    return name
+
+
+def register_sensitive_sysmeta(name):
+    """
+    Register an object sysmeta name whose non-empty values need encryption.
+    Names are case-insensitive, fully qualified HTTP header names.
+    Registrations are additive and idempotent.
+
+    :param name: (str) a valid HTTP header name in the 'x-object-sysmeta-'
+        namespace.
+    :raises ValueError: if the name is not a valid HTTP header name starting
+        with the prefix 'x-object-sysmeta-', has '_', or is crypto sysmeta.
+    :raises TypeError: if the name is not a ``str``.
+    """
+    _sensitive_sysmeta_names.add(_normalize_sensitive_sysmeta(name))
+
+
+def is_sensitive_sysmeta(header):
+    """Return True when an object sysmeta header is registered sensitive."""
+    return header.lower() in _sensitive_sysmeta_names
 
 
 def get_sensitive_headers():
