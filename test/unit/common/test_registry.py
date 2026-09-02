@@ -226,6 +226,10 @@ class TestSensitiveRegistry(unittest.TestCase):
         patcher = mock.patch.object(registry, '_sensitive_params', set())
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(
+            registry, '_sensitive_sysmeta_names', set())
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_register_sensitive_header(self):
         self.assertFalse(registry._sensitive_headers)
@@ -294,3 +298,71 @@ class TestSensitiveRegistry(unittest.TestCase):
                          {'Param1', 'param'})
         self.assertEqual(registry.get_sensitive_params(),
                          registry._sensitive_params)
+
+    def test_register_sensitive_sysmeta(self):
+        self.assertFalse(registry.is_sensitive_sysmeta(
+            'x-object-sysmeta-example-secret'))
+        registry.register_sensitive_sysmeta('x-object-sysmeta-example-secret')
+        self.assertEqual({'x-object-sysmeta-example-secret'},
+                         registry._sensitive_sysmeta_names)
+        self.assertTrue(registry.is_sensitive_sysmeta(
+            'x-object-sysmeta-example-secret'))
+        self.assertFalse(registry.is_sensitive_sysmeta(
+            'x-object-sysmeta-example-secret-other'))
+
+    def test_register_sensitive_sysmeta_case_insensitive(self):
+        self.assertFalse(registry.is_sensitive_sysmeta(
+            'X-Object-Sysmeta-Example-Secret'))
+        registry.register_sensitive_sysmeta('X-Object-Sysmeta-Example-Secret')
+        self.assertEqual({'x-object-sysmeta-example-secret'},
+                         registry._sensitive_sysmeta_names)
+        self.assertTrue(registry.is_sensitive_sysmeta(
+            'X-Object-Sysmeta-Example-Secret'))
+        self.assertTrue(registry.is_sensitive_sysmeta(
+            'x-object-sysmeta-example-secret'))
+
+        registry.register_sensitive_sysmeta('x-object-sysmeta-example-secret')
+        self.assertEqual({'x-object-sysmeta-example-secret'},
+                         registry._sensitive_sysmeta_names)
+        self.assertTrue(registry.is_sensitive_sysmeta(
+            'X-Object-Sysmeta-Example-Secret'))
+
+    def test_register_sensitive_sysmeta_is_additive(self):
+        registry.register_sensitive_sysmeta(
+            'x-object-sysmeta-example-secret-one')
+        registry.register_sensitive_sysmeta(
+            'x-object-sysmeta-example-secret-two')
+        self.assertTrue(registry.is_sensitive_sysmeta(
+            'x-object-sysmeta-example-secret-one'))
+        self.assertTrue(registry.is_sensitive_sysmeta(
+            'x-object-sysmeta-example-secret-two'))
+
+    def test_register_sensitive_sysmeta_rejects_invalid_values(self):
+        invalid_names = (
+            '', 'x-object-sysmeta-', 'x-object-meta-example-secret',
+            'x-object-sysmeta-example secret',
+            'x-object-sysmeta-example:secret',
+            'x-object-sysmeta-example-secret\n',
+            'x-object-sysmeta-crypto-etag',
+            'x-object-sysmeta-crypto-sysmeta-example-secret',
+            'x-object-sysmeta-\N{SNOWMAN}')
+        for name in invalid_names:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    registry.register_sensitive_sysmeta(name)
+
+        for name in (None, 1, [], {}, (), True, object()):
+            with self.subTest(name=name):
+                with self.assertRaises(TypeError):
+                    registry.register_sensitive_sysmeta(name)
+
+        self.assertFalse(registry._sensitive_sysmeta_names)
+
+    def test_register_sensitive_sysmeta_rejects_underscore(self):
+        with self.assertRaises(ValueError) as cm:
+            registry.register_sensitive_sysmeta(
+                'X-Object-Sysmeta-Example_Secret')
+        self.assertEqual(
+            'Cannot use "_" in a sensitive sysmeta name: '
+            "'X-Object-Sysmeta-Example_Secret'", str(cm.exception))
+        self.assertFalse(registry._sensitive_sysmeta_names)
