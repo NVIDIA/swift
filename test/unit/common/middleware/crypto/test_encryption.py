@@ -18,8 +18,9 @@ import hmac
 import json
 import unittest
 import uuid
+from unittest import mock
 
-from swift.common import storage_policy, constraints
+from swift.common import storage_policy, constraints, registry
 from swift.common.middleware import copy
 from swift.common.middleware import crypto
 from swift.common.middleware.crypto import keymaster
@@ -27,6 +28,7 @@ from swift.common.middleware.crypto.crypto_utils import (
     load_crypto_meta, Crypto)
 from swift.common.ring import Ring
 from swift.common.swob import Request, str_to_wsgi
+from swift.common.utils import MD5_OF_EMPTY_STRING
 from swift.obj import diskfile
 
 from test.debug_logger import debug_logger
@@ -34,6 +36,10 @@ from test.unit import skip_if_no_xattrs
 from test.unit.common.middleware.crypto.crypto_helpers import (
     md5hex, encrypt, TEST_KEYMASTER_CONF)
 from test.unit.helpers import setup_servers, teardown_servers
+
+SENSITIVE_HEADER = 'X-Object-Sysmeta-Test-Digest'
+ENC_SENSITIVE_HEADER = 'X-Object-Sysmeta-Crypto-Sysmeta-Test-Digest'
+SENSITIVE_VALUE = 'ziJc4A=='
 
 
 class TestCryptoPipelineChanges(unittest.TestCase):
@@ -56,6 +62,10 @@ class TestCryptoPipelineChanges(unittest.TestCase):
 
     def setUp(self):
         skip_if_no_xattrs()
+        patcher = mock.patch.object(
+            registry, '_sensitive_sysmeta_names', set())
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.plaintext = b'unencrypted body content'
         self.plaintext_etag = md5hex(self.plaintext)
         self._setup_crypto_app()
@@ -66,6 +76,7 @@ class TestCryptoPipelineChanges(unittest.TestCase):
         # via the crypto middleware. Make a fresh instance for each test to
         # avoid any state coupling.
         conf = {'disable_encryption': disable_encryption}
+        registry.register_sensitive_sysmeta(SENSITIVE_HEADER)
         self.encryption = crypto.filter_factory(conf)(self.proxy_app)
         self.encryption.logger = self.proxy_app.logger
         km_conf = dict(TEST_KEYMASTER_CONF)
@@ -95,10 +106,11 @@ class TestCryptoPipelineChanges(unittest.TestCase):
         resp = req.get_response(app)
         self.assertEqual(policy_name, resp.headers['X-Storage-Policy'])
 
-    def _put_object(self, app, body):
+    def _put_object(self, app, body, headers=None):
         req = Request.blank(
             str_to_wsgi(self.object_path), method='PUT', body=body,
-            headers={'Content-Type': 'application/test'})
+            headers=dict(headers or {}, **{
+                'Content-Type': 'application/test'}))
         resp = req.get_response(app)
         self.assertEqual('201 Created', resp.status)
         self.assertEqual(self.plaintext_etag, resp.headers['Etag'])
@@ -268,6 +280,24 @@ class TestCryptoPipelineChanges(unittest.TestCase):
         self._check_match_requests('GET', self.crypto_app)
         self._check_match_requests('HEAD', self.crypto_app)
         self._check_listing(self.crypto_app)
+
+    def test_write_with_crypto_read_with_crypto_empty_body(self):
+        # verify that user metadata and sensitive sysmeta headers are encrypted
+        # and decrypted even when there is no body
+        self._create_container(self.proxy_app, policy_name='one')
+        self.plaintext_etag = MD5_OF_EMPTY_STRING
+        self._put_object(self.crypto_app, b'',
+                         headers={'x-object-meta-foo': 'bar',
+                                  SENSITIVE_HEADER: SENSITIVE_VALUE})
+
+        object_path = str_to_wsgi(self.object_path)
+        req = Request.blank(object_path, method='GET')
+        resp = req.get_response(self.crypto_app)
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(b'', resp.body)
+        self.assertEqual(MD5_OF_EMPTY_STRING, resp.headers['Etag'])
+        self.assertEqual('bar', resp.headers.get('x-object-meta-foo'))
+        self.assertEqual(SENSITIVE_VALUE, resp.headers.get(SENSITIVE_HEADER))
 
     def test_write_with_crypto_read_with_crypto_different_root_secrets(self):
         root_secret = self.crypto_app.root_secret
@@ -554,6 +584,50 @@ class TestCryptoPipelineChanges(unittest.TestCase):
         self._check_match_requests(
             'HEAD', copy_crypto_app, object_path=dest_obj_path)
 
+    def test_copy_sensitive_sysmeta_encrypted_to_encrypted(self):
+        # a copied value is encrypted again with the destination key
+        checksum_value = 'ziJc4A=='
+        self._create_container(self.proxy_app, policy_name='one')
+
+        def callback(footers):
+            footers[SENSITIVE_HEADER] = checksum_value
+
+        req = Request.blank(
+            self.object_path, method='PUT', body=self.plaintext)
+        req.environ['swift.callback.update_footers'] = callback
+        resp = req.get_response(self.crypto_app)
+        self.assertEqual('201 Created', resp.status)
+
+        copy_crypto_app = copy.ServerSideCopyMiddleware(self.crypto_app, {})
+        dest_container = uuid.uuid4().hex
+        dest_container_path = 'http://localhost:8080/v1/a/' + dest_container
+        self._create_container(copy_crypto_app, policy_name='one',
+                               container_path=dest_container_path)
+        dest_obj_path = dest_container_path + '/o'
+        self._copy_object(copy_crypto_app, '/%s/%s' % (dest_container, 'o'))
+
+        # bypass crypto: the destination holds ciphertext, not plaintext
+        req = Request.blank(dest_obj_path, method='GET')
+        encrypted_resp = req.get_response(self.proxy_app)
+        self.assertEqual('200 OK', encrypted_resp.status)
+        self.assertNotIn(SENSITIVE_HEADER, encrypted_resp.headers)
+        enc_checksum, _junk, checksum_meta = encrypted_resp.headers[
+            ENC_SENSITIVE_HEADER].partition('; swift_meta=')
+        dest_key = self.km.create_key('/a/%s/o' % dest_container)
+        exp_enc_checksum = base64.b64encode(encrypt(
+            checksum_value.encode('ascii'), dest_key,
+            load_crypto_meta(checksum_meta)['iv'])).decode('ascii')
+        self.assertEqual(exp_enc_checksum, enc_checksum)
+
+        # through crypto, the plaintext value is returned
+        req = Request.blank(dest_obj_path, method='GET')
+        resp = req.get_response(copy_crypto_app)
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(self.plaintext, resp.body)
+        self.assertEqual(
+            checksum_value,
+            resp.headers[SENSITIVE_HEADER])
+
     def test_copy_encrypted_to_encrypted(self):
         self._test_copy_encrypted_to_encrypted('ec', 'ec')
         self._test_copy_encrypted_to_encrypted('one', 'ec')
@@ -563,7 +637,8 @@ class TestCryptoPipelineChanges(unittest.TestCase):
     def _test_copy_encrypted_to_unencrypted(
             self, src_policy_name, dest_policy_name):
         self._create_container(self.proxy_app, policy_name=src_policy_name)
-        self._put_object(self.crypto_app, self.plaintext)
+        self._put_object(self.crypto_app, self.plaintext,
+                         headers={SENSITIVE_HEADER: SENSITIVE_VALUE})
         self._post_object(self.crypto_app)
 
         # make a pipeline with encryption disabled, use it to copy object
@@ -587,6 +662,12 @@ class TestCryptoPipelineChanges(unittest.TestCase):
         self._check_match_requests(
             'HEAD', self.proxy_app, object_path=dest_obj_path)
 
+        # the destination has no encrypter, so the value is in the clear
+        req = Request.blank(dest_obj_path, method='GET')
+        resp = req.get_response(self.proxy_app)
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(SENSITIVE_VALUE, resp.headers[SENSITIVE_HEADER])
+
     def test_copy_encrypted_to_unencrypted(self):
         self._test_copy_encrypted_to_unencrypted('ec', 'ec')
         self._test_copy_encrypted_to_unencrypted('one', 'ec')
@@ -596,7 +677,8 @@ class TestCryptoPipelineChanges(unittest.TestCase):
     def _test_copy_unencrypted_to_encrypted(
             self, src_policy_name, dest_policy_name):
         self._create_container(self.proxy_app, policy_name=src_policy_name)
-        self._put_object(self.proxy_app, self.plaintext)
+        self._put_object(self.proxy_app, self.plaintext,
+                         headers={SENSITIVE_HEADER: SENSITIVE_VALUE})
         self._post_object(self.proxy_app)
 
         copy_crypto_app = copy.ServerSideCopyMiddleware(self.crypto_app, {})
@@ -616,6 +698,17 @@ class TestCryptoPipelineChanges(unittest.TestCase):
             'GET', copy_crypto_app, object_path=dest_obj_path)
         self._check_match_requests(
             'HEAD', copy_crypto_app, object_path=dest_obj_path)
+
+        # a value that the source held in the clear is encrypted here
+        req = Request.blank(dest_obj_path, method='GET')
+        resp = req.get_response(self.proxy_app)
+        self.assertEqual('200 OK', resp.status)
+        self.assertNotIn(SENSITIVE_HEADER, resp.headers)
+        self.assertIn(ENC_SENSITIVE_HEADER, resp.headers)
+        req = Request.blank(dest_obj_path, method='GET')
+        resp = req.get_response(copy_crypto_app)
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(SENSITIVE_VALUE, resp.headers[SENSITIVE_HEADER])
 
     def test_copy_unencrypted_to_encrypted(self):
         self._test_copy_unencrypted_to_encrypted('ec', 'ec')

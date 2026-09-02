@@ -18,9 +18,12 @@ import hmac
 from contextlib import contextmanager
 
 from swift.common.constraints import check_metadata
+from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_success
 from swift.common.middleware.crypto.crypto_utils import CryptoWSGIContext, \
-    dump_crypto_meta, append_crypto_meta, Crypto
+    dump_crypto_meta, append_crypto_meta, Crypto, \
+    ENCRYPTED_SENSITIVE_SYSMETA_PREFIX, OBJECT_SYSMETA_PREFIX
+from swift.common.registry import is_sensitive_sysmeta
 from swift.common.request_helpers import get_object_transient_sysmeta, \
     strip_user_meta_prefix, is_user_meta, update_etag_is_at_header, \
     get_container_update_override_key
@@ -94,15 +97,50 @@ class EncInputWrapper(InputProxy):
             self.plaintext_md5 = md5(usedforsecurity=False)
             self.ciphertext_md5 = md5(usedforsecurity=False)
 
+    def filter_sensitive_sysmeta(self, headers):
+        sensitive_sysmeta = HeaderKeyDict()
+        for name in list(headers):
+            if is_sensitive_sysmeta(name):
+                sensitive_sysmeta[name] = headers.pop(name)
+        return sensitive_sysmeta
+
+    def encrypt_sensitive_sysmeta(self, sensitive_sysmeta):
+        # Encrypt even when there is no body: unlike the Etag, a
+        # sensitive value can be secret when the body is empty. Include the
+        # key_id in x-object-sysmeta-crypto-meta, because it is not
+        # persisted with body_crypto_meta when there is no body.
+        crypto_sysmeta = {}
+        crypto_meta = None
+        for name, val in sensitive_sysmeta.items():
+            if not val:
+                crypto_sysmeta[name] = val
+                continue
+            new_name = ENCRYPTED_SENSITIVE_SYSMETA_PREFIX + \
+                name[len(OBJECT_SYSMETA_PREFIX):]
+            enc_val, crypto_meta = encrypt_header_val(
+                self.crypto, val, self.keys['object'])
+            crypto_sysmeta[new_name] = append_crypto_meta(
+                enc_val, crypto_meta)
+        if crypto_meta:
+            meta = dump_crypto_meta({'cipher': crypto_meta['cipher'],
+                                     'key_id': self.keys['id']})
+            crypto_sysmeta['x-object-sysmeta-crypto-meta'] = meta
+        return crypto_sysmeta
+
     def install_footers_callback(self, req):
-        # the proxy controller will call back for footer metadata after
-        # body has been sent
+        # Gather the state that is needed to construct the footer metadata,
+        # and install a callback that the proxy controller will call for
+        # footer metadata after the body has been sent.
         inner_callback = req.environ.get('swift.callback.update_footers')
         # remove any Etag from headers, it won't be valid for ciphertext and
         # we'll send the ciphertext Etag later in footer metadata
         client_etag = req.headers.pop('etag', None)
         override_header = get_container_update_override_key('etag')
         container_listing_etag_header = req.headers.get(override_header)
+        # Remove sensitive sysmeta from headers, for example when object
+        # versioning archives an object with an internal PUT. The footers
+        # callback puts it back.
+        sensitive_sysmeta = self.filter_sensitive_sysmeta(req.headers)
 
         def footers_callback(footers):
             if inner_callback:
@@ -110,6 +148,10 @@ class EncInputWrapper(InputProxy):
                 # registered before this one. It may override any footers that
                 # were set.
                 inner_callback(footers)
+
+            # a value in the footers replaces a value in the headers
+            sensitive_sysmeta.update(self.filter_sensitive_sysmeta(footers))
+            footers.update(self.encrypt_sensitive_sysmeta(sensitive_sysmeta))
 
             plaintext_etag = None
             if self.body_crypto_ctxt:
@@ -226,9 +268,7 @@ class EncrypterObjContext(CryptoWSGIContext):
             req.headers.pop(name)
         # store a single copy of the crypto meta items that are common to all
         # encrypted user metadata independently of any such meta that is stored
-        # with the object body because it might change on a POST. This is done
-        # for future-proofing - the meta stored here is not currently used
-        # during decryption.
+        # with the object body because it might change on a POST.
         if crypto_meta:
             meta = dump_crypto_meta({'cipher': crypto_meta['cipher'],
                                      'key_id': keys['id']})

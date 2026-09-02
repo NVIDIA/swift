@@ -381,3 +381,77 @@ so that middlewares can avoid potential conflict with user metadata keys.
 Transient-sysmeta deliberately uses a different header prefix to system
 metadata to emphasize the fact that the data is only persisted until a
 subsequent POST.
+
+.. _sensitive_sysmeta:
+
+************************
+Object Sensitive Sysmeta
+************************
+
+Middleware must declare sensitive object system metadata in the sensitive
+sysmeta registry. The plaintext header uses the original object sysmeta name.
+An example is ``X-Object-Sysmeta-Example-Secret: <value>``.
+
+Like any object sysmeta (see :ref:`sysmeta`), sensitive sysmeta can only be set
+with a PUT request. Middleware sets the header in the request headers, or in
+the footers of the PUT.
+
+Use :func:`.register_sensitive_sysmeta` in ``swift.common.registry`` to
+register exact names::
+
+  register_sensitive_sysmeta('x-object-sysmeta-example-secret')
+
+Register only metadata that downstream components can store and return without
+interpreting its original name or value. Do not register fields that proxy
+controllers, object servers, or backend daemons must interpret before
+decryption. Registration does not verify this requirement. The middleware
+author must check all consumers.
+
+Middleware must register its exact names before it writes a sensitive value.
+It should register them in its filter factory. It must register them also
+when the operator disables the feature of the middleware.
+
+Each process has its own registry, and only the encrypter uses it. The
+decrypter restores each encrypted value, also in a process that did not
+register the name. If such a process copies the object, its encrypter stores
+the copied value in clear text. Load the registering middleware in every
+proxy pipeline that can copy such objects.
+
+If the pipeline contains enabled encryption middleware, the encrypter encrypts
+each registered non-empty value with the object key. It replaces only the fixed
+object sysmeta prefix and stores the value as::
+
+  X-Object-Sysmeta-Crypto-Sysmeta-Example-Secret: <encrypted value>
+
+The suffix after ``Crypto-Sysmeta-`` is the suffix from the original object
+sysmeta name. Each value has its own crypto metadata.
+``X-Object-Sysmeta-Crypto-Meta`` stores the cipher and key ID for all such
+fields. This also protects a non-empty value on a zero-byte object. An empty
+value stays in clear text. The decrypter restores the original object sysmeta
+name. For a non-empty encrypted value, an invalid encrypted sysmeta name, a
+missing companion header, or an unknown key makes the GET or HEAD fail.
+
+The decrypter ignores and removes an encrypted sysmeta header with an empty
+value. That header alone does not need a companion crypto metadata header.
+
+Sensitivity controls encryption. It does not control whether metadata is valid
+after COPY. Middleware that must remove or change its metadata during COPY must
+install a copy-source hook. Generic COPY otherwise preserves the field.
+``swift.crypto.override`` bypasses normal decryption and purge behavior, so it
+returns encrypted sysmeta without a change. ``disable_encryption = true`` stops
+new encryption but keeps decryption enabled. See
+:doc:`overview_encryption`.
+
+Upgrading to use sensitive sysmeta
+----------------------------------
+
+An old proxy removes an unknown ``X-Object-Sysmeta-Crypto-*`` field from GET
+and HEAD responses. Middleware must accept that a sensitive field can be absent
+during an upgrade. :doc:`overview_encryption` describes the upgrade steps for
+operators.
+
+.. note::
+
+    Swift does not register a sensitive sysmeta name by default. Middleware
+    that registers a name must check all consumers and test the registered
+    fields with encryption enabled.

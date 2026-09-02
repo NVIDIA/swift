@@ -22,11 +22,18 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import urllib.parse
 
 from swift.common.exceptions import EncryptionException, UnknownSecretIdError
+from swift.common.request_helpers import get_sys_meta_prefix
 from swift.common.swob import HTTPInternalServerError
 from swift.common.utils import get_logger, parse_header
 from swift.common.wsgi import WSGIContext
 
 CRYPTO_KEY_CALLBACK = 'swift.callback.fetch_crypto_keys'
+
+# The encrypter stores an encrypted value under a crypto sysmeta name.
+# It keeps the suffix from the original object sysmeta name.
+OBJECT_SYSMETA_PREFIX = get_sys_meta_prefix('object')
+ENCRYPTED_SENSITIVE_SYSMETA_PREFIX = \
+    OBJECT_SYSMETA_PREFIX + 'crypto-sysmeta-'
 
 
 class Crypto(object):

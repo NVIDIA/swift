@@ -22,6 +22,7 @@ import unittest
 from unittest import mock
 
 import urllib.parse
+from swift.common import registry
 from swift.common.middleware.crypto import encrypter
 from swift.common.middleware.crypto.crypto_utils import (
     CRYPTO_KEY_CALLBACK, Crypto)
@@ -35,11 +36,21 @@ from test.unit.common.middleware.crypto.crypto_helpers import (
     fetch_crypto_keys, md5hex, FAKE_IV, encrypt)
 from test.unit.common.middleware.helpers import FakeSwift, FakeAppThatExcepts
 
+# Register an object sysmeta name for the generic crypto tests.
+SENSITIVE_HEADER = 'X-Object-Sysmeta-Test-Digest'
+ENC_SENSITIVE_HEADER = \
+    'X-Object-Sysmeta-Crypto-Sysmeta-Test-Digest'
+
 
 @mock.patch('swift.common.middleware.crypto.crypto_utils.Crypto.create_iv',
             lambda *args: FAKE_IV)
 class TestEncrypter(unittest.TestCase):
     def setUp(self):
+        patcher = mock.patch.object(
+            registry, '_sensitive_sysmeta_names', set())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        registry.register_sensitive_sysmeta(SENSITIVE_HEADER)
         self.app = FakeSwift()
         self.encrypter = encrypter.Encrypter(self.app, {})
         self.encrypter.logger = debug_logger()
@@ -340,6 +351,151 @@ class TestEncrypter(unittest.TestCase):
         # verify that an override etag value of MD5_OF_EMPTY_STRING will be
         # encrypted when there was a non-zero body length
         self._test_PUT_with_other_footers(MD5_OF_EMPTY_STRING)
+
+    def _test_PUT_with_sensitive_sysmeta(self, in_footers, plaintext=b'FAKE'):
+        # the object key encrypts the value, and the plaintext is not sent
+        checksum_value = 'ziJc4A=='
+        env = {'REQUEST_METHOD': 'PUT',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        hdrs = {'content-type': 'text/plain',
+                'content-length': str(len(plaintext))}
+        if in_footers:
+            env['swift.callback.update_footers'] = lambda footers: \
+                footers.update({SENSITIVE_HEADER: checksum_value})
+        else:
+            hdrs[SENSITIVE_HEADER] = checksum_value
+        req = Request.blank(
+            '/v1/a/c/o', environ=env, body=plaintext, headers=hdrs)
+        self.app.register('PUT', '/v1/a/c/o', HTTPCreated, {})
+        resp = req.get_response(self.encrypter)
+        self.assertEqual('201 Created', resp.status)
+
+        call = self.app.call_list[0]
+        self.assertNotIn(SENSITIVE_HEADER, call.headers)
+        self.assertNotIn(SENSITIVE_HEADER, call.footers)
+
+        enc_val, _junk, param = call.footers[
+            ENC_SENSITIVE_HEADER].partition(';')
+        param = param.strip()
+        self.assertTrue(param.startswith('swift_meta='), param)
+        actual_meta = json.loads(
+            urllib.parse.unquote_plus(param[len('swift_meta='):]))
+        self.assertEqual({'cipher': Crypto.cipher,
+                          'iv': base64.b64encode(FAKE_IV).decode('utf8')},
+                         actual_meta)
+        exp_val = encrypt(checksum_value.encode('ascii'),
+                          fetch_crypto_keys()['object'], FAKE_IV)
+        self.assertEqual(exp_val, base64.b64decode(enc_val))
+
+        self.assertIn('x-object-sysmeta-crypto-meta', call.footers)
+        actual_meta = json.loads(urllib.parse.unquote_plus(
+            call.footers['x-object-sysmeta-crypto-meta']))
+        self.assertEqual(
+            {'cipher': Crypto.cipher,
+             'key_id': fetch_crypto_keys()['id']},
+            actual_meta)
+
+    def test_PUT_with_sensitive_sysmeta_in_footers(self):
+        self._test_PUT_with_sensitive_sysmeta(in_footers=True)
+
+    def test_PUT_with_sensitive_sysmeta_in_headers(self):
+        self._test_PUT_with_sensitive_sysmeta(in_footers=False)
+
+    def test_PUT_with_sensitive_sysmeta_in_headers_and_footers(self):
+        # a value in the footers replaces a value in the headers in a
+        # case-insensitive manner
+        plaintext = b'FAKE'
+        env = {'REQUEST_METHOD': 'PUT',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys,
+               'swift.callback.update_footers':
+                   lambda footers: footers.update(
+                       {SENSITIVE_HEADER.lower(): 'from-the-footers'})}
+        req = Request.blank(
+            '/v1/a/c/o', environ=env, body=plaintext,
+            headers={'content-type': 'text/plain',
+                     'content-length': str(len(plaintext)),
+                     SENSITIVE_HEADER.upper(): 'from-the-headers'})
+        self.app.register('PUT', '/v1/a/c/o', HTTPCreated, {})
+        resp = req.get_response(self.encrypter)
+        self.assertEqual('201 Created', resp.status)
+
+        call = self.app.call_list[0]
+        self.assertNotIn(SENSITIVE_HEADER, call.headers)
+        self.assertNotIn(SENSITIVE_HEADER, call.footers)
+        enc_val = call.footers[ENC_SENSITIVE_HEADER].partition(';')[0]
+        exp_val = encrypt(b'from-the-footers',
+                          fetch_crypto_keys()['object'], FAKE_IV)
+        self.assertEqual(exp_val, base64.b64decode(enc_val))
+
+    def _test_PUT_with_empty_sensitive_sysmeta(self, header_value,
+                                               empty_in_footers=False):
+        plaintext = b'FAKE'
+        env = {'REQUEST_METHOD': 'PUT',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        if empty_in_footers:
+            env['swift.callback.update_footers'] = lambda footers: \
+                footers.update({SENSITIVE_HEADER: ''})
+        req = Request.blank(
+            '/v1/a/c/o', environ=env, body=plaintext,
+            headers={'content-type': 'text/plain',
+                     'content-length': str(len(plaintext)),
+                     SENSITIVE_HEADER: header_value})
+        self.app.register('PUT', '/v1/a/c/o', HTTPCreated, {})
+        resp = req.get_response(self.encrypter)
+        self.assertEqual('201 Created', resp.status)
+
+        call = self.app.call_list[0]
+        # nothing is encrypted, so there is no companion crypto meta either
+        self.assertNotIn(ENC_SENSITIVE_HEADER, call.headers)
+        self.assertNotIn(ENC_SENSITIVE_HEADER, call.footers)
+        self.assertNotIn('x-object-sysmeta-crypto-meta', call.footers)
+        self.assertNotIn(SENSITIVE_HEADER, call.headers)
+        self.assertEqual('', call.footers[SENSITIVE_HEADER])
+
+    def test_PUT_with_empty_sensitive_sysmeta(self):
+        # an empty value reveals nothing, so it is stored in the clear
+        self._test_PUT_with_empty_sensitive_sysmeta('')
+
+    def test_PUT_with_sensitive_sysmeta_cleared_in_footers(self):
+        # an empty value in the footers replaces a value in the headers
+        self._test_PUT_with_empty_sensitive_sysmeta(
+            'from-the-headers', empty_in_footers=True)
+
+    def test_PUT_with_sensitive_sysmeta_and_empty_body(self):
+        # unlike the Etag, a sensitive value is encrypted with no body
+        self._test_PUT_with_sensitive_sysmeta(in_footers=False, plaintext=b'')
+        self.app.clear_calls()
+        self._test_PUT_with_sensitive_sysmeta(in_footers=True, plaintext=b'')
+
+    def test_PUT_with_exact_registered_sensitive_sysmeta(self):
+        header = 'X-Object-Sysmeta-Private-Secret'
+        other_header = 'X-Object-Sysmeta-Private-Other'
+        registry.register_sensitive_sysmeta(header)
+        env = {'REQUEST_METHOD': 'PUT',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        req = Request.blank(
+            '/v1/a/c/o', environ=env, body=b'',
+            headers={header: 'secret', other_header: 'ordinary'})
+        self.app.register('PUT', '/v1/a/c/o', HTTPCreated, {})
+        self.assertEqual('201 Created',
+                         req.get_response(self.encrypter).status)
+        call = self.app.call_list[0]
+        self.assertIn(
+            'X-Object-Sysmeta-Crypto-Sysmeta-Private-Secret',
+            call.footers)
+        self.assertEqual('ordinary', call.headers[other_header])
+
+    def test_PUT_with_unregistered_sensitive_token_is_unchanged(self):
+        header = 'X-Object-Sysmeta-Example-Sensitive-Field'
+        env = {'REQUEST_METHOD': 'PUT',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        req = Request.blank(
+            '/v1/a/c/o', environ=env, body=b'', headers={header: 'ordinary'})
+        self.app.register('PUT', '/v1/a/c/o', HTTPCreated, {})
+        self.assertEqual('201 Created',
+                         req.get_response(self.encrypter).status)
+        call = self.app.call_list[0]
+        self.assertEqual('ordinary', call.headers[header])
 
     def _test_PUT_with_etag_override_in_headers(self, override_etag):
         # verify handling of another middleware's
@@ -944,7 +1100,8 @@ class TestEncrypter(unittest.TestCase):
                'swift.callback.update_footers':
                    lambda footers: footers.update(other_footers)}
         hdrs = {'content-type': 'text/plain',
-                'content-length': str(len(body))}
+                'content-length': str(len(body)),
+                SENSITIVE_HEADER: 'not encrypted'}
         req = Request.blank('/v1/a/c/o', environ=env, body=body, headers=hdrs)
         self.app.register('PUT', '/v1/a/c/o', HTTPCreated, {})
         resp = req.get_response(self.encrypter)
@@ -955,6 +1112,7 @@ class TestEncrypter(unittest.TestCase):
         call = self.app.call_list[0]
         for k, v in other_footers.items():
             self.assertEqual(v, call.footers[k])
+        self.assertEqual('not encrypted', call.headers[SENSITIVE_HEADER])
 
         # verify object is NOT encrypted by getting direct from the app
         get_req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'GET'})
