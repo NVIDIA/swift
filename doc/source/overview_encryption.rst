@@ -29,6 +29,8 @@ The following data are encrypted while at rest in Swift:
 * The entity tag (ETag) of objects that have non-zero content
 * All custom user object metadata values i.e. metadata sent using
   X-Object-Meta- prefixed headers with PUT or POST requests
+* Non-empty object system metadata values whose exact header names middleware
+  declares in the sensitive sysmeta registry
 
 Any data or metadata not included in the list above are not encrypted,
 including:
@@ -38,7 +40,7 @@ including:
 * All custom user metadata names
 * Object Content-Type values
 * Object size
-* System metadata
+* System metadata that is not declared in the sensitive sysmeta registry
 
 .. note::
 
@@ -473,6 +475,24 @@ content of those objects will not be encrypted unless they are written again by
 a PUT or COPY request. Any user metadata of those objects will not be encrypted
 unless it is written again by a PUT, POST or COPY request.
 
+Middleware can register object system metadata names as sensitive (see
+:ref:`sensitive_sysmeta`). The encrypter then encrypts the values of these
+names. Before you enable the feature of such a middleware, do these steps:
+
+#. Upgrade all proxy servers to a Swift version that supports sensitive
+   system metadata.
+#. Add the middleware that registers the names to the pipeline of every proxy
+   server that can write or copy such objects. A proxy server without this
+   middleware stores the values in clear text, also when it copies an object
+   that has an encrypted value.
+#. Wait until all proxy server processes of the old version stop.
+#. Enable the feature of the middleware.
+
+If an object contains an encrypted sensitive value, do not downgrade a proxy
+server to a Swift version that does not support sensitive system metadata. An
+old proxy server removes the value from GET and HEAD responses. A COPY through
+an old proxy server does not copy the value.
+
 Disabling Encryption
 --------------------
 
@@ -637,6 +657,27 @@ are transformed to::
 
 The unencrypted custom user metadata headers are removed.
 
+Sensitive object system metadata
+++++++++++++++++++++++++++++++++
+
+The encrypter uses the registry described in :ref:`sensitive_sysmeta` for
+object sysmeta. It encrypts each registered non-empty value with the object
+key. It changes only the fixed object sysmeta prefix. For example::
+
+  X-Object-Sysmeta-Example-Secret: value
+
+is stored as::
+
+  X-Object-Sysmeta-Crypto-Sysmeta-Example-Secret:
+    E(value, object_key, header_iv); swift_meta={"iv": header_iv,
+                                                 "cipher": "AES_CTR_256"}
+
+The shared ``X-Object-Sysmeta-Crypto-Meta`` header stores the cipher and key
+ID. The decrypter uses the stored encrypted sysmeta header, not the registry,
+to restore the original object sysmeta name. The current AES-CTR format gives
+confidentiality. It does not authenticate metadata against modification or
+removal.
+
 Object body
 +++++++++++
 
@@ -743,6 +784,8 @@ discovered then it will:
 #. Decrypt the ``X-Object-Sysmeta-Crypto-Etag`` value
 #. Decrypt the ``X-Object-Sysmeta-Container-Update-Override-Etag`` value
 #. Decrypt metadata header values using the object key
+#. Decrypt sensitive object sysmeta and restore each original object sysmeta
+   name
 #. Decrypt the wrapped body key found in ``X-Object-Sysmeta-Crypto-Body-Meta``
 #. Decrypt the body using the body key
 
