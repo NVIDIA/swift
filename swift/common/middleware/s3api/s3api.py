@@ -508,7 +508,8 @@ class S3ApiMiddleware(object):
         return resp(env, start_response)
 
     def handle_request(self, req):
-        controller = req.controller(self.app, self.conf, self.logger)
+        controller = req.controller(
+            self.app, self.conf, self.logger, statsd=self.statsd)
         req.set_acl_handler(req.controller.acl_handler(req, self.logger))
 
         if hasattr(controller, req.method):

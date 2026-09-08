@@ -1325,19 +1325,57 @@ class UploadController(Controller):
 
         return HTTPNoContent()
 
-    @public
-    @object_operation
-    @check_container_existence
-    def POST(self, req):
-        """
-        Handles Complete Multipart Upload.
-        """
+    def _emit_complete_mpu_metric(self, req, outcome):
+        """Emit the result of a CompleteMultipartUpload request."""
+        if self.statsd is None:
+            return
+
+        base_labels = req.environ.get('swift.base_labels', {})
+        checksum_attrs = self._complete_mpu_checksum_attrs
+        self.statsd.increment('swift_s3_complete_mpu', labels={
+            'outcome': outcome,
+            'account': base_labels.get('account', req.account),
+            'container': base_labels.get('container', req.container_name),
+            'checksum_algorithm': checksum_attrs.algorithm,
+            'checksum_type': checksum_attrs.type,
+        })
+
+    @staticmethod
+    def _complete_mpu_error_outcome(err_resp):
+        """Classify a CompleteMultipartUpload error."""
+        if isinstance(err_resp, BadDigest):
+            return 'bad_digest'
+        if isinstance(err_resp, (EntityTooSmall, InvalidPart,
+                                 InvalidPartOrder, InvalidArgument)):
+            return 'invalid_part'
+        # SLO can use InvalidRequest for a backend failure, e.g. object server
+        # fails the SLO manifest PUT with a 503
+        if (isinstance(err_resp, InvalidRequest) and
+                500 <= err_resp.status_int < 600):
+            return 'backend_error'
+        if isinstance(err_resp, (MalformedXML, InvalidRequest)):
+            return 'invalid_request'
+        if isinstance(err_resp, PreconditionFailed):
+            return 'precondition_failed'
+        if isinstance(err_resp, S3NotImplemented):
+            return 'unsupported'
+        if isinstance(err_resp, NoSuchUpload):
+            return 'no_such_upload'
+        if err_resp.status_int < 500:
+            # Includes XAmzContentSHA256Mismatch, IncompleteBody,
+            # NoSuchBucket, and InvalidChunkSizeError.
+            return 'invalid_request'
+        return 'backend_error'
+
+    def _get_complete_mpu_upload(self, req):
+        """Get and validate the upload for CompleteMultipartUpload."""
         upload_id = get_param(req, 'uploadId')
         # Check for conditional requests before getting upload info so the
         # headers can't bleed into the HEAD
         if req.headers.get('If-None-Match', '*') != '*' or any(
                 h in req.headers for h in (
-                    'If-Match', 'If-Modified-Since', 'If-Unmodified-Since')):
+                    'If-Match', 'If-Modified-Since',
+                    'If-Unmodified-Since')):
             raise S3NotImplemented(
                 'Conditional uploads are not supported.')
 
@@ -1345,23 +1383,33 @@ class UploadController(Controller):
         request_checksum_attrs = MPUChecksumAttrs.from_request(req)
         mpu_checksum_attrs = MPUChecksumAttrs.from_sysmeta(
             resp.sysmeta_headers, is_marker)
+        self._complete_mpu_checksum_attrs = mpu_checksum_attrs
         _validate_mpu_complete_checksum_headers(
             request_checksum_attrs, mpu_checksum_attrs)
 
         marker_delta = (
-            float(Timestamp(resp.sw_headers.get('X-Backend-Timestamp', '0')))
+            float(Timestamp(resp.sw_headers.get(
+                'X-Backend-Timestamp', '0')))
             - float(NormalTimestamp.now()))
         if is_marker and marker_delta >= 0:
-            # Somehow the marker was created in the future w.r.t. this thread's
-            # clock. The manifest PUT may succeed but the subsequent marker
-            # DELETE will fail, so don't attempt either.
+            # Somehow the marker was created in the future w.r.t. this
+            # thread's clock. The manifest PUT may succeed but the subsequent
+            # marker DELETE will fail, so don't attempt either.
             self.logger.error('Unable to Complete Multipart Upload,'
                               ' marker is %0.5fs newer', marker_delta)
             raise ServiceUnavailable(reason='mpu_clock_skew')
 
-        headers = {'Accept': 'application/json',
-                   s3api_sysmeta_header('object', 'upload-id'): upload_id}
-        for key, val in resp.headers.items():
+        return (upload_id, resp, request_checksum_attrs,
+                mpu_checksum_attrs)
+
+    @staticmethod
+    def _make_complete_mpu_headers(upload_id, upload_resp):
+        """Make headers for the SLO manifest PUT."""
+        headers = {
+            'Accept': 'application/json',
+            s3api_sysmeta_header('object', 'upload-id'): upload_id,
+        }
+        for key, val in upload_resp.headers.items():
             _key = key.lower()
             if _key.startswith('x-amz-meta-'):
                 headers['x-object-meta-' + _key[11:]] = val
@@ -1370,22 +1418,25 @@ class UploadController(Controller):
                 headers[key] = val
 
         hct_header = s3api_sysmeta_header('object', 'has-content-type')
-        if resp.s3api_sysmeta_headers.get(hct_header) == 'yes':
-            content_type = resp.s3api_sysmeta_headers.get(
+        if upload_resp.s3api_sysmeta_headers.get(hct_header) == 'yes':
+            content_type = upload_resp.s3api_sysmeta_headers.get(
                 s3api_sysmeta_header('object', 'content-type'))
-        elif hct_header in resp.s3api_sysmeta_headers:
+        elif hct_header in upload_resp.s3api_sysmeta_headers:
             # has-content-type is present but false, so no content type was
             # set on initial upload. In that case, we won't set one on our
             # PUT request. Swift will end up guessing one based on the
             # object name.
             content_type = None
         else:
-            content_type = resp.headers.get('Content-Type')
+            content_type = upload_resp.headers.get('Content-Type')
 
         if content_type:
             headers['Content-Type'] = content_type
+        return headers
 
-        container = req.container_name + MULTIUPLOAD_SUFFIX
+    def _parse_complete_mpu_manifest(
+            self, req, upload_id, container, mpu_checksum_attrs):
+        """Parse and validate a CompleteMultipartUpload manifest."""
         s3_etag_hasher = md5(usedforsecurity=False)
         manifest = []
         req_part_checksums = []
@@ -1393,7 +1444,8 @@ class UploadController(Controller):
         try:
             xml = req.xml(MAX_COMPLETE_UPLOAD_BODY_SIZE)
             if not xml:
-                raise InvalidRequest(msg='You must specify at least one part')
+                raise InvalidRequest(
+                    msg='You must specify at least one part')
             # If an MD5 was provided, we need to verify it.
             if req.check_md5(xml):
                 # We're only interested in the body here, in the
@@ -1429,7 +1481,8 @@ class UploadController(Controller):
                     })
                 manifest.append({
                     'path': '/%s/%s/%s/%d' % (
-                        wsgi_to_str(container), wsgi_to_str(req.object_name),
+                        wsgi_to_str(container),
+                        wsgi_to_str(req.object_name),
                         upload_id, part_number),
                     'etag': etag})
                 s3_etag_hasher.update(binascii.a2b_hex(etag))
@@ -1438,31 +1491,50 @@ class UploadController(Controller):
             raise MalformedXML()
         except ErrorResponse:
             raise
-        except Exception as e:
-            self.logger.error(e)
+        except Exception as err:
+            self.logger.error(err)
             raise
 
         s3_etag = '%s-%d' % (s3_etag_hasher.hexdigest(), len(manifest))
+        return manifest, req_part_checksums, s3_etag
+
+    def _prepare_complete_mpu(self, req):
+        """
+        Prepare a CompleteMultipartUpload response.
+
+        Return the response and completion data. A None manifest identifies a
+        replay, so no completion work is needed.
+        """
+        (upload_id, upload_resp, request_checksum_attrs,
+         mpu_checksum_attrs) = self._get_complete_mpu_upload(req)
+        headers = self._make_complete_mpu_headers(upload_id, upload_resp)
+        container = req.container_name + MULTIUPLOAD_SUFFIX
+        manifest, req_part_checksums, s3_etag = \
+            self._parse_complete_mpu_manifest(
+                req, upload_id, container, mpu_checksum_attrs)
         s3_etag_header = s3api_sysmeta_header('object', 'etag')
-        # This header should only already be present if the upload marker
-        # has been cleaned up and the current target uses the same upload-id
-        already_uploaded_s3_etag = resp.s3api_sysmeta_headers.get(
-            s3_etag_header)
+        # This header should only already be present if the upload marker has
+        # been cleaned up and the current target uses the same upload-id.
+        already_uploaded_s3_etag = (
+            upload_resp.s3api_sysmeta_headers.get(s3_etag_header))
         if already_uploaded_s3_etag == s3_etag:
-            # If the segments to use haven't changed, the work is already done.
-            # S3 omits the checksum elements when replaying a completed upload.
-            return HTTPOk(body=_make_complete_body(req, s3_etag, False),
-                          content_type='application/xml')
+            # If the segments to use have not changed, the work is done.
+            # S3 omits checksum elements when it replays a completed upload.
+            replay_response = HTTPOk(
+                body=_make_complete_body(req, s3_etag, False),
+                content_type='application/xml')
+            return replay_response, None, None, None, None
         elif already_uploaded_s3_etag:
-            # If the header's present but *doesn't* match, upload-id is
-            # no longer valid
+            # If the header is present but does not match, upload-id is no
+            # longer valid.
             raise NoSuchUpload(upload_id=upload_id)
+
         headers[s3_etag_header] = s3_etag
-        # Leave base header value blank; SLO will populate
+        # Leave base header value blank; SLO will populate it.
         headers[get_container_update_override_key('etag')] = \
             serialize_header('', {'s3_etag': s3_etag})
 
-        # Install the SLO manifest hook
+        # Install the SLO manifest hook.
         manifest_hook = _CompleteMultipartUploadSloManifestHook(
             min_segment_size=self.conf.min_segment_size,
             upload_id=upload_id,
@@ -1471,16 +1543,16 @@ class UploadController(Controller):
             req_part_checksums=req_part_checksums)
         req.environ['swift.callback.slo_manifest_hook'] = manifest_hook
 
-        # SLO invokes the manifest hook before issuing the downstream manifest
-        # PUT. By the time the object controller requests footers for that PUT,
-        # the hook has calculated the final checksum metadata.
+        # SLO invokes the manifest hook before it sends the downstream
+        # manifest PUT. The hook calculates the final checksum metadata before
+        # the object controller requests PUT footers.
         if self.conf.allow_store_checksums and \
                 mpu_checksum_attrs.is_checksum_aware:
             original_update_footers = req.environ.get(
                 'swift.callback.update_footers')
 
             def update_footers(footers):
-                """Persist final MPU checksum metadata, when available."""
+                """Persist final MPU checksum metadata."""
                 if original_update_footers:
                     original_update_footers(footers)
                 checksum_value = manifest_hook.final_checksum_value
@@ -1493,6 +1565,14 @@ class UploadController(Controller):
 
         start_time = time.time()
 
+        # An error can change this status before the first heartbeat.
+        resp = HTTPOk()
+        resp.content_type = "application/xml"
+        return resp, manifest, headers, start_time, manifest_hook
+
+    def _complete_mpu_response(
+            self, req, resp, manifest, headers, start_time, manifest_hook):
+        """Complete the manifest PUT and return the S3 response."""
         def response_iter():
             # NB: XML requires that the XML declaration, if present, be at the
             # very start of the document. Clients *will* call us out on not
@@ -1500,8 +1580,9 @@ class UploadController(Controller):
             # Track whether we've sent anything yet so we can yield out that
             # declaration *first*
             yielded_anything = False
-
             try:
+                upload_id = manifest_hook.upload_id
+                mpu_checksum_attrs = manifest_hook.mpu_checksum_attrs
                 try:
                     # TODO: add support for versioning
                     put_resp = req.get_response(
@@ -1533,7 +1614,8 @@ class UploadController(Controller):
                             for seg, err in body['Errors']:
                                 if err == manifest_hook.ERROR_MESSAGE:
                                     raise manifest_hook.error
-                                elif err in ('Etag Mismatch', '404 Not Found'):
+                                elif err in (
+                                        'Etag Mismatch', '404 Not Found'):
                                     raise InvalidPart(upload_id=upload_id)
                             raise InvalidRequest(
                                 status=body['Response Status'],
@@ -1551,6 +1633,7 @@ class UploadController(Controller):
                         raise
 
                 # clean up the multipart-upload record
+                container = req.container_name + MULTIUPLOAD_SUFFIX
                 obj = '%s/%s' % (req.object_name, upload_id)
                 try:
                     req.get_response(self.app, 'DELETE', container, obj)
@@ -1561,15 +1644,26 @@ class UploadController(Controller):
                     # complete), so much the better.
                     pass
 
+                s3_etag = headers[s3api_sysmeta_header('object', 'etag')]
                 checksum_value = (
                     manifest_hook.final_checksum_value
                     if self.conf.allow_store_checksums else None)
-                yield _make_complete_body(
+                complete_body = _make_complete_body(
                     req, s3_etag, yielded_anything,
                     mpu_checksum_attrs.header,
                     checksum_value,
                     mpu_checksum_attrs.type)
+                # A calculated checksum does not mean it was stored.
+                if (not mpu_checksum_attrs.is_checksum_aware or
+                        not self.conf.allow_store_checksums):
+                    outcome = 'completed'
+                elif checksum_value:
+                    outcome = 'persisted'
+                else:
+                    outcome = 'skipped_untrusted_part'
             except ErrorResponse as err_resp:
+                self._emit_complete_mpu_metric(
+                    req, self._complete_mpu_error_outcome(err_resp))
                 if yielded_anything:
                     err_resp.xml_declaration = False
                     yield b'\n'
@@ -1578,9 +1672,42 @@ class UploadController(Controller):
                     resp.status = err_resp.status
                 for chunk in err_resp({}, lambda *a: None):
                     yield chunk
+            except Exception:
+                self._emit_complete_mpu_metric(req, 'backend_error')
+                raise
+            else:
+                self._emit_complete_mpu_metric(req, outcome)
+                yield complete_body
 
-        resp = HTTPOk()  # assume we're good for now... but see above!
+        # reiterate() consumes response_iter() through its first non-empty
+        # chunk. Keep it outside the setup error handler so iterator failures
+        # emit one metric only.
         resp.app_iter = reiterate(response_iter())
-        resp.content_type = "application/xml"
-
         return resp
+
+    @public
+    @object_operation
+    @check_container_existence
+    def POST(self, req):
+        """
+        Handles Complete Multipart Upload.
+        """
+        self._complete_mpu_checksum_attrs = MPUChecksumAttrs()
+        # This handler covers request and response preparation only.
+        try:
+            resp, manifest, headers, start_time, manifest_hook = \
+                self._prepare_complete_mpu(req)
+        except ErrorResponse as err_resp:
+            self._emit_complete_mpu_metric(
+                req, self._complete_mpu_error_outcome(err_resp))
+            raise
+        except Exception:
+            self._emit_complete_mpu_metric(req, 'backend_error')
+            raise
+
+        if manifest is None:  # The upload is already complete.
+            self._emit_complete_mpu_metric(req, 'replayed')
+            return resp
+
+        return self._complete_mpu_response(
+            req, resp, manifest, headers, start_time, manifest_hook)

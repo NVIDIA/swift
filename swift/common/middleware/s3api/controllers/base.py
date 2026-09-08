@@ -87,10 +87,11 @@ class Controller(object):
                 'do not rely on inherited controller metadata' % (
                     cls.__name__, ', '.join(sorted(missing))))
 
-    def __init__(self, app, conf, logger, **kwargs):
+    def __init__(self, app, conf, logger, statsd=None, **kwargs):
         self.app = app
         self.conf = conf
         self.logger = logger
+        self.statsd = statsd
 
 
 class UnsupportedController(Controller):

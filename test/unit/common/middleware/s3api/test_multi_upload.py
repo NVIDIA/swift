@@ -42,6 +42,7 @@ from swift.common.middleware.s3api.controllers.multi_upload import \
     MPUChecksumAttrs, _CompleteMultipartUploadSloManifestHook
 from swift.common.middleware.s3api.utils import S3Timestamp
 from swift.common.middleware.s3api.s3request import MAX_32BIT_INT
+from swift.common.statsd_client import LabelsMap
 from swift.common.storage_policy import StoragePolicy, POLICIES
 from swift.proxy.controllers.base import get_cache_key
 
@@ -296,6 +297,27 @@ class BaseS3ApiMultiUpload(object):
                             swob.HTTPNoContent, {}, None)
         self.swift.register('DELETE', self.segment_bucket + '/object/X/2',
                             swob.HTTPNoContent, {}, None)
+
+    def _assert_complete_mpu_metric(
+            self, outcome, account='AUTH_test', container='bucket',
+            checksum_algorithm=None, checksum_type=None):
+        metric_calls = [
+            call for call in self.statsd.calls['increment']
+            if call[0] == ('swift_s3_complete_mpu',)
+        ]
+        if outcome is None:
+            expected = []
+        else:
+            expected = [(('swift_s3_complete_mpu',), {
+                'labels': {
+                    'outcome': outcome,
+                    'account': account,
+                    'container': container,
+                    'checksum_algorithm': checksum_algorithm,
+                    'checksum_type': checksum_type,
+                },
+            })]
+        self.assertEqual(expected, metric_calls)
 
     def test_bucket_upload_part_missing_key(self):
         req = Request.blank('/bucket?partNumber=1&uploadId=x',
@@ -795,8 +817,10 @@ class BaseS3ApiMultiUpload(object):
                             body=malformed_xml)
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'MalformedXML')
+        self._assert_complete_mpu_metric('invalid_request')
 
-        # without target bucket
+        # The container decorator rejects this request before completion.
+        self.statsd.clear()
         req = Request.blank('/nobucket/object?uploadId=X',
                             environ={'REQUEST_METHOD': 'POST'},
                             headers={'Authorization': 'AWS test:tester:hmac',
@@ -809,6 +833,7 @@ class BaseS3ApiMultiUpload(object):
                                 swob.HTTPNotFound, {}, None)
             status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'NoSuchBucket')
+        self._assert_complete_mpu_metric(None)
 
     def test_object_multipart_upload_abort_error(self):
         req = Request.blank('/bucket/object?uploadId=invalid',
@@ -2442,6 +2467,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self._register_bucket_policy_index_head('bucket+segments',
                                                 segment_bucket_policy_index)
         status, headers, body = self.call_s3api(req)
+        self._assert_complete_mpu_metric('completed')
         elem = fromstring(body, 'CompleteMultipartUploadResult')
         self.assertNotIn('Etag', headers)
         self.assertEqual(elem.find('ETag').text, S3_ETAG)
@@ -2485,6 +2511,36 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
     def test_object_multipart_upload_complete(self):
         self._do_test_object_multipart_upload_complete()
 
+    def test_complete_mpu_metric_base_labels(self):
+        cases = (
+            ({'account': 'AUTH_client'}, 'AUTH_client', 'bucket',
+             XML, '200 OK', 'completed'),
+            ({'container': 'client-bucket'}, 'AUTH_test', 'client-bucket',
+             'malformed_XML', '400 Bad Request', 'invalid_request'),
+            ({'account': None}, None, 'bucket',
+             XML, '200 OK', 'completed'),
+        )
+        for identity, account, container, body, status, outcome in cases:
+            with self.subTest(identity=identity, outcome=outcome):
+                self.statsd.clear()
+                base_labels = LabelsMap(
+                    method='POST', api='S3', resource='object', **identity)
+                original_labels = dict(base_labels)
+                req = Request.blank(
+                    '/bucket/object?uploadId=X', method='POST',
+                    environ={'swift.base_labels': base_labels}, headers={
+                        'Authorization': 'AWS test:tester:hmac',
+                        'Date': self.get_date_header(),
+                    }, body=body)
+
+                actual_status, _headers, _body = self.call_s3api(req)
+
+                self.assertEqual(status, actual_status)
+                self._assert_complete_mpu_metric(
+                    outcome, account=account, container=container)
+                self.assertIs(base_labels, req.environ['swift.base_labels'])
+                self.assertEqual(original_labels, base_labels)
+
     def test_object_multipart_upload_complete_with_if_none_match_star(self):
         self._do_test_object_multipart_upload_complete(
             extra_headers={'If-None-Match': '*'}
@@ -2520,6 +2576,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         elem = fromstring(body, 'Error')
         self.assertEqual(elem.find('Code').text, 'NotImplemented')
         self.assertEqual(status.split()[0], '501')
+        self._assert_complete_mpu_metric('unsupported')
 
         self.assertEqual(self.swift.calls, [
             # Bucket exists
@@ -2530,7 +2587,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
     def test_object_multipart_upload_complete_with_if_match(self):
         self._do_test_object_multipart_upload_complete_501(
-            extra_headers={'If-Match': 'not-the-etag'}
+            extra_headers={'If-Match': 'not-the-etag',
+                           'X-Amz-Checksum-Crc32': 'AAAAAA==',
+                           'X-Amz-Checksum-Type': 'FULL_OBJECT'}
         )
 
     def test_object_multipart_upload_complete_with_if_none_match(self):
@@ -2585,6 +2644,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             with self.subTest(checksum_type=checksum_type,
                               send_final=send_final):
                 self.swift.clear_calls()
+                self.statsd.clear()
                 checksum_func = (make_composite_checksum
                                  if checksum_type == 'COMPOSITE'
                                  else make_full_object_checksum)
@@ -2618,6 +2678,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                     self.app.app = original_app
 
                 self.assertEqual(status, '200 OK')
+                self._assert_complete_mpu_metric(
+                    'persisted', checksum_algorithm='CRC32',
+                    checksum_type=checksum_type)
                 elem = fromstring(body, 'CompleteMultipartUploadResult')
                 self.assertEqual(S3_ETAG, elem.find('ETag').text)
                 self.assertEqual(
@@ -2779,6 +2842,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                 with self.subTest(enabled=enabled,
                                   headers=checksum_headers, xml=request_xml):
                     self.swift.clear_calls()
+                    self.statsd.clear()
                     req = Request.blank(
                         '/bucket/object?uploadId=X', method='POST', headers={
                             'Authorization': 'AWS test:tester:hmac',
@@ -2792,6 +2856,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                         self.app.app = original_app
 
                     self.assertEqual('200 OK', status, body)
+                    self._assert_complete_mpu_metric('completed')
                     elem = fromstring(body, 'CompleteMultipartUploadResult')
                     self.assertEqual(S3_ETAG, elem.find('ETag').text)
                     self.assertIsNone(elem.find('ChecksumCRC32'))
@@ -2853,6 +2918,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                     checksum.crc32(b'wrong part').digest()).decode('ascii')),
                  'InvalidPart')):
             self.swift.clear_calls()
+            self.statsd.clear()
             with self.subTest(headers=checksum_headers, error=error):
                 req = Request.blank(
                     '/bucket/object?uploadId=X', method='POST', headers={
@@ -2866,6 +2932,12 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                 finally:
                     self.app.app = original_app
 
+                self._assert_complete_mpu_metric(
+                    {None: 'completed',
+                     'BadDigest': 'bad_digest',
+                     'InvalidRequest': 'invalid_request',
+                     'InvalidPart': 'invalid_part'}[error],
+                    checksum_algorithm='CRC32', checksum_type=checksum_type)
                 if error:
                     self.assertEqual('400 Bad Request', status)
                     self.assertEqual(error, self._get_error_code(body))
@@ -3006,6 +3078,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
         self.assertEqual('400 Bad Request', status)
         self.assertEqual('EntityTooSmall', self._get_error_code(body))
+        self._assert_complete_mpu_metric('invalid_part')
         self.assertEqual(
             'Your proposed upload is smaller than the minimum allowed '
             'object size.', self._get_error_message(body))
@@ -3245,6 +3318,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             with self.subTest(checksum_type=checksum_type,
                               stored_checksum_headers=stored_checksum_headers):
                 self.swift.clear_calls()
+                self.statsd.clear()
                 part_one_checksum = base64.b64encode(
                     checksum.crc32(b'part one').digest()).decode('ascii')
                 part_two_checksum = base64.b64encode(
@@ -3279,6 +3353,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                     self.app.app = original_app
 
                 self.assertEqual('200 OK', status)
+                self._assert_complete_mpu_metric(
+                    'skipped_untrusted_part', checksum_algorithm='CRC32',
+                    checksum_type=checksum_type)
                 elem = fromstring(body, 'CompleteMultipartUploadResult')
                 self.assertEqual(S3_ETAG, elem.find('ETag').text)
                 self.assertIsNone(elem.find('ChecksumCRC32'))
@@ -3343,6 +3420,10 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertNotEqual(part_one_checksum, bad_part_one_checksum)
         self.assertNotEqual(part_two_checksum, bad_part_two_checksum)
         self.assertEqual('400 Bad Request', status)
+        # The SLO error is known before any heartbeat is emitted.
+        self._assert_complete_mpu_metric(
+            'invalid_part', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         self.assertEqual('InvalidPart', self._get_error_code(body))
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test'),
@@ -3716,6 +3797,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertEqual(
             'Invalid Base64 or multiple checksums present in request',
             self._get_error_message(body))
+        self._assert_complete_mpu_metric(
+            'invalid_part', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         elem = fromstring(body, 'Error')
         self.assertEqual('Checksum', elem.find('./ArgumentName').text)
         self.assertEqual(
@@ -3892,6 +3976,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                                      request_checksum},
                             body=xml)
 
+        self.statsd.clear()
         status, headers, body = self.call_s3api(req)
 
         self.assertEqual(status, '400 Bad Request')
@@ -3899,6 +3984,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertEqual(
             'Value for x-amz-checksum-crc32 header is invalid.',
             self._get_error_message(body))
+        self._assert_complete_mpu_metric(
+            'invalid_request', checksum_algorithm='CRC32',
+            checksum_type=checksum_type)
         # rejected before any part was looked at
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test'),
@@ -4063,6 +4151,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         for checksum_type in ('COMPOSITE', 'FULL_OBJECT'):
             with self.subTest(checksum_type=checksum_type):
                 self.swift.clear_calls()
+                self.statsd.clear()
                 part_one_checksum = base64.b64encode(
                     checksum.crc32(b'part one').digest()).decode('ascii')
                 part_two_checksum = base64.b64encode(
@@ -4090,6 +4179,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
                 self.assertEqual(status, '400 Bad Request')
                 self.assertEqual('InvalidRequest', self._get_error_code(body))
+                self._assert_complete_mpu_metric(
+                    'invalid_request', checksum_algorithm='CRC32',
+                    checksum_type=checksum_type)
                 self.assertEqual(
                     'Checksum Type mismatch occurred, expected checksum Type: '
                     'crc32, actual checksum Type: sha256',
@@ -4235,6 +4327,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
         self.assertEqual(status, '400 Bad Request')
         self.assertEqual('EntityTooSmall', self._get_error_code(body))
+        self._assert_complete_mpu_metric(
+            'invalid_part', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
 
     def test_composite_nonconsecutive_defers_to_bad_digest(self):
         # A final checksum mismatch is a client error and must not be masked
@@ -4263,6 +4358,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
         self.assertEqual(status, '400 Bad Request')
         self.assertEqual('BadDigest', self._get_error_code(body))
+        self._assert_complete_mpu_metric(
+            'bad_digest', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
 
     def test_object_multipart_upload_complete_composite_out_of_order(self):
         part_one_checksum = base64.b64encode(
@@ -4292,6 +4390,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
         self.assertEqual(status, '400 Bad Request')
         self.assertEqual('InvalidPartOrder', self._get_error_code(body))
+        self._assert_complete_mpu_metric(
+            'invalid_part', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test'),
             ('HEAD', '/v1/AUTH_test/bucket'),
@@ -4299,6 +4400,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         ], self.swift.calls)
 
         # Repeating a part number is also an ordering error.
+        self.statsd.clear()
         xml = self._complete_mpu_xml_with_crc32((
             (1, part_one_checksum),
             (2, part_two_checksum),
@@ -4316,6 +4418,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
         self.assertEqual(status, '400 Bad Request')
         self.assertEqual('InvalidPartOrder', self._get_error_code(body))
+        self._assert_complete_mpu_metric(
+            'invalid_part', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test'),
             ('HEAD', '/v1/AUTH_test/bucket'),
@@ -4442,6 +4547,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             self.app.app = original_app
 
         self.assertEqual('200 OK', status)
+        self._assert_complete_mpu_metric(
+            'persisted', checksum_algorithm='CRC32',
+            checksum_type='FULL_OBJECT')
         elem = fromstring(body, 'CompleteMultipartUploadResult')
         self.assertEqual(S3_ETAG, elem.find('ETag').text)
         self.assertEqual(final_checksum, elem.find('ChecksumCRC32').text)
@@ -4775,6 +4883,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
         self.assertEqual('400 Bad Request', status)
         self.assertEqual('EntityTooSmall', self._get_error_code(body))
+        self._assert_complete_mpu_metric(
+            'invalid_part', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test'),
             ('HEAD', '/v1/AUTH_test/bucket'),
@@ -4821,6 +4932,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
         self.assertEqual('400 Bad Request', status)
         self.assertEqual('EntityTooSmall', self._get_error_code(body))
+        self._assert_complete_mpu_metric(
+            'invalid_part', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test'),
             ('HEAD', '/v1/AUTH_test/bucket'),
@@ -4860,6 +4974,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
         self.assertEqual('400 Bad Request', status)
         self.assertEqual('EntityTooSmall', self._get_error_code(body))
+        self._assert_complete_mpu_metric(
+            'invalid_part', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test'),
             ('HEAD', '/v1/AUTH_test/bucket'),
@@ -4904,6 +5021,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
         self.assertEqual('400 Bad Request', status)
         self.assertEqual('EntityTooSmall', self._get_error_code(body))
+        self._assert_complete_mpu_metric(
+            'invalid_part', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test'),
             ('HEAD', '/v1/AUTH_test/bucket'),
@@ -4952,6 +5072,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
         self.assertEqual('400 Bad Request', status)
         self.assertEqual('BadDigest', self._get_error_code(body))
+        self._assert_complete_mpu_metric(
+            'bad_digest', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         self.assertEqual(
             'The crc32 you specified did not match the calculated checksum.',
             self._get_error_message(body))
@@ -5079,7 +5202,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             checksum.crc32(b'part two').digest()).decode('ascii')
         final_checksum = make_composite_checksum(
             checksum.crc32, (b'part one', b'part two'))
-        self._register_checksum_upload_marker()
+        self._register_checksum_upload_marker(checksum_type='composite')
         self._register_part_checksum(1, part_one_checksum)
         self._register_part_checksum(2, part_two_checksum)
         xml = self._complete_mpu_xml_with_crc32((
@@ -5105,6 +5228,15 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertEqual(final_checksum, elem.find('ChecksumCRC32').text)
         self.assertEqual('COMPOSITE', elem.find('ChecksumType').text)
         self.assertEqual([
+            (('swift_s3_complete_mpu',), {
+                'labels': {
+                    'outcome': 'persisted',
+                    'account': 'AUTH_test',
+                    'container': 'bucket',
+                    'checksum_algorithm': 'CRC32',
+                    'checksum_type': 'COMPOSITE',
+                },
+            }),
             (('swift_s3_checksum_algo_request',), {
                 'labels': {
                     'account': 'AUTH_test',
@@ -5158,7 +5290,12 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                                      'Content-MD5': content_md5,
                                      **extra_headers},
                             body=body)
+        self.statsd.clear()
         status, headers, body = self.call_s3api(req)
+        self._assert_complete_mpu_metric(
+            'replayed', checksum_algorithm=(
+                checksum_algorithm_from_header(checksum_header)
+                if checksum_header else None), checksum_type=checksum_type)
         elem = fromstring(body, 'CompleteMultipartUploadResult')
         self.assertNotIn('Etag', headers)
         self.assertEqual(elem.find('ETag').text, S3_ETAG)
@@ -5187,6 +5324,38 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
 
     def test_object_multipart_upload_retry_complete(self):
         self._do_test_object_multipart_upload_retry_complete()
+
+    def test_object_multipart_upload_retry_metric_failure_emits_once(self):
+        self.swift.register(
+            'HEAD', '/v1/AUTH_test/bucket+segments/object/X',
+            swob.HTTPNotFound, {}, None)
+        recent_ts = S3Timestamp.now(delta=-1000000).internal
+        self.swift.register(
+            'HEAD', '/v1/AUTH_test/bucket/object', swob.HTTPOk, {
+                'x-object-sysmeta-s3api-upload-id': 'X',
+                'x-object-sysmeta-s3api-etag': S3_ETAG.strip('"'),
+                'x-timestamp': recent_ts,
+            }, None)
+        req = Request.blank(
+            '/bucket/object?uploadId=X', method='POST', headers={
+                'Authorization': 'AWS test:tester:hmac',
+                'Date': self.get_date_header(),
+            }, body=XML)
+
+        with patch.object(
+                self.statsd, 'increment',
+                side_effect=RuntimeError('statsd unavailable')) as increment:
+            status, headers, body = self.call_s3api(req)
+
+        self.assertEqual('500 Internal Server Error', status)
+        self.assertEqual('InternalError', self._get_error_code(body))
+        increment.assert_called_once_with('swift_s3_complete_mpu', labels={
+            'outcome': 'replayed',
+            'account': 'AUTH_test',
+            'container': 'bucket',
+            'checksum_algorithm': None,
+            'checksum_type': None,
+        })
 
     def test_object_multipart_upload_retry_complete_with_checksum(self):
         # A completed upload ignores well-formed final checksum fields.
@@ -5331,6 +5500,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         elem = fromstring(body, 'Error')
         self.assertEqual(elem.find('Code').text, 'NoSuchUpload')
         self.assertEqual(status.split()[0], '404')
+        self._assert_complete_mpu_metric('no_such_upload')
 
         self.assertEqual(self.swift.calls, [
             # Bucket exists
@@ -5486,6 +5656,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertEqual(self._get_error_message(body),
                          'The Content-MD5 you specified did '
                          'not match what we received.')
+        self._assert_complete_mpu_metric('bad_digest')
 
     def test_object_multipart_upload_invalid_sha256(self):
         bad_sha = hashlib.sha256(
@@ -5507,6 +5678,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertEqual('400 Bad Request', status)
         self.assertEqual(self._get_error_code(body),
                          'XAmzContentSHA256Mismatch')
+        self._assert_complete_mpu_metric('invalid_request')
         self.assertEqual('/v1/AUTH_test/bucket+segments/object/X',
                          req.environ.get('swift.backend_path'))
 
@@ -5578,6 +5750,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertFalse(lines[1].strip())
         fromstring(body, 'Error')
         self.assertEqual('200 OK', status)
+        self._assert_complete_mpu_metric(
+            'invalid_part', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         self.assertEqual('InvalidPart', self._get_error_code(body))
         self.assertEqual([
             ('X', _CompleteMultipartUploadSloManifestHook.ERROR_MESSAGE),
@@ -5637,6 +5812,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertFalse(lines[1].strip())
         fromstring(body, 'Error')
         self.assertEqual('200 OK', status)
+        self._assert_complete_mpu_metric(
+            'bad_digest', checksum_algorithm='CRC32',
+            checksum_type='COMPOSITE')
         self.assertEqual('BadDigest', self._get_error_code(body))
         self.assertEqual(
             'The crc32 you specified did not match the '
@@ -5663,6 +5841,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         for send_final in (True, False):
             with self.subTest(send_final=send_final):
                 self.swift.clear_calls()
+                self.statsd.clear()
                 self._register_checksum_upload_marker()
                 self._register_part_checksum(1, part_one_checksum)
                 self._register_part_checksum(2, part_two_checksum)
@@ -5698,6 +5877,9 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                 self.assertFalse(lines[1].strip())
                 elem = fromstring(body, 'CompleteMultipartUploadResult')
                 self.assertEqual('200 OK', status)
+                self._assert_complete_mpu_metric(
+                    'persisted', checksum_algorithm='CRC32',
+                    checksum_type='COMPOSITE')
                 self.assertEqual([
                     'Location',
                     'Bucket',
@@ -5730,6 +5912,65 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                     'x-object-sysmeta-s3api-checksum-value'])
                 self.assertEqual('COMPOSITE', put_call.footers[
                     'x-object-sysmeta-s3api-checksum-type'])
+
+    @patch('swift.common.middleware.s3api.controllers.multi_upload.time')
+    def test_checksum_mpu_metric_waits_for_terminal_result(self, mock_time):
+        part_checksum = base64.b64encode(
+            hashlib.sha256(b'part one').digest()).decode('ascii')
+        self._register_checksum_upload_marker(
+            header='x-amz-checksum-sha256')
+        self._register_part_checksum(
+            1, part_checksum, header='x-amz-checksum-sha256')
+        xml = (
+            '<CompleteMultipartUpload>'
+            '<Part>'
+            '<PartNumber>1</PartNumber>'
+            '<ETag>0123456789abcdef0123456789abcdef</ETag>'
+            '<ChecksumSHA256>%s</ChecksumSHA256>'
+            '</Part>'
+            '</CompleteMultipartUpload>' % part_checksum)
+        req = Request.blank(
+            '/bucket/object?uploadId=X', method='POST', headers={
+                'Authorization': 'AWS test:tester:hmac',
+                'Date': self.get_date_header(),
+            }, body=xml)
+        self.assertNotIn('x-amz-checksum-sha256', req.headers)
+
+        original_app = self.app.app
+        self.app.app = slo.filter_factory(
+            {}, yield_frequency='0')(self.swift)
+        mock_time.time.side_effect = (
+            1,   # CompleteMultipartUpload starts
+            11,  # Initial SLO heartbeat
+            11,  # Segment heartbeat
+        )
+        status = [None]
+
+        def start_response(response_status, headers, exc_info=None):
+            status[0] = response_status
+
+        try:
+            body_iter = self.s3api(req.environ, start_response)
+            self.assertEqual('200 OK', status[0])
+            self._assert_complete_mpu_metric(None)
+
+            xml_declaration = next(body_iter)
+            self.assertTrue(xml_declaration.startswith(b'<?xml '))
+            self._assert_complete_mpu_metric(None)
+
+            heartbeat = next(body_iter)
+            self.assertTrue(heartbeat)
+            self.assertFalse(heartbeat.strip())
+            self._assert_complete_mpu_metric(None)
+
+            body = b''.join((xml_declaration, heartbeat, *body_iter))
+        finally:
+            self.app.app = original_app
+
+        fromstring(body, 'CompleteMultipartUploadResult')
+        self._assert_complete_mpu_metric(
+            'persisted', checksum_algorithm='SHA256',
+            checksum_type='COMPOSITE')
 
     @patch('swift.common.middleware.s3api.controllers.multi_upload.time')
     def test_object_multipart_upload_complete_with_heartbeat(self, mock_time):
@@ -5773,6 +6014,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         self.assertFalse(lines[1].strip())
         fromstring(body, 'CompleteMultipartUploadResult')
         self.assertEqual(status.split()[0], '200')
+        self._assert_complete_mpu_metric('completed')
         # NB: S3_ETAG includes quotes
         self.assertIn(('<ETag>%s</ETag>' % S3_ETAG).encode('ascii'), body)
         self.assertEqual(self.swift.calls, [
@@ -5789,7 +6031,10 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             self, mock_time):
         self.swift.register(
             'HEAD', '/v1/AUTH_test/bucket+segments/heartbeat-fail/X',
-            swob.HTTPOk, {}, None)
+            swob.HTTPOk, {
+                'x-object-sysmeta-s3api-checksum-algorithm': 'CRC32',
+                'x-object-sysmeta-s3api-checksum-type': 'COMPOSITE',
+            }, None)
         self.swift.register(
             'GET', '/v1/AUTH_test/bucket+segments', swob.HTTPOk, {},
             json.dumps([
@@ -5797,42 +6042,147 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                  'last_modified': item[1], 'hash': item[2], 'bytes': item[3]}
                 for item in OBJECTS_TEMPLATE
             ]))
+        cases = (
+            ('400 Bad Request', [['some/object', '403 Forbidden']],
+             'invalid_request', 'InvalidRequest',
+             'some/object: 403 Forbidden', (12,)),
+            ('412 Precondition Failed', [],
+             'precondition_failed', 'PreconditionFailed',
+             'At least one of the preconditions you specified did not hold.',
+             (2, 12)),
+            # Segment validation passed, but the manifest PUT failed with 503,
+            # SLO returns Errors=[] and InvalidRequest with 503 message.
+            ('503 Service Unavailable', [],
+             'backend_error', 'InvalidRequest', 'Invalid Request.', (2, 12)),
+        )
+        for (slo_status, errors, outcome, error_code, error_message,
+             heartbeat_times) in cases:
+            for heartbeat_time in heartbeat_times:
+                with self.subTest(slo_status=slo_status,
+                                  heartbeat_time=heartbeat_time):
+                    self.swift.clear_calls()
+                    self.statsd.clear()
+                    self.swift.register(
+                        'PUT', '/v1/AUTH_test/bucket/heartbeat-fail',
+                        swob.HTTPAccepted, {}, [b' ', json.dumps({
+                            'Response Status': slo_status,
+                            'Errors': errors,
+                        }).encode('ascii')])
+                    # The early heartbeat is suppressed. After the later
+                    # heartbeat, HTTP 200 cannot change when completion fails.
+                    mock_time.time.side_effect = (1, heartbeat_time)
+
+                    req = Request.blank(
+                        '/bucket/heartbeat-fail?uploadId=X', method='POST',
+                        headers={
+                            'Authorization': 'AWS test:tester:hmac',
+                            'Date': self.get_date_header(),
+                            'If-None-Match': '*',
+                        }, body=XML)
+                    status, headers, body = self.call_s3api(req)
+                    lines = body.split(b'\n')
+                    self.assertTrue(lines[0].startswith(b'<?xml '),
+                                    (status, lines))
+                    if heartbeat_time == 12:
+                        self.assertTrue(lines[1])
+                        self.assertFalse(lines[1].strip())
+                        self.assertEqual('200 OK', status)
+                    else:
+                        self.assertEqual(slo_status, status)
+                    fromstring(body, 'Error')
+                    self._assert_complete_mpu_metric(
+                        outcome, checksum_algorithm='CRC32',
+                        checksum_type='COMPOSITE')
+                    self.assertEqual(error_code, self._get_error_code(body))
+                    self.assertEqual(error_message,
+                                     self._get_error_message(body))
+                    self.assertEqual(self.swift.calls, [
+                        ('HEAD', '/v1/AUTH_test'),
+                        ('HEAD', '/v1/AUTH_test/bucket'),
+                        ('HEAD', '/v1/AUTH_test/bucket+segments/'
+                                 'heartbeat-fail/X'),
+                        ('PUT', '/v1/AUTH_test/bucket/heartbeat-fail?'
+                                'heartbeat=on&multipart-manifest=put'),
+                    ])
+
+    @patch('swift.common.middleware.s3api.controllers.multi_upload.time')
+    def test_complete_mpu_iterator_failure_before_heartbeat_emits_once(
+            self, mock_time):
+        self._register_checksum_upload_marker()
+        # The incomplete SLO response fails before reiterate() can return a
+        # response to POST(). The iterator must emit only one failure metric,
+        # including when that metric call also fails.
         self.swift.register(
-            'PUT', '/v1/AUTH_test/bucket/heartbeat-fail',
-            swob.HTTPAccepted, {}, [b' ', b' ', b' ', json.dumps({
-                'Response Status': '400 Bad Request',
-                'Errors': [['some/object', '403 Forbidden']],
+            'PUT', '/v1/AUTH_test/bucket/object',
+            swob.HTTPAccepted, {}, [b' '])
+
+        for metric_error in (None, RuntimeError('statsd unavailable')):
+            with self.subTest(metric_error=metric_error):
+                mock_time.time.side_effect = (
+                    1,  # CompleteMultipartUpload starts
+                    2,  # SLO whitespace is suppressed before the threshold
+                )
+                req = Request.blank(
+                    '/bucket/object?uploadId=X', method='POST', headers={
+                        'Authorization': 'AWS test:tester:hmac',
+                        'Date': self.get_date_header(),
+                    }, body=XML)
+
+                with patch.object(
+                        self.statsd, 'increment',
+                        side_effect=metric_error) as increment:
+                    status, headers, body = self.call_s3api(req)
+
+                self.assertEqual('500 Internal Server Error', status)
+                self.assertEqual('InternalError', self._get_error_code(body))
+                increment.assert_called_once_with(
+                    'swift_s3_complete_mpu', labels={
+                        'outcome': 'backend_error',
+                        'account': 'AUTH_test',
+                        'container': 'bucket',
+                        'checksum_algorithm': 'CRC32',
+                        'checksum_type': 'COMPOSITE',
+                    })
+
+    @patch('swift.common.middleware.s3api.controllers.multi_upload.time')
+    def test_complete_mpu_success_metric_failure_after_heartbeat_emits_once(
+            self, mock_time):
+        # Once a heartbeat is sent, POST() has returned its response. A metric
+        # failure after a successful completion must propagate to the WSGI
+        # caller without a second backend-error metric attempt.
+        self.swift.register(
+            'PUT', '/v1/AUTH_test/bucket/object',
+            swob.HTTPAccepted, {}, [b' ', json.dumps({
+                'Response Status': '201 Created',
+                'Errors': [],
             }).encode('ascii')])
         mock_time.time.side_effect = (
-            1,  # start_time
-            12,  # first whitespace
-            13,  # second...
-            14,  # third...
-            15,  # JSON body
+            1,   # CompleteMultipartUpload starts
+            12,  # SLO heartbeat
         )
+        req = Request.blank(
+            '/bucket/object?uploadId=X', method='POST', headers={
+                'Authorization': 'AWS test:tester:hmac',
+                'Date': self.get_date_header(),
+            }, body=XML)
 
-        req = Request.blank('/bucket/heartbeat-fail?uploadId=X',
-                            environ={'REQUEST_METHOD': 'POST'},
-                            headers={'Authorization': 'AWS test:tester:hmac',
-                                     'Date': self.get_date_header(), },
-                            body=XML)
-        status, headers, body = self.call_s3api(req)
-        lines = body.split(b'\n')
-        self.assertTrue(lines[0].startswith(b'<?xml '), (status, lines))
-        self.assertTrue(lines[1])
-        self.assertFalse(lines[1].strip())
-        fromstring(body, 'Error')
-        self.assertEqual(status.split()[0], '200')
-        self.assertEqual(self._get_error_code(body), 'InvalidRequest')
-        self.assertEqual(self._get_error_message(body),
-                         'some/object: 403 Forbidden')
-        self.assertEqual(self.swift.calls, [
-            ('HEAD', '/v1/AUTH_test'),
-            ('HEAD', '/v1/AUTH_test/bucket'),
-            ('HEAD', '/v1/AUTH_test/bucket+segments/heartbeat-fail/X'),
-            ('PUT', '/v1/AUTH_test/bucket/heartbeat-fail?'
-                    'heartbeat=on&multipart-manifest=put'),
-        ])
+        with patch.object(
+                self.statsd, 'increment',
+                side_effect=RuntimeError('statsd unavailable')) as increment:
+            status, headers, body, caught_exc = self.call_s3api(
+                req, expect_exception=True)
+
+        self.assertEqual('200 OK', status)
+        self.assertTrue(body.startswith(b'<?xml '))
+        self.assertIsInstance(caught_exc, RuntimeError)
+        self.assertEqual('statsd unavailable', str(caught_exc))
+        increment.assert_called_once_with('swift_s3_complete_mpu', labels={
+            'outcome': 'completed',
+            'account': 'AUTH_test',
+            'container': 'bucket',
+            'checksum_algorithm': None,
+            'checksum_type': None,
+        })
 
     @patch('swift.common.middleware.s3api.controllers.multi_upload.time')
     def test_object_multipart_upload_missing_part_with_heartbeat(
@@ -5929,6 +6279,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
             status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '503')
         self.assertEqual('ServiceUnavailable', self._get_error_code(body))
+        self._assert_complete_mpu_metric('backend_error')
         self.assertEqual(self.swift.calls, [
             ('HEAD', '/v1/AUTH_test'),
             ('HEAD', '/v1/AUTH_test/bucket'),
@@ -6064,6 +6415,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
         for min_segment_size in (1, 5242880):
             with self.subTest(min_segment_size=min_segment_size):
                 self.swift.clear_calls()
+                self.statsd.clear()
                 self.s3api.conf.min_segment_size = min_segment_size
                 msg = 'some/path: %s' \
                       % _CompleteMultipartUploadSloManifestHook.ERROR_MESSAGE
@@ -6083,6 +6435,7 @@ class TestS3ApiMultiUpload(BaseS3ApiMultiUpload, S3ApiTestCase):
                         EntityTooSmall('whatever')):
                     status, headers, body = self.call_s3api(req)
                 self.assertEqual(status.split()[0], '400')
+                self._assert_complete_mpu_metric('invalid_part')
                 self.assertEqual(self._get_error_code(body), 'EntityTooSmall')
                 self.assertEqual(self._get_error_message(body), 'whatever')
                 # We punt to SLO to do the validation
