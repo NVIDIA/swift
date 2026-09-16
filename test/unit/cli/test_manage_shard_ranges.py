@@ -1196,6 +1196,7 @@ class TestManageShardRanges(BaseUnitTestCase):
         self.assertEqual(['Loaded db broker for a/c'],
                          err.getvalue().splitlines())
         self._assert_enabled(broker, now)
+        self.assertEqual(now, broker.get_own_shard_range().timestamp)
         self.assertEqual(100, broker.get_info()['object_count'])
         self.assertEqual(100, broker.get_own_shard_range().object_count)
         self.assertEqual(900, broker.get_info()['bytes_used'])
@@ -1248,6 +1249,7 @@ class TestManageShardRanges(BaseUnitTestCase):
         self.assertEqual(['Loaded db broker for a/c'],
                          err.getvalue().splitlines())
         self._assert_enabled(broker, now)
+        self.assertEqual(now, broker.get_own_shard_range().timestamp)
         found_shard_ranges = broker.get_shard_ranges()
         self.assertEqual(
             [(data['lower'], data['upper']) for data in self.shard_data],
