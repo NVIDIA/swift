@@ -1773,11 +1773,13 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         # we'll use other broker as a template to use the "default" osrs
         other_broker = self._get_broker('a', 'c', node_index=2)
         other_broker.initialize(Timestamp.now().internal, POLICIES.default.idx)
-        default_osr = other_broker.get_own_shard_range()
+        default_osr = other_broker.get_own_shard_range_for_routing()
         self.assertIsNone(default_osr.epoch)
         osr_with_epoch = other_broker.get_own_shard_range()
+        osr_with_epoch.timestamp = NormalTimestamp.now()
         osr_with_epoch.epoch = NormalTimestamp.now()
         osr_with_different_epoch = other_broker.get_own_shard_range()
+        osr_with_different_epoch.timestamp = NormalTimestamp.now()
         osr_with_different_epoch.epoch = NormalTimestamp.now()
         default_osr_newer = ShardRange(**dict(default_osr))
         default_osr_newer.timestamp = NormalTimestamp.now()
@@ -1814,6 +1816,43 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         for i, params in enumerate(tests):
             with self.subTest(i=i, params=params):
                 do_test(*params)
+
+    def test_sync_zero_routing_fallback_with_epoched_osr(self):
+        for state, first_sender in itertools.product(
+                (ShardRange.SHARDING, ShardRange.SHARDED), (0, 1)):
+            with self.subTest(state=state, first_sender=first_sender):
+                container = 'c-%s-%s' % (state, first_sender)
+                brokers = [self._get_broker('a', container, node_index=i)
+                           for i in (0, 1)]
+                put_timestamp = Timestamp.now().internal
+                for broker in brokers:
+                    broker.initialize(put_timestamp, POLICIES.default.idx)
+
+                fallback = brokers[1].get_own_shard_range_for_routing()
+                self.assertEqual(NormalTimestamp.zero(), fallback.timestamp)
+                self.assertIsNone(fallback.epoch)
+                brokers[1].merge_shard_ranges(fallback)
+
+                epoch = NormalTimestamp.now()
+                own_sr = brokers[0].enable_sharding(epoch)
+                own_sr.update_state(state, NormalTimestamp.now())
+                brokers[0].merge_shard_ranges(own_sr)
+                self.assertNotEqual(NormalTimestamp.zero(), own_sr.timestamp)
+                expected = (own_sr.timestamp, own_sr.state,
+                            own_sr.state_timestamp, own_sr.epoch)
+
+                daemon = replicator.ContainerReplicator(
+                    {}, logger=debug_logger())
+                for sender in (first_sender, 1 - first_sender):
+                    source, target = brokers[sender], brokers[1 - sender]
+                    part, node = self._get_broker_part_node(target)
+                    self.assertTrue(daemon._repl_to_node(
+                        node, source, part, source.get_replication_info()))
+                    for broker in brokers:
+                        actual = broker.get_own_shard_range(no_default=True)
+                        self.assertEqual(expected, (
+                            actual.timestamp, actual.state,
+                            actual.state_timestamp, actual.epoch))
 
     def test_sync_shard_ranges(self):
         put_timestamp = Timestamp.now().internal
