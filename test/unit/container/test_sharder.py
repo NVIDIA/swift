@@ -7666,6 +7666,7 @@ class TestSharder(BaseTestSharder):
                     broker, [own_sr])
         own_sr = broker.get_own_shard_range()
         self.assertEqual(ShardRange.SHARDING, own_sr.state)
+        self.assertEqual(now, own_sr.timestamp)
         self.assertEqual(now, own_sr.state_timestamp)
         self.assertEqual(now, own_sr.epoch)
 

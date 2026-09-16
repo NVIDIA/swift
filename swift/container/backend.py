@@ -1696,13 +1696,17 @@ class ContainerBroker(DatabaseBroker):
                 raise
 
     def _make_filler_shard_range(self, namespaces, marker, end_marker):
+        """
+        Return the own shard range with bounds narrowed to the trailing gap.
+
+        The gap ends at the own shard range's upper bound, subject to marker
+        and end_marker. Interior gaps between namespaces are not filled.
+        Return None if there is no trailing gap to fill.
+        """
         if namespaces and namespaces[-1].upper == Namespace.MAX:
             return None
 
-        # Insert a modified copy of own shard range to fill any gap between the
-        # end of any found and the upper bound of own shard range. Gaps
-        # enclosed within the found shard ranges are not filled.
-        own_shard_range = self.get_own_shard_range()
+        own_shard_range = self.get_own_shard_range_for_routing()
         if namespaces:
             last_upper = namespaces[-1].upper
         else:
@@ -2040,6 +2044,11 @@ class ContainerBroker(DatabaseBroker):
 
         return shard_ranges
 
+    def _make_default_own_shard_range(self, timestamp):
+        return ShardRange(
+            self.path, timestamp, ShardRange.MIN, ShardRange.MAX,
+            state=ShardRange.ACTIVE)
+
     def get_own_shard_range(self, no_default=False):
         """
         Returns a shard range representing this broker's own shard range. If no
@@ -2064,10 +2073,32 @@ class ContainerBroker(DatabaseBroker):
         elif no_default:
             own_shard_range = None
         else:
-            own_shard_range = ShardRange(
-                self.path, NormalTimestamp.now(),
-                ShardRange.MIN, ShardRange.MAX,
-                state=ShardRange.ACTIVE)
+            own_shard_range = self._make_default_own_shard_range(
+                NormalTimestamp.now())
+        return own_shard_range
+
+    def get_own_shard_range_for_routing(self):
+        """
+        Return the stored own shard range unchanged, a default fallback range.
+
+        If no own shard range is stored, synthesize an ACTIVE full-namespace
+        range with no epoch and timestamp zero. This method does not persist
+        the fallback.
+
+        :return: an instance of :class:`~swift.common.utils.ShardRange`
+        """
+        own_shard_range = self.get_own_shard_range(no_default=True)
+        if own_shard_range is None:
+            # TODO: This is tactical containment for
+            #  https://bugs.launchpad.net/swift/+bug/2171006:
+            #  misplaced moves still merge this range into the destination DB.
+            #  The fallback's zero timestamp lets a real OSR with a positive
+            #  timestamp take precedence, preserving its epoch or replacing a
+            #  persisted fallback during replication.
+            #  Separating _get_shard_broker's cleaving and move side effects is
+            #  follow-up work.
+            own_shard_range = self._make_default_own_shard_range(
+                NormalTimestamp.zero())
         return own_shard_range
 
     def is_own_shard_range(self, shard_range):
