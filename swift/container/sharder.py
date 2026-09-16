@@ -1800,6 +1800,20 @@ class ContainerSharder(ContainerSharderConf, ContainerReplicator):
                     # TODO: the root may not yet know about shard ranges to
                     # which a shard is sharding, but those could come from
                     # the broker
+                    # Note: The 'updating' query may return shard ranges that
+                    # include a fallback 'filler' shard range to route
+                    # misplaced objects to the root container. When the root
+                    # replica does not yet have a persisted own-shard-range, it
+                    # will synthesize this filler range with incomplete state
+                    # (e.g. the epoch is None). The filler range is still used
+                    # as a staging destination for misplaced objects, causing a
+                    # local DB to be cleaved with the synthesized
+                    # own-shard-range. A synthesized filler range has a zero
+                    # timestamp so replication will eventually overwrite it
+                    # with the root's genuine own-shard-range. This ensures
+                    # that misplaced objects are moved to the root ASAP, rather
+                    # than remaining misplaced in their current shard until a
+                    # later shard lookup returns a genuine destination.
                     ranges = self._fetch_shard_ranges(
                         broker, newest=True,
                         params={'states': 'updating',
