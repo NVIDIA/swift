@@ -29,7 +29,7 @@ from swift.common.internal_client import UnexpectedResponse
 from swift.common.manager import Manager
 from swift.common.memcached import MemcacheRing
 from swift.common.utils import ShardRange, parse_db_filename, quorum_size, \
-    config_true_value, Timestamp, md5, Namespace
+    config_true_value, Timestamp, NormalTimestamp, md5, Namespace
 from swift.container.backend import ContainerBroker, UNSHARDED, SHARDING, \
     SHARDED
 from swift.container.sharder import CleavingContext, ContainerSharder
@@ -41,8 +41,8 @@ from swift.proxy.controllers.obj import num_container_updates
 from test.debug_logger import debug_logger
 from test.probe import PROXY_BASE_URL
 from test.probe.brain import BrainSplitter
-from test.probe.common import ReplProbeTest, get_server_number, \
-    wait_for_server_to_hangup, ENABLED_POLICIES, exclude_nodes
+from test.probe.common import kill_server, ReplProbeTest, get_server_number, \
+    start_server, wait_for_server_to_hangup, ENABLED_POLICIES, exclude_nodes
 from unittest import mock
 
 try:
@@ -4271,6 +4271,390 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         handoff_osr = handoff_broker.get_own_shard_range(no_default=True)
         self.assertIsNotNone(handoff_osr.epoch)
 
+    def _make_misplaced_row_in_sharded_child(self, obj_names):
+        """
+        Build the common setup for moving a misplaced child-shard row.
+
+        Return the physical node and broker for the child replica that
+        contains the misplaced row. Its device also holds a primary root
+        replica, so the child sharder will choose that local root DB as the
+        move destination. The broker provides the logical child identity and
+        the misplaced object row.
+        """
+        # Set up a root with eight objects and replicate every object row to
+        # the root DB that swift-manage-shard-ranges will inspect.
+        self.put_objects(obj_names)
+        self.container_replicators.once()
+
+        # Find two child ranges, enable sharding on one root replica, then
+        # replicate the ranges and let every root replica finish sharding.
+        self.assert_subprocess_success([
+            'swift-manage-shard-ranges',
+            self.get_db_file(self.brain.part, self.brain.nodes[0]),
+            'find_and_replace', '4', '--enable', '--minimum-shard-size', '2'])
+        self.container_replicators.once(
+            additional_args='--partitions=%s' % self.brain.part)
+        self.sharders_once_non_auto(
+            additional_args='--partitions=%s' % self.brain.part)
+        self.sharders_once_non_auto()
+        # All root replicas have finished sharding into two children.
+        self.assert_container_states('sharded', 2)
+
+        # Pick the first child in a different partition so one targeted pass
+        # can process the child without also processing the root.
+        root_broker = self.get_broker(self.brain.part, self.brain.nodes[0])
+        child_ranges = root_broker.get_shard_ranges()
+        for child_range in child_ranges:
+            child_part, child_nodes = self.brain.ring.get_nodes(
+                child_range.account, child_range.container)
+            if child_part != self.brain.part:
+                break
+        else:
+            self.fail(
+                'All child ranges are on root partition %s: %r' %
+                (self.brain.part, child_ranges))
+
+        # Refresh the proxy's view of the now-sharded root through the public
+        # API. The next object PUT will consequently fetch and cache the two
+        # child namespaces as the PUT's updating route.
+        self.assert_container_listing(
+            obj_names, req_hdrs={'X-Newest': 'true'})
+
+        # Populate that updating route while this child is still a leaf.
+        # Re-PUT an existing object so the namespace keeps eight names.
+        misplaced_name = next(name for name in obj_names
+                              if name in child_range)
+        client.put_object(
+            self.url, self.token, self.container_name, misplaced_name,
+            b'prime updating cache')
+
+        # Shard the selected child into two grandchildren. After child
+        # sharding completes, any later object row in the child is misplaced.
+        self.assert_subprocess_success([
+            'swift-manage-shard-ranges',
+            self.get_shard_broker(child_range).db_file,
+            'find_and_replace', '2', '--enable', '--minimum-shard-size', '1'])
+        self.container_replicators.once(
+            additional_args='--partitions=%s' % child_part)
+        self.sharders_once_non_auto(
+            additional_args='--partitions=%s' % child_part)
+
+        # All child replicas have finished sharding into two grandchildren,
+        # and the namespace still has all eight objects.
+        for node in child_nodes:
+            self.assert_container_state(
+                node, 'sharded', 2, account=child_range.account,
+                container=child_range.container, part=child_part)
+        self.assert_container_listing(obj_names)
+
+        # Create the failure-inducing input with an ordinary object PUT. The
+        # proxy's cached route still points to the child that has now sharded.
+        # Object-server updates do not request redirection, so the child
+        # accepts the update; the child sharder must move the misplaced row.
+        content_type = 'application/x-misplaced-update'
+        client.put_object(
+            self.url, self.token, self.container_name, misplaced_name,
+            b'misplaced update', content_type=content_type)
+
+        # A PUT only sends container updates to a subset of child primaries.
+        # Select a child DB replica that received the misplaced row and whose
+        # device also holds a root primary DB. With two updates and three root
+        # primaries across four devices, one device must match.
+        root_ids = {node['id'] for node in self.brain.nodes}
+        for child_node in child_nodes:
+            if child_node['id'] not in root_ids:
+                continue
+            child_broker = self.get_broker(
+                child_part, child_node, child_range.account,
+                child_range.container)
+            child_objects = child_broker.get_objects()
+            if child_objects:
+                break
+        else:
+            self.fail(
+                'No child DB on a root-primary device received the misplaced '
+                'update: '
+                'root=%r, child=%r' % (self.brain.nodes, child_nodes))
+        self.assertEqual([misplaced_name],
+                         [obj['name'] for obj in child_objects])
+        self.assertEqual(content_type, child_objects[0]['content_type'])
+        return child_node, child_broker
+
+    def test_recreated_root_fallback_during_misplaced_object_move(self):
+        """
+        Verify a recreated root's fallback cannot corrupt a sharded root.
+
+        In the verified probe scenario:
+
+        * An ordinary object PUT follows a cached updating route into a child
+          that has since sharded, leaving a misplaced row in that child.
+        * A child shard receives an epochless synthetic fallback over the
+          network from a recreated root replica with no shard metadata.
+        * That child shard runs on a device with a valid primary root DB.
+        * The child sharder uses the fallback to open that local root primary
+          as its move destination.
+        * The real OSR and its epoch must remain unchanged.
+        """
+        child_node, child_broker = \
+            self._make_misplaced_row_in_sharded_child(
+                self._make_object_names(8))
+        child_osr = child_broker.get_own_shard_range(no_default=True)
+        child_part, _ = self.brain.ring.get_nodes(
+            child_osr.account, child_osr.container)
+        misplaced = child_broker.get_objects()[0]
+
+        # Snapshot the co-located root's valid OSR and epoched DB filename. A
+        # different root primary will be recreated to supply the fallback.
+        recreated_root_node = next(
+            node for node in self.brain.nodes
+            if node['id'] != child_node['id'])
+        local_root_broker = self.get_broker(
+            self.brain.part, child_node)
+        orig_osr = local_root_broker.get_own_shard_range(no_default=True)
+        orig_db_file = local_root_broker.db_file
+        self.assertIsNotNone(orig_osr.epoch)
+        self.assertEqual(SHARDED, local_root_broker.get_db_state())
+
+        # Simulate loss of one root DB, then recreate the missing replica with
+        # an ordinary container PUT. The recreated DB's creation timestamp
+        # must be newer for X-Newest to select that replica's response.
+        os.remove(self.get_db_file(self.brain.part, recreated_root_node))
+        client.put_container(self.url, self.token, self.container_name)
+        recreated_root_broker = self.get_broker(
+            self.brain.part, recreated_root_node)
+        self.assertIsNone(
+            recreated_root_broker.get_own_shard_range(no_default=True))
+        self.assertEqual([], recreated_root_broker.get_shard_ranges())
+        self.assertGreater(recreated_root_broker.get_info()['created_at'],
+                           local_root_broker.get_info()['created_at'])
+
+        # Verify that an X-Newest routing lookup now returns the recreated
+        # root's synthetic, epochless full-namespace fallback. The fallback is
+        # generated for the response and is not stored in the recreated DB.
+        ranges = self.get_container_shard_ranges(
+            headers={'X-Newest': 'true'}, params={'states': 'updating'})
+        self.assertEqual(1, len(ranges))
+        fallback = ranges[0]
+        self.assertEqual('%s/%s' % (self.account, self.container_name),
+                         fallback.name)
+        self.assertEqual(('', ''), (fallback.lower_str, fallback.upper_str))
+        self.assertEqual(ShardRange.ACTIVE, fallback.state)
+        self.assertIsNone(fallback.epoch)
+        self.assertEqual(NormalTimestamp.zero(), fallback.timestamp)
+        self.assertIsNone(
+            recreated_root_broker.get_own_shard_range(no_default=True))
+
+        # The selected child is complete, so the newly accepted row in that
+        # child is misplaced and ready for the sharder pass below.
+        self.assertEqual(SHARDED, child_broker.get_db_state())
+        _, child_server_number = get_server_number(
+            (child_node['ip'], child_node['port']), self.ipport2server)
+
+        # Turn the crank on only the selected child replica. Its sharder uses
+        # the synthetic fallback to locate the co-located root destination.
+        self.run_custom_sharder(
+            child_server_number, {}, override_partitions=[child_part],
+            override_devices=[child_node['device']], auto_shard=False)
+
+        # Successful destination replication removes the misplaced row from
+        # the child, proving that the sharder completed the object move.
+        self.assertEqual([], child_broker.get_objects())
+
+        # Every OSR field, the epoched filename, and the state remain intact.
+        local_root_broker = self.get_broker(
+            self.brain.part, child_node)
+        persisted = local_root_broker.get_own_shard_range(no_default=True)
+        for key in ('name', 'lower', 'upper', 'timestamp', 'state',
+                    'state_timestamp', 'epoch', 'deleted'):
+            self.assertEqual(dict(orig_osr)[key], dict(persisted)[key], key)
+        self.assertEqual(orig_db_file, local_root_broker.db_file)
+        self.assertEqual(orig_osr.epoch, local_root_broker.db_epoch)
+        self.assertEqual(SHARDED, local_root_broker.get_db_state())
+
+        # Ignoring the older fallback must not reject the object: the local
+        # destination write still puts the misplaced update into the root DB.
+        moved = [obj for obj in local_root_broker.get_objects()
+                 if obj['name'] == misplaced['name']]
+        self.assertEqual(1, len(moved))
+        self.assertEqual(misplaced['content_type'], moved[0]['content_type'])
+        self.assertEqual(misplaced['created_at'], moved[0]['created_at'])
+
+    def test_recreated_local_root_recovers_from_synthetic_fallback(self):
+        """
+        Verify replication repairs a recreated local root destination.
+
+        In this second probe scenario:
+
+        * An ordinary object PUT leaves a misplaced row in a child that has
+          already sharded.
+        * The child replica shares a device with a root primary, but that
+          local root DB is then lost and recreated without shard metadata.
+        * An X-Newest lookup returns that recreated root's synthetic,
+          epochless fallback to the child sharder.
+        * The child sharder uses the fallback to open the empty local root and
+          moves the object there.
+        * Replication restores the root's metadata, allowing its sharder to
+          forward the staged update to the current leaf.
+        """
+        obj_names = self._make_object_names(8)
+        child_node, child_broker = \
+            self._make_misplaced_row_in_sharded_child(obj_names)
+        child_osr = child_broker.get_own_shard_range(no_default=True)
+        child_part, _ = self.brain.ring.get_nodes(
+            child_osr.account, child_osr.container)
+        misplaced = child_broker.get_objects()[0]
+
+        # Preserve the real OSR from a healthy root. The root primary on the
+        # child's device will instead become the empty move destination.
+        healthy_root_node = next(
+            node for node in self.brain.nodes
+            if node['id'] != child_node['id'])
+        healthy_root_broker = self.get_broker(
+            self.brain.part, healthy_root_node)
+        real_osr = healthy_root_broker.get_own_shard_range(no_default=True)
+        self.assertIsNotNone(real_osr.epoch)
+        self.assertEqual(SHARDED, healthy_root_broker.get_db_state())
+
+        # Simulate loss of the co-located root DB. An ordinary container PUT
+        # recreates that primary as a plain DB with no stored OSR.
+        os.remove(self.get_db_file(self.brain.part, child_node))
+        client.put_container(self.url, self.token, self.container_name)
+        recreated_root_broker = self.get_broker(
+            self.brain.part, child_node)
+        self.assertIsNone(
+            recreated_root_broker.get_own_shard_range(no_default=True))
+        self.assertEqual([], recreated_root_broker.get_shard_ranges())
+        self.assertEqual(UNSHARDED, recreated_root_broker.get_db_state())
+        self.assertGreater(recreated_root_broker.get_info()['created_at'],
+                           healthy_root_broker.get_info()['created_at'])
+
+        # X-Newest selects the newly created DB response and returns its
+        # synthetic routing fallback.
+        ranges = self.get_container_shard_ranges(
+            headers={'X-Newest': 'true'}, params={'states': 'updating'})
+        self.assertEqual(1, len(ranges))
+        fallback = ranges[0]
+        self.assertEqual('%s/%s' % (self.account, self.container_name),
+                         fallback.name)
+        self.assertEqual(('', ''), (fallback.lower_str, fallback.upper_str))
+        self.assertEqual(ShardRange.ACTIVE, fallback.state)
+        self.assertIsNone(fallback.epoch)
+        self.assertEqual(NormalTimestamp.zero(), fallback.timestamp)
+
+        # The completed child contains the row that will make its sharder
+        # open the empty, co-located root as the destination broker. Stop the
+        # other root primaries so destination replication cannot immediately
+        # reach quorum and remove the source row before the fallback can be
+        # inspected. The local primary counts as one success, so both remote
+        # peers must be stopped.
+        self.assertEqual(SHARDED, child_broker.get_db_state())
+        _, child_server_number = get_server_number(
+            (child_node['ip'], child_node['port']), self.ipport2server)
+        root_peers = [node for node in self.brain.nodes
+                      if node['id'] != child_node['id']]
+        self.assertEqual(self.brain.ring.replica_count - 1, len(root_peers))
+        stopped_root_peers = []
+        try:
+            for node in root_peers:
+                kill_server((node['ip'], node['port']), self.ipport2server)
+                stopped_root_peers.append(node)
+            self.run_custom_sharder(
+                child_server_number, {}, override_partitions=[child_part],
+                override_devices=[child_node['device']], auto_shard=False)
+
+            # TODO: This stopgap still persists a synthetic OSR and sharding
+            # metadata. Separate _get_shard_broker's cleaving and move side
+            # effects in the follow-up; the fallback's zero timestamp allows
+            # replication to replace it with the real OSR.
+            recreated_root_broker = self.get_broker(
+                self.brain.part, child_node)
+            persisted_fallback = recreated_root_broker.get_own_shard_range(
+                no_default=True)
+            for key in ('name', 'lower', 'upper', 'timestamp', 'state',
+                        'state_timestamp', 'epoch', 'deleted'):
+                self.assertEqual(
+                    dict(fallback)[key], dict(persisted_fallback)[key], key)
+            self.assertEqual(NormalTimestamp.zero(),
+                             persisted_fallback.timestamp)
+            self.assertIsNone(persisted_fallback.epoch)
+            self.assertEqual(
+                '%s/%s' % (self.account, self.container_name),
+                recreated_root_broker.root_path)
+            self.assertEqual(
+                'True', recreated_root_broker.metadata[
+                    'X-Container-Sysmeta-Sharding'][0])
+
+            # Failed destination replication leaves the misplaced row for a
+            # later sharder pass rather than risking its loss.
+            self.assertEqual(
+                [misplaced['name']],
+                [obj['name'] for obj in child_broker.get_objects()])
+
+        finally:
+            for node in stopped_root_peers:
+                start_server((node['ip'], node['port']), self.ipport2server)
+
+        # Ordinary container replication supplies the real OSR from the
+        # healthy root replicas.
+        self.container_replicators.once(
+            additional_args='--partitions=%s' % self.brain.part)
+        recreated_root_broker = self.get_broker(
+            self.brain.part, child_node)
+        repaired = recreated_root_broker.get_own_shard_range(no_default=True)
+        for key in ('name', 'lower', 'upper', 'timestamp', 'state',
+                    'state_timestamp', 'epoch', 'deleted'):
+            self.assertEqual(dict(real_osr)[key], dict(repaired)[key], key)
+
+        # Retry the misplaced move. Destination replication can now reach
+        # quorum, allowing the child sharder to remove the misplaced row.
+        self.run_custom_sharder(
+            child_server_number, {}, override_partitions=[child_part],
+            override_devices=[child_node['device']], auto_shard=False)
+
+        # The move completed, including destination replication, so the row
+        # left the child and the recreated root learned the healthy root's
+        # real OSR.
+        self.assertEqual([], child_broker.get_objects())
+        recreated_root_broker = self.get_broker(
+            self.brain.part, child_node)
+        persisted = recreated_root_broker.get_own_shard_range(no_default=True)
+        for key in ('name', 'lower', 'upper', 'timestamp', 'state',
+                    'state_timestamp', 'epoch', 'deleted'):
+            self.assertEqual(dict(real_osr)[key], dict(persisted)[key], key)
+
+        # The OSR is repaired, but the root DB filename still lacks the epoch.
+        # Normal daemon passes create the epoched DB and forward the
+        # staged object to the current leaf.
+        self.assertEqual(UNSHARDED, recreated_root_broker.get_db_state())
+        for _ in range(2):
+            self.container_replicators.once()
+            self.sharders_once_non_auto()
+        self.assert_container_states(SHARDED, 3)
+        recreated_root_broker = self.get_broker(
+            self.brain.part, child_node)
+        self.assertEqual(real_osr.epoch, recreated_root_broker.db_epoch)
+        self.assertEqual(SHARDED, recreated_root_broker.get_db_state())
+
+        # Repairing the root must not lose the object that triggered the move.
+        _, listing = self.assert_container_listing(obj_names)
+        listed = next(
+            obj for obj in listing if obj['name'] == misplaced['name'])
+        self.assertEqual(misplaced['content_type'], listed['content_type'])
+        root_broker = self.get_broker(
+            self.brain.part, healthy_root_node)
+        leaf = next(sr for sr in root_broker.get_shard_ranges()
+                    if misplaced['name'] in sr)
+        leaf_part, leaf_nodes = self.brain.ring.get_nodes(
+            leaf.account, leaf.container)
+        for node in leaf_nodes:
+            leaf_broker = self.get_broker(
+                leaf_part, node, leaf.account, leaf.container)
+            moved = next(
+                obj for obj in leaf_broker.get_objects()
+                if obj['name'] == misplaced['name'])
+            self.assertEqual(misplaced['content_type'], moved['content_type'])
+            self.assertEqual(misplaced['created_at'], moved['created_at'])
+
     def test_force_replication_of_a_reset_own_shard_range(self):
         obj_names = self._make_object_names(100)
         self.put_objects(obj_names)
@@ -4334,8 +4718,8 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
         self.assertIsNone(
             new_primary_broker.get_own_shard_range(no_default=True))
 
-        # Let's reset the osr by hand.
-        reset_osr = new_primary_broker.get_own_shard_range()
+        # Simulate an accidentally persisted routing fallback.
+        reset_osr = new_primary_broker.get_own_shard_range_for_routing()
         self.assertIsNone(reset_osr.epoch)
         self.assertEqual(reset_osr.state, ShardRange.ACTIVE)
         new_primary_broker.merge_shard_ranges(reset_osr)
@@ -4351,15 +4735,11 @@ class TestManagedContainerSharding(BaseTestContainerSharding):
                                              quarantine_ok=True)
         new_osr = new_primary_broker.get_own_shard_range()
 
-        # This version stops replicating a remote non-epoch osr over a local
-        # epoched osr. But it doesn't do the other way. So it means the
-        # primary with non-epoched OSR get's stuck with it, if it is newer then
-        # the other epoched versions.
+        # The synthetic reset OSR has the smallest possible timestamp, so
+        # replication replaces it with the real sharded OSR.
         self.assertIsNotNone(old_osr.epoch)
         self.assertEqual(old_osr.state, ShardRange.SHARDED)
-
-        self.assertIsNone(new_osr.epoch)
-        self.assertGreater(new_osr.timestamp, old_osr.timestamp)
+        self.assertEqual(dict(old_osr), dict(new_osr))
 
     def test_manage_shard_ranges_missing_epoch_no_false_positives(self):
         # when one replica of a shard is sharding before the others, it's epoch
