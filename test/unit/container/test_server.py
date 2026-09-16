@@ -39,7 +39,7 @@ from swift.common.swob import (Request, WsgiBytesIO, HTTPNoContent,
 import swift.container
 from swift.container import server as container_server
 from swift.common import constraints
-from swift.common.utils.timestamp import Timestamp
+from swift.common.utils.timestamp import Timestamp, NormalTimestamp
 from swift.common.utils import (mkdirs, public, replication,
                                 storage_directory, lock_parent_directory,
                                 ShardRange, RESERVED_STR, Namespace)
@@ -3018,7 +3018,8 @@ class TestContainerController(BaseUnitTestCase):
 
         # listing shards don't cover entire namespace so expect an extra filler
         extra_shard_range = ShardRange(
-            'a/c', normal_ts_now, shard_ranges[2].upper, ShardRange.MAX, 0, 0,
+            'a/c', NormalTimestamp.zero(), shard_ranges[2].upper,
+            ShardRange.MAX, 0, 0,
             state=ShardRange.ACTIVE)
         expected = shard_ranges[:3] + [extra_shard_range]
         check_shard_GET(expected, 'a/c', params='&states=listing')
@@ -3032,7 +3033,8 @@ class TestContainerController(BaseUnitTestCase):
             params='&states=listing&reverse=true&end_marker=pickle')
         # updating shards don't cover entire namespace so expect a filler
         extra_shard_range = ShardRange(
-            'a/c', normal_ts_now, shard_ranges[3].upper, ShardRange.MAX, 0, 0,
+            'a/c', NormalTimestamp.zero(), shard_ranges[3].upper,
+            ShardRange.MAX, 0, 0,
             state=ShardRange.ACTIVE)
         expected = shard_ranges[1:4] + [extra_shard_range]
         check_shard_GET(expected, 'a/c', params='&states=updating')
@@ -3041,7 +3043,7 @@ class TestContainerController(BaseUnitTestCase):
         # when no listing shard ranges cover the requested namespace range then
         # filler is for entire requested namespace
         extra_shard_range = ShardRange(
-            'a/c', normal_ts_now, 'treacle', ShardRange.MAX, 0, 0,
+            'a/c', NormalTimestamp.zero(), 'treacle', ShardRange.MAX, 0, 0,
             state=ShardRange.ACTIVE)
         check_shard_GET([extra_shard_range], 'a/c',
                         params='&states=listing&marker=treacle')
@@ -3049,7 +3051,7 @@ class TestContainerController(BaseUnitTestCase):
             [extra_shard_range], 'a/c',
             params='&states=listing&reverse=true&end_marker=treacle')
         extra_shard_range = ShardRange(
-            'a/c', normal_ts_now, 'treacle', 'walnut', 0, 0,
+            'a/c', NormalTimestamp.zero(), 'treacle', 'walnut', 0, 0,
             state=ShardRange.ACTIVE)
         params = '&states=listing&marker=treacle&end_marker=walnut'
         check_shard_GET([extra_shard_range], 'a/c', params=params)

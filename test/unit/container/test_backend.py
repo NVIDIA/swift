@@ -4895,10 +4895,10 @@ class TestContainerBroker(test_db.TestDbBase):
             quarantine_ok=True)
         broker.initialize(self.ts().internal, 0)
 
-        # no row for own shard range - expect a default own shard range
-        # covering the entire namespace default
-        now = NormalTimestamp.now()
-        own_sr = ShardRange(broker.path, now, '', '', 0, 0, now,
+        # A new own shard range has a current timestamp so it can be
+        # persisted when sharding is enabled.
+        now = self.normal_ts()
+        own_sr = ShardRange(broker.path, now, '', '',
                             state=ShardRange.ACTIVE)
         with mock_normal_timestamp_now(now):
             actual = broker.get_own_shard_range()
@@ -4906,6 +4906,14 @@ class TestContainerBroker(test_db.TestDbBase):
 
         actual = broker.get_own_shard_range(no_default=True)
         self.assertIsNone(actual)
+
+        # A routing fallback is older than any ordinary own shard range and
+        # does not create a row in the broker.
+        fallback = broker.get_own_shard_range_for_routing()
+        self.assertEqual(NormalTimestamp.zero(), fallback.timestamp)
+        self.assertEqual(broker.path, fallback.name)
+        self.assertEqual(('', ''), (fallback.lower_str, fallback.upper_str))
+        self.assertIsNone(broker.get_own_shard_range(no_default=True))
 
         # row for own shard range and others
         ts_1 = self.normal_ts()
@@ -4915,6 +4923,8 @@ class TestContainerBroker(test_db.TestDbBase):
              ShardRange('.a/c1', self.normal_ts(), 'b', 'c'),
              ShardRange('.a/c2', self.normal_ts(), 'c', 'd')])
         actual = broker.get_own_shard_range()
+        self.assertEqual(dict(own_sr), dict(actual))
+        actual = broker.get_own_shard_range_for_routing()
         self.assertEqual(dict(own_sr), dict(actual))
 
         # check stats are not automatically updated
@@ -4979,6 +4989,7 @@ class TestContainerBroker(test_db.TestDbBase):
         epoch = self.normal_ts()
         broker.enable_sharding(epoch)
         own_sr = broker.get_own_shard_range(no_default=True)
+        self.assertNotEqual(NormalTimestamp.zero(), own_sr.timestamp)
         self.assertEqual(epoch, own_sr.epoch)
         self.assertEqual(epoch, own_sr.state_timestamp)
         self.assertEqual(ShardRange.SHARDING, own_sr.state)
