@@ -69,7 +69,8 @@ on accounts and containers, which provides a delay between when an object
 is marked for deletion, or expired, and when it is actually reaped from disk.
 When this is set in the object expirer config the object expirer leaves expired
 objects on disk (and in container listings) for the ``delay_reaping`` time.
-After this delay has passed objects will be reaped as normal.
+After this delay has passed, objects become eligible for reaping, subject to
+any configured reaping spread described below.
 
 The ``delay_reaping`` value can be set either at an account level or a
 container level. When set at an account level, the object expirer will
@@ -97,6 +98,36 @@ section in the ``object-server.conf``::
     ``delay_reaping`` value but overrides the account level value for the same
     account if it exists. By default, no ``delay_reaping`` value is configured
     for any accounts or containers.
+
+To spread reaping work when many objects expire together, set
+``reaping_spread_seconds`` to a positive integer in the same
+``[object-expirer]`` section. The default is ``0``, which disables spreading
+and preserves existing reaping behavior. For example, ``64800`` spreads
+eligibility over an 18-hour window.
+
+The expirer hashes the full task name, including its expiration timestamp and
+target account, container, and object path, to select a pseudo-random offset
+from zero to ``reaping_spread_seconds - 1`` seconds. The offset is deterministic:
+retries of the same task keep the same offset across passes, restarts, and
+worker assignments. Different expiration timestamps for the same object path
+may produce different offsets.
+
+The offset is added to the applicable account or container delay, rather than
+replacing it or taking the larger of the two values::
+
+    eligible_at = expiration_timestamp + delay_reaping + spread_offset
+
+The container delay still overrides the account delay. With no configured
+delay, ``delay_reaping`` is zero. With a two-day delay and an 18-hour spread,
+objects become eligible between two days and two days plus 17 hours, 59 minutes,
+and 59 seconds after expiration. Adding the spread after the fixed delay
+avoids merely moving a simultaneous-expiration workload to a later time.
+
+Eligibility does not guarantee immediate reaping: the expirer must encounter
+the task during a queue scan and process it within its rate limit. Neither
+delay changes the original ``X-Delete-At`` timestamp or the timestamp used for
+conditional deletion. Client-requested asynchronous deletes bypass both
+``delay_reaping`` and the spread, but remain subject to the rate limit.
 
 Accessing Objects After Expiration
 ----------------------------------

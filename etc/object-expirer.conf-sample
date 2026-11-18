@@ -81,7 +81,6 @@
 # The expirer can delay the reaping of expired objects on disk (and in
 # container listings) with an account level or container level delay_reaping
 # time.
-# After the delay_reaping time has passed objects will be reaped as normal.
 # You may configure this delay_reaping value in seconds with dynamic config
 # option names prefixed with delay_reaping_<ACCT> for account level delays
 # and delay_reaping_<ACCT>/<CNTR> for container level delays.
@@ -99,6 +98,25 @@
 # delay_reaping_AUTH_test/special%0Achars%3Dshould%20be%20quoted
 # N.B. By default no delay_reaping value is configured for any accounts or
 # containers.
+#
+# To spread the reaping of expired objects over time, set a positive integer
+# number of seconds. The default of 0 disables the spread and preserves the
+# existing reaping behavior. The expirer hashes the full task name, including
+# the expiration timestamp and target account, container, and object path,
+# to select a stable offset from 0 to reaping_spread_seconds - 1 seconds.
+# Different expirations of the same path may get different offsets; retries
+# of the same task keep the same offset, independent of worker assignment.
+# Eligibility is expiration time + applicable delay_reaping + spread offset.
+# The container delay overrides the account delay; the spread is added after
+# that delay, even when the configured delay exceeds the spread window.
+# For example, a two-day delay with a spread of 64800 seconds makes tasks
+# eligible between two days and two days plus 17:59:59 after expiration.
+# This spreads work even when many objects share a fixed reaping delay.
+# The expirer reaps eligible objects as it scans the queue, subject to its
+# rate limit. The spread does not change X-Delete-At. Client-requested
+# asynchronous deletes bypass both the spread and delay_reaping, but remain
+# subject to the rate limit.
+# reaping_spread_seconds = 0
 
 # When the expirer is configured in "multi-process" mode using the
 # process/processes configuration each process will handle a subset of the

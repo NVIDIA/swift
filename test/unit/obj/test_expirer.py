@@ -21,7 +21,7 @@ from time import time
 from unittest import main, TestCase
 from test.debug_logger import debug_logger
 from test.unit import FakeRing, mocked_http_conn, BaseUnitTestCase, \
-    mock_normal_timestamp_now, mock_normal_timestamp_now_with_iter
+    mock_normal_timestamp_now
 from test.unit.common.middleware.helpers import FakeSwift
 from tempfile import mkdtemp
 from shutil import rmtree
@@ -1037,6 +1037,17 @@ class TestObjectExpirer(BaseUnitTestCase):
         with self.assertRaises(ValueError) as ctx:
             x.override_proceses_config_from_command_line(**vals)
         self.assertEqual(str(ctx.exception), expected_msg)
+
+    def test_reaping_spread_seconds(self):
+        self.assertEqual(0, self.expirer.reaping_spread_seconds)
+        for value in ('0', '43200'):
+            x = expirer.ObjectExpirer({'reaping_spread_seconds': value},
+                                      swift=self.fake_swift)
+            self.assertEqual(int(value), x.reaping_spread_seconds)
+        for value in ('-1', '1.5', 'bad'):
+            with self.assertRaises(ValueError):
+                expirer.ObjectExpirer({'reaping_spread_seconds': value},
+                                      swift=self.fake_swift)
 
     def test_valid_delay_reaping(self):
         conf = {}
@@ -2178,8 +2189,8 @@ class TestObjectExpirer(BaseUnitTestCase):
         self.conf['delay_reaping_a1'] = delay
         x = expirer.ObjectExpirer(self.conf, logger=debug_logger(),
                                   swift=fake_swift)
-        with mock_normal_timestamp_now_with_iter(
-                [NormalTimestamp(now), NormalTimestamp(mock_past - delay)]):
+        with mock.patch('swift.common.utils.timestamp.time.time',
+                        return_value=mock_past):
             tasks = list(x._iter_task_container(
                 '.expiring_objects', task_container, 0, 1))
         # delete_ts (now-350) > NormalTimestamp(mock_past - delay = now-400)
@@ -2417,6 +2428,97 @@ class TestObjectExpirer(BaseUnitTestCase):
             proc_stats,
         )
         self.assertEqual(expected_task_paths, sorted(actual_task_paths))
+
+    def test_iter_task_container_reaping_spread(self):
+        self.conf.update({'reaping_spread_seconds': '43200',
+                          'delay_reaping_a': '3600.25',
+                          'delay_reaping_a/c': '10.5'})
+        queue = self.get_expirer_container('0000864000')
+        self._setup_fake_swift({'.expiring_objects': {queue: [
+            '0000864000-a/c/obj/é', '0000864000-a/d/obj/é']}})
+        # Map current times to expected yielded tasks.
+        # Check one timestamp tick before and exactly at each eligibility
+        # boundary. The later listing row becomes eligible first.
+        cases = {
+            884194.24999: [],
+            884194.25: ['0000864000-a/d/obj/é'],
+            886415.49999: ['0000864000-a/d/obj/é'],
+            886415.5: ['0000864000-a/c/obj/é', '0000864000-a/d/obj/é'],
+        }
+        for now, expected in cases.items():
+            with self.subTest(now=now), mock.patch(
+                    'swift.common.utils.timestamp.time.time',
+                    return_value=now):
+                self.assertEqual(
+                    expected,
+                    [task['task_object'] for task in
+                     self.expirer._iter_task_container(
+                         '.expiring_objects', queue, 0, 1)])
+
+    def test_reaping_spread_varies_with_expiration_time(self):
+        self.conf['reaping_spread_seconds'] = '43200'
+        first_queue = self.get_expirer_container('0000864000')
+        second_queue = self.get_expirer_container('0000972000')
+        self._setup_fake_swift({'.expiring_objects': {
+            first_queue: ['0000864000-a/c/o'],
+            second_queue: ['0000972000-a/c/o'],
+        }})
+        offsets = []
+        hash_mod = self.expirer.hash_mod
+
+        def record_offset(name, divisor):
+            result = hash_mod(name, divisor)
+            if divisor == int(self.conf['reaping_spread_seconds']):
+                offsets.append(result)
+            return result
+
+        # Observe the real hash results used by task iteration, excluding
+        # the separate hash used for worker assignment.
+        with mock.patch.object(self.expirer, 'hash_mod',
+                               side_effect=record_offset), mock.patch(
+                'swift.common.utils.timestamp.time.time',
+                return_value=1100000):
+            tasks = list(self.expirer.iter_task_to_expire([
+                ('.expiring_objects', first_queue),
+                ('.expiring_objects', second_queue)], 0, 1))
+        self.assertEqual(['0000864000-a/c/o', '0000972000-a/c/o'],
+                         [task['task_object'] for task in tasks])
+        self.assertEqual(2, len(offsets))
+        self.assertEqual(
+            2, len(set(offsets)),
+            'expected different offsets for two different tasks: %s' % offsets)
+
+    def test_async_delete_bypasses_reaping_delay_and_spread(self):
+        self.conf.update({'reaping_spread_seconds': '43200',
+                          'delay_reaping_a': '300'})
+        delete_at = '0000864000'
+        queue = self.get_expirer_container(delete_at)
+        self._setup_fake_swift({'.expiring_objects': {queue: [
+            delete_at + '-a/c/o',
+            {'name': delete_at + '-a/c/p',
+             'content_type': expirer.ASYNC_DELETE_TYPE}]}})
+
+        def hash_mod(name, divisor):
+            if divisor == int(self.conf['reaping_spread_seconds']):
+                return 600  # Ten minutes of jitter.
+            return 0  # Assign both tasks to this worker.
+
+        ordinary_task = self.make_task(queue, delete_at, 'a/c/o')
+        async_task = self.make_task(queue, delete_at, 'a/c/p', True)
+        cases = {
+            864000: [async_task],  # Original expiration time.
+            864300: [async_task],  # Account delay alone has elapsed.
+            864600: [async_task],  # Jitter alone has elapsed.
+            864900: [ordinary_task, async_task],  # Both delays have elapsed.
+        }
+        with mock.patch.object(self.expirer, 'hash_mod', side_effect=hash_mod):
+            for now, expected in cases.items():
+                with self.subTest(now=now), mock.patch(
+                        'swift.common.utils.timestamp.time.time',
+                        return_value=now):
+                    self.assertEqual(
+                        expected, list(self.expirer._iter_task_container(
+                            '.expiring_objects', queue, 0, 1)))
 
     def test_iter_task_to_expire_with_delay_reaping(self):
         aco_dict = {
