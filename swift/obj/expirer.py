@@ -364,6 +364,8 @@ class ObjectExpirer(Daemon):
         self.reclaim_age = int(conf.get('reclaim_age', 604800))
 
         self.delay_reaping_times = read_conf_for_delay_reaping_times(conf)
+        self.reaping_spread_seconds = non_negative_int(
+            conf.get('reaping_spread_seconds', 0))
         self.round_robin_task_cache_size = int(
             conf.get('round_robin_task_cache_size', MAX_OBJECTS_TO_CACHE))
 
@@ -470,9 +472,7 @@ class ObjectExpirer(Daemon):
 
     def hash_mod(self, name, divisor):
         """
-        :param name: a task object name
-        :param divisor: a divisor number
-        :return: an integer to decide which expirer is assigned to the task
+        Return a stable hash of the name modulo the divisor.
         """
         if not isinstance(name, bytes):
             name = name.encode('utf8')
@@ -669,10 +669,8 @@ class ObjectExpirer(Daemon):
                 self.logger.increment('tasks.parse_errors')
                 continue
             last_modified = last_modified_date_to_timestamp(last_modified_str)
-            delay_reaping = self.get_delay_reaping(target_account,
-                                                   target_container)
-
-            if delete_timestamp > NormalTimestamp.now():
+            now = NormalTimestamp.now()
+            if delete_timestamp > now:
                 # we shouldn't yield ANY more objects that can't reach
                 # the expiration date yet.
                 break
@@ -683,18 +681,24 @@ class ObjectExpirer(Daemon):
                 self.logger.increment('tasks.skipped')
                 continue
 
-            if delete_timestamp > NormalTimestamp.now(
-                    delta=int(-1e5 * delay_reaping)) and not is_async:
-                # we shouldn't yield the object during the delay
-                self.logger.increment('tasks.delayed')
-                continue
+            target_path = '/'.join((target_account, target_container,
+                                    target_object))
+            if not is_async:
+                delay = self.get_delay_reaping(
+                    target_account, target_container)
+                if self.reaping_spread_seconds:
+                    delay += self.hash_mod(
+                        task_object, self.reaping_spread_seconds)
+                if now < NormalTimestamp(delete_timestamp,
+                                         delta=int(1e5 * delay)):
+                    self.logger.increment('tasks.delayed')
+                    continue
 
             self.logger.increment('tasks.assigned')
             yield {'task_account': task_account,
                    'task_container': task_container,
                    'task_object': task_object,
-                   'target_path': '/'.join([
-                       target_account, target_container, target_object]),
+                   'target_path': target_path,
                    'delete_timestamp': delete_timestamp,
                    'is_async_delete': is_async,
                    'task_timestamp': last_modified}
